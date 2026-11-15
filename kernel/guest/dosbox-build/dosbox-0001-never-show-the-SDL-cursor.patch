@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 08:34:18 +0000
+Subject: [PATCH] Never show SDL's cursor (the unkernel's framebuffer console)
+
+---
+ src/gui/sdlmain.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index 0704c9b..0fe345f 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -36,6 +36,12 @@
+ #include "cross.h"
+ #include "SDL.h"
+ 
++/* unkernel: on the framebuffer console there is no host pointer to show
++ * (DOS programs draw their own mouse cursor), so SDL's software cursor,
++ * which fbcon would draw into the picture, stays hidden. */
++static int ShowCursorNever(int) { return SDL_ShowCursor(SDL_DISABLE); }
++#define SDL_ShowCursor ShowCursorNever
++
+ #include "dosbox.h"
+ #include "video.h"
+ #include "mouse.h"

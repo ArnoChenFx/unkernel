@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// The universal part of the SDK, re-exported by both entries (node.ts, web.ts).
+
+export { IRQ_SYNC, Kernel, bundledBoot, moduleIsMemory64 } from "./kernel.ts";
+export type { BootStage, ExitKind, ExitResult, KernelConfig, KernelStats, MemoryStage, NetDevice } from "./kernel.ts";
+export { decodeSnapshot, encodeSnapshot, snapshotDeviceMismatch, snapshotDiskMismatch } from "./snapshot.ts";
+export type { DeviceKind, DeviceSnapshots, KernelSnapshot } from "./snapshot.ts";
+export { CowDisk, F_DISCARD, F_FLUSH, F_RO, F_WRITE_ZEROES, FlushTracker, HttpBase, SparseBase, ZERO_BLOCK, ZeroBase } from "./block.ts";
+export type { BlockDevice, BlockStats, CowDiskOptions, CowDiskStats, DiskBase, DiskSnapshotState, HttpBaseOptions, MaybePromise, OverlayStore, StoreIndex } from "./block.ts";
+export { KWSPARSE_MAGIC, decodeKwsparse, encodeKwsparse, gunzipIfNeeded, gzipBlob, isZeroBlock, kwsparseHeader, readKwsparse } from "./kwsparse.ts";
+export type { KwsparseImage } from "./kwsparse.ts";
+export { NetStack, ip4, ip4str } from "./net.ts";
+export type { NetBackend, NetConnection, NetConnectionEvents, NetStackOptions, NetStats } from "./net.ts";
+export { DEFAULT_WISP_SERVERS, wispBackend } from "./net-wisp.ts";
+export type { WispBackend, WispBackendOptions } from "./net-wisp.ts";
+export { ANSI, ConsoleRouter, IMPORTANT, KSTAMP } from "./console.ts";
+export type { ConsoleRouterOptions, KernelLineInfo } from "./console.ts";
+export { checkJspi, checkSupport } from "./support.ts";
+export type { SupportReport } from "./support.ts";
+export { BootError, download, loadBytes, loadKernelModule } from "./load.ts";
+export type { BootFailStage, BytesSource, DownloadProgress, KernelSource, LoadOptions } from "./load.ts";
+export { JitHost } from "./jit.ts";
+export { DEFAULT_DISPLAY_SIZE, DisplayHost, FOURCC_XRGB8888, frameToPpm, xrgbToRgba } from "./display.ts";
+export type { DisplayFrame, DisplayHostOptions, DisplayMode, DisplayOption, DisplaySize, DisplayStats } from "./display.ts";
+export { ABS_MAX, ABS_X, ABS_Y, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DOM_CODE_TO_LINUX, EV_ABS, EV_KEY, EV_REL, EV_SYN, INPUT_KEYBOARD, INPUT_MOUSE, INPUT_TABLET, InputHost, REL_WHEEL, REL_X, REL_Y, domButtonToLinux, domCodeToLinux } from "./input.ts";
+export type { Evdev, InputHostOptions, InputState, InputStats } from "./input.ts";
+export { SOUND_FORMAT_S16_LE, SOUND_FORMAT_U8, SoundHost, convertPcm, pcmToFloat32, wavHeader } from "./sound.ts";
+export type { SoundChunk, SoundEvent, SoundFormat, SoundHostOptions, SoundOption, SoundSink, SoundState, SoundStats } from "./sound.ts";
+export type { JitHostOptions, JitStats, KwemuStats } from "./jit.ts";
+export { KernelInstance } from "./instance.ts";
+export type { BootProgress, CreateKernelOptions, InstanceStats, KernelHandle, VsockOption, WorkerOption } from "./instance.ts";
+export { VSOCK_GUEST_CID, VSOCK_HEADER_SIZE, VSOCK_HOST_CID, VsockDevice, VsockError, VsockHost, decodeVsockHeader, encodeVsockPacket } from "./vsock.ts";
+export type { Vsock, VsockConnection, VsockDeviceOptions, VsockDeviceStats, VsockHeader, VsockHostOptions, VsockListener, VsockStats } from "./vsock.ts";
+export { PtyError, TTY_FEATURE_CONNECT, TTY_FEATURE_PIPES, TTY_PORT, TTY_SIGNALS, TTY_VERSION, TtyFrameParser, connectGuest, encodeTtyFrame, encodeTtyOpen, encodeTtyResize, execSubprocess, spawnPty, spawnSubprocess } from "./tty.ts";
+export type { ConnectOptions, ExecOptions, ExecResult, GuestSocket, PipeOptions, Pty, PtyEnd, PtyErrorCode, PtyOptions, PtySize, SpawnOptions, Subprocess, TtyFrame } from "./tty.ts";
+export { HTTP_MAX_HEADER_BYTES, fetchOver } from "./http.ts";
+export type { ByteDuplex, GuestConnect } from "./http.ts";
+export { FsError } from "./fs.ts";
+export type { Fs, FsAttr, FsDirEntry, FsFile, FsFileType, FsOpenFlags, FsSetAttr, FsStatFs } from "./fs.ts";
+export { MemoryFs } from "./memfs.ts";
+export type { FsTree, FsTreeFile, MemoryFsChange } from "./memfs.ts";
+export { MountError } from "./mounts.ts";
+export type { FsSource, Mount, MountErrorCode, MountOptions, MountSpec, MountStats, MountsOption } from "./mounts.ts";
+export { SHM_PAGE_SIZE, ShmClient, ShmDevice, ShmError, inlineShm } from "./shm.ts";
+export type { InlineShmFile, Shm, ShmBackend, ShmCall, ShmCallResult, ShmCloseReason, ShmDeviceOptions, ShmDeviceStats, ShmFile, ShmInfo, ShmStats } from "./shm.ts";
+export { WorkerKernel } from "./worker-host.ts";
+export type { WorkerKernelOptions } from "./worker-host.ts";
+export { sharedMemoryAvailable } from "./worker-shared.ts";
+export type { KernelTransport } from "./worker-shared.ts";
+export { DEVICE_SPEC_VERSION, isDiskSpec, isNetSpec } from "./devices.ts";
+export type { DataDiskSpec, DiskSpec, DiskState, FileDiskSpec, HttpDiskSpec, NetBackendSpec, NetSpec, SkippedDisk } from "./devices.ts";

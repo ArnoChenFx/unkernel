@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 08:11:02 +0000
+Subject: [PATCH 2/2] fbcon: let a driver that takes any size set it, remapping
+ the buffer
+
+---
+ src/video/fbcon/SDL_fbvideo.c | 63 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/src/video/fbcon/SDL_fbvideo.c b/src/video/fbcon/SDL_fbvideo.c
+index ba9eb25..bd87153 100644
+--- a/src/video/fbcon/SDL_fbvideo.c
++++ b/src/video/fbcon/SDL_fbvideo.c
+@@ -137,6 +137,14 @@ enum {
+ 
+ /* Initialization/Query functions */
+ static int FB_VideoInit(_THIS, SDL_PixelFormat *vformat);
++/*
++ * A driver that takes any size and reallocates its buffer for it, like the
++ * unkernel's kwfb (which refuses a new size with EBUSY while the buffer is
++ * mapped): then every size is offered at its depth, and a mode change
++ * unmaps the buffer first and maps the new one after.
++ */
++static int fb_any_size;
++static int FB_Remap(_THIS);
+ static SDL_Rect **FB_ListModes(_THIS, SDL_PixelFormat *format, Uint32 flags);
+ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current, int width, int height, int bpp, Uint32 flags);
+ #ifdef VGA16_FBCON_SUPPORT
+@@ -582,6 +590,21 @@ static int FB_VideoInit(_THIS, SDL_PixelFormat *vformat)
+ 		}
+ 	}
+ 
++	/* Before mapping: does the driver take a size it cannot have listed? */
++	{
++		struct fb_var_screeninfo probe;
++
++		fb_any_size = 0;
++		if ( ioctl(console_fd, FBIOGET_VSCREENINFO, &probe) == 0 ) {
++			probe.xres = probe.xres_virtual = 333;
++			probe.yres = probe.yres_virtual = 222;
++			probe.xoffset = probe.yoffset = 0;
++			probe.activate = FB_ACTIVATE_TEST;
++			fb_any_size = ioctl(console_fd, FBIOPUT_VSCREENINFO, &probe) == 0 &&
++			              probe.xres == 333 && probe.yres == 222;
++		}
++	}
++
+ 	/* Memory map the device, compensating for buggy PPC mmap() */
+ 	mapped_offset = (((long)finfo.smem_start) -
+ 	                (((long)finfo.smem_start)&~(pagesize-1)));
+@@ -827,9 +850,35 @@ static int FB_VideoInit(_THIS, SDL_PixelFormat *vformat)
+ 
+ static SDL_Rect **FB_ListModes(_THIS, SDL_PixelFormat *format, Uint32 flags)
+ {
++	if ( fb_any_size && format->BitsPerPixel == this->info.vfmt->BitsPerPixel ) {
++		return((SDL_Rect **)-1);
++	}
+ 	return(SDL_modelist[((format->BitsPerPixel+7)/8)-1]);
+ }
+ 
++/* Map the buffer again after a mode change (fb_any_size). */
++static int FB_Remap(_THIS)
++{
++	struct fb_fix_screeninfo finfo;
++	const int pagesize = SDL_getpagesize();
++
++	if ( ioctl(console_fd, FBIOGET_FSCREENINFO, &finfo) < 0 ) {
++		SDL_SetError("Couldn't get console hardware info");
++		return(-1);
++	}
++	mapped_offset = (((long)finfo.smem_start) -
++	                (((long)finfo.smem_start)&~(pagesize-1)));
++	mapped_memlen = finfo.smem_len+mapped_offset;
++	mapped_mem = do_mmap(NULL, mapped_memlen,
++	                  PROT_READ|PROT_WRITE, MAP_SHARED, console_fd, 0);
++	if ( mapped_mem == (char *)-1 ) {
++		mapped_mem = NULL;
++		SDL_SetError("Unable to memory map the video hardware");
++		return(-1);
++	}
++	return(0);
++}
++
+ /* Various screen update functions available */
+ static void FB_DirectUpdate(_THIS, int numrects, SDL_Rect *rects);
+ #ifdef VGA16_FBCON_SUPPORT
+@@ -1078,11 +1127,25 @@ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current,
+ 		fprintf(stderr, "Printing wanted vinfo:\n");
+ 		print_vinfo(&vinfo);
+ #endif
++		if ( fb_any_size && mapped_mem ) {
++			munmap(mapped_mem, mapped_memlen);
++			mapped_mem = NULL;
++		}
+ 		if ( !shadow_fb &&
+ 				ioctl(console_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0 ) {
+ 			vinfo.yres_virtual = height;
+ 			if ( ioctl(console_fd, FBIOPUT_VSCREENINFO, &vinfo) < 0 ) {
+ 				SDL_SetError("Couldn't set console screen info");
++				if ( fb_any_size && !mapped_mem ) {
++					ioctl(console_fd, FBIOGET_VSCREENINFO, &vinfo);
++					FB_Remap(this);
++				}
++				return(NULL);
++			}
++		}
++		if ( fb_any_size && !mapped_mem ) {
++			ioctl(console_fd, FBIOGET_VSCREENINFO, &vinfo);
++			if ( FB_Remap(this) < 0 ) {
+ 				return(NULL);
+ 			}
+ 		}

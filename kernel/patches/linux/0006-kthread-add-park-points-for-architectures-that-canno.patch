@@ -1,0 +1,488 @@
+From b01543025ebe6ed61690ad5be6bae93926b17bc9 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 13:43:35 +0000
+Subject: [PATCH] kthread: add park points for architectures that cannot keep a
+ stack
+
+An architecture whose kernel stacks live outside guest memory (arch/wasm:
+each task runs on its own Wasm stack in the host engine) cannot save a
+sleeping task's continuation. To bring the whole machine state into
+memory, for a snapshot or to move a task, it parks every task at a point
+where nothing on the task's stack is needed again, and later resumes it on
+a fresh stack.
+
+Add linux/kw_park.h and a kw_park_point(fn, arg) in the main loop of each
+kernel thread that a minimal system runs: kthreadd, kthread workers,
+workqueue workers and rescuers, smpboot threads, devtmpfsd, oom_reaper,
+kcompactd, kswapd, khvcd, kjournald2 and ext4lazyinit. Each sits where the
+thread holds no locks and has no wait queue entry or timer on its stack.
+fn(arg) re-enters the loop; kthreadd, kcompactd, kswapd, devtmpfsd and
+kjournald2 get a separate loop function so that their one-time setup is
+not redone. Waits that a wakeup does not end (wait_event*()) also end
+while kw_park_pending(), and kcompactd, kswapd and kjournald2 then skip
+their work and go back to the park point.
+
+Without CONFIG_KW_PARK both helpers are empty inlines.
+---
+ drivers/base/devtmpfs.c       | 10 ++++++
+ drivers/tty/hvc/hvc_console.c |  2 ++
+ fs/ext4/super.c               |  4 +++
+ fs/jbd2/journal.c             | 25 ++++++++++++---
+ include/linux/kw_park.h       | 60 +++++++++++++++++++++++++++++++++++
+ kernel/kthread.c              | 11 +++++++
+ kernel/smpboot.c              |  2 ++
+ kernel/workqueue.c            |  4 +++
+ mm/compaction.c               | 23 ++++++++++++--
+ mm/oom_kill.c                 |  5 ++-
+ mm/vmscan.c                   | 19 +++++++++--
+ 11 files changed, 155 insertions(+), 10 deletions(-)
+ create mode 100644 include/linux/kw_park.h
+
+diff --git a/drivers/base/devtmpfs.c b/drivers/base/devtmpfs.c
+index 11c70888f38..44dc5a02042 100644
+--- a/drivers/base/devtmpfs.c
++++ b/drivers/base/devtmpfs.c
+@@ -27,6 +27,7 @@
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/init_syscalls.h>
+ #include <uapi/linux/mount.h>
+ #include "base.h"
+@@ -437,9 +438,12 @@ static int handle(const char *name, umode_t mode, kuid_t uid, kgid_t gid,
+ 		return handle_remove(name, dev);
+ }
+ 
++static int devtmpfs_work_fn(void *unused);
++
+ static void __noreturn devtmpfs_work_loop(void)
+ {
+ 	while (1) {
++		kw_park_point(devtmpfs_work_fn, NULL);
+ 		spin_lock(&req_lock);
+ 		while (requests) {
+ 			struct req *req = requests;
+@@ -482,6 +486,12 @@ static noinline int __init devtmpfs_setup(void *p)
+  * calls.  That call is done while devtmpfs_init, which is marked __init,
+  * synchronously waits for it to complete.
+  */
++/* Where devtmpfsd resumes after parking (kw_park.h), past its setup. */
++static int devtmpfs_work_fn(void *unused)
++{
++	devtmpfs_work_loop();
++}
++
+ static int __ref devtmpfsd(void *p)
+ {
+ 	int err = devtmpfs_setup(p);
+diff --git a/drivers/tty/hvc/hvc_console.c b/drivers/tty/hvc/hvc_console.c
+index 45d090bf090..aa5c4b9d947 100644
+--- a/drivers/tty/hvc/hvc_console.c
++++ b/drivers/tty/hvc/hvc_console.c
+@@ -15,6 +15,7 @@
+ #include <linux/kbd_kern.h>
+ #include <linux/kernel.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/list.h>
+ #include <linux/major.h>
+ #include <linux/atomic.h>
+@@ -794,6 +795,7 @@ static int khvcd(void *unused)
+ 
+ 	set_freezable();
+ 	do {
++		kw_park_point(khvcd, unused);
+ 		poll_mask = 0;
+ 		hvc_kicked = 0;
+ 		try_to_freeze();
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index a8c4a227edf..0e37df67ae6 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -44,6 +44,7 @@
+ #include <linux/unicode.h>
+ #include <linux/part_stat.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/freezer.h>
+ #include <linux/fsnotify.h>
+ #include <linux/fs_context.h>
+@@ -3874,6 +3875,9 @@ static int ext4_lazyinit_thread(void *arg)
+ 	while (true) {
+ 		bool next_wakeup_initialized = false;
+ 
++		/* Nothing held, no timer on the stack: re-entering the loop is all. */
++		kw_park_point(ext4_lazyinit_thread, arg);
++
+ 		next_wakeup = 0;
+ 		mutex_lock(&eli->li_list_mtx);
+ 		if (list_empty(&eli->li_request_list)) {
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index 55b4ce01022..0fabc9a953a 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -30,6 +30,7 @@
+ #include <linux/freezer.h>
+ #include <linux/pagemap.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/poison.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+@@ -156,10 +157,11 @@ static void commit_timeout(struct timer_list *t)
+  *    known as checkpointing, and this thread is responsible for that job.
+  */
+ 
++static int kjournald2_loop(void *arg);
++
+ static int kjournald2(void *arg)
+ {
+ 	journal_t *journal = arg;
+-	transaction_t *transaction;
+ 
+ 	/*
+ 	 * Set up an interval timer which can be used to trigger a commit wakeup
+@@ -181,15 +183,30 @@ static int kjournald2(void *arg)
+ 	 */
+ 	memalloc_nofs_save();
+ 
+-	/*
+-	 * And now, wait forever for commit wakeup events.
+-	 */
++	return kjournald2_loop(journal);
++}
++
++/*
++ * Wait forever for commit wakeup events. The thread also resumes here
++ * after parking (kw_park.h), past its setup.
++ */
++static int kjournald2_loop(void *arg)
++{
++	journal_t *journal = arg;
++	transaction_t *transaction;
++
+ 	write_lock(&journal->j_state_lock);
+ 
+ loop:
+ 	if (journal->j_flags & JBD2_UNMOUNT)
+ 		goto end_loop;
+ 
++	if (kw_park_pending()) {
++		write_unlock(&journal->j_state_lock);
++		kw_park_point(kjournald2_loop, journal);
++		write_lock(&journal->j_state_lock);
++	}
++
+ 	jbd2_debug(1, "commit_sequence=%u, commit_request=%u\n",
+ 		journal->j_commit_sequence, journal->j_commit_request);
+ 
+diff --git a/include/linux/kw_park.h b/include/linux/kw_park.h
+new file mode 100644
+index 00000000000..d5e71f70002
+--- /dev/null
++++ b/include/linux/kw_park.h
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Park points (CONFIG_KW_PARK).
++ *
++ * arch/wasm cannot save a sleeping task's stack: each kernel task runs on
++ * its own stack in the host engine, outside guest memory. To make the whole
++ * machine state live in memory (for a snapshot, or to move a task), it
++ * parks every task at a point where nothing on its stack is needed again,
++ * and later resumes it on a fresh stack. User tasks park at the user-mode
++ * boundary. A kernel thread parks at a kw_park_point() in its main loop,
++ * placed where it holds no locks and has nothing on its stack linked into
++ * shared structures (no wait queue entry, no on-stack timer), and resumes
++ * by calling fn(arg), which re-enters that loop without redoing one-time
++ * setup.
++ *
++ * Kernel threads without a park point keep a snapshot from completing.
++ */
++#ifndef _LINUX_KW_PARK_H
++#define _LINUX_KW_PARK_H
++
++#include <linux/compiler.h>
++#include <linux/types.h>
++
++#ifdef CONFIG_KW_PARK
++extern int kw_park_kthreads;
++
++void kw_park_kthread(int (*fn)(void *), void *arg);
++
++/*
++ * True while kernel threads are asked to park. Wait conditions that a
++ * plain wake_up_process() does not end (wait_event*()) add it, so that the
++ * thread gets back to its park point.
++ */
++static inline bool kw_park_pending(void)
++{
++	return unlikely(READ_ONCE(kw_park_kthreads));
++}
++
++/*
++ * Park here if asked to. The thread then never returns from this call: it
++ * resumes on a fresh stack in fn(arg), whose return value is its exit code
++ * as for a kthread function.
++ */
++static inline void kw_park_point(int (*fn)(void *), void *arg)
++{
++	if (kw_park_pending())
++		kw_park_kthread(fn, arg);
++}
++#else
++static inline bool kw_park_pending(void)
++{
++	return false;
++}
++
++static inline void kw_park_point(int (*fn)(void *), void *arg)
++{
++}
++#endif
++
++#endif /* _LINUX_KW_PARK_H */
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index a3f95c90456..b7e17bab503 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -14,6 +14,7 @@
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/completion.h>
+ #include <linux/err.h>
+ #include <linux/cgroup.h>
+@@ -784,6 +785,8 @@ int kthread_stop_put(struct task_struct *k)
+ }
+ EXPORT_SYMBOL(kthread_stop_put);
+ 
++static int kthreadd_loop(void *unused);
++
+ int kthreadd(void *unused)
+ {
+ 	static const char comm[TASK_COMM_LEN] = "kthreadd";
+@@ -799,7 +802,14 @@ int kthreadd(void *unused)
+ 
+ 	kthread_affine_node();
+ 
++	return kthreadd_loop(NULL);
++}
++
++/* kthreadd's loop; it also resumes here after parking (kw_park.h). */
++static int kthreadd_loop(void *unused)
++{
+ 	for (;;) {
++		kw_park_point(kthreadd_loop, NULL);
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		if (list_empty(&kthread_create_list))
+ 			schedule();
+@@ -998,6 +1008,7 @@ int kthread_worker_fn(void *worker_ptr)
+ 		set_freezable();
+ 
+ repeat:
++	kw_park_point(kthread_worker_fn, worker_ptr);
+ 	set_current_state(TASK_INTERRUPTIBLE);	/* mb paired w/ kthread_stop */
+ 
+ 	if (kthread_should_stop()) {
+diff --git a/kernel/smpboot.c b/kernel/smpboot.c
+index 4503b60ce9b..7ec98f80a8b 100644
+--- a/kernel/smpboot.c
++++ b/kernel/smpboot.c
+@@ -14,6 +14,7 @@
+ #include <linux/export.h>
+ #include <linux/percpu.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/smpboot.h>
+ 
+ #include "smpboot.h"
+@@ -105,6 +106,7 @@ static int smpboot_thread_fn(void *data)
+ 	struct smp_hotplug_thread *ht = td->ht;
+ 
+ 	while (1) {
++		kw_park_point(smpboot_thread_fn, data);
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		preempt_disable();
+ 		if (kthread_should_stop()) {
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index c1cb328bce3..27f5096829a 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -37,6 +37,7 @@
+ #include <linux/cpu.h>
+ #include <linux/notifier.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/hardirq.h>
+ #include <linux/mempolicy.h>
+ #include <linux/freezer.h>
+@@ -3510,6 +3511,8 @@ static int worker_thread(void *__worker)
+ 	/* tell the scheduler that this is a workqueue worker */
+ 	set_pf_worker(true);
+ woke_up:
++	/* Idle (WORKER_IDLE), no locks: resume from the top (kw_park.h). */
++	kw_park_point(worker_thread, __worker);
+ 	raw_spin_lock_irq(&pool->lock);
+ 
+ 	/* am I supposed to die? */
+@@ -3667,6 +3670,7 @@ static int rescuer_thread(void *__rescuer)
+ 	 */
+ 	set_pf_worker(true);
+ repeat:
++	kw_park_point(rescuer_thread, __rescuer);
+ 	set_current_state(TASK_IDLE);
+ 
+ 	/*
+diff --git a/mm/compaction.c b/mm/compaction.c
+index a049415512c..252edab855f 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -20,6 +20,7 @@
+ #include <linux/page-isolation.h>
+ #include <linux/kasan.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/freezer.h>
+ #include <linux/page_owner.h>
+ #include <linux/psi.h>
+@@ -3191,11 +3192,11 @@ void wakeup_kcompactd(pg_data_t *pgdat, int order, int highest_zoneidx)
+  * The background compaction daemon, started as a kernel thread
+  * from the init process.
+  */
++static int kcompactd_loop(void *p);
++
+ static int kcompactd(void *p)
+ {
+ 	pg_data_t *pgdat = (pg_data_t *)p;
+-	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
+-	long timeout = default_timeout;
+ 
+ 	current->flags |= PF_KCOMPACTD;
+ 	set_freezable();
+@@ -3203,9 +3204,21 @@ static int kcompactd(void *p)
+ 	pgdat->kcompactd_max_order = 0;
+ 	pgdat->kcompactd_highest_zoneidx = pgdat->nr_zones - 1;
+ 
++	return kcompactd_loop(p);
++}
++
++/* kcompactd's loop; it also resumes here after parking (kw_park.h). */
++static int kcompactd_loop(void *p)
++{
++	pg_data_t *pgdat = (pg_data_t *)p;
++	long default_timeout = msecs_to_jiffies(HPAGE_FRAG_CHECK_INTERVAL_MSEC);
++	long timeout = default_timeout;
++
+ 	while (!kthread_should_stop()) {
+ 		unsigned long pflags;
+ 
++		kw_park_point(kcompactd_loop, p);
++
+ 		/*
+ 		 * Avoid the unnecessary wakeup for proactive compaction
+ 		 * when it is disabled.
+@@ -3214,7 +3227,8 @@ static int kcompactd(void *p)
+ 			timeout = MAX_SCHEDULE_TIMEOUT;
+ 		trace_mm_compaction_kcompactd_sleep(pgdat->node_id);
+ 		if (wait_event_freezable_timeout(pgdat->kcompactd_wait,
+-			kcompactd_work_requested(pgdat), timeout) &&
++			kcompactd_work_requested(pgdat) || kw_park_pending(),
++			timeout) && !kw_park_pending() &&
+ 			!pgdat->proactive_compact_trigger) {
+ 
+ 			psi_memstall_enter(&pflags);
+@@ -3231,6 +3245,9 @@ static int kcompactd(void *p)
+ 			continue;
+ 		}
+ 
++		if (kw_park_pending())
++			continue;
++
+ 		/*
+ 		 * Start the proactive work with default timeout. Based
+ 		 * on the fragmentation score, this timeout is updated.
+diff --git a/mm/oom_kill.c b/mm/oom_kill.c
+index 5f372f6e26f..f7b902568e5 100644
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -41,6 +41,7 @@
+ #include <linux/ftrace.h>
+ #include <linux/ratelimit.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/init.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/cred.h>
+@@ -638,7 +639,9 @@ static int oom_reaper(void *unused)
+ 	while (true) {
+ 		struct task_struct *tsk = NULL;
+ 
+-		wait_event_freezable(oom_reaper_wait, oom_reaper_list != NULL);
++		kw_park_point(oom_reaper, unused);
++		wait_event_freezable(oom_reaper_wait,
++				     oom_reaper_list != NULL || kw_park_pending());
+ 		spin_lock_irq(&oom_reaper_lock);
+ 		if (oom_reaper_list != NULL) {
+ 			tsk = oom_reaper_list;
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 6a53762d554..daaecc4c3d3 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -37,6 +37,7 @@
+ #include <linux/notifier.h>
+ #include <linux/delay.h>
+ #include <linux/kthread.h>
++#include <linux/kw_park.h>
+ #include <linux/freezer.h>
+ #include <linux/memcontrol.h>
+ #include <linux/migrate.h>
+@@ -7494,10 +7495,10 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
+  * If there are applications that are active memory-allocators
+  * (most normal use), this basically shouldn't matter.
+  */
++static int kswapd_loop(void *p);
++
+ static int kswapd(void *p)
+ {
+-	unsigned int alloc_order, reclaim_order;
+-	unsigned int highest_zoneidx = MAX_NR_ZONES - 1;
+ 	pg_data_t *pgdat = (pg_data_t *)p;
+ 	struct task_struct *tsk = current;
+ 
+@@ -7519,9 +7520,21 @@ static int kswapd(void *p)
+ 	WRITE_ONCE(pgdat->kswapd_order, 0);
+ 	WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
+ 	atomic_set(&pgdat->nr_writeback_throttled, 0);
++	return kswapd_loop(p);
++}
++
++/* kswapd's loop; it also resumes here after parking (kw_park.h). */
++static int kswapd_loop(void *p)
++{
++	unsigned int alloc_order, reclaim_order;
++	unsigned int highest_zoneidx = MAX_NR_ZONES - 1;
++	pg_data_t *pgdat = (pg_data_t *)p;
++	struct task_struct *tsk = current;
++
+ 	for ( ; ; ) {
+ 		bool was_frozen;
+ 
++		kw_park_point(kswapd_loop, p);
+ 		alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
+ 		highest_zoneidx = kswapd_highest_zoneidx(pgdat,
+ 							highest_zoneidx);
+@@ -7529,6 +7542,8 @@ static int kswapd(void *p)
+ kswapd_try_sleep:
+ 		kswapd_try_to_sleep(pgdat, alloc_order, reclaim_order,
+ 					highest_zoneidx);
++		if (kw_park_pending())
++			continue;
+ 
+ 		/* Read the new order and highest_zoneidx */
+ 		alloc_order = READ_ONCE(pgdat->kswapd_order);
+-- 
+2.56.0
+

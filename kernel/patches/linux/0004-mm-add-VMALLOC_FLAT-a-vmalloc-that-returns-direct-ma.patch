@@ -1,0 +1,389 @@
+From a618a9cb3fb97fe920584aead7a60b474ca8f8af Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 10:16:08 +0000
+Subject: [PATCH] mm: add VMALLOC_FLAT, a vmalloc that returns direct-mapped
+ memory
+
+For an MMU architecture whose kernel runs only in a flat direct map (on
+wasm, virtual = physical = linear address): vmalloc() and friends hand
+out physically contiguous direct-mapped memory, as on NOMMU, while user
+space keeps real page tables. Mostly lifted from mm/nommu.c. vmap() of
+scattered pages is not supported.
+
+/proc/meminfo's VmallocUsed reads the NR_VMALLOC node counter, which flat
+vmalloc never charges, so it reads 0.
+
+Signed-off-by: Pooya Parsa <pooya@pi0.io>
+---
+ mm/Kconfig        |   7 +
+ mm/Makefile       |  10 +-
+ mm/vmalloc-flat.c | 318 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 334 insertions(+), 1 deletion(-)
+ create mode 100644 mm/vmalloc-flat.c
+
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 604c58199ac..68ba95db79b 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -1033,6 +1033,13 @@ config ARCH_SUPPORTS_PUD_PFNMAP
+ config ARCH_MODULE_NEEDS_WEAK_PER_CPU
+        bool
+ 
++#
++# MMU architectures that cannot remap kernel memory (no aliasing, e.g. wasm):
++# vmalloc() returns direct-mapped memory as on !MMU.
++#
++config VMALLOC_FLAT
++	bool
++
+ #
+ # UP and nommu archs use km based percpu allocator
+ #
+diff --git a/mm/Makefile b/mm/Makefile
+index e7245cb88c6..0428793c1a0 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -37,7 +37,15 @@ mmu-y			:= nommu.o
+ mmu-$(CONFIG_MMU)	:= highmem.o memory.o mincore.o \
+ 			   mlock.o mmap.o mmu_gather.o mprotect.o mremap.o \
+ 			   msync.o page_vma_mapped.o pagewalk.o \
+-			   pgtable-generic.o rmap.o vmalloc.o vma.o vma_exec.o
++			   pgtable-generic.o rmap.o vma.o vma_exec.o
++
++ifdef CONFIG_MMU
++ifdef CONFIG_VMALLOC_FLAT
++mmu-y			+= vmalloc-flat.o
++else
++mmu-y			+= vmalloc.o
++endif
++endif
+ 
+ 
+ ifdef CONFIG_CROSS_MEMORY_ATTACH
+diff --git a/mm/vmalloc-flat.c b/mm/vmalloc-flat.c
+new file mode 100644
+index 00000000000..9602f9b2153
+--- /dev/null
++++ b/mm/vmalloc-flat.c
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * vmalloc for MMU kernels that cannot remap kernel memory (wasm: the kernel
++ * runs in Wasm linear memory with no hardware MMU, so there is no way to
++ * alias pages into a separate virtual range).
++ *
++ * As on !MMU, vmalloc() hands out physically contiguous, directly mapped
++ * memory from the slab/page allocator and is_vmalloc_addr() is always false,
++ * so kvfree()/vfree() and friends all end up in kfree(). vmap() of
++ * non-contiguous pages is impossible and fails.
++ *
++ * Mostly lifted from mm/nommu.c.
++ */
++
++#include <linux/export.h>
++#include <linux/mm.h>
++#include <linux/sched/mm.h>
++#include <linux/mman.h>
++#include <linux/highmem.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/uio.h>
++#include <linux/seq_file.h>
++#include "internal.h"
++#include "vmalloc.h"
++
++void vfree(const void *addr)
++{
++	kfree(addr);
++}
++EXPORT_SYMBOL(vfree);
++
++void *__vmalloc_noprof(unsigned long size, gfp_t gfp_mask)
++{
++	/*
++	 *  You can't specify __GFP_HIGHMEM with kmalloc() since kmalloc()
++	 * returns only a logical address.
++	 */
++	return kmalloc_noprof(size, (gfp_mask | __GFP_COMP) & ~__GFP_HIGHMEM);
++}
++EXPORT_SYMBOL(__vmalloc_noprof);
++
++void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align,
++				 gfp_t flags, int node)
++{
++	return krealloc_noprof(p, size, (flags | __GFP_COMP) & ~__GFP_HIGHMEM);
++}
++
++void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
++		unsigned long start, unsigned long end, gfp_t gfp_mask,
++		pgprot_t prot, unsigned long vm_flags, int node,
++		const void *caller)
++{
++	return __vmalloc_noprof(size, gfp_mask);
++}
++
++void *__vmalloc_node_noprof(unsigned long size, unsigned long align, gfp_t gfp_mask,
++		int node, const void *caller)
++{
++	return __vmalloc_noprof(size, gfp_mask);
++}
++
++void *vmalloc_user_noprof(unsigned long size)
++{
++	return __vmalloc_noprof(size, GFP_KERNEL | __GFP_ZERO);
++}
++EXPORT_SYMBOL(vmalloc_user_noprof);
++
++struct page *vmalloc_to_page(const void *addr)
++{
++	return virt_to_page(addr);
++}
++EXPORT_SYMBOL(vmalloc_to_page);
++
++unsigned long vmalloc_to_pfn(const void *addr)
++{
++	return page_to_pfn(virt_to_page(addr));
++}
++EXPORT_SYMBOL(vmalloc_to_pfn);
++
++long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
++{
++	/* Don't allow overflow */
++	if ((unsigned long) addr + count < count)
++		count = -(unsigned long) addr;
++
++	return copy_to_iter(addr, count, iter);
++}
++
++/*
++ *	vmalloc  -  allocate virtually contiguous memory
++ *
++ *	@size:		allocation size
++ *
++ *	Allocate enough pages to cover @size from the page level
++ *	allocator and map them into contiguous kernel virtual space.
++ *
++ *	For tight control over page level allocator and protection flags
++ *	use __vmalloc() instead.
++ */
++void *vmalloc_noprof(unsigned long size)
++{
++	return __vmalloc_noprof(size, GFP_KERNEL);
++}
++EXPORT_SYMBOL(vmalloc_noprof);
++
++/*
++ *	vmalloc_huge_node  -  allocate virtually contiguous memory, on a node
++ *
++ *	@size:		allocation size
++ *	@gfp_mask:	flags for the page level allocator
++ *	@node:          node to use for allocation or NUMA_NO_NODE
++ *
++ *	Allocate enough pages to cover @size from the page level
++ *	allocator and map them into contiguous kernel virtual space.
++ *
++ *	Due to NOMMU implications the node argument and HUGE page attribute is
++ *	ignored.
++ */
++void *vmalloc_huge_node_noprof(unsigned long size, gfp_t gfp_mask, int node)
++{
++	return __vmalloc_noprof(size, gfp_mask);
++}
++
++/*
++ *	vzalloc - allocate virtually contiguous memory with zero fill
++ *
++ *	@size:		allocation size
++ *
++ *	Allocate enough pages to cover @size from the page level
++ *	allocator and map them into contiguous kernel virtual space.
++ *	The memory allocated is set to zero.
++ *
++ *	For tight control over page level allocator and protection flags
++ *	use __vmalloc() instead.
++ */
++void *vzalloc_noprof(unsigned long size)
++{
++	return __vmalloc_noprof(size, GFP_KERNEL | __GFP_ZERO);
++}
++EXPORT_SYMBOL(vzalloc_noprof);
++
++/**
++ * vmalloc_node - allocate memory on a specific node
++ * @size:	allocation size
++ * @node:	numa node
++ *
++ * Allocate enough pages to cover @size from the page level
++ * allocator and map them into contiguous kernel virtual space.
++ *
++ * For tight control over page level allocator and protection flags
++ * use __vmalloc() instead.
++ */
++void *vmalloc_node_noprof(unsigned long size, int node)
++{
++	return vmalloc_noprof(size);
++}
++EXPORT_SYMBOL(vmalloc_node_noprof);
++
++/**
++ * vzalloc_node - allocate memory on a specific node with zero fill
++ * @size:	allocation size
++ * @node:	numa node
++ *
++ * Allocate enough pages to cover @size from the page level
++ * allocator and map them into contiguous kernel virtual space.
++ * The memory allocated is set to zero.
++ *
++ * For tight control over page level allocator and protection flags
++ * use __vmalloc() instead.
++ */
++void *vzalloc_node_noprof(unsigned long size, int node)
++{
++	return vzalloc_noprof(size);
++}
++EXPORT_SYMBOL(vzalloc_node_noprof);
++
++/**
++ * vmalloc_32  -  allocate virtually contiguous memory (32bit addressable)
++ *	@size:		allocation size
++ *
++ *	Allocate enough 32bit PA addressable pages to cover @size from the
++ *	page level allocator and map them into contiguous kernel virtual space.
++ */
++void *vmalloc_32_noprof(unsigned long size)
++{
++	return __vmalloc_noprof(size, GFP_KERNEL);
++}
++EXPORT_SYMBOL(vmalloc_32_noprof);
++
++/**
++ * vmalloc_32_user - allocate zeroed virtually contiguous 32bit memory
++ *	@size:		allocation size
++ *
++ * The resulting memory area is 32bit addressable and zeroed so it can be
++ * mapped to userspace without leaking data.
++ *
++ * VM_USERMAP is set on the corresponding VMA so that subsequent calls to
++ * remap_vmalloc_range() are permissible.
++ */
++void *vmalloc_32_user_noprof(unsigned long size)
++{
++	return vmalloc_user_noprof(size);
++}
++EXPORT_SYMBOL(vmalloc_32_user_noprof);
++
++static bool pages_contiguous(struct page **pages, unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 1; i < count; i++)
++		if (page_to_pfn(pages[i]) != page_to_pfn(pages[0]) + i)
++			return false;
++	return true;
++}
++
++void *vmap(struct page **pages, unsigned int count, unsigned long flags,
++	   pgprot_t prot)
++{
++	if (count && pages_contiguous(pages, count))
++		return page_address(pages[0]);
++	WARN_ONCE(1, "vmap: cannot map %u non-contiguous pages\n", count);
++	return NULL;
++}
++EXPORT_SYMBOL(vmap);
++
++void vunmap(const void *addr)
++{
++}
++EXPORT_SYMBOL(vunmap);
++
++void *vm_map_ram(struct page **pages, unsigned int count, int node)
++{
++	return vmap(pages, count, 0, PAGE_KERNEL);
++}
++EXPORT_SYMBOL(vm_map_ram);
++
++void vm_unmap_ram(const void *mem, unsigned int count)
++{
++}
++EXPORT_SYMBOL(vm_unmap_ram);
++
++void vm_unmap_aliases(void)
++{
++}
++EXPORT_SYMBOL_GPL(vm_unmap_aliases);
++
++void free_vm_area(struct vm_struct *area)
++{
++	kfree(area);
++}
++EXPORT_SYMBOL_GPL(free_vm_area);
++
++int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
++				void *kaddr, unsigned long pgoff,
++				unsigned long size)
++{
++	int ret;
++
++	kaddr += pgoff << PAGE_SHIFT;
++	size = PAGE_ALIGN(size);
++	while (size) {
++		ret = vm_insert_page(vma, uaddr, virt_to_page(kaddr));
++		if (ret)
++			return ret;
++		uaddr += PAGE_SIZE;
++		kaddr += PAGE_SIZE;
++		size -= PAGE_SIZE;
++	}
++	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
++	return 0;
++}
++
++int remap_vmalloc_range(struct vm_area_struct *vma, void *addr,
++			unsigned long pgoff)
++{
++	return remap_vmalloc_range_partial(vma, vma->vm_start, addr, pgoff,
++					   vma->vm_end - vma->vm_start);
++}
++EXPORT_SYMBOL(remap_vmalloc_range);
++
++bool vmalloc_dump_obj(void *object)
++{
++	return false;
++}
++
++struct vm_struct *find_vm_area(const void *addr)
++{
++	return NULL;
++}
++
++void __init vmalloc_init(void)
++{
++}
++
++void __init vm_area_add_early(struct vm_struct *vm)
++{
++}
++
++void __init vm_area_register_early(struct vm_struct *vm, size_t align)
++{
++}
++
++bool is_vmalloc_addr(const void *x)
++{
++	return false;
++}
++EXPORT_SYMBOL(is_vmalloc_addr);
++
++int is_vmalloc_or_module_addr(const void *x)
++{
++	return 0;
++}
++
++void vfree_atomic(const void *addr)
++{
++	kfree(addr);
++}
+-- 
+2.56.0
+

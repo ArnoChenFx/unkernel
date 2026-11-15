@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 01:07:50 +0000
+Subject: [PATCH 4/6] Exit on I_Error instead of spinning forever
+
+---
+ fbdoom/i_system.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/fbdoom/i_system.c b/fbdoom/i_system.c
+index 5d00091..978117c 100644
+--- a/fbdoom/i_system.c
++++ b/fbdoom/i_system.c
+@@ -460,9 +460,7 @@ void I_Error (char *error, ...)
+ 
+     exit(-1);
+ #else
+-    while (true)
+-    {
+-    }
++    exit(-1);
+ #endif
+ }
+ 

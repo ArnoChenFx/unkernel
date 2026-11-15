@@ -1,0 +1,27 @@
+From 8b195cd211cc799ea40d3f14250a8b1036fca607 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Thu, 12 Nov 2026 16:57:40 +0000
+Subject: [PATCH] wasm-ld: number linker-script data segments for non-shared
+ memory
+
+Signed-off-by: Pooya Parsa <pooya@pi0.io>
+---
+ lld/wasm/Writer.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lld/wasm/Writer.cpp b/lld/wasm/Writer.cpp
+index 8bfbe2bcc..6c8c74781 100644
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -683,7 +683,7 @@ void Writer::runScript() {
+   // But we can/will have at least two, so let's fake index.
+   size_t nonIndex = 0;
+   for (size_t i = 0; i < segments.size(); ++i)
+-    if (needsPassiveInitialization(segments[i]) && !segments[i]->isBss)
++    if (segments[i]->requiredInBinary())
+       segments[i]->index = nonIndex++;
+     else
+       segments[i]->index = static_cast<uint32_t>(-1);
+-- 
+2.56.0
+

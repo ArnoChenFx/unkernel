@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// unkernel for browsers: the universal SDK plus HTTP disks with an
+// IndexedDB overlay, memory sizing for the device, and the bundled kernel
+// fetched (and compiled while it downloads) from next to this module.
+//
+//   import { createKernel, wispBackend, DEFAULT_WISP_SERVERS } from "unkernel";
+//   const vm = await createKernel({ net: wispBackend(DEFAULT_WISP_SERVERS),
+//     onProgress: (p) => console.log(p) });
+//   vm.onOutput((b) => term.write(b));
+//   term.onData((d) => vm.write(d));
+//
+// Needs JSPI (WebAssembly.Suspending/promising); checkSupport() tells.
+
+import { createKernelOn, type CreateKernelOptions, type KernelHandle, type KernelInstance, type WorkerOption } from "./core/instance.ts";
+import type { WorkerKernel } from "./core/worker-host.ts";
+import { webPlatform } from "./web/platform.ts";
+
+export * from "./core/index.ts";
+export { DATA_DISK_NAME, DATA_DISK_VERSION, IdbStore, dataDiskStore, importDataDisk, openDataDisk, openHttpDisk, resetDataDisk, resetHttpDisk } from "./web/disk.ts";
+export type { DataDiskNameOptions, HttpDiskOptions, IdbStoreOptions, OpenDataDiskOptions } from "./web/disk.ts";
+export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, isMobile } from "./web/memory.ts";
+
+/**
+ * The bundled kernel: vmlinux32.wasm with the Alpine root file system and
+ * its command line in custom sections, next to this module (bundlers that
+ * understand `new URL(..., import.meta.url)` emit it as an asset).
+ */
+export const bundledKernelUrl: URL = new URL("./unkernel-alpine.wasm", import.meta.url);
+
+const platform = webPlatform(bundledKernelUrl);
+
+/**
+ * Load, compile and boot a kernel (default: the bundled Alpine) and return
+ * the running instance. Rejects with a BootError if it cannot start.
+ * Memory defaults to autoMemoryMiB() with DEFAULT_MEMORY_FALLBACK_MIB. With
+ * `worker: true` the kernel is loaded, compiled and run in a Web Worker and
+ * the result is a WorkerKernel (experimental; disks and the network as
+ * specs, see WorkerOption).
+ */
+export function createKernel(opts: CreateKernelOptions & { worker: true }): Promise<WorkerKernel>;
+export function createKernel(opts?: CreateKernelOptions & { worker?: false }): Promise<KernelInstance>;
+export function createKernel(opts?: CreateKernelOptions & WorkerOption): Promise<KernelHandle>;
+export function createKernel(opts: CreateKernelOptions & WorkerOption = {}): Promise<KernelHandle> {
+	return createKernelOn(platform, opts);
+}

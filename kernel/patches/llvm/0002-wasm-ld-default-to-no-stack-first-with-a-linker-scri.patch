@@ -1,0 +1,29 @@
+From f5ae40ad76c7a871dc53bbfc524a74410a7a11f6 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Thu, 12 Nov 2026 16:57:40 +0000
+Subject: [PATCH] wasm-ld: default to --no-stack-first with a linker script
+
+Signed-off-by: Pooya Parsa <pooya@pi0.io>
+---
+ lld/wasm/Driver.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/lld/wasm/Driver.cpp b/lld/wasm/Driver.cpp
+index ae05efaaf..4296f764b 100644
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -611,7 +611,10 @@ static void readConfigs(opt::InputArgList &args) {
+   ctx.arg.shlibSigCheck = !args.hasArg(OPT_no_shlib_sigcheck);
+   ctx.arg.stripAll = args.hasArg(OPT_strip_all);
+   ctx.arg.stripDebug = args.hasArg(OPT_strip_debug);
+-  ctx.arg.stackFirst = args.hasFlag(OPT_stack_first, OPT_no_stack_first, true);
++  // With a linker script the script places everything (including any
++  // stack), so --stack-first only applies when explicitly requested.
++  ctx.arg.stackFirst = args.hasFlag(OPT_stack_first, OPT_no_stack_first,
++                                    !args.hasArg(OPT_script));
+   ctx.arg.trace = args.hasArg(OPT_trace);
+   ctx.arg.thinLTOCacheDir = args.getLastArgValue(OPT_thinlto_cache_dir);
+   ctx.arg.thinLTOCachePolicy = CHECK(
+-- 
+2.56.0
+

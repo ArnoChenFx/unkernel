@@ -1,0 +1,793 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// createKernel(): load, compile and boot a kernel, and attach to its console.
+//
+// The entries (node.ts, web.ts) bind it to their platform: where the bundled
+// kernel is, how to read local files and how to start a worker. With
+// `worker: true` the kernel runs in a worker (worker-host.ts) instead.
+
+import type { BlockDevice, BlockStats } from "./block.ts";
+import type { DisplayFrame, DisplayHost, DisplayMode, DisplayOption, DisplayStats } from "./display.ts";
+import type { Evdev, InputHost, InputState, InputStats } from "./input.ts";
+import type { JitStats, KwemuStats } from "./jit.ts";
+import type { SoundHost, SoundOption, SoundState, SoundStats } from "./sound.ts";
+import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
+import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
+import { connectOn, execOn, spawnOn, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess } from "./tty.ts";
+import { fetchOver } from "./http.ts";
+import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
+import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
+import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
+import { NetStack, type NetBackend, type NetStats } from "./net.ts";
+import { buildDisks, buildNet, isNetSpec, type DeviceRegistry, type DiskSpec, type NetSpec, type SkippedDisk } from "./devices.ts";
+import { ConsoleOutput } from "./output.ts";
+import type { KernelSnapshot } from "./snapshot.ts";
+import { checkWorkerOptions, createKernelInWorker, type WorkerKernel } from "./worker-host.ts";
+import type { WorkerEndpoint } from "./worker-protocol.ts";
+import type { KernelTransport } from "./worker-shared.ts";
+
+/**
+ * Boot progress, in order: downloads (with compile overlapping them when
+ * streaming), memory, instantiate, start. Worker mode adds "worker" (the
+ * worker runs, and whether it has JSPI) before "memory": it may come
+ * before, during or after the download and compile, which run on the
+ * owner's thread while the worker starts (unless compileInWorker).
+ */
+export type BootProgress =
+	| { stage: "worker"; jspi: boolean }
+	| DownloadProgress
+	| { stage: "compile" }
+	| { stage: "compiled"; ms: number; memory64: boolean }
+	| ({ stage: "memory" } & MemoryStage)
+	| { stage: "instantiate" }
+	| { stage: "start"; cmdline: string };
+
+export interface CreateKernelOptions {
+	/**
+	 * Resume a snapshot (KernelInstance.snapshot()) instead of booting: the
+	 * same kernel build; initrd, cmdline and memoryMiB are ignored. In
+	 * worker mode the memory is copied to the worker (see
+	 * WorkerOption.transferRestore). `disks` must be the snapshot's disks,
+	 * unchanged since it was taken (same identity and write generation); otherwise createKernel
+	 * rejects, naming the disk, and the caller can boot normally instead.
+	 * The devices must be the snapshot's too: display, sound, vsock, shm
+	 * and network each given, or not, as when it was taken (a network with
+	 * the same MAC), or createKernel rejects. vsock sessions (spawn(),
+	 * exec(), connect(), fetch(), listeners' connections) and the guest's
+	 * TCP connections do not survive: the guest's ends are reset. Host file
+	 * systems do (inline only): `mounts` must give one for each mount path
+	 * in the snapshot, read-only as it was, and the guest's open files on
+	 * it are opened again by path (a file gone meanwhile answers ESTALE);
+	 * nothing of their files is in the snapshot. Other `mounts` are
+	 * mounted as at boot.
+	 */
+	restore?: KernelSnapshot;
+	/**
+	 * The kernel: a URL (a path or file: URL on Node), bytes, a Response or
+	 * a compiled WebAssembly.Module. Default: the bundled Alpine kernel
+	 * (unkernel-alpine.wasm next to the entry).
+	 */
+	kernel?: KernelSource;
+	/**
+	 * The initramfs (a cpio, optionally gzipped). Default (undefined): the
+	 * one bundled into the kernel, if any; null boots without one.
+	 */
+	initrd?: BytesSource | null;
+	/**
+	 * Kernel command line. Default: the kernel's bundled one if its bundled
+	 * initramfs is used; else "console=hvc0 root=/dev/wda rw" with disks and
+	 * no initramfs; else "console=hvc0 rdinit=/init".
+	 */
+	cmdline?: string;
+	/** Kernel memory (fixed for the run). Default 512 on Node; on the web, autoMemoryMiB(). */
+	memoryMiB?: number;
+	/** Smaller sizes to try in order if memoryMiB cannot be allocated. Default none on Node; DEFAULT_MEMORY_FALLBACK_MIB on the web. */
+	memoryFallbackMiB?: number[];
+	/** Memory type; default: detected from the module. */
+	memory64?: boolean;
+	/**
+	 * kwblk disks: /dev/wda, wdb, ... (CowDisk, HttpBase-backed disks,
+	 * FileDisk on Node, or your own BlockDevice), or specs (devices.ts:
+	 * plain data such as { kind: "file", path } on Node or { kind: "data",
+	 * template: "bundled" } in browsers), which the instance builds, owns
+	 * and closes at exit. Worker mode takes specs only.
+	 */
+	disks?: Array<BlockDevice | DiskSpec>;
+	/**
+	 * Network: a NetBackend (wrapped in a NetStack), a NetStack, any
+	 * NetDevice, or a spec ({ kind: "net", backend: { kind: "direct" } } on
+	 * Node, or { kind: "wisp", servers }). Default: none (the guest has no
+	 * eth0). The instance closes it (and its backend) when the kernel exits.
+	 * Worker mode takes a spec only.
+	 */
+	net?: NetDevice | NetBackend | NetSpec;
+	/** A disk built from a spec failed to save a flush (e.g. QuotaExceededError; the guest gets EIO for it). */
+	onDiskError?: (index: number, error: unknown) => void;
+	/**
+	 * kwemu's JIT tier: hot guest code is compiled to WebAssembly modules at
+	 * run time (synchronously, a few KiB each). Default true; false runs the
+	 * interpreter only.
+	 */
+	jit?: boolean;
+	/**
+	 * A display: the guest gets /dev/fb0 (kwfb, XRGB8888), and frame() /
+	 * display read what it draws. true = 640x480; or a size; or a function
+	 * returning the size wanted each time a program first opens the device
+	 * (e.g. the window's size; the kernel caps it at 1M pixels by dividing
+	 * by an integer; in worker mode it is asked ahead of time instead, see
+	 * WorkerOption). A program may set its own size; onDisplay reports
+	 * every change. Default false (no device).
+	 */
+	display?: DisplayOption;
+	/** A guest program opened the display or changed its mode (the mode), or the last one closed it (null). */
+	onDisplay?: (mode: DisplayMode | null) => void;
+	/**
+	 * With a display the guest also gets a keyboard and a mouse (evdev,
+	 * /dev/input/event0 and event1). Called when a program opens or the
+	 * last one closes them; send keys and motion through `evdev` only
+	 * while they are open, and to the console otherwise.
+	 */
+	onInput?: (state: InputState) => void;
+	/**
+	 * A sound card (kwsnd: ALSA hw:0,0 and OSS /dev/dsp, playback only):
+	 * true (output dropped) or a sink that receives the PCM chunks with
+	 * their format and the playback state (sound.ts). Default false (no card).
+	 */
+	sound?: SoundOption;
+	/**
+	 * A vsock device (kwvsock: AF_VSOCK, guest CID 3, host CID 2): `vsock`
+	 * on the instance listens for guest connections and connects to guest
+	 * listeners, each a byte stream (vsock.ts), and spawn() and exec() run
+	 * programs through it (tty.ts). true, or options. Default true; false:
+	 * the guest has no vsock transport.
+	 */
+	vsock?: boolean | VsockOption;
+	/**
+	 * kwshm: `shm` on the instance opens guest shmem files (by name in
+	 * /dev/shm, or by the id a guest program got from /dev/kwshm) and reads
+	 * and writes their pages in place (shm.ts). Default false: no device.
+	 */
+	shm?: boolean;
+	/**
+	 * Host file systems to mount in the guest (mounts.ts): guest paths to a
+	 * file system (an Fs such as MemoryFs or nodeFs(), or a plain object
+	 * tree of files: strings, bytes, functions, subdirectory objects), or to
+	 * { fs, readOnly, timeout, requestTimeout }. Each is served over 9p on
+	 * vsock and mounted by the guest's kw9p, through kwtty, once it answers.
+	 * spawn() and exec() wait for them; if one failed, the calls that waited
+	 * reject with its MountError (it is logged too). Needs vsock (the default).
+	 */
+	mounts?: MountsOption;
+	/** Initial console size (cols x rows); resize() changes it later. */
+	consoleSize?: { cols: number; rows: number };
+	/** Console output, from the first byte. */
+	onOutput?: (bytes: Uint8Array) => void;
+	/** Host diagnostics ("[host] ...", "[net] ..."). Default console.error. */
+	log?: (msg: string) => void;
+	/** Download, compile and boot progress. */
+	onProgress?: (p: BootProgress) => void;
+	/** Aborts the downloads; once booted, stops the kernel (stop()). */
+	signal?: AbortSignal;
+}
+
+export interface VsockOption {
+	/** The host's receive buffer per connection: the credit the guest gets. Default 256 KiB. */
+	bufferSize?: number;
+	/**
+	 * Low level, inline only: the guest's packets (virtio-vsock header and
+	 * payload) go to `onPacket` instead of the SDK's protocol, and `vsock`
+	 * on the instance is undefined; send with kernel.vsock.deliver().
+	 */
+	raw?: { onPacket: (pkt: Uint8Array) => void; onInit?: (guestCid: number, rxMax: number) => void };
+}
+
+/**
+ * The worker option, kept out of CreateKernelOptions so that plain
+ * options still type createKernel() as a KernelInstance.
+ */
+export interface WorkerOption {
+	/**
+	 * Run the kernel in a worker (a worker_threads Worker on Node, a module
+	 * Web Worker in browsers), so it never blocks this thread. The
+	 * result is a WorkerKernel: the console, sync(), stop(), stats(),
+	 * exited, the disks' state, the display (frame() is the latest frame
+	 * the worker sent; readFrame() waits for a fresh one), evdev and sound,
+	 * without the low-level `kernel`. Disks and the network must be specs
+	 * (devices.ts), which the worker builds. A `display` function is asked
+	 * on this thread at boot, on resize() and on
+	 * WorkerKernel.updateDisplaySize(). The worker starts at once, and while
+	 * it starts this thread downloads (or reads) and compiles the kernel
+	 * (the engine compiles off-thread) and then posts the compiled
+	 * WebAssembly.Module to it. Default false.
+	 */
+	worker?: boolean;
+	/**
+	 * Worker mode: load and compile the kernel in the worker instead of on
+	 * this thread (it then starts only once the worker runs, which is
+	 * slower). A kernel given as a WebAssembly.Module is posted as it is
+	 * either way. Default false.
+	 */
+	compileInWorker?: boolean;
+	/**
+	 * Worker mode: console and evdev input and frames through
+	 * SharedArrayBuffers (worker-shared.ts), which the worker reads while the
+	 * kernel runs, instead of messages it handles only when the kernel
+	 * yields (up to 20 ms while the guest is busy). Default (undefined):
+	 * shared where a SharedArrayBuffer can be posted (Node; a browser page
+	 * only when cross-origin isolated), else messages. false: messages
+	 * always. true: shared, or a BootError ("support") where it cannot be.
+	 * WorkerKernel.transport says which is used.
+	 */
+	shared?: boolean;
+	/**
+	 * Worker mode with `restore`: hand the snapshot's memory buffer to the
+	 * worker instead of copying it (about 150 ms per 512 MiB), for a
+	 * snapshot that is used once; its `memory` is detached then. Default false.
+	 */
+	transferRestore?: boolean;
+}
+
+export interface InstanceStats extends KernelStats {
+	/** Milliseconds since kernel entry. */
+	uptimeMs: number;
+	/** Milliseconds to download and compile the kernel (0 if a Module was given). */
+	compileMs: number;
+	block: BlockStats;
+	net?: NetStats;
+	jit: JitStats;
+	/** kwemu's counters, only from a -Dkwemu-stats kernel (`kernel/build.sh stats`). */
+	kwemu?: KwemuStats;
+	display?: DisplayStats;
+	evdev?: InputStats;
+	sound?: SoundStats;
+	vsock?: VsockStats;
+	shm?: ShmStats;
+}
+
+/** What the entry points supply. */
+export interface Platform {
+	/** The bundled kernel. */
+	defaultKernel(): KernelSource;
+	readFile?: (src: URL | string) => Promise<Uint8Array> | undefined;
+	defaultMemoryMiB?: () => number;
+	defaultMemoryFallbackMiB?: number[];
+	/** Start a worker running serveKernel() (worker-serve.ts); without it there is no worker mode. */
+	spawnWorker?: () => WorkerEndpoint;
+	/** A relative kernel or initrd location as an absolute URL, for the worker (Node: a path -> file: URL). */
+	absoluteUrl?: (src: string) => string | undefined;
+	/** The device kinds this platform builds from specs (devices.ts). */
+	devices?: DeviceRegistry;
+}
+
+/**
+ * A running kernel, wherever it runs: KernelInstance (on this thread) and
+ * WorkerKernel (in a worker) both have this surface.
+ */
+export interface KernelHandle {
+	/** The command line it booted with. */
+	readonly cmdline: string;
+	/** Settles when the kernel exits: halt (power off 0, halt 1, restart 2), panic 253, trap 254, fatal 255, or stop(). */
+	readonly exited: Promise<ExitResult>;
+	/** Console output as a stream: the first access gets everything since boot (the last 1 MiB); closes at exit. */
+	readonly output: ReadableStream<Uint8Array>;
+	/** Call `listener` with console output from now on. Returns the unsubscribe function. */
+	onOutput(listener: (bytes: Uint8Array) => void): () => void;
+	/** Type into the console (bytes, or text encoded as UTF-8); "\n" or "\r" is Enter. */
+	write(data: Uint8Array | string): void;
+	/** Console input as a stream. */
+	readonly input: WritableStream<Uint8Array | string>;
+	/** Set the console window size; the guest's foreground process gets SIGWINCH. */
+	resize(cols: number, rows: number): void;
+	/** Ask the guest to sync its file systems and disks; true once persistent disks have flushed. */
+	sync(opts?: { timeout?: number }): Promise<boolean>;
+	/** Stop the kernel now (no clean shutdown). Resolves with the exit. */
+	stop(res?: { code?: number; reason?: string }): Promise<ExitResult>;
+	/** Save the machine; resume it with createKernel({ restore }) (see KernelInstance.snapshot()). */
+	snapshot(opts?: { stop?: boolean }): Promise<KernelSnapshot>;
+	/** Counters (in a worker: the latest snapshot, at most about 500 ms old while running). */
+	stats(): InstanceStats;
+	/** Memory actually allocated, in MiB. */
+	readonly memoryMiB: number;
+	readonly memory64: boolean;
+	/** With the display option: the mode while a program has /dev/fb0 open, else null. */
+	readonly display: { readonly mode: DisplayMode | null } | undefined;
+	/** With the display option: the keyboard, mouse and tablet (InputHost's methods). */
+	readonly evdev: Evdev | undefined;
+	/** The current frame as RGBA (in a worker: the latest one it sent), or null. */
+	frame(out?: Uint8ClampedArray): DisplayFrame | null;
+	/** A fresh frame as RGBA (in a worker: a round trip), or null. */
+	readFrame(out?: Uint8ClampedArray): Promise<DisplayFrame | null>;
+	/** With the sound option: the playback state. */
+	readonly sound: { readonly state: SoundState; readonly playing: boolean } | undefined;
+	/**
+	 * With the vsock option: listen() for guest connections to the host
+	 * (CID 2) and connect() to guest listeners (CID 3). In worker mode the
+	 * protocol runs on this thread and the packets cross as messages.
+	 */
+	readonly vsock: Vsock | undefined;
+	/**
+	 * Run `file` with `args` in the guest (no file: root's login shell),
+	 * served by the guest's kwtty over vsock (tty.ts): on its own pty, a Pty
+	 * (the zigpty / node-pty shape), or with `pty: false` on stdin, stdout
+	 * and stderr pipes, a Subprocess. Rejects with a PtyError ENODEV when
+	 * the instance was created with `vsock: false`. Waits until
+	 * createKernel's `mounts` are mounted, as exec() does, and rejects with
+	 * the MountError if one of them failed.
+	 */
+	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
+	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
+	/**
+	 * Run `file` with `args` on pipes, feed it `input`, and resolve with
+	 * its stdout and stderr (strings, or bytes with `encoding: "buffer"`)
+	 * and how it ended (a non-zero exit resolves too). tty.ts.
+	 */
+	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
+	exec(file: string, args: readonly string[] | undefined, opts: ExecOptions & { encoding: "buffer" }): Promise<ExecResult<Uint8Array>>;
+	/**
+	 * A raw byte stream to TCP `port` on the guest's 127.0.0.1, through the
+	 * guest's kwtty (tty.ts, CONNECT): resolves once the guest connected,
+	 * rejects with a PtyError ECONNREFUSED when nothing listens there, or
+	 * ENODEV without vsock. Waits for createKernel's `mounts`, as spawn().
+	 */
+	connect(port: number, opts?: ConnectOptions): Promise<GuestSocket>;
+	/**
+	 * An HTTP/1.1 request to a server on the guest's loopback (http.ts
+	 * fetchOver() over connect()): the URL's port picks the guest port
+	 * (default 80), its host only goes into the Host header.
+	 */
+	fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
+	/**
+	 * Mount a host file system at guest `path` (mounts.ts): serve `fs` over
+	 * 9p and run kw9p in the guest. Resolves with the Mount (unmount(),
+	 * stats) once the guest has it mounted; rejects with a MountError
+	 * (ENODEV without vsock or without 9p in the kernel, ENOENT without kw9p
+	 * in the image, EBUSY, ETIMEDOUT, ...).
+	 */
+	mount(path: string, fs: FsSource, opts?: MountOptions): Promise<Mount>;
+	/** The mounts the guest has now, by guest path. */
+	readonly mounts: ReadonlyMap<string, Mount>;
+	/**
+	 * With the shm option: guest shmem files read and written in place
+	 * (open(), create(), openId(); ShmFile.read()/write()). In worker mode the
+	 * copies run in the worker, where the kernel's memory is.
+	 */
+	readonly shm: Shm | undefined;
+	/**
+	 * How input and frames reach the kernel: "inline" (this thread),
+	 * "messages" or "shared" (worker mode; see WorkerOption.shared).
+	 */
+	readonly transport: KernelTransport;
+}
+
+function isBackend(n: NetDevice | NetBackend): n is NetBackend {
+	return typeof (n as NetBackend).connect === "function" && typeof (n as NetDevice).send !== "function";
+}
+
+/** A booted kernel: its console, its exit, and the low-level Kernel. */
+export class KernelInstance implements KernelHandle {
+	/** The low-level runtime object (imports, memory, IRQ bits). */
+	readonly kernel: Kernel;
+	readonly module: WebAssembly.Module;
+	/** The command line it booted with. */
+	readonly cmdline: string;
+	/** The network device, if any. */
+	readonly net: NetDevice | undefined;
+	/** Disks whose spec was optional and could not be built, and why. */
+	skippedDisks: SkippedDisk[] = [];
+	/** Disks built from specs: the instance closes them at exit. */
+	#owned: BlockDevice[] = [];
+	/** Settles when the kernel exits: halt (power off 0, halt 1, restart 2), panic 253, trap 254, fatal 255, or stop(). */
+	readonly exited: Promise<ExitResult>;
+	#out: ConsoleOutput;
+	#input: WritableStream<Uint8Array | string> | undefined;
+	#compileMs: number;
+	#vsock: VsockHost | undefined;
+	#shm: ShmClient<InlineShmFile> | undefined;
+	#mounts = new MountTable(undefined, () => {});
+
+	/** @internal Use createKernel(). */
+	constructor(kernel: Kernel, module: WebAssembly.Module, cmdline: string, net: NetDevice | undefined, compileMs: number) {
+		this.kernel = kernel;
+		this.module = module;
+		this.cmdline = cmdline;
+		this.net = net;
+		this.#compileMs = compileMs;
+		this.#out = new ConsoleOutput(() => !!kernel.result);
+		if (kernel.shm.enabled) this.#shm = inlineShm(kernel.shm);
+		this.exited = kernel.exited.then((res) => {
+			this.#mounts.shutdown();
+			this.#vsock?.shutdown();
+			this.#shm?.shutdown();
+			this.#closeNet();
+			this.#out.close();
+			void this.#closeDisks();
+			return res;
+		});
+	}
+
+	/** @internal The vsock protocol's host end, when the vsock option is set (and not raw). */
+	attachVsock(host: VsockHost): void {
+		this.#vsock = host;
+		const mounts = this.#mounts = new MountTable(host, host.log);
+		// The 9p server runs here, on the kernel's thread: its sessions are
+		// saved at the snapshot point, with the vsock device.
+		this.kernel.vsock.onSave = () => mounts.save();
+		this.kernel.vsock.hostBusy = () => mounts.snapshotBusy();
+	}
+
+	/**
+	 * @internal createKernel({ restore, mounts }), before the kernel runs:
+	 * serve the snapshot's mounts again and tell the kernel to keep their
+	 * connections. Returns the mounts to mount once it runs.
+	 */
+	async restoreMounts(snap: KernelSnapshot, list: ReturnType<typeof parseMounts>): Promise<ReturnType<typeof parseMounts>> {
+		const { keep, rest } = await this.#mounts.restore(snap.devices?.vsock?.mounts, list);
+		this.kernel.vsock.keep = keep;
+		return rest;
+	}
+
+	/** @internal createKernel's `mounts`, once the kernel runs. */
+	startMounts(list: ReturnType<typeof parseMounts>): void {
+		this.#mounts.mountAll(list);
+	}
+
+	/**
+	 * With the vsock option: listen() for guest connections to the host
+	 * (CID 2, any port) and connect() to guest listeners (CID 3), each a
+	 * byte stream with half-close and reset (VsockHost, vsock.ts).
+	 */
+	get vsock(): VsockHost | undefined {
+		return this.#vsock;
+	}
+
+	/**
+	 * A program on its own pty, or on pipes (`pty: false`), served by the
+	 * guest's kwtty on vsock port 1022 (tty.ts).
+	 */
+	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
+	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
+	spawn(file?: string, args?: readonly string[], opts?: PtyOptions | PipeOptions): Promise<Pty | Subprocess> {
+		return this.#mounts.gate(() => spawnOn(this.#vsock, file, args, opts));
+	}
+
+	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
+	exec(file: string, args: readonly string[] | undefined, opts: ExecOptions & { encoding: "buffer" }): Promise<ExecResult<Uint8Array>>;
+	exec(file: string, args?: readonly string[], opts?: ExecOptions): Promise<ExecResult<string | Uint8Array>> {
+		return this.#mounts.gate(() => execOn(this.#vsock, file, args, opts));
+	}
+
+	/** A raw byte stream to a TCP server on the guest's loopback (see KernelHandle.connect()). */
+	connect(port: number, opts?: ConnectOptions): Promise<GuestSocket> {
+		return this.#mounts.gate(() => connectOn(this.#vsock, port, opts));
+	}
+
+	/** HTTP/1.1 to a server on the guest's loopback (see KernelHandle.fetch()). */
+	fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		return fetchOver((port, o) => this.connect(port, o), input, init);
+	}
+
+	/** Mount a host file system in the guest (mounts.ts; see KernelHandle.mount()). */
+	mount(path: string, fs: FsSource, opts?: MountOptions): Promise<Mount> {
+		return this.#mounts.mount(path, fs, opts);
+	}
+
+	get mounts(): ReadonlyMap<string, Mount> {
+		return this.#mounts.mounts;
+	}
+
+
+	/**
+	 * With the shm option: open guest shmem files by name or by a guest
+	 * export's id and read and write their pages in place (shm.ts). Handles
+	 * have views() too: zero-copy views of the kernel's memory, valid until
+	 * the kernel runs again.
+	 */
+	get shm(): ShmClient<InlineShmFile> | undefined {
+		return this.#shm;
+	}
+
+	/** @internal Disks built from specs, closed (after their last save) when the kernel exits. */
+	own(disks: BlockDevice[]): void {
+		this.#owned.push(...disks);
+	}
+
+	/** Resolves once every save in flight on the disks has settled (a no-op for disks without saves). */
+	async settled(): Promise<void> {
+		await Promise.all(this.kernel.block.disks.map((d) => d.saving?.catch(() => {})));
+	}
+
+	async #closeDisks(): Promise<void> {
+		await this.settled();
+		for (const d of this.#owned) {
+			try {
+				const c = d as BlockDevice & { close?: () => void; store?: { close?: () => Promise<void> } | null };
+				if (typeof c.close === "function") c.close();
+				else await c.store?.close?.();
+			} catch {}
+		}
+	}
+
+	/** @internal Console output from the kernel. */
+	emit(bytes: Uint8Array): void {
+		this.#out.emit(bytes);
+	}
+
+	/**
+	 * Console output as a stream. The first access gets everything since
+	 * boot (the last 1 MiB); later chunks are queued without limit, so keep
+	 * reading it (or use onOutput()). Closes when the kernel exits. There is
+	 * one such stream; tee() it for more readers.
+	 */
+	get output(): ReadableStream<Uint8Array> {
+		return this.#out.stream;
+	}
+
+	/** Call `listener` with console output from now on. Returns the unsubscribe function. */
+	onOutput(listener: (bytes: Uint8Array) => void): () => void {
+		return this.#out.listen(listener);
+	}
+
+	/** Type into the console (bytes, or text encoded as UTF-8); "\n" or "\r" is Enter. */
+	write(data: Uint8Array | string): void {
+		this.kernel.sendInput(data);
+	}
+
+	/** Console input as a stream (e.g. pipe a terminal into it). */
+	get input(): WritableStream<Uint8Array | string> {
+		return (this.#input ??= new WritableStream<Uint8Array | string>({
+			write: (chunk) => this.write(chunk),
+		}));
+	}
+
+	/** Set the console window size; the guest's foreground process gets SIGWINCH. */
+	resize(cols: number, rows: number): void {
+		this.kernel.setConsoleSize(cols, rows);
+	}
+
+	/**
+	 * Ask the guest to write back all file systems and flush its disks (the
+	 * sync IRQ), e.g. before a page goes away. Resolves true once every
+	 * persistent disk (FileDisk, a CowDisk saved in IndexedDB) has completed
+	 * a flush issued after the call, false after `timeout` ms (default 3000).
+	 * True at once without persistent disks.
+	 */
+	sync(opts: { timeout?: number } = {}): Promise<boolean> {
+		return this.kernel.requestSync(opts);
+	}
+
+	/**
+	 * Save the machine (Kernel.snapshot()); resume it with createKernel({
+	 * restore }). Disks are not copied: the snapshot stays restorable only
+	 * while they are unchanged. Without `stop` the guest keeps running, and
+	 * its next disk write ends that; `stop: true` stops the kernel right
+	 * after the copy (no clean shutdown), the usual way to suspend a machine
+	 * with disks. The devices' host state is saved (display, input, sound,
+	 * shm exports, the network's MAC); vsock sessions and TCP connections
+	 * are not (a restored guest's ends are reset). Host file systems are:
+	 * each mount's 9p session and the guest's open files on it (not the
+	 * files themselves; restore with the same `mounts`). Rejects while a
+	 * mount or unmount runs, or when a 9p request is in flight at the
+	 * snapshot point.
+	 */
+	snapshot(opts: { stop?: boolean } = {}): Promise<KernelSnapshot> {
+		const why = this.#mounts.snapshotBlocker(true);
+		if (why) return Promise.reject(new Error(`snapshot: ${why}`));
+		return this.kernel.snapshot(opts);
+	}
+
+	/**
+	 * Stop the kernel now (no clean shutdown: the guest is not told and
+	 * unflushed disk writes are lost; prefer typing `poweroff` or call
+	 * sync() first). Resolves
+	 * with the exit, which is the stop unless the kernel had already exited.
+	 */
+	stop(res: { code?: number; reason?: string } = {}): Promise<ExitResult> {
+		this.kernel.stop(res);
+		return this.exited;
+	}
+
+	stats(): InstanceStats {
+		const k = this.kernel;
+		return {
+			...k.stats,
+			uptimeMs: k.bootTime ? performance.now() - k.bootTime : 0,
+			compileMs: this.#compileMs,
+			block: { ...k.block.stats },
+			jit: { ...k.jit.stats },
+			kwemu: k.jit.kwemuStats(),
+			net: this.net instanceof NetStack ? { ...this.net.stats } : undefined,
+			display: k.display.enabled ? { ...k.display.stats } : undefined,
+			evdev: k.evdev.enabled ? { ...k.evdev.stats } : undefined,
+			sound: k.sound.enabled ? { ...k.sound.stats } : undefined,
+			vsock: this.#vsock ? { ...this.#vsock.stats } : undefined,
+			shm: this.#shm?.stats,
+		};
+	}
+
+	/** The kernel runs on this thread. */
+	get transport(): KernelTransport {
+		return "inline";
+	}
+
+	/** The sound card's host side, if the sound option was set: `playing`, `state`, `stats`. */
+	get sound(): SoundHost | undefined {
+		return this.kernel.sound.enabled ? this.kernel.sound : undefined;
+	}
+
+	/** Memory actually allocated, in MiB. */
+	get memoryMiB(): number {
+		return this.kernel.memory.buffer.byteLength / 1048576;
+	}
+
+	get memory64(): boolean {
+		return this.kernel.memory64;
+	}
+
+	/**
+	 * The display's host side, if the display option was set: its mode and
+	 * the address of the pixels while a guest program has /dev/fb0 open.
+	 */
+	get display(): DisplayHost | undefined {
+		return this.kernel.display.enabled ? this.kernel.display : undefined;
+	}
+
+	/**
+	 * The current frame as RGBA (canvas ImageData layout), or null when there
+	 * is no display or no program has it open. The guest is suspended
+	 * whenever this can run, but a program may be in the middle of drawing;
+	 * call it once per animation frame at most. `out` is reused when it has
+	 * the right size.
+	 */
+	/**
+	 * The keyboard and mouse (with the display option): key(), button(),
+	 * move(), wheel(), and their open state (keyboardOpen, mouseOpen).
+	 */
+	get evdev(): InputHost | undefined {
+		return this.kernel.evdev.enabled ? this.kernel.evdev : undefined;
+	}
+
+	frame(out?: Uint8ClampedArray): DisplayFrame | null {
+		return this.kernel.display.enabled ? this.kernel.display.readRGBA(out) : null;
+	}
+
+	/** frame(), as a promise (the same call as WorkerKernel.readFrame(), which needs a round trip). */
+	readFrame(out?: Uint8ClampedArray): Promise<DisplayFrame | null> {
+		return Promise.resolve(this.frame(out));
+	}
+
+	#closeNet(): void {
+		const n = this.net;
+		try {
+			n?.close?.();
+			if (n instanceof NetStack) n.backend.close?.();
+		} catch {}
+	}
+}
+
+/**
+ * createKernel() for a platform (the entries export it bound): a
+ * KernelInstance, or with `worker: true` a WorkerKernel.
+ */
+export function createKernelOn(platform: Platform, opts: CreateKernelOptions & { worker: true }): Promise<WorkerKernel>;
+export function createKernelOn(platform: Platform, opts?: CreateKernelOptions & { worker?: false }): Promise<KernelInstance>;
+export function createKernelOn(platform: Platform, opts?: CreateKernelOptions & WorkerOption): Promise<KernelHandle>;
+export async function createKernelOn(platform: Platform, opts: CreateKernelOptions & WorkerOption = {}): Promise<KernelHandle> {
+	if (typeof WebAssembly !== "object" || typeof WebAssembly.Suspending !== "function" || typeof WebAssembly.promising !== "function")
+		throw new BootError("support", "This engine has no JSPI (WebAssembly.Suspending / WebAssembly.promising), which the kernel needs");
+	const { signal, onProgress } = opts;
+	const progress = (p: BootProgress) => { try { onProgress?.(p); } catch {} };
+	const vopt = opts.vsock ?? true;
+	const raw = typeof vopt === "object" ? vopt.raw : undefined;
+	const mounts = parseMounts(opts.mounts, !!vopt && !raw);
+	const savedMounts = opts.restore?.devices?.vsock?.mounts;
+	if (savedMounts?.mounts.length && (opts.worker || raw))
+		throw new BootError("boot", `snapshot: it has host file systems (${savedMounts.mounts.map((m) => m.path).join(", ")}), which resume inline only (not in worker mode or with vsock.raw)`);
+	const mountsWhy = opts.restore && snapshotMountMismatch(savedMounts, mounts);
+	if (mountsWhy) throw new BootError("boot", `snapshot: ${mountsWhy}`);
+	if (opts.worker) {
+		checkWorkerOptions(platform, opts);
+		const vm = await createKernelInWorker(platform, opts, progress);
+		vm.startMounts(mounts);
+		return vm;
+	}
+	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
+
+	const t0 = performance.now();
+	const kernelSource = opts.kernel ?? platform.defaultKernel();
+	if (!(kernelSource instanceof WebAssembly.Module)) progress({ stage: "compile" });
+	const [module, initrdBytes] = await Promise.all([
+		loadKernelModule(kernelSource, { ...loadOpts, what: "kernel" }),
+		opts.initrd == null ? opts.initrd : loadBytes(opts.initrd, { ...loadOpts, what: "initrd" }),
+	]);
+	const compileMs = kernelSource instanceof WebAssembly.Module ? 0 : performance.now() - t0;
+	if (!(kernelSource instanceof WebAssembly.Module)) progress({ stage: "compiled", ms: compileMs, memory64: moduleIsMemory64(module) });
+	if (signal?.aborted) throw new BootError("download", "aborted", { cause: signal.reason });
+
+	const bundled = bundledBoot(module);
+	const initrd = initrdBytes === undefined ? bundled.initrd ?? null : initrdBytes;
+	const log = opts.log ?? ((m: string) => console.error(m));
+	const devCtx = { module, log, onDiskError: (i: number, e: unknown) => { try { opts.onDiskError?.(i, e); } catch {} } };
+	const items = opts.disks ?? [];
+	const { disks, skipped } = await buildDisks(items, platform.devices, devCtx);
+	const owned = disks.filter((d) => !items.includes(d));
+	const cmdline = opts.cmdline ?? (initrdBytes === undefined && bundled.initrd && bundled.cmdline ? bundled.cmdline
+		: disks.length && !initrd ? "console=hvc0 root=/dev/wda rw" : "console=hvc0 rdinit=/init");
+
+	const net = !opts.net ? undefined : isNetSpec(opts.net) ? buildNet(opts.net, platform.devices, devCtx)
+		: isBackend(opts.net) ? new NetStack({ backend: opts.net, log: opts.log }) : opts.net;
+
+	let kernelRef: Kernel | undefined;
+	const vsock = vopt && !raw ? new VsockHost({
+		send: (pkt) => kernelRef?.vsock.deliver(pkt),
+		bufferSize: typeof vopt === "object" ? vopt.bufferSize : undefined,
+		log,
+	}) : undefined;
+
+	let instance: KernelInstance | undefined;
+	let started!: () => void;
+	const startedP = new Promise<void>((r) => (started = r));
+	const kernel = new Kernel({
+		module, initrd, cmdline, disks, net,
+		memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 512,
+		memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,
+		memory64: opts.memory64,
+		jit: opts.jit,
+		restore: opts.restore,
+		display: opts.display,
+		onDisplay: opts.onDisplay,
+		onInput: opts.onInput,
+		sound: opts.sound,
+		vsock: !!vopt,
+		onVsockPacket: raw ? raw.onPacket : vsock && ((pkt) => vsock.receive(pkt)),
+		onVsockInit: raw ? raw.onInit : vsock && ((cid, rxMax) => vsock.deviceReady(cid, rxMax)),
+		shm: !!opts.shm,
+		log: opts.log,
+		write: (bytes) => {
+			opts.onOutput?.(bytes);
+			instance?.emit(bytes);
+		},
+		onStage: (stage, detail) => {
+			if (stage === "memory") progress({ stage, ...(detail as MemoryStage) });
+			else if (stage === "instantiate") progress({ stage });
+			else if (stage === "start") {
+				progress({ stage, cmdline });
+				started();
+			}
+		},
+	});
+	kernelRef = kernel;
+	instance = new KernelInstance(kernel, module, cmdline, net, compileMs);
+	if (vsock) instance.attachVsock(vsock);
+	instance.skippedDisks = skipped;
+	instance.own(owned);
+	if (opts.consoleSize) kernel.setConsoleSize(opts.consoleSize.cols, opts.consoleSize.rows);
+	let rest = mounts;
+	if (opts.restore && vsock) {
+		try {
+			rest = await instance.restoreMounts(opts.restore, mounts);
+		} catch (e) {
+			instance.stop({ code: 1, reason: (e as Error).message });
+			throw new BootError("boot", `snapshot: host file systems: ${(e as Error).message}`, { cause: e });
+		}
+	}
+
+	const booting = kernel.boot();
+	try {
+		await Promise.race([startedP, booting]);
+	} catch (e) {
+		const err = e as Error;
+		instance.stop({ code: 1, reason: err.message });
+		throw new BootError(err.name === "MemoryAllocationError" ? "memory" : "boot", err.message, { cause: e });
+	}
+	booting.catch(() => {});
+	instance.startMounts(rest);
+	if (signal) {
+		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
+		if (signal.aborted) onAbort();
+		else {
+			signal.addEventListener("abort", onAbort, { once: true });
+			void instance.exited.then(() => signal.removeEventListener("abort", onAbort));
+		}
+	}
+	return instance;
+}

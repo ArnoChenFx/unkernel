@@ -1,0 +1,66 @@
+From 2e2eff5f551ae041f5a0996027828a7f3d982fc3 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 10:16:08 +0000
+Subject: [PATCH] wasm: allow building with stock LLVM (no WasmAsmParser
+ extensions)
+
+Stock LLVM's WasmAsmParser does not accept the "a" section flag or
+.previous. Disable symbol exports when there are no modules and use
+wasm-friendly section syntax for the initramfs blob.
+
+Signed-off-by: Pooya Parsa <pooya@pi0.io>
+---
+ include/linux/export.h |  3 ++-
+ usr/initramfs_data.S   | 13 +++++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/export.h b/include/linux/export.h
+index a686fd0ba40..3337c686fe0 100644
+--- a/include/linux/export.h
++++ b/include/linux/export.h
+@@ -38,7 +38,8 @@
+ 		__EXPORT_SYMBOL_REF(sym)	ASM_NL	\
+ 	.previous
+ 
+-#if defined(__DISABLE_EXPORTS)
++/* Stock LLVM's WasmAsmParser lacks the "a" section flag and .previous. */
++#if defined(__DISABLE_EXPORTS) || (defined(__wasm__) && !defined(CONFIG_MODULES))
+ 
+ /*
+  * Allow symbol exports to be disabled completely so that C code may
+diff --git a/usr/initramfs_data.S b/usr/initramfs_data.S
+index e92fb59b3fb..5f3d83affed 100644
+--- a/usr/initramfs_data.S
++++ b/usr/initramfs_data.S
+@@ -22,11 +22,21 @@
+   in the ELF header, as required by certain architectures.
+ */
+ 
++#ifdef __wasm__ /* stock LLVM's WasmAsmParser rejects the "a" flag */
++.section .init.ramfs,"",@
++#else
+ .section .init.ramfs,"a"
++#endif
+ __irf_start:
+ .incbin "usr/initramfs_inc_data"
+ __irf_end:
++#ifdef __wasm__
++.size __irf_start, __irf_end - __irf_start
++.size __irf_end, 0
++.section .init.ramfs.info,"",@
++#else
+ .section .init.ramfs.info,"a"
++#endif
+ .globl __initramfs_size
+ __initramfs_size:
+ #ifdef CONFIG_64BIT
+@@ -34,3 +44,6 @@ __initramfs_size:
+ #else
+ 	.long __irf_end - __irf_start
+ #endif
++#ifdef __wasm__
++.size __initramfs_size, __SIZEOF_LONG__
++#endif
+-- 
+2.56.0
+

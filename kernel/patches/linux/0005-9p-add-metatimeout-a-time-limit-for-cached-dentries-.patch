@@ -1,0 +1,303 @@
+From ed5300e3f11bc71a15f273ace2ffe95382bb6cb0 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 10:16:08 +0000
+Subject: [PATCH] 9p: add metatimeout, a time limit for cached dentries and
+ attributes
+
+With metatimeout=MS the session caches dentries and attributes
+(CACHE_META) but trusts them only for MS milliseconds, as NFS does with
+its attribute cache: after that, the next lookup revalidation or stat
+asks the server again with one getattr. A changed qid.version, size or
+mtime then drops the file's cached pages (a symlink's target too), a
+name that now holds another file (another qid.path) or none drops the
+dentry, and negative dentries expire after the same time unless
+negtimeout says otherwise.
+
+This bounds how stale the cache can get without a way for the server
+to invalidate it: a server whose files also change behind the client
+(a host directory shared with a guest) can still let the client skip
+most of the round trips of a lookup and a stat. Writes are not
+affected: without CACHE_WRITEBACK they are still sent at each write.
+
+The option is refused (EINVAL) with a cache mode that has
+CACHE_WRITEBACK (mmap, loose, fscache): a refresh rewrites the inode
+from the server without writing back dirty pages first, so it could
+truncate writes still pending in the page cache.
+
+The option is meant for 9P2000.L, the only protocol for which it sets
+the expiry and refreshes a stat. With the legacy protocols the expiry
+is never set, so lookups always revalidate, but a stat of an inode
+that is already cached does not refresh it. Without the option nothing
+changes.
+---
+ fs/9p/v9fs.c            | 21 ++++++++++++++++++++-
+ fs/9p/v9fs.h            |  4 ++++
+ fs/9p/v9fs_vfs.h        |  9 +++++++++
+ fs/9p/vfs_dentry.c      |  2 ++
+ fs/9p/vfs_inode.c       |  1 +
+ fs/9p/vfs_inode_dotl.c  | 34 ++++++++++++++++++++++++++++++++--
+ fs/9p/vfs_super.c       | 10 ++++++++++
+ include/net/9p/client.h |  2 ++
+ 8 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/fs/9p/v9fs.c b/fs/9p/v9fs.c
+index 274c5157135..221b06e8df6 100644
+--- a/fs/9p/v9fs.c
++++ b/fs/9p/v9fs.c
+@@ -42,7 +42,7 @@ enum {
+ 	 * source if we rejected it as EINVAL */
+ 	Opt_source,
+ 	/* Options that take integer arguments */
+-	Opt_debug, Opt_dfltuid, Opt_dfltgid, Opt_afid, Opt_negtimeout,
++	Opt_debug, Opt_dfltuid, Opt_dfltgid, Opt_afid, Opt_negtimeout, Opt_metatimeout,
+ 	/* String options */
+ 	Opt_uname, Opt_remotename, Opt_cache, Opt_cachetag,
+ 	/* Options that take no arguments */
+@@ -97,6 +97,7 @@ const struct fs_parameter_spec v9fs_param_spec[] = {
+ 	fsparam_flag	("posixacl",	Opt_posixacl),
+ 	fsparam_u32	("locktimeout",	Opt_locktimeout),
+ 	fsparam_s32	("negtimeout",	Opt_negtimeout),
++	fsparam_u32	("metatimeout",	Opt_metatimeout),
+ 
+ 	/* client options */
+ 	fsparam_u32	("msize",	Opt_msize),
+@@ -166,6 +167,8 @@ int v9fs_show_options(struct seq_file *m, struct dentry *root)
+ 	if (v9ses->flags & V9FS_NDENTRY_TIMEOUT_SET)
+ 		seq_printf(m, ",negtimeout=%d",
+ 			   (int)v9ses->ndentry_timeout_ms);
++	if (v9ses->meta_timeout_ms)
++		seq_printf(m, ",metatimeout=%u", v9ses->meta_timeout_ms);
+ 	if (strcmp(v9ses->uname, V9FS_DEFUSER) != 0)
+ 		seq_printf(m, ",uname=%s", v9ses->uname);
+ 	if (strcmp(v9ses->aname, V9FS_DEFANAME) != 0)
+@@ -354,6 +357,10 @@ int v9fs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 		}
+ 		break;
+ 
++	case Opt_metatimeout:
++		session_opts->meta_timeout_ms = result.uint_32;
++		break;
++
+ 	/* Options for client */
+ 	case Opt_msize:
+ 		if (result.uint_32 < 4096) {
+@@ -444,6 +451,18 @@ static void v9fs_apply_options(struct v9fs_session_info *v9ses,
+ 	v9ses->uid = ctx->session_opts.uid;
+ 	v9ses->session_lock_timeout = ctx->session_opts.session_lock_timeout;
+ 	v9ses->ndentry_timeout_ms = ctx->session_opts.ndentry_timeout_ms;
++	v9ses->meta_timeout_ms = ctx->session_opts.meta_timeout_ms;
++
++	/*
++	 * metatimeout: cache dentries and attributes (CACHE_META), but trust
++	 * them, and negative dentries unless negtimeout says otherwise, only
++	 * for that long; then the next use revalidates with one getattr.
++	 */
++	if (v9ses->meta_timeout_ms) {
++		v9ses->cache |= CACHE_META;
++		if (!(v9ses->flags & V9FS_NDENTRY_TIMEOUT_SET))
++			v9ses->ndentry_timeout_ms = v9ses->meta_timeout_ms;
++	}
+ 
+ 	/* If negative dentry timeout has not been overridden set default for
+ 	 * cache=loose
+diff --git a/fs/9p/v9fs.h b/fs/9p/v9fs.h
+index 2ac863dc844..0da87b3261c 100644
+--- a/fs/9p/v9fs.h
++++ b/fs/9p/v9fs.h
+@@ -106,6 +106,8 @@ enum p9_cache_bits {
+  * @clnt: reference to 9P network client instantiated for this session
+  * @slist: reference to list of registered 9p sessions
+  * @ndentry_timeout_ms: Negative dentry caching retention time
++ * @meta_timeout_ms: how long cached dentries and attributes are trusted
++ *		     before they are revalidated (metatimeout; 0: no limit)
+  *
+  * This structure holds state for each session instance established during
+  * a sys_mount() .
+@@ -122,6 +124,7 @@ struct v9fs_session_info {
+ 	unsigned int afid;
+ 	unsigned int cache;
+ 	unsigned int ndentry_timeout_ms;
++	unsigned int meta_timeout_ms;
+ #ifdef CONFIG_9P_FSCACHE
+ 	char *cachetag;
+ 	struct fscache_volume *fscache;
+@@ -149,6 +152,7 @@ struct v9fs_inode {
+ 	struct netfs_inode netfs; /* Netfslib context and vfs inode */
+ 	struct p9_qid qid;
+ 	unsigned int cache_validity;
++	u64 attr_expire;	/* jiffies64: attributes refreshed until (metatimeout) */
+ 	struct mutex v_mutex;
+ };
+ 
+diff --git a/fs/9p/v9fs_vfs.h b/fs/9p/v9fs_vfs.h
+index 1856d91f870..c23bb111fc2 100644
+--- a/fs/9p/v9fs_vfs.h
++++ b/fs/9p/v9fs_vfs.h
+@@ -88,6 +88,15 @@ static inline void v9fs_invalidate_inode_attr(struct inode *inode)
+ 	v9inode->cache_validity |= V9FS_INO_INVALID_ATTR;
+ }
+ 
++/* metatimeout: the cached attributes are older than the session trusts them. */
++static inline bool v9fs_attr_expired(struct inode *inode)
++{
++	struct v9fs_session_info *v9ses = v9fs_inode2v9ses(inode);
++
++	return v9ses->meta_timeout_ms &&
++	       time_after_eq64(get_jiffies_64(), V9FS_I(inode)->attr_expire);
++}
++
+ int v9fs_open_to_dotl_flags(int flags);
+ 
+ #endif
+diff --git a/fs/9p/vfs_dentry.c b/fs/9p/vfs_dentry.c
+index fa6b7143db9..8e88f408d6a 100644
+--- a/fs/9p/vfs_dentry.c
++++ b/fs/9p/vfs_dentry.c
+@@ -150,6 +150,8 @@ static int __v9fs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
+ 		return !v9fs_ndentry_is_expired(dentry);
+ 
+ 	v9inode = V9FS_I(inode);
++	if (v9fs_attr_expired(inode))
++		v9inode->cache_validity |= V9FS_INO_INVALID_ATTR;
+ 	if (v9inode->cache_validity & V9FS_INO_INVALID_ATTR) {
+ 		int retval;
+ 		struct v9fs_session_info *v9ses;
+diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+index 3829554ca36..6c059735ead 100644
+--- a/fs/9p/vfs_inode.c
++++ b/fs/9p/vfs_inode.c
+@@ -232,6 +232,7 @@ struct inode *v9fs_alloc_inode(struct super_block *sb)
+ 	if (!v9inode)
+ 		return NULL;
+ 	v9inode->cache_validity = 0;
++	v9inode->attr_expire = 0;
+ 	mutex_init(&v9inode->v_mutex);
+ 	return &v9inode->netfs.inode;
+ }
+diff --git a/fs/9p/vfs_inode_dotl.c b/fs/9p/vfs_inode_dotl.c
+index 116b29e95f2..bde31452927 100644
+--- a/fs/9p/vfs_inode_dotl.c
++++ b/fs/9p/vfs_inode_dotl.c
+@@ -427,6 +427,17 @@ v9fs_vfs_getattr_dotl(struct mnt_idmap *idmap,
+ 	p9_debug(P9_DEBUG_VFS, "dentry: %p\n", dentry);
+ 	v9ses = v9fs_dentry2v9ses(dentry);
+ 	if (v9ses->cache & (CACHE_META|CACHE_LOOSE)) {
++		if (v9fs_attr_expired(inode)) {
++			int retval;
++
++			fid = v9fs_fid_lookup(dentry);
++			if (IS_ERR(fid))
++				return PTR_ERR(fid);
++			retval = v9fs_refresh_inode_dotl(fid, inode);
++			p9_fid_put(fid);
++			if (retval)
++				return retval;
++		}
+ 		generic_fillattr(&nop_mnt_idmap, request_mask, inode, stat);
+ 		return 0;
+ 	} else if (v9ses->cache) {
+@@ -679,6 +690,8 @@ v9fs_stat2inode_dotl(struct p9_stat_dotl *stat, struct inode *inode,
+ 	 * because the inode structure does not have fields for them.
+ 	 */
+ 	v9inode->cache_validity &= ~V9FS_INO_INVALID_ATTR;
++	v9inode->attr_expire = get_jiffies_64() +
++		msecs_to_jiffies(v9fs_inode2v9ses(inode)->meta_timeout_ms);
+ }
+ 
+ static int
+@@ -932,20 +945,33 @@ v9fs_vfs_get_link_dotl(struct dentry *dentry,
+ 
+ int v9fs_refresh_inode_dotl(struct p9_fid *fid, struct inode *inode)
+ {
++	struct v9fs_inode *v9inode = V9FS_I(inode);
++	struct timespec64 mtime = inode_get_mtime(inode);
+ 	struct p9_stat_dotl *st;
+ 	struct v9fs_session_info *v9ses;
+ 	unsigned int flags;
++	bool changed;
+ 
+ 	v9ses = v9fs_inode2v9ses(inode);
+ 	st = p9_client_getattr_dotl(fid, P9_STATS_ALL);
+ 	if (IS_ERR(st))
+ 		return PTR_ERR(st);
+ 	/*
+-	 * Don't update inode if the file type is different
++	 * Don't update inode if the file type is different, or with
++	 * metatimeout if the name now holds another file: the attributes
++	 * stay invalid, so lookup revalidation drops the dentry.
+ 	 */
+-	if (inode_wrong_type(inode, st->st_mode))
++	if (inode_wrong_type(inode, st->st_mode) ||
++	    (v9ses->meta_timeout_ms && st->qid.path != v9inode->qid.path))
+ 		goto out;
+ 
++	/* metatimeout: cached data (file pages, a link's target) of a file that changed goes. */
++	changed = v9ses->meta_timeout_ms && !S_ISDIR(inode->i_mode) &&
++		  (st->qid.version != v9inode->qid.version ||
++		   st->st_size != i_size_read(inode) ||
++		   st->st_mtime_sec != mtime.tv_sec ||
++		   st->st_mtime_nsec != mtime.tv_nsec);
++
+ 	/*
+ 	 * We don't want to refresh inode->i_size,
+ 	 * because we may have cached data
+@@ -953,6 +979,10 @@ int v9fs_refresh_inode_dotl(struct p9_fid *fid, struct inode *inode)
+ 	flags = (v9ses->cache & CACHE_LOOSE) ?
+ 		V9FS_STAT2INODE_KEEP_ISIZE : 0;
+ 	v9fs_stat2inode_dotl(st, inode, flags);
++	if (changed) {
++		v9inode->qid.version = st->qid.version;
++		invalidate_inode_pages2(inode->i_mapping);
++	}
+ out:
+ 	kfree(st);
+ 	return 0;
+diff --git a/fs/9p/vfs_super.c b/fs/9p/vfs_super.c
+index 79526044685..fe1fef2ac0e 100644
+--- a/fs/9p/vfs_super.c
++++ b/fs/9p/vfs_super.c
+@@ -85,11 +85,21 @@ static int v9fs_get_tree(struct fs_context *fc)
+ 	struct inode *inode = NULL;
+ 	struct dentry *root = NULL;
+ 	struct v9fs_session_info *v9ses = NULL;
++	struct v9fs_context *ctx = fc->fs_private;
+ 	struct p9_fid *fid;
+ 	int retval = 0;
+ 
+ 	p9_debug(P9_DEBUG_VFS, "\n");
+ 
++	/*
++	 * metatimeout's refresh rewrites the inode from the server without
++	 * writing back dirty pages first, so with a write-back cache it could
++	 * truncate writes still pending in the page cache.
++	 */
++	if (ctx->session_opts.meta_timeout_ms &&
++	    (ctx->session_opts.cache & CACHE_WRITEBACK))
++		return invalfc(fc, "metatimeout needs a cache mode without write-back");
++
+ 	v9ses = kzalloc_obj(struct v9fs_session_info);
+ 	if (!v9ses)
+ 		return -ENOMEM;
+diff --git a/include/net/9p/client.h b/include/net/9p/client.h
+index 55c6cb54bd2..948206c0ae4 100644
+--- a/include/net/9p/client.h
++++ b/include/net/9p/client.h
+@@ -193,6 +193,7 @@ struct p9_rdma_opts {
+  * @uid: if %V9FS_ACCESS_SINGLE, the numeric uid which mounted the hierarchy
+  * @session_lock_timeout: retry interval for blocking locks
+  * @ndentry_timeout_ms: Negative dentry lookup cache retention time in ms
++ * @meta_timeout_ms: how long cached dentries and attributes are trusted (0: no limit)
+  *
+  * This strucure holds options which are parsed and will be transferred
+  * to the v9fs_session_info structure when mounted, and therefore largely
+@@ -205,6 +206,7 @@ struct p9_session_opts {
+ 	unsigned int afid;
+ 	unsigned int cache;
+ 	unsigned int ndentry_timeout_ms;
++	unsigned int meta_timeout_ms;
+ #ifdef CONFIG_9P_FSCACHE
+ 	char *cachetag;
+ #endif
+-- 
+2.56.0
+

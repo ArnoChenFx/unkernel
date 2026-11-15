@@ -1,0 +1,436 @@
+From 9ae4f81cf46776e4d22bc824cf028a9347ea466c Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 10:16:09 +0000
+Subject: [PATCH] wasm: kwfb, a lazy framebuffer read by the JavaScript host
+
+A small fbdev driver for graphical programs on a host that has a
+display. At boot it asks the host (wasm_driver_fb_init(); < 0 means no
+display) and registers nothing without one, so a normal boot only pays
+for the code. With a display, /dev/fb0 is a 32 bpp XRGB8888 framebuffer
+on a platform device (the X.Org fbdev driver skips a framebuffer without
+a device/subsystem link in sysfs).
+
+No pixel memory exists until the first open. The mode is chosen then:
+the driver asks the host for the size it wants (wasm_driver_fb_mode():
+width << 16 | height, 0 for 640x480), e.g. a browser viewport. The
+buffer is one physically contiguous allocation: the kernel runs in the
+direct map, so the host gets a single linear address through
+wasm_driver_fb_attach() and reads the pixels in place whenever it runs
+(idle, the periodic yield, task switches). The last release frees it
+and attaches NULL. A mapping holds a reference to its file, so release
+comes only after the last munmap. wasm_driver_fb_attach() returns the
+size at which the host shows the picture, in millimetres (width << 16 |
+height, 0 for unknown), which goes into fb_var_screeninfo's width and
+height, the fields from which programs derive a DPI.
+
+There is one host picture, so one program has it at a time: an open from
+user space fails with -EBUSY while another user open file exists, and
+two programs cannot draw over each other. The claim is the open file's,
+so it lasts through fork (the child shares the file) and through a
+mapping that outlives close(), and ends at that file's release, which
+process exit always reaches.
+
+A program may set its own size with FBIOPUT_VSCREENINFO (32 bpp; other
+depths are adjusted to 32). The buffer is reallocated in set_par, which
+is allowed only while the caller's file is the only open one and nothing
+is mapped (mappings are counted with vm_ops open/close); otherwise a
+size change fails with -EBUSY. line_length (4 * xres) and smem_len
+follow the mode.
+
+Limits: 64 to 4096 pixels per side, and one buffer of at most 4 MiB,
+the largest block the buddy allocator hands out (MAX_PAGE_ORDER), so 1M
+pixels. A larger size is divided by the smallest integer that fits (the
+host scales it back up by that integer, so pixels stay sharp), and if
+the allocation fails at open, the size is halved until it succeeds.
+
+read() and write() use the sysmem helpers. mmap() inserts the pages
+directly: kwemu walks the page tables to the same linear memory.
+Neither import suspends. No fbcon (VT stays off), no drawing helpers.
+---
+ drivers/video/fbdev/Kconfig  |  10 +
+ drivers/video/fbdev/Makefile |   1 +
+ drivers/video/fbdev/kwfb.c   | 342 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 353 insertions(+)
+ create mode 100644 drivers/video/fbdev/kwfb.c
+
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index e8cd8cb7687..926faacee0f 100644
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1675,6 +1675,16 @@ config FB_VIRTUAL
+ 
+ 	  If unsure, say N.
+ 
++config FB_KWFB
++	bool "unkernel host display"
++	depends on FB=y && WASM
++	select FB_SYSMEM_FOPS
++	help
++	  Framebuffer (/dev/fb0) whose pixels the JavaScript host of a
++	  unkernel instance reads out of kernel memory (js/core/display.ts).
++	  It is registered only when the host has a display, and its memory
++	  is allocated only while the device is open.
++
+ config XEN_FBDEV_FRONTEND
+ 	tristate "Xen virtual frame buffer support"
+ 	depends on FB && XEN
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+index 0b17c878154..401a87776c4 100644
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -124,3 +124,4 @@ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
++obj-$(CONFIG_FB_KWFB)             += kwfb.o
+diff --git a/drivers/video/fbdev/kwfb.c b/drivers/video/fbdev/kwfb.c
+new file mode 100644
+index 00000000000..3c757f729dc
+--- /dev/null
++++ b/drivers/video/fbdev/kwfb.c
+@@ -0,0 +1,342 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * kwfb: a framebuffer whose pixels the JavaScript host (unkernel) reads
++ * straight out of kernel memory.
++ *
++ * The device is lazy. At boot the driver only asks the host whether it has
++ * a display (wasm_driver_fb_init() < 0: none, and nothing is registered).
++ * With one, /dev/fb0 exists, but no pixel memory is allocated until the
++ * first open, which asks the host for the mode it wants
++ * (wasm_driver_fb_mode(), e.g. the size of a browser viewport); the last
++ * release frees it. Each change is reported with wasm_driver_fb_attach(),
++ * which tells the host where the pixels are and their layout (NULL: there
++ * are none). The host samples the buffer whenever it runs, i.e. while the
++ * kernel is suspended in idle, a periodic yield or a task switch; there is
++ * no flush or vsync, and it scales the picture to its window itself.
++ *
++ * One display, one program: an open from user space fails with -EBUSY
++ * while another user open file exists, so that two programs never draw
++ * over each other (or read each other's keys) on the one host picture.
++ * The claim belongs to the open file, not to a process: it ends at that
++ * file's release, i.e. when its last descriptor (inherited by fork, passed
++ * over a socket) is closed and its last mapping is gone, which process
++ * exit always does. Kernel opens (user == 0; there is no fbcon here) are
++ * not refused.
++ *
++ * Pixels are XRGB8888 (32 bpp, little endian: B, G, R, X), rows packed
++ * (line_length = 4 * xres). A program may ask for another size with
++ * FBIOPUT_VSCREENINFO; the buffer is then reallocated, which is allowed
++ * only while the caller's open file is the only one and nothing is mapped
++ * (-EBUSY otherwise, unless the size does not change). Other depths are
++ * adjusted to 32 bpp, as fbdev's check_var does with unsupported values.
++ *
++ * The buffer is one physically contiguous allocation (alloc_pages_exact).
++ * The kernel runs in the direct map (virtual == physical == Wasm linear
++ * address), so the host needs a single address, and user space maps the
++ * pages with remap_pfn_range(): kwemu walks the page tables to the same
++ * linear memory. The buddy allocator gives at most 4 MiB in one piece
++ * (MAX_PAGE_ORDER), so a mode is at most 1M pixels: a larger request is
++ * divided by the smallest integer that makes it fit (the host scales it
++ * back up by that integer), and if the allocation still fails at open, the
++ * size is halved until it succeeds. A mapping holds a reference to its
++ * file, so the buffer is freed only after the last mapping is gone too;
++ * mappings are counted (vm_ops) for the reallocation rule.
++ */
++
++#include <linux/platform_device.h>
++#include <linux/fb.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <asm/wasm.h>
++
++#define KWFB_DEF_W	640
++#define KWFB_DEF_H	480
++#define KWFB_MIN	64		/* pixels, each side */
++#define KWFB_MAX	4096		/* pixels, each side */
++#define KWFB_MAX_BYTES	(PAGE_SIZE << MAX_PAGE_ORDER)
++/* DRM_FORMAT_XRGB8888, fourcc "XR24". */
++#define KWFB_FORMAT	0x34325258
++
++/* Host imports, module "unkernel" (js/core/display.ts). Never suspend. */
++/* < 0: the host has no display (no device is registered). */
++long wasm_driver_fb_init(void)
++	__unkernel_import(wasm_driver_fb_init);
++/* The mode the host wants at first open: width << 16 | height, 0 = default. */
++u32 wasm_driver_fb_mode(void)
++	__unkernel_import(wasm_driver_fb_mode);
++/*
++ * The pixels are now at @pixels (NULL: gone): @height rows of @stride
++ * bytes, @width pixels of @format (a DRM fourcc) each. The host answers
++ * with the size at which it shows that picture, in millimetres, as
++ * width << 16 | height, or 0 if it does not know.
++ */
++u32 wasm_driver_fb_attach(void *pixels, u32 width, u32 height, u32 stride,
++			  u32 format)
++	__unkernel_import(wasm_driver_fb_attach);
++
++struct kwfb {
++	struct fb_info *info;
++	unsigned int users;	/* open files, under info->lock */
++	bool claimed;		/* a user open file exists, under info->lock */
++	atomic_t maps;		/* user mappings of the buffer */
++	void *pixels;
++	size_t alloc;		/* bytes allocated (page aligned) */
++	u32 width, height;
++	u32 mm_w, mm_h;		/* size of the picture on the host, 0: unknown */
++};
++
++static struct kwfb kwfb;
++
++/*
++ * Clamp a size to the limits; if it has more pixels than one allocation
++ * can hold, divide both sides by the smallest integer that makes it fit.
++ */
++static void kwfb_fit(u32 *w, u32 *h)
++{
++	u32 k = 1;
++
++	*w = clamp_t(u32, *w, KWFB_MIN, KWFB_MAX);
++	*h = clamp_t(u32, *h, KWFB_MIN, KWFB_MAX);
++	while ((u64)(*w / k) * (*h / k) * 4 > KWFB_MAX_BYTES)
++		k++;
++	*w = max_t(u32, *w / k, KWFB_MIN);
++	*h = max_t(u32, *h / k, KWFB_MIN);
++}
++
++static void kwfb_set_var(struct fb_var_screeninfo *var, u32 w, u32 h)
++{
++	var->xres = var->xres_virtual = w;
++	var->yres = var->yres_virtual = h;
++	var->xoffset = var->yoffset = 0;
++	var->bits_per_pixel = 32;
++	var->grayscale = 0;
++	var->red = (struct fb_bitfield){ .offset = 16, .length = 8 };
++	var->green = (struct fb_bitfield){ .offset = 8, .length = 8 };
++	var->blue = (struct fb_bitfield){ .offset = 0, .length = 8 };
++	var->transp = (struct fb_bitfield){ };
++	var->nonstd = 0;
++	/* The physical size, for programs that derive a DPI from it. */
++	if (w == kwfb.width && h == kwfb.height && kwfb.mm_w && kwfb.mm_h) {
++		var->width = kwfb.mm_w;
++		var->height = kwfb.mm_h;
++	} else {
++		var->height = var->width = -1;
++	}
++	var->vmode = FB_VMODE_NONINTERLACED;
++	/* Nominal timings, for programs that compute a refresh rate from them. */
++	var->pixclock = 39721;
++	var->left_margin = 40;
++	var->right_margin = 24;
++	var->upper_margin = 32;
++	var->lower_margin = 11;
++	var->hsync_len = 96;
++	var->vsync_len = 2;
++}
++
++/* Allocate a zeroed buffer for @w x @h; NULL on failure. */
++static void *kwfb_alloc(u32 w, u32 h, size_t *size)
++{
++	*size = PAGE_ALIGN((size_t)w * h * 4);
++	return alloc_pages_exact(*size, GFP_KERNEL | __GFP_ZERO |
++				 __GFP_NOWARN | __GFP_RETRY_MAYFAIL);
++}
++
++/* Switch to the buffer @p (@size bytes) for @w x @h and tell the host. */
++static void kwfb_install(struct fb_info *info, void *p, size_t size, u32 w,
++			 u32 h)
++{
++	void *old = kwfb.pixels;
++	size_t old_size = kwfb.alloc;
++	u32 mm = 0;
++
++	kwfb.pixels = p;
++	kwfb.alloc = size;
++	kwfb.width = w;
++	kwfb.height = h;
++	info->screen_buffer = p;
++	info->screen_size = (size_t)w * h * 4;
++	info->fix.smem_start = p ? virt_to_phys(p) : 0;
++	info->fix.smem_len = w * h * 4;
++	info->fix.line_length = w * 4;
++	if (p)
++		mm = wasm_driver_fb_attach(p, w, h, w * 4, KWFB_FORMAT);
++	else
++		wasm_driver_fb_attach(NULL, 0, 0, 0, 0);
++	kwfb.mm_w = mm >> 16;
++	kwfb.mm_h = mm & 0xffff;
++	kwfb_set_var(&info->var, w, h);
++	if (old)
++		free_pages_exact(old, old_size);
++}
++
++static int kwfb_open(struct fb_info *info, int user)
++{
++	u32 mode, w, h;
++	size_t size;
++	void *p;
++
++	/* One program at a time: see the top of this file. */
++	if (user && kwfb.claimed)
++		return -EBUSY;
++	if (kwfb.users++)
++		goto claim;
++	mode = wasm_driver_fb_mode();
++	w = mode ? mode >> 16 : KWFB_DEF_W;
++	h = mode ? mode & 0xffff : KWFB_DEF_H;
++	kwfb_fit(&w, &h);
++	while (!(p = kwfb_alloc(w, h, &size))) {
++		if (w <= KWFB_MIN && h <= KWFB_MIN) {
++			kwfb.users = 0;
++			return -ENOMEM;
++		}
++		fb_info(info, "no contiguous memory for %ux%u, trying %ux%u\n",
++			w, h, max_t(u32, w / 2, KWFB_MIN),
++			max_t(u32, h / 2, KWFB_MIN));
++		w = max_t(u32, w / 2, KWFB_MIN);
++		h = max_t(u32, h / 2, KWFB_MIN);
++	}
++	kwfb_install(info, p, size, w, h);
++claim:
++	if (user)
++		kwfb.claimed = true;
++	return 0;
++}
++
++static int kwfb_release(struct fb_info *info, int user)
++{
++	if (user)
++		kwfb.claimed = false;
++	if (--kwfb.users)
++		return 0;
++	kwfb_install(info, NULL, 0, kwfb.width, kwfb.height);
++	return 0;
++}
++
++/* FBIOPUT_VSCREENINFO, under info->lock: adjust @var to what can be set. */
++static int kwfb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
++{
++	u32 w = var->xres, h = var->yres;
++
++	kwfb_fit(&w, &h);
++	if ((w != kwfb.width || h != kwfb.height) &&
++	    (kwfb.users > 1 || atomic_read(&kwfb.maps)))
++		return -EBUSY;
++	kwfb_set_var(var, w, h);
++	return 0;
++}
++
++static int kwfb_set_par(struct fb_info *info)
++{
++	u32 w = info->var.xres, h = info->var.yres;
++	size_t size;
++	void *p;
++
++	if (w == kwfb.width && h == kwfb.height)
++		return 0;
++	/* check_var said: only our file is open and nothing is mapped. */
++	p = kwfb_alloc(w, h, &size);
++	if (!p)
++		return -ENOMEM;
++	kwfb_install(info, p, size, w, h);
++	return 0;
++}
++
++static void kwfb_vm_open(struct vm_area_struct *vma)
++{
++	atomic_inc(&kwfb.maps);
++}
++
++static void kwfb_vm_close(struct vm_area_struct *vma)
++{
++	atomic_dec(&kwfb.maps);
++}
++
++static const struct vm_operations_struct kwfb_vm_ops = {
++	.open	= kwfb_vm_open,
++	.close	= kwfb_vm_close,
++};
++
++static int kwfb_mmap(struct fb_info *info, struct vm_area_struct *vma)
++{
++	unsigned long size = vma->vm_end - vma->vm_start;
++	unsigned long pgoff = vma->vm_pgoff;
++	int err;
++
++	/* mmap needs an open file, so the buffer exists. */
++	if (!kwfb.pixels)
++		return -ENODEV;
++	if (pgoff >= kwfb.alloc >> PAGE_SHIFT ||
++	    size > kwfb.alloc - (pgoff << PAGE_SHIFT))
++		return -EINVAL;
++	err = remap_pfn_range(vma, vma->vm_start,
++			      PHYS_PFN(virt_to_phys(kwfb.pixels)) + pgoff,
++			      size, vma->vm_page_prot);
++	if (err)
++		return err;
++	vma->vm_ops = &kwfb_vm_ops;
++	atomic_inc(&kwfb.maps);
++	return 0;
++}
++
++static const struct fb_ops kwfb_ops = {
++	.owner		= THIS_MODULE,
++	.fb_open	= kwfb_open,
++	.fb_release	= kwfb_release,
++	__FB_DEFAULT_SYSMEM_OPS_RDWR,
++	.fb_check_var	= kwfb_check_var,
++	.fb_set_par	= kwfb_set_par,
++	.fb_mmap	= kwfb_mmap,
++};
++
++static int __init kwfb_init(void)
++{
++	struct platform_device *pdev;
++	struct fb_info *info;
++	int err;
++
++	if (wasm_driver_fb_init() < 0) {
++		pr_info("kwfb: no host display\n");
++		return 0;
++	}
++
++	/*
++	 * A parent on the platform bus: the X.Org fbdev driver skips a
++	 * framebuffer whose sysfs node has no device/subsystem link.
++	 */
++	pdev = platform_device_register_simple("kwfb", -1, NULL, 0);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++	info = framebuffer_alloc(0, &pdev->dev);
++	if (!info) {
++		platform_device_unregister(pdev);
++		return -ENOMEM;
++	}
++	info->fbops = &kwfb_ops;
++	info->flags = FBINFO_VIRTFB;
++
++	strscpy(info->fix.id, "kwfb", sizeof(info->fix.id));
++	info->fix.type = FB_TYPE_PACKED_PIXELS;
++	info->fix.visual = FB_VISUAL_TRUECOLOR;
++	info->fix.accel = FB_ACCEL_NONE;
++	/* Until the first open: the default mode, no memory. */
++	kwfb.width = KWFB_DEF_W;
++	kwfb.height = KWFB_DEF_H;
++	info->fix.line_length = KWFB_DEF_W * 4;
++	info->fix.smem_len = KWFB_DEF_W * KWFB_DEF_H * 4;
++	kwfb_set_var(&info->var, KWFB_DEF_W, KWFB_DEF_H);
++	info->var.activate = FB_ACTIVATE_NOW;
++
++	err = register_framebuffer(info);
++	if (err) {
++		framebuffer_release(info);
++		platform_device_unregister(pdev);
++		return err;
++	}
++	kwfb.info = info;
++	fb_info(info, "kwfb host display, mode chosen at open (up to %lu KiB)\n",
++		KWFB_MAX_BYTES / 1024);
++	return 0;
++}
++device_initcall(kwfb_init);
+-- 
+2.56.0
+

@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// The unkernel page: Vite for the client (index.html, src/: React and
+// Tailwind), Nitro for the build output (.output/ with the Node preset,
+// `node .output/server/index.mjs`; .vercel/output/ on Vercel) and the
+// response headers. The page is static: the kernel
+// (kernel/unkernel-alpine.wasm, the newest GitHub release's, which
+// scripts/kernel.ts fetches before anything else) is a Vite asset. The page's service worker
+// (the offline copy, the guest preview) is public/vm-sw.js, the preview's
+// server fallback server/vm.ts.
+//
+// Build settings (environment variables): KW_KERNEL, KW_KERNEL_RELEASE,
+// GITHUB_TOKEN pick the kernel (scripts/kernel.ts; the dev server runs
+// web/kernel/'s file as it is).
+//
+// Runtime settings (environment variables of the built Node server):
+//   PORT, HOST (NITRO_PORT, NITRO_HOST)  where it listens (default: port 3000, all interfaces)
+import { execFileSync } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import tailwindcss from "@tailwindcss/vite";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+import { nitro } from "nitro/vite";
+import { fetchKernel, KERNEL_FILE } from "./scripts/kernel.ts";
+
+const git = (...args: string[]) => {
+	try { return execFileSync("git", args, { cwd: import.meta.dirname, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+	catch { return ""; }
+};
+
+/**
+ * __KW_BUILD__ (src/env.d.ts), shown in the About dialog: the Linux release
+ * from the kernel's banner, the kernel's release tag and the page's commit.
+ * Empty where unknown (no git).
+ */
+async function buildInfo(dev: boolean) {
+	const kernel = await fetchKernel(dev);
+	const linux = /Linux version (\S+)/.exec(await readFile(KERNEL_FILE, "latin1"))?.[1] ?? "";
+	const [commit = "", date = ""] = git("log", "-1", "--format=%H %cI").split(" ");
+	return {
+		linux,
+		kernel: kernel.tag,
+		commit: commit || process.env.VERCEL_GIT_COMMIT_SHA || "",
+		date,
+	};
+}
+
+export default defineConfig({
+	// Every interface, so a phone on the LAN can open http://<this-machine>:8080/.
+	server: {
+		host: true,
+		port: 8080,
+		// The dev server's own responses (modules, /@fs/) do not go through
+		// Nitro's route rules below. A worker script must carry COEP itself,
+		// or a cross-origin isolated page refuses to start it (?worker=1).
+		headers: { "cross-origin-opener-policy": "same-origin", "cross-origin-embedder-policy": "require-corp" },
+	},
+	build: { target: "esnext" },
+	// The SDK's worker mode (?worker=1): js/web/worker.ts starts a module worker.
+	worker: { format: "es" },
+	plugins: [
+		{
+			// The kernel first: fetched before the build resolves it, and
+			// __KW_BUILD__ reads its banner.
+			name: "unkernel:kernel",
+			// The dev server keeps the file that is there (a local build).
+			async config(_, { command }) {
+				return { define: { __KW_BUILD__: JSON.stringify(await buildInfo(command === "serve")) } };
+			},
+		},
+		{
+			// Files in public/ are answered by Nitro's dev handler, with neither
+			// server.headers above nor the route rules below. Set the isolation
+			// headers first, so a document there is
+			// cross-origin isolated like the page.
+			name: "unkernel:isolate-public",
+			configureServer(server) {
+				server.middlewares.use((_req, res, next) => {
+					res.setHeader("cross-origin-opener-policy", "same-origin");
+					res.setHeader("cross-origin-embedder-policy", "require-corp");
+					next();
+				});
+			},
+		},
+		{
+			// /kw-assets.json: every file of the build under /assets/ (the kernel among
+			// them), which the service worker (public/vm-sw.js) caches before it serves
+			// a new build's page, so the cached page always has its files.
+			name: "unkernel:asset-list",
+			apply: "build",
+			generateBundle(_, bundle) {
+				if (this.environment.name !== "client") return;
+				const files = Object.keys(bundle).filter((f) => f.startsWith("assets/")).map((f) => `/${f}`).sort();
+				this.emitFile({ type: "asset", fileName: "kw-assets.json", source: `${JSON.stringify({ files })}\n` });
+			},
+		},
+		react(),
+		tailwindcss(),
+		nitro({
+			// The kernel (9 MiB) is sent br/zstd/gzip-encoded by the Node server.
+			compressPublicAssets: true,
+			// The guest preview (src/preview.ts): /vm/** reaches the server only when the
+			// service worker (public/vm-sw.js, served at /vm-sw.js) did not answer.
+			handlers: [{ route: "/vm/**", handler: "./server/vm.ts" }],
+			routeRules: {
+				// Cross-origin isolation (secure contexts only), so SharedArrayBuffer
+				// is available. The kernel does not need it yet (its memory is not shared).
+				"/**": {
+					headers: {
+						"cross-origin-opener-policy": "same-origin",
+						"cross-origin-embedder-policy": "require-corp",
+					},
+				},
+				// Checked for updates on every registration; not cached by the CDN.
+				"/vm-sw.js": { headers: { "cache-control": "no-cache" } },
+				// The service worker's update check reads it with each new page.
+				"/kw-assets.json": { headers: { "cache-control": "no-cache" } },
+			},
+		}),
+	],
+});

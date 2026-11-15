@@ -1,0 +1,364 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+#
+# Release: build everything from source (patched wasm-ld, kernel, Alpine
+# initramfs, data disk template, bundle), smoke-test it, build and pack the
+# npm package, and for a release publish it to npm (trusted publishing,
+# with provenance) and publish a GitHub release (a normal one, marked
+# latest) with the npm tarball and the bundle (unkernel-alpine.wasm)
+# attached.
+#
+# Runs:
+#   - by hand from main (Actions > Release > Run workflow): a release with
+#     a generated version <package.json version>-<YYMMDD>-<commit>, e.g.
+#     0.1.0-261115-7e36b21 (the commit's UTC date and short hash). After the
+#     build passes it tags the commit v<version>. Unchecking "release" makes
+#     it a smoke run (same build and version, no tag or release).
+#   - on a pushed tag v<version> that points at a commit on main: a release
+#     of that version
+# Any other ref is refused before anything is built or any cache is touched.
+# The version is stamped into package.json before the package is built and
+# packed. A tag the workflow creates (with GITHUB_TOKEN) does not start it
+# again.
+#
+# Caches (all restored and saved explicitly, so an expensive step is kept
+# even when a later step fails):
+#   toolchain   the patched wasm-ld (~1 h to build on a 2-core runner);
+#               key: LLVM commit, kernel/patches/llvm
+#   linux-src   the patched kernel tree; key: base commit, kernel/patches/linux
+#   kernel-out  the kernel build directory, reused only with the same tree
+#               (same patches, clang and fake-llvm wrapper), so Kbuild
+#               rebuilds incrementally and never from a different source
+#   downloads   Alpine minirootfs and Binaryen (checksums are verified anyway)
+#   zig, pnpm   by their setup actions
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Tag this commit v<version>-<YYMMDD>-<commit> and publish a GitHub release (unchecked = smoke run)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    name: Check the ref is on main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Refuse refs that are not main or a tag on main; pick the version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_INPUT: ${{ inputs.release }}
+        run: |
+          case "$GITHUB_REF" in
+          refs/heads/main)
+            base="$(gh api "repos/$GITHUB_REPOSITORY/contents/package.json?ref=$GITHUB_SHA" \
+              -H "Accept: application/vnd.github.raw" | jq -r .version)"
+            date="$(date -u -d "$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .commit.committer.date)" +%y%m%d)"
+            # One prerelease identifier (hyphens do not split it), so a commit
+            # like 0123456 is fine, and same-base versions sort by date.
+            version="$base-$date-${GITHUB_SHA::7}"
+            release="${RELEASE_INPUT:-true}"
+            if [ "$release" = true ] && gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" --silent 2>/dev/null; then
+              echo "::error::tag v$version exists already: this commit has been released"
+              exit 1
+            fi
+            ;;
+          refs/tags/v*)
+            # "identical" or "behind": the tagged commit is main or an ancestor of it.
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)"
+            case "$status" in
+            identical | behind) ;;
+            *) echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main (compare: $status)"; exit 1 ;;
+            esac
+            version="${GITHUB_REF_NAME#v}"
+            release=true
+            ;;
+          *) echo "::error::releases run only from main or a v* tag on main, not $GITHUB_REF"; exit 1 ;;
+          esac
+          # semver (npm rejects anything else), as in semver.org's regular expression
+          n='(0|[1-9][0-9]*)' id='(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)'
+          [[ "$version" =~ ^$n\.$n\.$n(-$id(\.$id)*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$ ]] ||
+            { echo "::error::$version is not a semver version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "ok: $GITHUB_REF ($GITHUB_SHA), $([ "$release" = true ] && echo "release" || echo "smoke run") of $version"
+
+  build:
+    name: Build and smoke-test
+    needs: guard
+    # The repository variable RELEASE_RUNNER names a larger runner (more
+    # cores for the wasm-ld and kernel builds), if one is set up.
+    runs-on: ${{ vars.RELEASE_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install clang 22 and host tools
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          cache: true
+
+      - name: Check prerequisites
+        run: ./setup.sh --check
+
+      - name: Cache keys
+        id: keys
+        run: |
+          {
+            echo "linux=$(sed -n 's/^LINUX_BASE=//p' kernel/build.sh)"
+            echo "llvm=$(sed -n 's/^LLVM_COMMIT=//p' kernel/build.sh)"
+            echo "clang=$(clang --version | head -1 | sha256sum | cut -c1-16)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Patched wasm-ld. With vendor/toolchain/bin/wasm-ld present, build.sh
+      # skips the toolchain step; lld is linked statically against LLVM.
+      # The key leaves out the clang version: apt.llvm.org rebuilds change
+      # it often, and which clang compiled the linker does not matter.
+      - name: Restore toolchain
+        id: toolchain
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/lld22/bin/lld
+            vendor/toolchain/bin
+          key: toolchain-${{ runner.os }}-${{ steps.keys.outputs.llvm }}-${{ hashFiles('kernel/patches/llvm/**') }}
+          # The earlier key (with the clang version), only while that cache exists.
+          restore-keys: toolchain-${{ runner.os }}-${{ steps.keys.outputs.llvm }}-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/llvm/**') }}
+      - name: Build the patched wasm-ld
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          if [ -x vendor/toolchain/bin/wasm-ld ]; then
+            echo "restored from ${{ steps.toolchain.outputs.cache-matched-key }}"
+          else
+            kernel/build.sh toolchain
+          fi
+      - name: Save toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/lld22/bin/lld
+            vendor/toolchain/bin
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+
+      - name: Restore downloads
+        id: downloads
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/downloads
+          key: downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh') }}
+          restore-keys: downloads-
+
+      # Exact key only: build.sh never re-applies the series on an existing
+      # kw-riscv-user branch, so a tree with other patches must not be restored.
+      - name: Restore the kernel tree
+        id: linux-src
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/src/linux-wasm-kernel
+          key: linux-src-${{ steps.keys.outputs.linux }}-${{ hashFiles('kernel/patches/linux/**') }}
+
+      # Only from a build of the same tree (exact linux-src key above), so
+      # file times order correctly and make rebuilds what changed.
+      - name: Restore the kernel build
+        id: kernel-out
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/kernel
+          key: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-${{ hashFiles('src/**', 'include/**', 'build.zig', 'build.zig.zon', 'kernel/build.sh') }}
+          restore-keys: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-
+
+      - name: Drop a kernel build that does not match the tree
+        if: steps.linux-src.outputs.cache-hit != 'true'
+        run: rm -rf vendor/build/kernel
+
+      # build.sh would run `zig build` itself, whose native artifacts (unused
+      # here) target the runner's CPU, and hosted runners vary in CPU model,
+      # which invalidates that part of the zig cache. Build for a baseline
+      # CPU instead and hand build.sh the library.
+      - name: Build kwemu
+        run: zig build -Dkwemu-jit=true -Dcpu=baseline
+
+      - name: Build the kernel
+        env:
+          KWEMU: ${{ github.workspace }}/zig-out/lib/libkwemu.a
+        run: kernel/build.sh kernel
+
+      - name: Save the kernel tree
+        if: steps.linux-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/src/linux-wasm-kernel
+          key: ${{ steps.linux-src.outputs.cache-primary-key }}
+      - name: Save the kernel build
+        if: steps.kernel-out.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/kernel
+          key: ${{ steps.kernel-out.outputs.cache-primary-key }}
+
+      - name: Build the Alpine initramfs, data disk template and bundle
+        run: |
+          kernel/build.sh alpine
+          kernel/build.sh datadisk   # refreshes the bundle with the template
+          ls -l vendor/build/bundle/unkernel-alpine.wasm
+          sha256sum vendor/build/bundle/unkernel-alpine.wasm
+
+      - name: Save downloads
+        if: steps.downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/downloads
+          key: ${{ steps.downloads.outputs.cache-primary-key }}
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: kwtest (JIT)
+        run: |
+          node js/cli.ts --timeout 600 --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          grep -q 'kwtest: 0 failure(s)' kwtest.log
+      - name: kwtest (no JIT)
+        run: |
+          node js/cli.ts --timeout 900 --no-jit --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          grep -q 'kwtest: 0 failure(s)' kwtest.log
+
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: SDK unit tests
+        run: |
+          pnpm test:tty
+          pnpm test:http
+          pnpm test:9p
+
+      - name: Build the package
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          npm pkg set version="$VERSION"
+          pnpm build
+      # The api suite (~85 s) runs once, on the built package: the same code
+      # as the sources, plus the packaging.
+      - name: Test the built package
+        run: |
+          node dist/cli.mjs --timeout 600 --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          grep -q 'kwtest: 0 failure(s)' kwtest.log
+          UNKERNEL_DIST=1 node --test test/api.test.ts
+      - name: Pack
+        run: |
+          mkdir -p out
+          # A fixed name; the version is inside (package.json) and in the tag.
+          mv "out/$(npm pack --pack-destination out | tail -1)" out/unkernel.tgz
+          cp vendor/build/bundle/unkernel-alpine.wasm out/
+          ls -l out
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: out/
+          if-no-files-found: error
+
+  # Every step can run again ("Re-run failed jobs"): the tag, the npm
+  # version and the GitHub release are each skipped when they exist.
+  release:
+    name: Tag, publish to npm and on GitHub
+    needs: [guard, build]
+    if: needs.guard.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the tag and the GitHub release
+      id-token: write # npm trusted publishing (OIDC, no token) and provenance
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: out
+
+      # A pushed tag exists already; a manual release creates it here, on the
+      # commit that was built.
+      - name: Create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.guard.outputs.version }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null; then
+            echo "$TAG exists"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" --silent
+            echo "created $TAG at $GITHUB_SHA"
+          fi
+
+      # Trusted publishing needs npm >= 11.5.1 (Node 26 has it). npmjs.com
+      # trusts this workflow file (release.yml) of this repository; no token.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+
+      # Every release goes to the dist-tag latest. npm refuses to publish a
+      # semver prerelease (every generated version) without an explicit
+      # --tag, hence the flag.
+      - name: Publish to npm
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          npm --version
+          if [ "$(npm view "unkernel@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "unkernel@$VERSION is on npm already"
+            exit 0
+          fi
+          npm publish ./out/unkernel.tgz --access public --provenance --tag latest
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.guard.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists"
+            exit 0
+          fi
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+            --latest --verify-tag --generate-notes --title "$TAG"

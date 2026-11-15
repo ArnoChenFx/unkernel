@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 01:10:15 +0000
+Subject: [PATCH 1/2] fbcon: run without a VT, keyboard and mouse from evdev or
+ the terminal
+
+---
+ src/video/fbcon/SDL_fbevents.c | 457 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 454 insertions(+), 3 deletions(-)
+
+diff --git a/src/video/fbcon/SDL_fbevents.c b/src/video/fbcon/SDL_fbevents.c
+index 2bb7458..eba7ae9 100644
+--- a/src/video/fbcon/SDL_fbevents.c
++++ b/src/video/fbcon/SDL_fbevents.c
+@@ -65,6 +65,123 @@ static SDLKey keymap[128];
+ static Uint16 keymap_temp[128]; /* only used at startup */
+ static SDL_keysym *TranslateKey(int scancode, SDL_keysym *keysym);
+ 
++/*
++ * Without a virtual terminal (no VT_*, KDSKBMODE or KDSETMODE, as in the
++ * unkernel) the keyboard and mouse come from evdev devices
++ * (/dev/input/event*: real presses and releases) and from the terminal on
++ * stdin. Both are read until the first evdev key event; from then on the
++ * terminal is only drained, so a host that sends each key to both does not
++ * deliver it twice. Keys are reported with Linux key codes as scancodes and
++ * US-layout keysyms.
++ *
++ * A terminal sends characters and escape sequences, not releases: a key goes
++ * down at its byte and up NOVT_HOLD ms later (sooner when the next key needs
++ * other modifiers), and a repeated byte releases and presses it again.
++ * Shift, Ctrl and Alt are derived from the character or the sequence's
++ * modifier parameter. The terminal is raw while the video mode is set and is
++ * restored at exit or on a signal; Ctrl-C (ISIG) still ends the program.
++ */
++#include <linux/input.h>
++#include <signal.h>
++
++#define NOVT_HOLD	250
++#define NOVT_MAX_EVDEV	8
++#define NOVT_SHIFT	1
++#define NOVT_ALT	2
++#define NOVT_CTRL	4
++
++static int novt;			/* 1: keyboard_fd is stdin or /dev/null */
++static int novt_term = -1;		/* stdin, while it is in raw mode */
++static struct termios novt_saved;
++static int novt_evdev[NOVT_MAX_EVDEV];
++static int novt_nevdev;
++static int novt_evdev_keys;		/* an evdev key event was seen */
++static Uint32 novt_up_at[128];		/* release time per key code, 0 = up */
++static int novt_mods;			/* modifiers pressed for terminal keys */
++
++/* US layout: the character of key codes 0-53, unshifted and shifted. */
++static const char novt_lower[] = "\0\0" "1234567890-=" "\0\0" "qwertyuiop[]"
++	"\0\0" "asdfghjkl;'`" "\0" "\\zxcvbnm,./";
++static const char novt_upper[] = "\0\0" "!@#$%^&*()_+" "\0\0" "QWERTYUIOP{}"
++	"\0\0" "ASDFGHJKL:\"~" "\0" "|ZXCVBNM<>?";
++
++static void novt_term_restore(void)
++{
++	if ( novt_term >= 0 ) {
++		tcsetattr(novt_term, TCSAFLUSH, &novt_saved);
++		novt_term = -1;
++	}
++}
++
++static void novt_signal(int sig)
++{
++	novt_term_restore();
++	signal(sig, SIG_DFL);
++	raise(sig);
++}
++
++static void novt_term_raw(void)
++{
++	static int hooked;
++	struct termios t;
++
++	if ( novt_term >= 0 || !isatty(0) || tcgetattr(0, &novt_saved) < 0 ) {
++		return;
++	}
++	t = novt_saved;
++	t.c_lflag &= ~(ICANON | ECHO);
++	t.c_iflag &= ~(ISTRIP | IGNCR | ICRNL | INLCR | IXOFF | IXON);
++	t.c_cc[VMIN] = 0;
++	t.c_cc[VTIME] = 0;
++	if ( tcsetattr(0, TCSAFLUSH, &t) < 0 ) {
++		return;
++	}
++	novt_term = 0;
++	if ( !hooked ) {
++		hooked = 1;
++		atexit(novt_term_restore);
++		signal(SIGINT, novt_signal);
++		signal(SIGTERM, novt_signal);
++		signal(SIGHUP, novt_signal);
++		signal(SIGQUIT, novt_signal);
++	}
++}
++
++static void novt_open_evdev(void)
++{
++	DIR *dir = opendir("/dev/input");
++	struct dirent *de;
++	unsigned long bits[KEY_MAX / (8 * sizeof(long)) + 1];
++	char path[300];
++	int fd, keyboard, mouse;
++
++	if ( !dir ) {
++		return;
++	}
++	while ( (de = readdir(dir)) != NULL && novt_nevdev < NOVT_MAX_EVDEV ) {
++		if ( SDL_strncmp(de->d_name, "event", 5) != 0 ) {
++			continue;
++		}
++		SDL_snprintf(path, sizeof(path), "/dev/input/%s", de->d_name);
++		fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++		if ( fd < 0 ) {
++			continue;
++		}
++		SDL_memset(bits, 0, sizeof(bits));
++		ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits);
++#define NOVT_BIT(b)	((bits[(b) / (8 * sizeof(long))] >> ((b) % (8 * sizeof(long)))) & 1)
++		keyboard = NOVT_BIT(KEY_A);
++		mouse = NOVT_BIT(BTN_LEFT);
++#undef NOVT_BIT
++		if ( keyboard || mouse ) {
++			novt_evdev[novt_nevdev++] = fd;
++		} else {
++			close(fd);
++		}
++	}
++	closedir(dir);
++}
++
+ /* Ugh, we have to duplicate the kernel's keysym mapping code...
+    Oh, it's not so bad. :-)
+ 
+@@ -156,6 +273,14 @@ int FB_EnterGraphicsMode(_THIS)
+ {
+ 	struct termios keyboard_termios;
+ 
++	if ( novt ) {
++		if ( (keyboard_fd >= 0) && !FB_InGraphicsMode(this) ) {
++			novt_term_raw();
++			saved_kbd_mode = K_XLATE;
++		}
++		return(keyboard_fd);
++	}
++
+ 	/* Set medium-raw keyboard mode */
+ 	if ( (keyboard_fd >= 0) && !FB_InGraphicsMode(this) ) {
+ 
+@@ -217,6 +342,11 @@ int FB_EnterGraphicsMode(_THIS)
+ 
+ void FB_LeaveGraphicsMode(_THIS)
+ {
++	if ( novt ) {
++		novt_term_restore();
++		saved_kbd_mode = -1;
++		return;
++	}
+ 	if ( FB_InGraphicsMode(this) ) {
+ 		ioctl(keyboard_fd, KDSETMODE, KD_TEXT);
+ 		ioctl(keyboard_fd, KDSKBMODE, saved_kbd_mode);
+@@ -233,6 +363,11 @@ void FB_LeaveGraphicsMode(_THIS)
+ 
+ void FB_CloseKeyboard(_THIS)
+ {
++	if ( novt ) {
++		while ( novt_nevdev > 0 ) {
++			close(novt_evdev[--novt_nevdev]);
++		}
++	}
+ 	if ( keyboard_fd >= 0 ) {
+ 		FB_LeaveGraphicsMode(this);
+ 		if ( keyboard_fd > 0 ) {
+@@ -240,6 +375,7 @@ void FB_CloseKeyboard(_THIS)
+ 		}
+ 	}
+ 	keyboard_fd = -1;
++	novt = 0;
+ }
+ 
+ int FB_OpenKeyboard(_THIS)
+@@ -298,8 +434,19 @@ int FB_OpenKeyboard(_THIS)
+ 		  }
+ 		}
+ 
++		if ( keyboard_fd < 0 ) {
++			/* No VT: stdin and evdev (novt, above) */
++			keyboard_fd = open("/dev/null", O_RDONLY);
++			if ( keyboard_fd >= 0 ) {
++				novt = 1;
++				novt_open_evdev();
++			}
++		}
++
+ 		/* Set up keymap */
+-		FB_vgainitkeymaps(keyboard_fd);
++		if ( !novt ) {
++			FB_vgainitkeymaps(keyboard_fd);
++		}
+  	}
+  	return(keyboard_fd);
+ }
+@@ -1026,6 +1173,307 @@ static void handle_keyboard(_THIS)
+ 	}
+ }
+ 
++static SDLKey novt_sym(int code)
++{
++	if ( code < (int)sizeof(novt_lower) && novt_lower[code] ) {
++		return (SDLKey)novt_lower[code];
++	}
++	if ( code >= KEY_F1 && code <= KEY_F10 ) {
++		return (SDLKey)(SDLK_F1 + (code - KEY_F1));
++	}
++	switch (code) {
++	    case KEY_ESC: return SDLK_ESCAPE;
++	    case KEY_BACKSPACE: return SDLK_BACKSPACE;
++	    case KEY_TAB: return SDLK_TAB;
++	    case KEY_ENTER: return SDLK_RETURN;
++	    case KEY_LEFTCTRL: return SDLK_LCTRL;
++	    case KEY_LEFTSHIFT: return SDLK_LSHIFT;
++	    case KEY_RIGHTSHIFT: return SDLK_RSHIFT;
++	    case KEY_KPASTERISK: return SDLK_KP_MULTIPLY;
++	    case KEY_LEFTALT: return SDLK_LALT;
++	    case KEY_SPACE: return SDLK_SPACE;
++	    case KEY_CAPSLOCK: return SDLK_CAPSLOCK;
++	    case KEY_NUMLOCK: return SDLK_NUMLOCK;
++	    case KEY_SCROLLLOCK: return SDLK_SCROLLOCK;
++	    case KEY_KP7: return SDLK_KP7;
++	    case KEY_KP8: return SDLK_KP8;
++	    case KEY_KP9: return SDLK_KP9;
++	    case KEY_KPMINUS: return SDLK_KP_MINUS;
++	    case KEY_KP4: return SDLK_KP4;
++	    case KEY_KP5: return SDLK_KP5;
++	    case KEY_KP6: return SDLK_KP6;
++	    case KEY_KPPLUS: return SDLK_KP_PLUS;
++	    case KEY_KP1: return SDLK_KP1;
++	    case KEY_KP2: return SDLK_KP2;
++	    case KEY_KP3: return SDLK_KP3;
++	    case KEY_KP0: return SDLK_KP0;
++	    case KEY_KPDOT: return SDLK_KP_PERIOD;
++	    case KEY_102ND: return SDLK_LESS;
++	    case KEY_F11: return SDLK_F11;
++	    case KEY_F12: return SDLK_F12;
++	    case KEY_KPENTER: return SDLK_KP_ENTER;
++	    case KEY_RIGHTCTRL: return SDLK_RCTRL;
++	    case KEY_KPSLASH: return SDLK_KP_DIVIDE;
++	    case KEY_SYSRQ: return SDLK_PRINT;
++	    case KEY_RIGHTALT: return SDLK_RALT;
++	    case KEY_HOME: return SDLK_HOME;
++	    case KEY_UP: return SDLK_UP;
++	    case KEY_PAGEUP: return SDLK_PAGEUP;
++	    case KEY_LEFT: return SDLK_LEFT;
++	    case KEY_RIGHT: return SDLK_RIGHT;
++	    case KEY_END: return SDLK_END;
++	    case KEY_DOWN: return SDLK_DOWN;
++	    case KEY_PAGEDOWN: return SDLK_PAGEDOWN;
++	    case KEY_INSERT: return SDLK_INSERT;
++	    case KEY_DELETE: return SDLK_DELETE;
++	    case KEY_PAUSE: return SDLK_PAUSE;
++	    case KEY_LEFTMETA: return SDLK_LSUPER;
++	    case KEY_RIGHTMETA: return SDLK_RSUPER;
++	    case KEY_COMPOSE: return SDLK_MENU;
++	}
++	return SDLK_UNKNOWN;
++}
++
++static void novt_post(int code, int pressed)
++{
++	SDL_keysym keysym;
++
++	if ( code <= 0 || code >= 128 ) {
++		return;
++	}
++	keysym.scancode = code;
++	keysym.sym = novt_sym(code);
++	keysym.mod = KMOD_NONE;
++	keysym.unicode = 0;
++	if ( pressed && SDL_TranslateUNICODE && code < (int)sizeof(novt_lower) ) {
++		keysym.unicode = (Uint8)((SDL_GetModState() & KMOD_SHIFT) ?
++			novt_upper[code] : novt_lower[code]);
++	}
++	if ( keysym.sym != SDLK_UNKNOWN ) {
++		posted += SDL_PrivateKeyboard(pressed ? SDL_PRESSED : SDL_RELEASED, &keysym);
++	}
++}
++
++static void novt_set_mods(int mods)
++{
++	static const int codes[3] = { KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTCTRL };
++	int i;
++
++	for ( i = 0; i < 3; ++i ) {
++		if ( (mods ^ novt_mods) & (1 << i) ) {
++			novt_post(codes[i], mods & (1 << i));
++		}
++	}
++	novt_mods = mods;
++}
++
++/* Release the terminal's keys that are due (all with force). */
++static void novt_release(int force)
++{
++	Uint32 now = SDL_GetTicks();
++	int code, held = 0;
++
++	for ( code = 0; code < 128; ++code ) {
++		if ( !novt_up_at[code] ) {
++			continue;
++		}
++		if ( force || (Sint32)(now - novt_up_at[code]) >= 0 ) {
++			novt_up_at[code] = 0;
++			novt_post(code, 0);
++		} else {
++			held = 1;
++		}
++	}
++	if ( !held && novt_mods ) {
++		novt_set_mods(0);
++	}
++}
++
++static void novt_key(int code, int mods)
++{
++	if ( code <= 0 || code >= 128 ) {
++		return;
++	}
++	if ( mods != novt_mods ) {
++		novt_release(1);
++		novt_set_mods(mods);
++	}
++	if ( novt_up_at[code] ) {
++		novt_post(code, 0);
++	}
++	novt_post(code, 1);
++	novt_up_at[code] = (SDL_GetTicks() + NOVT_HOLD) | 1;
++}
++
++/* The key code of an ESC [ or ESC O sequence: final byte c, number n. */
++static int novt_escape(int c, int n)
++{
++	switch (c) {
++	    case 'A': return KEY_UP;
++	    case 'B': return KEY_DOWN;
++	    case 'C': return KEY_RIGHT;
++	    case 'D': return KEY_LEFT;
++	    case 'H': return KEY_HOME;
++	    case 'F': return KEY_END;
++	    case 'P': return KEY_F1;
++	    case 'Q': return KEY_F2;
++	    case 'R': return KEY_F3;
++	    case 'S': return KEY_F4;
++	    case 'E': return KEY_KP5;
++	    case 'M': return KEY_KPENTER;
++	    case '~':
++		switch (n) {
++		    case 1: case 7: return KEY_HOME;
++		    case 2: return KEY_INSERT;
++		    case 3: return KEY_DELETE;
++		    case 4: case 8: return KEY_END;
++		    case 5: return KEY_PAGEUP;
++		    case 6: return KEY_PAGEDOWN;
++		    case 11: return KEY_F1;
++		    case 12: return KEY_F2;
++		    case 13: return KEY_F3;
++		    case 14: return KEY_F4;
++		    case 15: return KEY_F5;
++		    case 17: return KEY_F6;
++		    case 18: return KEY_F7;
++		    case 19: return KEY_F8;
++		    case 20: return KEY_F9;
++		    case 21: return KEY_F10;
++		    case 23: return KEY_F11;
++		    case 24: return KEY_F12;
++		}
++	}
++	return 0;
++}
++
++/* A character typed on the terminal, with extra modifiers. */
++static void novt_char(int c, int mods)
++{
++	int code;
++
++	if ( c == '\r' || c == '\n' ) {
++		novt_key(KEY_ENTER, mods);
++	} else if ( c == '\t' ) {
++		novt_key(KEY_TAB, mods);
++	} else if ( c == 0x7f || c == 0x08 ) {
++		novt_key(KEY_BACKSPACE, mods);
++	} else if ( c == ' ' ) {
++		novt_key(KEY_SPACE, mods);
++	} else if ( c >= 1 && c <= 26 ) {
++		novt_char('a' + c - 1, mods | NOVT_CTRL);
++	} else if ( c > ' ' && c < 0x7f ) {
++		for ( code = 0; code < (int)sizeof(novt_lower); ++code ) {
++			if ( novt_lower[code] == c ) {
++				novt_key(code, mods);
++				return;
++			}
++			if ( novt_upper[code] == c ) {
++				novt_key(code, mods | NOVT_SHIFT);
++				return;
++			}
++		}
++	}
++}
++
++static void novt_read_term(void)
++{
++	unsigned char buf[256];
++	int n, i, j, num, param2, field, c;
++
++	while ( (n = read(novt_term, buf, sizeof(buf))) > 0 ) {
++		if ( novt_evdev_keys ) {
++			continue;
++		}
++		for ( i = 0; i < n; ++i ) {
++			c = buf[i];
++			if ( c != 0x1b ) {
++				novt_char(c, 0);
++				continue;
++			}
++			if ( i + 2 < n && (buf[i + 1] == '[' || buf[i + 1] == 'O') ) {
++				/* ESC [ n ; m X: n picks the key, m-1 the modifiers. */
++				num = param2 = field = 0;
++				for ( j = i + 2; j < n - 1 &&
++				      (isdigit(buf[j]) || buf[j] == ';'); ++j ) {
++					if ( buf[j] == ';' ) {
++						++field;
++					} else if ( field == 0 ) {
++						num = num * 10 + (buf[j] - '0');
++					} else if ( field == 1 ) {
++						param2 = param2 * 10 + (buf[j] - '0');
++					}
++				}
++				param2 = param2 > 1 ? param2 - 1 : 0;
++				novt_key(novt_escape(buf[j], num),
++					 ((param2 & 1) ? NOVT_SHIFT : 0) |
++					 ((param2 & 2) ? NOVT_ALT : 0) |
++					 ((param2 & 4) ? NOVT_CTRL : 0));
++				i = j;
++			} else if ( i + 1 < n && buf[i + 1] != 0x1b ) {
++				/* ESC c: Alt+c */
++				novt_char(buf[++i], NOVT_ALT);
++			} else {
++				novt_key(KEY_ESC, 0);
++			}
++		}
++	}
++}
++
++static void novt_read_evdev(void)
++{
++	struct input_event ev;
++	int i, dx, dy;
++
++	for ( i = 0; i < novt_nevdev; ++i ) {
++		dx = dy = 0;
++		while ( read(novt_evdev[i], &ev, sizeof(ev)) == sizeof(ev) ) {
++			if ( ev.type == EV_REL ) {
++				if ( ev.code == REL_X ) {
++					dx += ev.value;
++				} else if ( ev.code == REL_Y ) {
++					dy += ev.value;
++				}
++				continue;
++			}
++			if ( ev.type != EV_KEY || ev.value == 2 ) {
++				continue;
++			}
++			if ( ev.code >= BTN_LEFT && ev.code <= BTN_MIDDLE ) {
++				static const Uint8 button[3] = {
++					SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE
++				};
++				if ( dx || dy ) {
++					posted += SDL_PrivateMouseMotion(0, 1, dx, dy);
++					dx = dy = 0;
++				}
++				posted += SDL_PrivateMouseButton(ev.value ?
++					SDL_PRESSED : SDL_RELEASED,
++					button[ev.code - BTN_LEFT], 0, 0);
++				continue;
++			}
++			if ( ev.code < 128 ) {
++				if ( !novt_evdev_keys ) {
++					novt_evdev_keys = 1;
++					novt_release(1);
++				}
++				novt_post(ev.code, ev.value);
++			}
++		}
++		if ( dx || dy ) {
++			posted += SDL_PrivateMouseMotion(0, 1, dx, dy);
++		}
++	}
++}
++
++static void novt_pump(void)
++{
++	novt_read_evdev();
++	if ( novt_term >= 0 ) {
++		novt_read_term();
++	}
++	novt_release(0);
++}
++
+ void FB_PumpEvents(_THIS)
+ {
+ 	fd_set fdset;
+@@ -1046,10 +1494,13 @@ void FB_PumpEvents(_THIS)
+ 		}
+ 
+ 		posted = 0;
++		if ( novt ) {
++			novt_pump();
++		}
+ 
+ 		FD_ZERO(&fdset);
+ 		max_fd = 0;
+-		if ( keyboard_fd >= 0 ) {
++		if ( keyboard_fd >= 0 && !novt ) {
+ 			FD_SET(keyboard_fd, &fdset);
+ 			if ( max_fd < keyboard_fd ) {
+ 				max_fd = keyboard_fd;
+@@ -1062,7 +1513,7 @@ void FB_PumpEvents(_THIS)
+ 			}
+ 		}
+ 		if ( select(max_fd+1, &fdset, NULL, NULL, &zero) > 0 ) {
+-			if ( keyboard_fd >= 0 ) {
++			if ( keyboard_fd >= 0 && !novt ) {
+ 				if ( FD_ISSET(keyboard_fd, &fdset) ) {
+ 					handle_keyboard(this);
+ 				}

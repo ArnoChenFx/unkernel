@@ -1,0 +1,712 @@
+# The SDK (`js/`, npm `unkernel`)
+
+The SDK is the host runtime, shared by the CLI, the page and npm users.
+README.md documents its public API. This file covers the rules and the
+parts that are easy to get wrong.
+
+## Rules
+
+- Node 24 runs the sources directly (`node js/cli.ts`,
+  `node --test test/*.test.ts`). `pnpm install` is needed only for
+  `pnpm typecheck` (`tsc`, TypeScript 7) and `pnpm build` (obuild).
+- `test/api.test.ts` runs its tests concurrently (one per core,
+  `UNKERNEL_TEST_CONCURRENCY=1` for one at a time). Boot with
+  `boot(t, opts)`, so that each test stops only its own kernels. Tests that
+  can share one kernel's boot options go in a `describe` with
+  `{ concurrency: 1 }` and `sharedKernel()`. A test that changes a global
+  (`crossOriginIsolated`) goes after the concurrent suite. The two 9p
+  suites are the longest, since their tests run in order.
+- Use TypeScript's erasable syntax only (no enums, namespaces or parameter
+  properties), relative imports with `.ts`, `import type` for types, and
+  tabs. Every file starts with the SPDX MIT header and a copyright line.
+  There are no runtime dependencies.
+- `js/core/` must stay universal: no `node:` imports and no DOM-only APIs
+  without a guard. Node-only code goes in `js/node/`, browser-only code in
+  `js/web/`.
+- Nothing may import `js/node.ts` or `js/web.ts` (the CLI uses
+  `js/node/platform.ts`). Rolldown moves an entry module that another
+  entry imports into a shared chunk, which would break the kernel URL
+  below.
+- The page builds from these sources (`web/src/sdk.ts`), so SDK changes
+  reach it without `pnpm build`.
+
+## Build (`pnpm build`, `build.config.ts`)
+
+- Entries `js/node.ts`, `js/web.ts` and `js/cli.ts` become `dist/*.mjs`
+  and `.d.mts`, with shared code in `dist/_chunks/`. A copy of
+  `vendor/build/bundle/unkernel-alpine.wasm` goes along, and the build
+  fails if the bundle is missing. `js/unkernel-alpine.wasm` is a symlink to
+  that bundle.
+- The build checks that `dist/web.mjs` reaches no Node built-in, and that
+  each entry (not a shared chunk) computes
+  `new URL("./unkernel-alpine.wasm", import.meta.url)`.
+- It inlines the kernel workers (Packaging, below) and checks that
+  `dist/node.mjs` and `dist/cli.mjs` carry the Node worker and
+  `dist/web.mjs` the web worker (and not the other), and that no dist file
+  mentions `worker-entry`.
+- Test the built package with `node dist/cli.mjs` and
+  `UNKERNEL_DIST=1 node --test test/api.test.ts`, which imports the package
+  by its own name.
+
+## Behaviour to keep
+
+- `createKernel()` (`js/core/instance.ts`) wraps the `Kernel` class
+  (`js/core/kernel.ts`: imports, JSPI, IRQs). With no `kernel` option it
+  loads the bundle, and with no `net` option there is no network device.
+- Programs run in a running guest through `vm.spawn()` and `vm.exec()`
+  (kwtty, below; over vsock, which is on unless `vsock: false`), on a pty
+  or on pipes; `vm.connect()` and `vm.fetch()` reach TCP servers on the
+  guest's loopback through kwtty too. The other channels are the hvc0
+  console, vsock streams to guest programs that listen or connect
+  themselves, host file systems mounted over 9p (`mounts`, `vm.mount()`;
+  below), and guest shmem files (`shm` option). kwtty is the only guest
+  service; there is no other guest agent (kw9p is a one-shot program that
+  kwtty runs). A one-shot program can be the init (`rdinit=`).
+- `stop()` parks the kernel at its next suspension point (kernel.md,
+  Tasks). The guest gets no shutdown, so prefer typing `poweroff`.
+- `sync()` (`Kernel.requestSync()`) raises IRQ 4 and resolves true once
+  every persistent disk has completed a flush issued after the call, or
+  false after the timeout (3 s by default). It then clears the bit itself,
+  because a kernel without IRQ 4 never does. Host file systems need no
+  sync: each guest write(2) reaches the handler before it returns.
+- Snapshots (`js/core/snapshot.ts`; kernel.md, Parking), inline and in
+  worker mode (Worker mode below). `KernelInstance.snapshot({ stop })`
+  (`Kernel.snapshot()`) raises IRQ 8 and, when the kernel calls `wasm_snapshot_point` at its consistent
+  point, copies the memory (without the pages the kernel reports free,
+  `copySnapshotMemory()`: they stay zero, and `KernelSnapshot.freeBytes`
+  says how much was left out) and seals every disk. It resolves with a
+  `KernelSnapshot` (the whole memory, the kernel's `linux_banner` as its
+  fingerprint, the guest's monotonic time, the console size, unread
+  console input, each disk's `DiskSnapshotState` and the other devices'
+  `DeviceSnapshots`) once the disks are durable. Without `stop` the guest
+  keeps running; `stop: true` calls `Kernel.stop()` inside the import, so
+  no task runs after the copy. It rejects when a disk cannot be in a
+  snapshot, when a task does not park (the error names it), when block,
+  net, vsock or shm queues are not empty at that point, or a 9p request
+  is in flight (`VsockDevice.blocker()`), and while a mount or unmount
+  runs (`MountTable.snapshotBlocker()`; in worker mode while anything is
+  mounted, Host file systems below).
+  `createKernel({ restore })` checks the disks (`snapshotDiskMismatch()`)
+  and the devices (`snapshotDeviceMismatch()`: display, sound, vsock, shm
+  and network each configured as when saved, the network with the same
+  MAC, since the restored kernel has exactly the drivers it had); a
+  mismatch rejects naming it, with no fallback. It then instantiates the
+  same build, copies the memory in and enters `kw_resume`;
+  `WasiHost.monoOffset` keeps the guest's monotonic clock going from the
+  saved value. `encodeSnapshot()`
+  leaves out zero 64 KiB chunks (4 KiB pages would save another 6%,
+  2026-11-15, so the format stays). `snapshot()` is on `KernelHandle`.
+  The CLI's `{save=FILE}`, `{suspend=FILE}` (`--input` tokens) and
+  `--restore FILE` are the test hooks; `test/api.test.ts` round-trips a
+  shell through one, and one with a data disk.
+- Disks in snapshots (core/block.ts, data-disk.md): disks are not copied.
+  `BlockDevice.snapshotState()` gives a disk's identity, write generation
+  and (files) a stamp; `snapshotSeal()`, called at the consistent point,
+  makes the content durable and starts a new generation at the next
+  write. The generation goes up before the first write after the disk is
+  opened and after each seal, so a restore accepts a disk only if nothing
+  wrote it since the snapshot: not the guest running on, not a later boot,
+  not another program. CowDisk with a store saves the generation in the
+  same transaction as the blocks (`OverlayStore.save()`'s `meta`;
+  `StoreIndex.gen` and `uid`); its seal takes the dirty blocks
+  synchronously (no flush can be queued: nothing is in flight) and saves
+  them as the next save in the chain, so later guest writes go to later
+  saves. FileDisk keeps it in `<image>.kwsnap` (`{"uid", "gen"}`, created
+  by the first snapshot that includes the image, then rewritten and
+  synced before the first write of each generation); the image's size and
+  mtime are the stamp. A CowDisk without a store can be in a snapshot only
+  while unwritten and over a base with an identity (FileBase: path, size,
+  mtime; HttpBase: URL, size, ETag). A disk without these methods (a
+  custom BlockDevice) makes `snapshot()` reject.
+- Devices in snapshots (`Kernel.saveDevices()`/`restoreDevices()`): each
+  host class has `saveState()` and `restoreState()` for what the kernel
+  told it once and does not tell a restored host again. A key in
+  `DeviceSnapshots` means the device was configured; null means its
+  driver had not started (it then starts after the restore, as at boot).
+  Host-only, except vsock:
+  - display: the attachment (address, mode, the size offered);
+    `restoreState()` reports it to `onDisplay` again. The pixels are in
+    the memory.
+  - input: the open mask, unread events, and the keys and buttons the
+    guest saw pressed; the restore releases those (the host's keys are
+    not held in the new session) and reports the open state to `onInput`.
+  - sound: the stream state; the restore replays open, prepare and start
+    to the sink. The kernel's timer goes on on the guest's clock, which
+    the restore continues.
+  - shm: the exports and their page runs (the kernel keeps the pages
+    held), so `openId()` works again; exports the old host opened stay
+    held in the kernel until closed by id.
+  - vsock: the guest CID and `rx_max`; the restore replays `onVsockInit`.
+    Connections do not survive, except host file systems' (`mounts`,
+    below): after a restore the kernel resets every connected socket the
+    host does not keep (kwvsock's park restore notifier asks
+    `wasm_driver_vsock_keep`, answered from `VsockDevice.keep`, kernel.md),
+    so kwtty's programs, `--forward` and `connect()` relays and guest
+    clients end, and listeners stay. The CLI's `--forward` listeners and
+    the SDK's `vsock.listen()` are the new host's own.
+  - network: the MAC kwnet got; the restore calls `NetDevice.attach()`
+    again. The stack keeps no state across it: a guest TCP segment of an
+    old flow gets an RST (`NetStack`, no such connection), so a flow ends
+    at its next send; an idle one lingers until the guest's own timeouts.
+    DHCP and ARP need nothing (fixed addresses and gateway MAC).
+  `test/api.test.ts` restores glimmer mid-test (picture, open devices,
+  stream, a key) and a machine with network and vsock (old sessions end;
+  wget, exec() and fetch() work after).
+- Host file systems in snapshots (inline only; mounts.ts, 9p.ts): the 9p
+  server runs on the kernel's thread, so `VsockDevice.saveState()` saves
+  the mounts at the snapshot point (`VsockSnapshot.mounts`:
+  `MountTable.save()`). Every guest task is parked and a 9p request holds
+  its task (killable wait) until answered, so the sessions are quiet
+  there; one that is not (`MountTable.snapshotBusy()`, through
+  `VsockDevice.hostBusy`) makes the snapshot point busy. Per mount: its
+  path, read-only flag, export name, the vsock connection's ports and
+  credit counters (`Connection.saveState()`), msize and the fids (path,
+  type, for an open file how it was opened and its qid.path, a directory
+  listing being read). The files are not copied: `createKernel({
+  restore, mounts })` must give a file system for each saved path,
+  read-only as saved (`snapshotMountMismatch()`, checked before boot;
+  worker mode and `vsock.raw` refuse such a snapshot). Before the kernel
+  runs, `MountTable.restore()` serves each under the saved name on the
+  connection `VsockHost.adopt()` takes over, opens the open files again
+  by path (`Session.restore()`) and sets `VsockDevice.keep`; other given
+  mounts are mounted once the kernel runs. A file gone, another file now
+  (another qid.path), unlinked or replaced by the guest while open
+  (`Fid.orphan`), or not opening within the request timeout leaves its fid
+  stale: its reads, writes, getattr, setattr and fsync answer ESTALE
+  ("Stale file handle" in the guest). A MemoryFs passed again keeps the
+  guest's changes; a new one has its own content, which the guest sees
+  within 1 s, as any host change. `test/9p.test.ts` saves and restores a
+  session on a real VsockHost (GuestVsock: the guest's end of the vsock
+  protocol), and `test/api.test.ts` a process with files open on a nodeFs
+  mount, and a MemoryFs mount, across a restore.
+- Any host that instantiates the kernel itself must provide the three
+  `unkernel.kw_host_jit_*` imports (caps returning 0 is enough), and the
+  display, input, sound, vsock and shm imports (kernel.md; `_init`
+  returning -1 is enough, as `test/wasi-node.ts` does, which also answers
+  `wasm_driver_vsock_keep` with 0). `Kernel.imports()`
+  fills a missing import with a stub that throws when called, so an old
+  host on a new kernel traps at that device's init.
+- Display, input and sound (`js/core/display.ts`, `input.ts`, `sound.ts`)
+  are off unless asked for; `display` also enables the evdev devices.
+  Presses and motion are queued only while a program has the device open;
+  a release always goes through if the guest saw the press, and keys still
+  down when the device closes are released, so nothing sticks. Sound's
+  `onChunk` returns the frames the sink has queued, which the guest sees
+  as delay. The CLI's `--display`, `--sound`, `--sound-wav` and the
+  `--input` tokens are the test hooks (`--help`).
+- `KernelHandle` (instance.ts) is the surface shared by `KernelInstance`
+  and `WorkerKernel`; a new device member goes there.
+- `Kernel.boot()` retries with the other memory type if instantiation
+  fails, so `jit.ts` and the imports read the memory and its type at call
+  time.
+
+## Worker mode (`createKernel({ worker: true })`)
+
+- Works on Node and in browsers, with disks, network, display, evdev,
+  sound, vsock and shm. Owner side `js/core/worker-host.ts`
+  (`WorkerKernel`), worker side `js/core/worker-serve.ts` (`serveKernel()`,
+  which calls `createKernelOn()`, so defaults, progress and errors match
+  inline mode), messages `js/core/worker-protocol.ts`; all universal, no
+  DOM. Bindings (`Platform.spawnWorker`): Node `js/node/worker.ts` and
+  `worker-entry.ts`; browsers `js/web/worker.ts` (a module Web Worker) and
+  `web-worker-entry.ts`, with `js/web/platform.ts` (shared by `js/web.ts`
+  and `web/src/sdk.ts`). `autoMemoryMiB()` reads `navigator`, so it runs
+  on the owner's thread and goes in the boot message.
+- Types: `worker: true` gives `WorkerKernel`, none or false
+  `KernelInstance`, a boolean `KernelHandle`. The option is its own
+  interface, `WorkerOption`, not part of `CreateKernelOptions`, so code
+  passing plain `CreateKernelOptions` (`web/src/sdk.ts`) still gets
+  `KernelInstance`. `WorkerKernel` has no `kernel`; its `stats()` and
+  `disks` (`DiskState`) are the worker's latest snapshot (every 500 ms and
+  at exit), with `uptimeMs` brought up to date.
+- Kernel loading: `createKernelInWorker()` spawns the worker and, while
+  it starts, compiles the kernel on the owner's thread
+  (`loadKernelModule()`: compileStreaming for URLs, a file read on Node)
+  and posts the `WebAssembly.Module` in the boot message, so the
+  `worker` progress stage may come before, during or after `compile`,
+  `download` and `compiled`. If posting the Module throws and the source
+  was a location or bytes, the worker gets those and loads the kernel
+  itself (a `[host]` log line); this path has never run, since no such
+  engine is known. `compileInWorker: true` always sends the location (an
+  absolute URL via `Platform.absoluteUrl`) or transferred bytes; the
+  initrd always goes that way. The worker never uses its own
+  `import.meta.url`. `load.ts` tests for a URL or path before `instanceof
+  Response`: on Node the first touch of `Response` loads undici (~23 ms).
+- Messages (`worker-protocol.ts`) are objects tagged with `t`; each side
+  ignores unknown tags. The worker's first message is `ready` (with
+  whether it has JSPI; a missing JSPI is a `boot-error` of stage
+  "support"). With the shared transport the owner sends no `input`,
+  `resize`, `evdev` or (while a frame buffer exists) `frame-want`.
+- Console output from a worker is posted once per microtask, so only when
+  the kernel suspends. Posting every write made `seq 1 200000` take 38 s
+  instead of 6 s; keep the batching.
+- Device specs (`js/core/devices.ts`): disks and the network as plain,
+  structured-cloneable data tagged with `kind` (`DEVICE_SPEC_VERSION` 1).
+  A `DeviceRegistry` builds them (`Platform.devices`, passed to
+  `serveKernel()` too): `coreDevices` has the universal kinds,
+  `js/node/devices.ts` and `js/web/devices.ts` add the platform ones. A
+  `data` store the page cannot use gives a fresh in-memory disk with a
+  `notice`; nothing is cleared. Inline `createKernel` builds specs the
+  same way, owns those disks and closes them at exit after their last
+  save. Worker mode takes specs only: a `BlockDevice`, `NetDevice` or
+  `NetBackend` object rejects with a `BootError` naming the spec to use.
+- `sync()` in worker mode is a round trip to `Kernel.requestSync()`. A
+  request open at exit is answered false; one left when the worker died
+  resolves false if a persistent disk was attached, else true; after exit
+  it resolves true at once. The worker reports the exit only after saves
+  in flight settled (at most 10 s), because ending a worker aborts its
+  IndexedDB transactions; `stop()` waits for that (12 s at most). A worker
+  crash is a 255 "fatal" exit. `detachDisk(i)` stops disk `i`'s saves,
+  waits for the one in flight and closes its store, so the owner may then
+  write the store; `exportDisk(i)` returns `CowDisk.exportParts()`.
+- Snapshots in worker mode: `WorkerKernel.snapshot()` checks the mounts
+  here (the 9p servers run on the owner, which the worker's snapshot
+  point cannot save, so it refuses while anything is mounted) and posts
+  `snapshot`; the worker
+  runs `KernelInstance.snapshot()` and answers `snapshot-result` with the
+  memory transferred (no second copy). It posts that before `exit`, which
+  waits for it, so a snapshot with `stop` always arrives. Every device
+  state is the worker's `Kernel` (`saveDevices()`), including vsock's,
+  because the worker's kwvsock holds the CID; the owner's `VsockHost`
+  starts fresh on the `vsock-ready` the restore replays. `createKernel({
+  worker: true, restore })` sends the snapshot in the boot spec and the
+  worker restores as inline (disk and device checks there). The memory is
+  copied with `slice()` and transferred (about 120-170 ms for 512 MiB on
+  Node 24; a structured clone took about 340 ms, 2026-11-15), or with
+  `transferRestore: true` (WorkerOption) the caller's buffer is handed
+  over and detached, for a snapshot read for one boot (the CLI's
+  `--restore`, the page). A snapshot from either mode resumes in either
+  (`test/api.test.ts`: a worker's snapshot resumed inline and in a worker,
+  one with a data disk resumed in a worker, saved again there and resumed
+  inline).
+- Devices in a worker (`js/core/worker-devices.ts` owner side,
+  `worker-serve.ts` worker side, both described at their top). The worker
+  handles messages only while the kernel is suspended (idle, or its 20 ms
+  yields), so everything the owner sends waits for that unless the shared
+  transport carries it.
+  - Display: frames are "latest frame", sent against credits (at most 2,
+    each carrying a buffer to reuse). The worker copies packed XRGB rows;
+    the owner converts to RGBA, off the kernel's thread. No OffscreenCanvas
+    in the worker: it would make `frame()` platform-dependent and draw on
+    the kernel's thread. The `display` size function stays on the owner.
+  - `evdev` is `RemoteEvdev`: InputHost's methods forwarded in order to
+    the worker's InputHost, which applies the queueing rules. Open state
+    and held keys are mirrored, so return values are synchronous (possibly
+    a yield stale). Do not merge consecutive moves: glimmer-check expects
+    every tablet position.
+  - Sound: the owner's queued-frames answer goes back stamped on a clock
+    both threads share (`performance.timeOrigin + now()`). kwsnd only
+    reports it as delay, so a few ms of error changes no timing.
+- Shared transport (`js/core/worker-shared.ts`, described at its top).
+  Where a SharedArrayBuffer can be posted (`sharedMemoryAvailable()`:
+  Node always, browsers when `crossOriginIsolated`) and `shared` is not
+  false, the owner sends a control block in the boot spec and `transport`
+  is `"shared"`. Console bytes and evdev calls go through two
+  single-producer rings, in order. `SharedServer` is `Kernel.poller`: `wasi.ts` calls
+  `poll()` in every monotonic `clock_time_get`, which the kernel reads at
+  each slice end just before `wasm_poll_irqs` (kernel.md, IRQs and time),
+  so input lands in the same slice. Idle: `poll_oneoff` calls `idle()`
+  (sets IDLE, then checks the doorbell; the owner bumps the doorbell, then
+  checks IDLE, both seq-cst) and the owner posts one `kick` per idle wait.
+  Frames: a SharedArrayBuffer per display size, three XRGB slots as a
+  triple buffer (the worker never touches the front slot). A failed
+  allocation falls back to credits. Sound, vsock and shm stay messages.
+  - Sharing the kernel's own memory is ruled out: the module imports an
+    unshared memory (a shared one is a LinkError), the posted compiled
+    Module cannot be rewritten, kwemu's JIT modules import the same memory,
+    the host's read-modify-write of `wasm_host_irqs` would race the
+    kernel's plain stores, and browsers refuse shared views in
+    `TextDecoder.decode` and `crypto.getRandomValues`. A seqlock over one
+    frame buffer forces retries, since the owner converts while the worker
+    copies the next frame.
+- vsock in a worker: the protocol (VsockHost) runs on the owner, so
+  `WorkerKernel.vsock` is the same object as inline; the worker's kernel
+  only passes packets (`createKernelOn` with `vsock: { raw }`), in order.
+  Credit bounds what is in flight.
+- Packaging: from source, `js/node/worker.ts` starts
+  `new URL("./worker-entry.ts", import.meta.url)`. `pnpm build` bundles
+  each entry with rolldown, and the `unkernel:inline-worker` plugin
+  replaces that expression (it must occur once) with the code as a string
+  (`new Worker(code, { eval: true })`), so the dist has no worker file and
+  needs nothing from a downstream bundler. In browsers `js/web/worker.ts`
+  uses `new Worker(new URL("./web-worker-entry.ts", import.meta.url), {
+  type: "module" })`, which Vite bundles when the page builds from source
+  (`worker.format: "es"`); for the dist the plugin replaces it with
+  `inlineWorkerUrl(code)`, a Blob URL revoked at the first message. Each
+  `WORKERS` entry has its own mark (`/*unkernel-worker:node*/`, `:web*/`).
+  Vite's `?worker&inline` is not usable: plain Node cannot load it.
+- A worker's WebSocket sends the page's origin, so the Wisp allow list
+  works as inline; Node workers send `NODE_WISP_HEADERS`.
+
+## vsock (`js/core/vsock.ts`)
+
+- The host side of kwvsock (kernel.md). `VsockDevice` (`Kernel.vsock`) is
+  the kernel's packet pipe; `VsockHost` is the host's end of virtio-vsock
+  at CID 2, behind `vm.vsock`.
+- Credit: each connection advertises `bufferSize` (256 KiB default) and
+  counts as consumed only what the reader took from `readable` (pull
+  stream, highWaterMark 0). CREDIT_UPDATE goes out when the guest's view
+  of free space falls below half of the guest's window, which is the
+  smaller of `bufferSize` and the guest's `buf_alloc` (Linux caps sends to
+  its own buffer and never asks; measuring against `bufferSize` alone
+  stalls transfers with large buffers). Sending keeps exactly to
+  `buf_alloc - (tx_cnt - fwd_cnt)` (Linux drops the excess), asks with
+  CREDIT_REQUEST once when stalled and then every 500 ms (re-asking on
+  every CREDIT_UPDATE ping-pongs and stalls), and splits payloads to the
+  kernel's `rx_max` less the header. Data beyond the host's credit, or an
+  unknown op, resets the connection (`stats.violations`).
+- Closing follows Linux: SHUTDOWN with both flags is answered with RST.
+  Once both directions are done the host sends SHUTDOWN with both flags
+  and waits up to 8 s (`VSOCK_CLOSE_TIMEOUT`) for the guest's RST, then
+  resets. The guest sees a host RST as EOF on reads and EPIPE on writes; a
+  refused guest connect is ECONNRESET.
+- User callbacks run from a microtask, never inside the kernel's import.
+  Packets from the guest are copies.
+- Do not feed a throughput test from busybox `head -c`: it copies a byte
+  at a time (~22 MiB/s by itself).
+- Test: `test/api.test.ts` (inline and worker) with
+  `kernel/guest/kwvsock.c`; `VsockDevice.refuse` is the hook that refuses
+  guest sends to exercise the kernel's retry path. Skipped when the kernel
+  under test has no `wasm_driver_vsock_init` import;
+  `UNKERNEL_TEST_KERNEL=path` runs the file against another bundle.
+
+## Programs on a pty or on pipes (`js/core/tty.ts`)
+
+- The host client of kwtty (`kernel/guest/kwtty.c`, `/usr/bin/kwtty
+  serve`, respawned by inittab), which gives each connection its own pty
+  and runs root's login shell, or a program, on it, or with PIPES runs it
+  on stdin, stdout and stderr pipes. On a pty the API follows zigpty /
+  node-pty (`spawn(file, args, options)`, `resize(cols, rows)`,
+  `kill(signal)`, `pid`, `cols`, `rows`, `exitCode`); keep it that way.
+  vsock port 1022 (`TTY_PORT` here, `KWTTY_PORT`
+  there; each names the other): a privileged port, so no unprivileged
+  guest program can take it. The server accepts only the host (CID 2).
+- `Pty.close()` is `conn.close()`, not a half-close: the guest closes the
+  master, so the session gets SIGHUP, and it closes its socket at once, so
+  `close()` resolves without vsock's 8 s close timeout. A Subprocess's
+  `close()` sends SIGHUP to the program's process group.
+- Protocol: described at the top of tty.ts and kwtty.c; a change goes in
+  both. Unknown frame types and options are skipped unless marked
+  critical, and the host marks every option an old guest must not ignore
+  critical, so a new feature can come within version 1 with a feature bit
+  (as PIPES and CONNECT did).
+- Connections into the guest (CONNECT, OPENED feature bit 1
+  `TTY_FEATURE_CONNECT`): `vm.connect(port, { timeout, signal, ttyPort })`
+  on both handles (waits for createKernel's `mounts`, as spawn() does;
+  ENODEV with `vsock: false`), or `connectGuest(vsock, port, opts)`. kwtty
+  connects to TCP 127.0.0.1:port (IPv4 only: the kernel has no IPv6)
+  before it sends OPENED, so the promise resolves connected. A refusal is
+  `PtyError` ECONNREFUSED (the guest's ERROR message starts with the errno
+  name), another connect error EREMOTE, and a guest from before CONNECT
+  refuses the critical option: EREMOTE. After OPENED no frames: a
+  `GuestSocket` (`port`, `readable`, `writable`, `close()`, `closed`,
+  `[Symbol.asyncDispose]`), which is a `ByteDuplex` for `fetchOver()`.
+  Bytes that came behind OPENED go out first (`TtyFrameParser.rest()`);
+  `readable` is a pull stream of its own, also because the connection's
+  has been read and `new Response()` refuses a disturbed stream. `writable`
+  is the connection's: `close()` is a half-close, `abort()` a reset.
+  `signal` only aborts connecting.
+- The guest's relay (`relay()` in kwtty.c, apart from `session_loop()`,
+  which is built around a program): one forked process per connection,
+  64 KiB in flight per direction, EOF passed on as `shutdown(SHUT_WR)`
+  once the bytes before it are written, both ways. It ends when both
+  directions are done, or at the first POLLERR or failed send or recv
+  (then it closes both sockets). POLLHUP only means both directions of
+  that socket are shut, with data possibly still unread, so it ends
+  nothing. Linux vsock shows no event when the host closes or resets after
+  it shut down its sending side, so while nothing else is asked of the
+  vsock socket the relay sends an empty message every second, which fails
+  with EPIPE once the host no longer reads.
+- CLI `--forward HOSTPORT:GUESTPORT` (repeatable): listens on the host's
+  127.0.0.1 before booting (a taken port exits 1), each connection is
+  `vm.connect()` (node:net with `allowHalfOpen`, so half-closes pass
+  through), and a refused guest port resets the host connection.
+- Credit: `output` is a pull stream (highWaterMark 0) over the
+  connection's `readable`, so vsock credit follows the reader. If nobody
+  reads `output`, the guest program blocks once the vsock window
+  (`bufferSize`, 256 KiB by default) and the pty buffer are full, and
+  `ended` does not settle: it settles when the reader asks past the last
+  output (EXIT comes behind it). Cancelling `output` discards the rest and
+  lets `ended` settle. Every frame goes out through one writer in call
+  order, so RESIZE and DATA never interleave or reorder. A Subprocess's
+  `stdout` and `stderr` share the connection: it is read while either has
+  a read waiting, and the other's frames queue on the host until read
+  (no limit), so read both or cancel one. The pump stops in the same turn
+  it decides to, so a pull right after starts a new one (a stream whose
+  pull resolves without data is not pulled again).
+- On pipes the guest takes turns reading stdout and stderr, and ends the
+  session as on a pty: EXIT once both pipes hit EOF after the exit, or
+  after 50 ms without output, or after 1 MiB.
+- Hangup: Linux signals only the session leader (the login shell); when
+  it exits, the foreground process group gets SIGHUP. A HUP trap in busybox
+  ash's own interactive shell does not run once its tty is hung up
+  (2026-11-14), so the test sets the trap in a foreground `sh -c`.
+- Test: `pnpm test:tty` (`test/tty.test.ts`, no kernel: the protocol
+  against a fake `Vsock` and a JS stand-in for the server, CONNECT's
+  handshake and raw bytes included) and `test/api.test.ts` (inline and
+  worker; for CONNECT a busybox `nc -lk -e` server in the guest: echo with
+  half-close, 1 MiB each way, ECONNREFUSED, the relay's exit after an
+  idle close, `vm.fetch()` from a shell HTTP server). Skipped when the
+  kernel has no kwvsock.
+
+## Host file systems (`js/core/fs.ts`, `9p.ts`, `memfs.ts`, `mounts.ts`, `js/node/nodefs.ts`)
+
+- One 9P2000.L server per VM on vsock port 564, started at the first
+  mount. Each mount is its own export with an attach name the server makes
+  up (`fs1`, `fs2`, ...) and exactly one guest connection: the first
+  connection that attaches to an export owns it for the export's life,
+  and a Tattach naming it from any other connection fails with EBUSY,
+  also after the owner ended (the mount is then gone anyway). The owner's
+  own later Tattaches (the kernel attaches again for each uid it acts as)
+  work. An unknown name fails Tattach with ENOENT, and so does a later
+  Tattach on a bound connection that names another export. One backend
+  mounted at two paths is two exports with a connection each. The guest's `kw9p NAME DIR [ro]`
+  (`kernel/guest/kw9p.c`) makes DIR (`mkdir -p`), refuses one that is
+  already a mount point (EBUSY), connects to CID 2 and mounts 9p with
+  `trans=fd` on the socket, source `kw9p:NAME`, and fixed options
+  `cache=readahead,metatimeout=1000,noxattr,access=client,msize=131072`.
+  It prints errors as `kw9p: what: text (errno N)` and the SDK maps N to a
+  `MountError`. The Ubuntu and Alpine disk images ship neither kwtty nor
+  kw9p.
+- The server and the handlers run on the owner, as vsock does. A mount
+  runs `kw9p` through `execSubprocess()`. `spawn()` and `exec()` wait
+  until createKernel's mounts are done, so a first `exec()` sees them. An
+  object is a `{ fs, ... }` spec only when it has `fs` (an object) and
+  nothing but option names, so a tree may contain a file or directory
+  called `fs`.
+- The public types (`Fs`, `MemoryFs`, `FsError`, `MountError`, ...) carry
+  no protocol names and their doc comments no protocol terms; the server,
+  framing, the errno table and helpers are internal, and nothing with a
+  `P9` prefix is exported.
+- Lifetime: a guest `reboot` ends the kernel (exit 2) and its mounts with
+  it; booting again with the same `mounts` mounts them again. A mount the
+  guest unmounts by itself (its connection ends) becomes `mounted: false`
+  and frees its path. A backend's `close()` runs once its last mount is
+  gone (the same `fs` may be mounted at several paths), at the latest when
+  the kernel exits.
+- Connection (`Connection` in 9p.ts): framing with at most one copy
+  (`P9FrameAssembler`), Tversion answered there (msize the smaller of the
+  client's and 128 KiB), the first Tattach binds the export. At most 16
+  requests run per connection, each holding its slot until its reply is
+  sent (replies alive <= 16 x msize); 16 more wait parsed, then the
+  connection stops reading, so vsock credit stops the guest. Tflush always
+  goes through: a queued request is dropped, a running one answered Rflush
+  at once (slot freed, the late reply dropped; a flushed walk or attach
+  makes no fid, a flushed open closes its file). A read-only export gets
+  EROFS for every change before the backend sees it (Tremove still drops
+  the fid).
+- Session (`Session`): path-based handlers, sync or async. Required
+  `getattr`, `readdir`, `open(path, flags)` returning an `FsFile` (`read`,
+  optional `write`, `getattr`, `setattr`, `fsync`, `close`), used for that
+  fid's I/O until it is clunked, so it must keep working after the path is
+  renamed or removed (MemoryFs holds the node, nodeFs the FileHandle).
+  Optional `create` (returns the file open), `mkdir`, `symlink`,
+  `readlink`, `remove`, `rename`, `setattr` (by path: chmod, utimes,
+  truncate by name), `statfs`, `close`. An FsError or an error with a Node
+  errno `code` answers that errno, anything else EIO plus one log line.
+  Missing methods: EROFS for changes, EOPNOTSUPP for `symlink`, mknod and
+  xattrs (kw9p mounts with `noxattr`); Tlink is always EPERM (no hard
+  links); a file without `write` is not opened for writing (EACCES);
+  Tfsync without `fsync` (a directory) succeeds. Tlcreate without O_EXCL
+  of a name that exists (the host made it after the guest's lookup) opens
+  it, honouring O_TRUNC. Writes, truncation, fsync and clunk through one
+  fid run in order; everything else concurrently. A rename moves the fids
+  below it. Names are made only below directory fids,
+  and walks never pass a non-directory, so no path goes through a symlink.
+- Hung handlers: each request has a deadline (`requestTimeout`, 30 s by
+  default, 0 for none). When it passes, the guest gets ETIMEDOUT and the
+  log a line; whatever the handler returns later is dropped (a file it
+  opens is closed), and the fid's ordered chain moves on. A guest process
+  blocked on a request dies at once when killed (the client sends Tflush);
+  one that waits gets the error after up to about three deadlines, because
+  netfs retries a failed read-ahead with two synchronous reads (2026-11-15,
+  `requestTimeout: 1000`: about 3 s). Poweroff completes with such a
+  reader left.
+- Names: names and link targets from the guest are decoded as strict
+  UTF-8, and one that is not is answered EILSEQ (lookup, create, rename,
+  unlink, symlink), never decoded lossily, so two byte names cannot alias
+  one string. nodeFs leaves host names that are not UTF-8 out of listings
+  and answers EILSEQ for such a link target.
+- Inode numbers: qid.path is the backend's (dev, ino) (dev << 40 xor ino),
+  else a 63-bit hash of the path with the top bit set, which a rename
+  changes. Readdir entries carry the same numbers (nodeFs lstats each
+  entry, so `ls -i` matches `stat`). qid.version is the backend's
+  `FsAttr.version`, else from mtime and size; a revalidation that sees it (or
+  the size or mtime) change drops the file's cached pages. 0 makes the
+  guest open the file P9L_DIRECT (no page cache; `fs/9p/fid.h`), which
+  MemoryFs uses for computed files, whose size can differ from the
+  guest's cached i_size (a cached read stops there).
+- MemoryFs: the Fs methods are the guest's side and report changes to
+  `onChange()` listeners; the host API reports nothing and bumps
+  `version`. A function in the tree is a computed file,
+  evaluated once per open: `open()` calls it and the open file serves that
+  one result for its life (reads slice it, its getattr reports its size),
+  so a `cat` of a file whose content or length changes from call to call
+  gets one whole value, and the next open a fresh one. A getattr by path
+  evaluates it for the size. Computed files are read-only (EACCES) and
+  have version 0, so the guest reads them uncached: its cached size can be
+  up to 1 s old (metatimeout).
+- nodeFs(dir) (Node only): `node:fs/promises`; lstat, never follows
+  symlinks (they are listed and read as links; the guest resolves them in
+  its own tree), opens with O_NOFOLLOW and O_NONBLOCK and only regular
+  files, one FileHandle per open fid, owners shown as root and chown
+  ignored, setattr on a symlink changes only its times. CLI: `--mount
+  HOSTDIR:GUESTPATH[:ro]`, repeatable.
+- Cache mode (the only one): `cache=readahead` (CACHE_FILE) with
+  `metatimeout=1000` (the `9p: add metatimeout` patch, kernel.md), which adds CACHE_META with
+  a 1 s limit. A name or attribute the guest has looked up is reused for
+  up to 1 s without asking the host; the next lookup or stat after that
+  revalidates it with one getattr, which drops a name that is gone or now
+  holds another file and the pages of a file that changed. Negative
+  dentries expire after 1 s too, and listings always come from the host.
+  So a host change (rewrite, shrink, grow, create, delete, rename) shows
+  within 1 s, also for a file a guest process holds open (tested). Within
+  the window the guest works from what it saw: `stat` shows the old
+  attributes, a read stops at the old size, a name the host created or
+  deleted is still missing or present (opening a deleted one fails with
+  ENOENT from the host). Writes go unbuffered (P9L_NOWRITECACHE): each
+  write(2) reaches the handler before it returns, so the guest sees its
+  own changes at once, `sync()` has nothing to wait for and `stop()`
+  loses nothing already written. Exec from a mount works (read-only
+  mmap).
+- Known limits of this mode:
+  - Shared writable mmap fails with EINVAL (`v9fs_file_mmap_prepare`
+    allows it only with CACHE_WRITEBACK), so sqlite in WAL mode and LMDB
+    do not work on a mount.
+  - Files the guest creates get the backend's gid, not the guest's.
+- Benchmark: `node test/9p-bench.ts [--worker] [--no-jit] [--node]
+  [--quick]` (MemoryFs or nodeFs, tmpfs as baseline, 16 MiB files, a
+  workload of `find | wc`, `tar | wc` and `ls -lR` over 30 x 100 small
+  files). 2026-11-15, x86 host, Node 24, JIT on, MemoryFs unless noted;
+  RT = 9p round trips:
+
+  | run | stat µs (RT) | open+close µs (RT) | cat µs (RT) | ls -l 1000, cold/warm ms | read bs=128k / 4k MB/s | write 1M MB/s | create µs | workload ms (RT) |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | inline | 7 (0) | 120 (3) | 132 (3) | 190 / 102 | 739 / 1025 | 518 | 357 | 1791 (21.7k) |
+  | worker | 13 (0) | 285 (3) | 287 (3) | 275 / 105 | 389 / 961 | 455 | 659 | 3185 (22.6k) |
+  | inline, nodeFs | 2 (0) | 256 (3) | 262 (3) | 263 / 107 | 289 / 801 | 388 | 709 | 2890 (22.6k) |
+
+  The same workload takes about 720 ms on tmpfs. One round trip is about
+  50 µs inline and 100 µs in a worker; run to run the throughput columns
+  vary by about 20 %. The 4k read is a cache hit. Plain `cache=readahead`
+  without metatimeout took about twice the round trips and time.
+- Rejected: `cache=mmap` with the `sync` mount flag (shared writable mmap
+  through CACHE_WRITEBACK) cost as many round trips as plain readahead,
+  wrote no faster, created files more slowly, and loses mapped writes on
+  `stop()`.
+- msize: 128 KiB. 64 KiB to 1 MiB were measured (2026-11-15): no
+  consistent gain above 128 KiB inline or in a worker, and each request in
+  flight costs the guest two msize buffers.
+- Tests: `pnpm test:9p` (`test/9p.test.ts`, no kernel: the server against
+  a fake Vsock and a 9P2000.L client written in the test) and
+  `test/api.test.ts` (inline and worker; skipped when the kernel has no
+  kwvsock or no 9p, found by the "9P2000.L" string in the module). Tests
+  that need the window to pass wait 1.2 s; a guest program that must hold
+  a file meanwhile waits on its stdin (`hold()`), not on a sleep.
+
+## shm (`js/core/shm.ts`)
+
+- The host side of kwshm (kernel.md): guest shmem files read and written
+  in place. `ShmDevice` (`Kernel.shm`) is the kernel's end (each live
+  export's page list merged into runs of consecutive pages); `ShmClient`
+  is the API (`vm.shm`) on a backend that runs `ShmCall`s: the ShmDevice
+  itself inline (`inlineShm()`), messages in worker mode.
+- Inline, `read()`/`write()` copy at once, and `InlineShmFile.views()`
+  returns one `Uint8Array` per page run over kernel memory, no copy, valid
+  only until the kernel runs again: use them synchronously. In worker mode
+  each call is a round trip, taken when the kernel next suspends (up to
+  20 ms while the guest is busy); `views()` throws EOPNOTSUPP.
+- Lifetime: the kernel unpins an export's pages only after its detach
+  import returned, and a refresh only after the new list's attach, so
+  ShmDevice never copies from a freed page. At exit everything is dropped
+  and handles end with "exit".
+- Test: `test/api.test.ts` (inline and worker) with `kernel/guest/kwshm.c`.
+  Skipped when the kernel has no kwshm.
+
+## Disks (`js/core/block.ts`)
+
+- `BlockHost` serves kwblk. Backends: `FileDisk` (`js/node/disk.ts`,
+  `readSync`/`writeSync` straight into kernel memory, flush =
+  `fdatasync`, no discard), `HttpBase` (read-only HTTP Range base in
+  256 KiB chunks, kept in memory), `CowDisk` (a 4 KiB copy-on-write overlay
+  over a base, in memory or in IndexedDB through `IdbStore` in
+  `js/web/disk.ts`), `ZeroBase` and `SparseBase`.
+- `CowDisk` with a store loads lazily: memory holds only the blocks written
+  since their last committed save. Writes to one block apply in submission
+  order, so a stale fetch never overwrites a newer write.
+- Store reads read ahead (`#loadAhead`): each store read is one IndexedDB
+  transaction, an IPC round trip in WebKit, and ext4 reads its orphan file
+  block by block at mount. A fetched-ahead block must equal the store's
+  record: every write drops it (`#dropAhead`), including one that lands
+  while the fetch is in flight (`aheadPending`).
+- The persistence rules for the data disk are in data-disk.md.
+- kwsparse (`js/core/kwsparse.ts`, CLI `kernel/tools/kwsparse.mjs`):
+  magic `KWSPARS1`, u64 LE size, u32 LE block size, u32 LE count, the
+  sorted u64 LE block indices, then the blocks. Usually gzipped.
+
+## HTTP into the guest (`js/core/http.ts`)
+
+- `fetchOver(connect, input, init)` is an HTTP/1.1 client over any
+  `GuestConnect` (`(port, { signal }) => Promise<{ readable, writable }>`);
+  `vm.fetch()` is this over `vm.connect()`. It knows nothing about vsock or
+  kwtty, so its tests (`test/http.test.ts`, `pnpm test:http`) need no
+  kernel.
+- http: only. The connection always goes to the guest's 127.0.0.1 at the
+  URL's port (default 80); the hostname goes only into `Host` (`url.host`,
+  so `localhost:8000`; Vite checks it). A caller's `Host` header wins where
+  the platform lets one through.
+- One connection per request, `Connection: close`, no redirects followed,
+  `Accept-Encoding: identity` unless the caller set one (browsers drop a
+  caller's, so it is always identity there). Hop-by-hop request headers
+  are dropped and set by the client.
+- Request bodies: an `init.body` of known length (string, buffer, view,
+  Blob, URLSearchParams, FormData) and a Request's own body are read in
+  full and sent with Content-Length; any other `init.body` (a
+  ReadableStream, an async iterable) is sent chunked (`duplex: "half"` is
+  added). The upload runs while the response is read, so an early response
+  (413) is not stuck behind it.
+- Never half-close before the response is in: a guest server, or kwtty's
+  splice, may take EOF as the end of the connection. After a complete
+  response the client closes the writable and cancels the readable; on an
+  error, abort or body cancel it aborts the writable (a vsock reset).
+- Response: 1xx are skipped (101 rejects), the head (all heads together)
+  is capped at `HTTP_MAX_HEADER_BYTES` (64 KiB). No body for HEAD, 204,
+  205 and 304; else chunked (trailers dropped), Content-Length, or until
+  EOF. Connection, Keep-Alive, Transfer-Encoding, Trailer, Upgrade and
+  headers named in Connection are dropped, Content-Length is kept only
+  when it framed the body. A malformed head rejects a TypeError
+  (`fetchOver: malformed response: ...`), a truncated or malformed body
+  errors the body stream.
+- The body stream has highWaterMark 0 and reads the connection only on a
+  pull, so vsock credit follows the consumer. Keep it that way.
+- Browsers drop `Set-Cookie` from a constructed Response (the "response"
+  header guard), and `res.url` is empty; Node keeps `Set-Cookie`
+  (`headers.getSetCookie()`).
+
+## Network (`js/core/net.ts`, `net-wisp.ts`, `js/node/net.ts`)
+
+- `NetStack` is a user-mode stack that terminates the guest's frames:
+  guest 10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3. It handles ARP,
+  DHCP, DNS A (AAAA gets an empty answer), ping to the gateway and DNS
+  addresses, and TCP (MSS, window scaling, flow control, go-back-N
+  retransmit, FIN, RST). Each TCP connection goes to a backend (any object
+  with `connect` and `lookup`). `net` may also be a spec (Worker mode).
+- `directBackend()` (Node only, the CLI's default) uses host sockets and
+  `dns.lookup`. With `hostLoopback`, 10.0.2.2 goes to the host's 127.0.0.1.
+- `wispBackend()` multiplexes connections over one WebSocket to a Wisp v1
+  server. `DEFAULT_WISP_SERVERS` is the project's
+  `wss://wisp.pi0.io:6680/`. With several URLs, all are opened at once and
+  the first handshake wins.
+- The project's Wisp server has an allow list of Origins
+  (`http://localhost` is on it) and answers anything else, including no
+  Origin, with 404. Node's WebSocket sends no Origin, so the Node entry
+  and the CLI's `--net-wisp` send `Origin: http://localhost`
+  (`NODE_WISP_HEADERS`, overridable with `headers`; browsers ignore it).
+- Wisp has no DNS, so the guest gets stable fake addresses from
+  198.18.0.0/15 and a bad name fails at connect time. It also has no
+  connect acknowledgement (a refused connect becomes a reset), no
+  half-close, and flow control in one direction only.
+- Not implemented: IPv6, IP fragments, UDP beyond DHCP and DNS, ICMP beyond
+  10.0.2.2/3, SACK, timestamps and inbound connections. A raw-Ethernet
+  relay backend is not useful: v86's relay gave DHCP but no upstream DNS
+  or TCP.

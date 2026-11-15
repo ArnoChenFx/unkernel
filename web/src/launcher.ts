@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// The launcher: presets that show what unkernel runs, opened from the status
+// line's first item (components/Launcher.tsx). Each demo is a file in demos/,
+// listed in order in demos/index.ts. The page ships no assets for
+// them, so a demo is text only: files written into the guest, packages
+// installed with apk, commands run in a new terminal window, and the
+// preview opened on the ports it serves.
+//
+// launch(demo):
+// 1. writes the demo's files under its directory (~/demos/<id> unless it
+//    sets dir) through vm.exec(), one exec per file (waiting for the
+//    guest's kwtty while it boots), and run.sh there: community enabled if
+//    the demo asks, `apk add` of the packages not yet installed, then the
+//    commands, each printed before it runs, under set -e;
+// 1b. gets the demo's downloads on the page (download.ts: plain http over
+//    Wisp, checked against their SHA-256, kept in the browser's cache) and
+//    pushes each into the guest, unless its `unless` test passes in dir or
+//    the file is there already. A failure is logged and toasted, not fatal:
+//    the demo's script must check the file and fetch it itself when missing;
+// 2. opens a terminal window named after the demo (windows.ts) running
+//    WRAP_SH in place of the login shell: it runs `cd <dir> && ./run.sh`
+//    and then execs root's login shell, so the window stays to edit run.sh
+//    and run it again. Ctrl-C stops run.sh, not the wrapper. (Typing the
+//    command into a fresh shell lost the start of the line: the login reads
+//    or flushes input typed ahead of its prompt.)
+// 3. with ports, waits until the guest answers http on each, opens the
+//    preview on the first (preview.ts) and toasts the others.
+// A demo runs once at a time: launching one whose window is open (a window
+// named after it, even after run.sh ended) shows that window instead.
+// Packages come from main; a demo with `community` enables community first
+// (lazy in the image, kernel/README.md), once per guest.
+// A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
+// but disabled, with why.
+// Launching a demo sets ?demo=<id> in the page's URL (history.replaceState),
+// so a reload launches it again once the guest is up (launchFromUrl, from
+// boot.ts); the last demo launched wins. Closing that demo's window (or its
+// shell exiting) removes ?demo= again (forgetDemo); the kernel stopping does not.
+import { DEMOS } from "./demos/index.ts";
+import { fmtMiB, getFile, pushFile, type FileSpec } from "./download.ts";
+import { KW } from "./kw.ts";
+import { selectWindow } from "./shortcuts.ts";
+import { ui$ } from "./store.ts";
+import type { KernelHandle } from "./sdk.ts";
+
+export interface DemoFile {
+	content: string;
+	/** Octal mode as a number, e.g. 0o755. Default 0o644. */
+	mode?: number;
+}
+
+/** A tile's pictogram: SVG elements (paths, shapes) as static markup from this repository. */
+export interface DemoIcon {
+	svg: string;
+	viewBox?: string;
+}
+
+/** A file the page fetches and pushes into the guest before the demo runs (download.ts). */
+export interface DemoDownload extends FileSpec {
+	/** Where it goes in the guest: relative to the demo's dir, or absolute. */
+	path: string;
+	/** A shell test run in dir: when it succeeds the file is not needed, and nothing is fetched. */
+	unless?: string;
+}
+
+export interface Demo {
+	id: string;
+	title: string;
+	/** Left out of the launcher (a demo that is not ready yet); its file stays. */
+	hidden?: boolean;
+	/** One line: the tile's tooltip, and what search matches besides the title. */
+	desc: string;
+	/**
+	 * The tile's glyph: a character or an emoji (default: the title's first
+	 * letter), or a pictogram as inline SVG markup in `viewBox` (default
+	 * "0 0 24 24"), filled white (currentColor) unless the markup sets its own.
+	 */
+	icon?: string | DemoIcon;
+	/** The tile's gradient, top left to bottom right (CSS colours). */
+	colors?: [string, string];
+	needs?: { display?: boolean; net?: boolean; sound?: boolean };
+	/** The working directory in the guest. Default ~/demos/<id>. */
+	dir?: string;
+	/** Files to write, by path relative to dir (or absolute). */
+	files?: Record<string, string | DemoFile>;
+	/** Files fetched by the page and pushed into the guest before run.sh starts. */
+	downloads?: DemoDownload[];
+	/** Alpine packages to install first (those not installed yet). */
+	packages?: string[];
+	/**
+	 * Some packages are in community: enable it first (/etc/kw-apk-enable).
+	 * The image starts apk with main only, since every apk command parses
+	 * all enabled indexes and community's makes that ~2 s slower.
+	 */
+	community?: boolean;
+	/** Shell commands run in order in dir (run.sh, set -e); the last may run in the foreground. */
+	commands: string[];
+	/** Ports the demo serves http on: the preview opens on the first once it answers. */
+	ports?: number[];
+}
+
+/** Show or hide the launcher overlay (components/Launcher.tsx). */
+export function setLauncher(open: boolean): void {
+	const $ = ui$();
+	if ($.get().launcher === open) return;
+	if (open) KW.ui?.closePanel();
+	$.set({ launcher: open });
+	if (!open && !KW.config.coarse) KW.term?.focus();
+}
+export const toggleLauncher = (): void => setLauncher(!ui$().get().launcher);
+
+/** Why the demo cannot run on this page, or null. */
+export function unavailable(d: Demo): string | null {
+	if (d.needs?.display && !KW.config.display) return "needs the display (off with ?display=0)";
+	if (d.needs?.net && !KW.config.net) return "needs the network (off with ?net=0)";
+	if (d.needs?.sound && !KW.config.sound) return "needs sound (off with ?sound=0)";
+	return null;
+}
+
+/** Single-quoted for sh. */
+const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+// Writes stdin to $1 with mode $2, making its directory.
+const WRITE_SH = `set -e
+case "$1" in */*) mkdir -p "\${1%/*}";; esac
+cat > "$1"
+chmod "$2" "$1"`;
+
+async function writeFiles(vm: KernelHandle, dir: string, files: NonNullable<Demo["files"]>) {
+	for (const [rel, f] of Object.entries(files)) {
+		const { content, mode = 0o644 } = typeof f === "string" ? { content: f } : f;
+		const path = rel.startsWith("/") ? rel : `${dir}/${rel}`;
+		// sh expands the ~ in dir; the path is passed as $1 so it is not split.
+		const r = await vm.exec("/bin/sh", ["-c", `cd ~ && ${WRITE_SH}`, "sh", path.replace(/^~\//, ""), mode.toString(8)], { input: content });
+		if (r.exitCode !== 0) throw new Error(`writing ${path} failed: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`);
+	}
+}
+
+// Prints "need" when $2 (relative to ~, or absolute) is missing or not $3
+// bytes long and the test $4 fails, run in $1.
+const NEED_SH = `cd ~ && cd "$1" || exit 1
+[ -n "$4" ] && eval "$4" >/dev/null 2>&1 && exit 0
+cd ~
+[ -f "$2" ] && [ "$(stat -c %s "$2")" = "$3" ] && exit 0
+echo need`;
+
+/** Fetch and push the demo's downloads (step 1b at the top of this file). Never rejects. */
+async function pushDownloads(vm: KernelHandle, d: Demo, dir: string): Promise<void> {
+	const ui = KW.ui!;
+	for (const f of d.downloads ?? []) {
+		const path = f.path.startsWith("/") ? f.path : `${dir}/${f.path}`;
+		const name = f.url.replace(/[?#].*$/, "").split("/").pop() || f.url;
+		try {
+			const need = await vm.exec("/bin/sh", ["-c", NEED_SH, "sh", dir.replace(/^~\/?/, "") || ".", path.replace(/^~\//, ""), String(f.size ?? -1), f.unless ?? ""]);
+			if (need.stdout.trim() !== "need") continue;
+			const t0 = performance.now();
+			const got = await getFile(f, {
+				servers: KW.config.wisp,
+				signal: AbortSignal.timeout(30 * 60_000),
+				onProgress: (n, total) => ui.toast(`${d.title}: fetching ${name}: ${fmtMiB(n)}${total ? ` of ${fmtMiB(total)}` : ""}`),
+			});
+			const t1 = performance.now();
+			ui.toast(`${d.title}: copying ${name} into the guest`);
+			await pushFile(vm, path, got.bytes);
+			ui.log(`[demo] ${d.id}: pushed ${name} (${fmtMiB(got.bytes.length)}, ${got.source === "cache" ? "from the browser cache" : "downloaded"}` +
+				`${got.checked ? "" : ", SHA-256 not checked: no secure context"}) to ${path}: ` +
+				`${((t1 - t0) / 1000).toFixed(1)} s to get, ${((performance.now() - t1) / 1000).toFixed(1)} s to push`, "h");
+		} catch (e) {
+			const msg = (e as Error)?.message ?? String(e);
+			ui.log(`[demo] ${d.id}: ${name}: ${msg}; the guest fetches it instead`, "e");
+			ui.toast(`${d.title}: could not fetch ${name} on the page (${msg}); the guest fetches it instead`);
+		}
+	}
+}
+
+/** run.sh: the packages, then the commands, each printed (dim, after a $) before it runs. */
+export function runScript(d: Demo): string {
+	const step = (shown: string, cmd = shown) => `printf '\\033[90m$ %s\\033[0m\\n' ${q(shown)}\n${cmd}\n`;
+	const pk = (d.packages ?? []).map(q).join(" ");
+	return `#!/bin/sh
+# The ${d.title} demo, written by the unkernel launcher. Edit it and run it again.
+set -e
+cd "$(dirname "$0")"
+${d.community ? step("/etc/kw-apk-enable   # community") : ""}${pk ? step(`apk add ${(d.packages ?? []).join(" ")}`, `apk info -e ${pk} >/dev/null 2>&1 || apk add ${pk}`) : ""}${d.commands.map((c) => step(c)).join("")}`;
+}
+
+// Runs in a demo's window as `sh -lc WRAP_SH sh DIR SHOWN`: run.sh in DIR
+// (relative to ~, or absolute; SHOWN is how to print it), then the login
+// shell. The INT trap (a handler, reset in children) keeps this shell alive
+// when Ctrl-C stops run.sh.
+const WRAP_SH = `trap : INT
+printf '\\033[90m$ cd %s && ./run.sh\\033[0m\\n' "$2"
+cd && cd "$1" && ./run.sh
+printf '\\033[90m[run.sh ended (status %s); ./run.sh runs it again]\\033[0m\\n' "$?"
+exec "\${SHELL:-/bin/sh}" -l`;
+
+/** Resolves once http://localhost:port answers at all (any status), or rejects after timeout ms. */
+async function waitPort(vm: KernelHandle, port: number, timeout: number, signal?: AbortSignal) {
+	const end = performance.now() + timeout;
+	for (;;) {
+		signal?.throwIfAborted();
+		try {
+			const r = await vm.fetch(`http://localhost:${port}/`, { method: "HEAD", signal: AbortSignal.timeout(5000) });
+			await r.body?.cancel();
+			return;
+		} catch {
+			if (performance.now() > end) throw new Error(`nothing answered on port ${port} within ${timeout / 1000} s`);
+			await new Promise((r) => setTimeout(r, 1000));
+		}
+	}
+}
+
+/** Sets ?demo=<id> in the page's URL, or removes it (null), replacing its history entry. */
+function setDemoParam(id: string | null): void {
+	try {
+		const u = new URL(location.href);
+		if (u.searchParams.get("demo") === id) return;
+		if (id === null) u.searchParams.delete("demo");
+		else u.searchParams.set("demo", id);
+		history.replaceState(history.state, "", u);
+	} catch {}
+}
+
+/** A window named `name` closed (windows.ts onClose): if it is ?demo='s, a reload no longer launches it. */
+export function forgetDemo(name: string): void {
+	if (new URLSearchParams(location.search).get("demo") === name) setDemoParam(null);
+}
+
+/** Launches the demo ?demo= names (hidden ones too), if any. Called once the guest is up (boot.ts). */
+export function launchFromUrl(): void {
+	const params = new URLSearchParams(location.search);
+	const id = params.get("demo");
+	// ?showcase or ?demo=-: the scripted tour of the demos, for a recording (showcase.ts).
+	if (id === "-" || (params.has("showcase") && params.get("showcase") !== "0")) {
+		void import("./showcase.ts").then((m) => m.runShowcase(params.get("showcase") ?? ""), (e) => KW.ui?.toast(`showcase: ${(e as Error)?.message ?? e}`));
+		return;
+	}
+	if (!id) return;
+	const d = DEMOS.find((x) => x.id === id);
+	if (d) void launch(d);
+	else KW.ui?.toast(`?demo=${id}: no such demo`);
+}
+
+/** Demos between the click and their window appearing (the files are being written). */
+const starting = new Set<string>();
+
+/** The terminal window a demo runs in (named after it), if one is open. */
+export const demoWindow = (d: Demo) => KW.windows?.list().find((w) => w.n !== 0 && w.name === d.id);
+
+/**
+ * Run a demo in a new terminal window (see the top of this file), or show
+ * its window if it already has one: a demo runs once at a time. Failures
+ * are toasts. keepUrl leaves ?demo= alone (the showcase).
+ */
+export async function launch(d: Demo, opts: { keepUrl?: boolean } = {}): Promise<void> {
+	const ui = KW.ui!;
+	const why = unavailable(d);
+	if (why) return ui.toast(`${d.title}: ${why}`);
+	const vm = KW.vm as KernelHandle | undefined;
+	if (!KW.windows || !vm) return ui.toast("The system is not running yet");
+	const open = demoWindow(d);
+	if (open) return selectWindow(open.n);
+	if (starting.has(d.id)) return;
+	starting.add(d.id);
+	if (!opts.keepUrl) setDemoParam(d.id); // a reload launches it again
+	try {
+		const dir = d.dir ?? `~/demos/${d.id}`;
+		try {
+			await writeFiles(vm, dir, { ...d.files, "run.sh": { content: runScript(d), mode: 0o755 } });
+			await pushDownloads(vm, d, dir);
+			// sh -l, so run.sh gets the login environment (PATH, the apk hooks).
+			const win = KW.windows.open({ name: d.id, file: "/bin/sh", args: ["-lc", WRAP_SH, "sh", dir.replace(/^~\//, ""), dir] });
+			starting.delete(d.id); // the window is listed from here on
+			await win;
+		} finally {
+			starting.delete(d.id);
+		}
+		// apk add can take minutes on a slow network.
+		await Promise.all((d.ports ?? []).map(async (port, i) => {
+			await waitPort(vm, port, 600_000);
+			if (i === 0) KW.preview?.open(port);
+			else ui.toast(`${d.title}: port ${port} answers too (Ctrl-A p, then change the port)`);
+		}));
+	} catch (e) {
+		ui.toast(`${d.title}: ${(e as Error)?.message ?? e}`);
+	}
+}

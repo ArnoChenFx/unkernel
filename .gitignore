@@ -1,0 +1,10 @@
+vendor/
+.zig-cache/
+zig-out/
+node_modules/
+__pycache__/
+dist/
+web/.output/
+web/.vercel/
+web/kernel/
+tmp/

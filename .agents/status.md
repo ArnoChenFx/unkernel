@@ -138,6 +138,17 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
+- **GNU ld binaries exec slower.** Alpine links everything with GNU ld,
+  whose one R+X segment for code and read-only data costs about 0.5 ms
+  per exec under kwemu against lld's layout (guest-packages.md). The cause
+  on the kwemu or kernel side is not known. Fixing it there would speed
+  up every Alpine binary.
+- **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
+  nghttp2) are Alpine's builds; only openssl and zlib are rebuilt. V8 can
+  emit Zba/Zbb with `--riscv-b-extension` (kwemu.md: -6.5% on an integer
+  JS benchmark), but it is off by default and `NODE_OPTIONS` does not
+  accept it. `npx --version` did not change with the rebuilt packages
+  (about 4.1 s, 2026-11-16): it is V8 in the node binary.
 - **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
   --seccomp FD` fails, and GTK programs that load images through glycin
   abort. Workaround in the image: `/usr/local/bin/bwrap`

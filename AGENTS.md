@@ -16,6 +16,7 @@ side, the devices and the guest image.
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
+| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
 | [.agents/testing.md](.agents/testing.md) | the full test matrix, for releases or when asked |
 | [.agents/status.md](.agents/status.md) | roadmap, open issues, work not yet in the image |
@@ -82,6 +83,10 @@ Details are in the area files.
   check `$KOUT/.config` after a change.
 - `js/core` stays universal: no `node:` imports, no unguarded DOM APIs
   (js.md).
+- The image's busybox, zlib, openssl and apk-tools are rebuilt from
+  pinned aports commits (`kernel/guest/alpine-opt.sh`). An Alpine update
+  needs new pins there; `alpine.sh` stops until they match
+  (guest-packages.md).
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
 

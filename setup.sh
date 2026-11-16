@@ -81,6 +81,38 @@ check() {
 	for t in mke2fs debugfs e2fsck; do
 		tool "$t" "e2fsprogs >= 1.43" && note "$t" ok
 	done
+	# kernel/guest/alpine-opt.sh, the guest packages rebuilt for kwemu (run by
+	# alpine.sh): meson for apk-tools (a Python program: only looked up),
+	# lua for apk's help text, perl modules for openssl's Configure.
+	for t in patch perl; do
+		tool "$t" && note "$t" ok
+	done
+	# Fedora's pkg-config is a shell script around the pkgconf binary.
+	t="$(real_bin pkgconf)"; [ -n "$t" ] || t="$(real_bin pkg-config)"
+	if [ -n "$t" ] && [ "$(head -c 4 "$t" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; then
+		note pkg-config ok
+	else
+		fail pkg-config "install pkg-config or pkgconf"
+	fi
+	if [ -n "$(type -P meson)" ]; then
+		note meson ok
+	else
+		fail meson "install meson (alpine-opt.sh builds apk-tools with it)"
+	fi
+	if [ "$(uname -m)" != x86_64 ]; then
+		note alpine-opt "WARNING: its gcc toolchain is for x86_64 hosts; build with KW_ALPINE_OPT=0 (Alpine's builds)"
+	fi
+	t="$(real_bin lua5.4)"; [ -n "$t" ] || t="$(real_bin lua)"
+	if [ -n "$t" ] && [ "$(head -c 4 "$t" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; then
+		note lua ok
+	else
+		fail lua "install lua 5.x (apk's help text)"
+	fi
+	if [ -n "$(real_bin perl)" ] && "$(real_bin perl)" -MFindBin -MIPC::Cmd -MFile::Compare -e 1 2>/dev/null; then
+		note perl-modules ok
+	else
+		fail perl-modules "perl with FindBin, IPC::Cmd and File::Compare (openssl's Configure)"
+	fi
 
 	avail="$(df -Pk "$root" | awk 'NR == 2 {print int($4 / 1048576)}')"
 	if [ ! -d "$vendor/src/llvm22" ] && [ "${avail:-0}" -lt 10 ]; then

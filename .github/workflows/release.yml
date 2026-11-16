@@ -30,6 +30,9 @@
 #               (same patches, clang and fake-llvm wrapper), so Kbuild
 #               rebuilds incrementally and never from a different source
 #   downloads   Alpine minirootfs and Binaryen (checksums are verified anyway)
+#   alpine-opt  the rebuilt busybox, zlib, openssl and apk-tools (installed
+#               files only, ~9 MB; ~4 min to rebuild); key: alpine-opt.sh,
+#               env.sh
 #   zig, pnpm   by their setup actions
 name: Release
 
@@ -123,7 +126,8 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs
+            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs \
+            meson pkg-config lua5.4 patch
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -238,12 +242,42 @@ jobs:
           path: vendor/build/kernel
           key: ${{ steps.kernel-out.outputs.cache-primary-key }}
 
+      # busybox, zlib, openssl and apk-tools rebuilt for kwemu
+      # (kernel/guest/alpine-opt.sh, run by alpine.sh). Its stamp is the
+      # script's hash plus ALPINE_VERSION, which is what the key hashes, so
+      # on a hit --install only copies files: it reads root/, .stamp and the
+      # APKBUILDs. Exact key only: a fallback restore could bring a stale
+      # build. Its host tools (meson, lua, ...) are in the host tools step,
+      # which setup.sh --check verifies; the gcc toolchain is downloaded.
+      - name: Restore the rebuilt Alpine packages
+        id: alpine-opt
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/alpine-opt/root
+            vendor/build/alpine-opt/.stamp
+            vendor/downloads/alpine-opt/*/APKBUILD
+          key: alpine-opt-${{ runner.os }}-${{ hashFiles('kernel/guest/alpine-opt.sh', 'kernel/tools/env.sh') }}
       - name: Build the Alpine initramfs, data disk template and bundle
         run: |
           kernel/build.sh alpine
           kernel/build.sh datadisk   # refreshes the bundle with the template
           ls -l vendor/build/bundle/unkernel-alpine.wasm
           sha256sum vendor/build/bundle/unkernel-alpine.wasm
+
+      - name: Save the rebuilt Alpine packages
+        if: steps.alpine-opt.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/alpine-opt/root
+            vendor/build/alpine-opt/.stamp
+            vendor/downloads/alpine-opt/*/APKBUILD
+          key: ${{ steps.alpine-opt.outputs.cache-primary-key }}
+      # Keep the rebuild's downloads (~190 MB: gcc, sources) out of the
+      # downloads cache below; only the APKBUILDs are needed again.
+      - name: Drop the package rebuild's downloads
+        run: find vendor/downloads/alpine-opt -type f ! -name APKBUILD -delete 2>/dev/null || true
 
       - name: Save downloads
         if: steps.downloads.outputs.cache-hit != 'true'

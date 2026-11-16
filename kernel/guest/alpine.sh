@@ -55,6 +55,10 @@ chmod 1777 "$stage/tmp" "$stage/var/tmp"
 # and upgrading libcrypto3 or libssl3 brings them back.
 rm -rf "$stage/usr/lib/engines-3" "$stage/usr/lib/ossl-modules/legacy.so" \
 	"$stage/etc/ssl/openssl.cnf.dist" "$stage/etc/ssl/ct_log_list.cnf.dist"
+# busybox, zlib, libcrypto, libssl, libapk and apk rebuilt for kwemu's CPU
+# (gcc 16 -O2 with Zba/Zbb/Zbs/Zicond, linked with lld), from the same source
+# as these packages; see alpine-opt.sh. alpine-disk.sh does the same.
+"$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk starts with main only. Every apk command that loads the indexes parses
 # all of them, and community (21k packages to main's 6k) makes that ~2.7 s
 # instead of ~0.65 s under kwemu. Its line moves to /etc/kw-apk-lazy, and

@@ -65,6 +65,9 @@ The API differs from 0.13-0.15. Examples of all of these are in
   `timeconst.h` with `HZ == 0` ("Totally bogus HZ value!"). Put the real
   tools first on `PATH` for such runs.
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
+- `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`)
+  also needs meson, ninja, pkg-config, patch, lua 5.x, and perl with
+  FindBin, IPC::Cmd and File::Compare (guest-packages.md).
 - `setup.sh` runs only ELF binaries for its version checks, so a wrapper
   that installs packages on first use is never triggered.
 
@@ -75,3 +78,7 @@ SHA-256 sums for Binaryen 133 and the Alpine 3.24.4 minirootfs are in
 build.sh and `kernel/tools/env.sh` (`ALPINE_TARBALL=file` overrides the
 download). wterm (`@wterm/dom` 0.5.10, Apache-2.0) is an npm dependency
 of `web/`, pinned exactly and locked in `pnpm-lock.yaml` (see web.md).
+`kernel/guest/alpine-opt.sh` pins Bootlin's riscv64 musl gcc
+(bleeding-edge 2026.08-1, gcc 16.2), the Alpine apks of its sysroot, and
+per package the aports commit and APKBUILD (whose sha512sums cover the
+sources).

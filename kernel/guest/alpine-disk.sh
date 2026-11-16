@@ -35,6 +35,8 @@ rm -rf "$stage"
 mkdir -p "$stage"
 tar -xzf "$ALPINE_TARBALL" -C "$stage" --no-same-owner 2>/dev/null || true
 chmod -R u+rwX "$stage"
+# busybox, zlib, openssl and apk-tools rebuilt for kwemu (see alpine.sh).
+"$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk with main only, community in /etc/kw-apk-lazy (see alpine.sh).
 r="$stage/etc/apk/repositories"
 grep '/community$' "$r" > "$stage/etc/kw-apk-lazy" || { echo "alpine: no community line in $r" >&2; exit 1; }

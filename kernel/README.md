@@ -99,6 +99,7 @@ separate and not part of `all`):
   without mke2fs warns and goes on.
 * **alpine** (`guest/alpine.sh`), the only initramfs, `vendor/build/initramfs/alpine.cpio`:
   * The Alpine minirootfs 3.24.4 (version and checksum pinned in `tools/env.sh`, `ALPINE_TARBALL=file` overrides). It gets a small `/init` and an inittab with `hvc0::respawn:-/bin/sh` and `::respawn:/usr/bin/kwtty serve` (see vsock).
+  * busybox, zlib, libcrypto, libssl, libapk and apk are the same Alpine packages rebuilt for kwemu's CPU (`guest/alpine-opt.sh`: gcc 16 `-O2` with Zba/Zbb/Zbs/Zicond, linked with lld), which made shell scripts about 20% faster and apk about 11% (2026-11-16). The disk image gets them too. Details in `.agents/guest-packages.md`.
   * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target riscv64-linux-musl`, so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell.
   * `/usr/bin/glimmer`, built the same way (see Display, input and sound), and so are `/usr/bin/kwvsock`, `/usr/bin/kwshm`, `/usr/bin/kwtty` and `/usr/bin/kw9p` (see vsock, Host file systems and Shared memory).
   * The cpio archive is written by `tools/mkcpio.py`; no root is needed.

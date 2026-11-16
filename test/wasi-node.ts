@@ -135,7 +135,8 @@ async function test(): Promise<void> {
 	const k32 = path.join(root, "vendor/build/kernel/vmlinux32.wasm");
 	const k64 = path.join(root, "vendor/build/kernel/vmlinux");
 	const alpineCpio = path.join(root, "vendor/build/initramfs/alpine.cpio");
-	const kwtest = { initrd: alpineCpio, cmdline: "console=hvc0 rdinit=/usr/bin/kwtest", expect: [/kwtest: 0 failure\(s\)/] };
+	const testCpio = path.join(root, "vendor/build/initramfs/alpine-test.cpio");
+	const kwtest = { initrd: testCpio, cmdline: "console=hvc0 rdinit=/usr/bin/kwtest", expect: [/kwtest: 0 failure\(s\)/] };
 	const cases: Case[] = [
 		{ name: "kwtest vmlinux32.wasm", kernel: k32, ...kwtest },
 		{ name: "kwtest vmlinux (memory64)", kernel: k64, ...kwtest },

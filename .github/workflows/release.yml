@@ -113,6 +113,11 @@ jobs:
     # cores for the wasm-ld and kernel builds), if one is set up.
     runs-on: ${{ vars.RELEASE_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 240
+    env:
+      # alpine.sh then writes alpine.cpio, which the bundle gets, without
+      # kwtest and kwbench. The kwtest steps boot this bundle's kernel with
+      # alpine-test.cpio instead: the same image plus the test programs.
+      KW_RELEASE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -291,11 +296,13 @@ jobs:
 
       - name: kwtest (JIT)
         run: |
-          node js/cli.ts --timeout 600 --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          node js/cli.ts --timeout 600 --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+            --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
       - name: kwtest (no JIT)
         run: |
-          node js/cli.ts --timeout 900 --no-jit --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          node js/cli.ts --timeout 900 --no-jit --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+            --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
 
       - name: Typecheck
@@ -316,7 +323,8 @@ jobs:
       # as the sources, plus the packaging.
       - name: Test the built package
         run: |
-          node dist/cli.mjs --timeout 600 --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          node dist/cli.mjs --timeout 600 --kernel dist/unkernel-alpine.wasm --initrd vendor/build/initramfs/alpine-test.cpio \
+            --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
           UNKERNEL_DIST=1 node --test test/api.test.ts
       - name: Pack

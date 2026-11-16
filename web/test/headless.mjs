@@ -27,8 +27,9 @@
 //   modfail   the network drops the boot module (boot-*.js, or src/boot.ts
 //             with --dev): main.tsx reports it in the panel.
 //   lowmem    ?simulate=lowmem&mem=512: allocations above 128 MiB fail, the
-//             SDK falls back to 128 MiB and kwtest still passes
-//             (rdinit=/usr/bin/kwtest).
+//             SDK falls back to 128 MiB and Alpine still boots to the shell
+//             and runs a command. (kwtest is not in release bundles, which
+//             the built page runs.)
 // Layout checks (nothing overflows or overlaps) run at both viewports.
 // Screenshots go to --shots (default: $TMPDIR/unkernel-shots).
 import { mkdirSync } from "node:fs";
@@ -350,12 +351,13 @@ const scenarios = {
 
 	async lowmem(page) {
 		await page.emulate(DESKTOP);
-		await page.goto(`http://127.0.0.1:${port}/?simulate=lowmem&mem=512&append=${encodeURIComponent("console=hvc0 rdinit=/usr/bin/kwtest")}`);
-		await page.waitFor("['halted', 'error'].includes(document.getElementById('app').dataset.state)", "kwtest to finish", 60000);
+		await page.goto(`http://127.0.0.1:${port}/?simulate=lowmem&mem=512`);
+		await page.waitScreen(PROMPT, "shell prompt");
+		await page.evaluate(`globalThis.kernel.sendInput(${JSON.stringify("echo $((7*6))\r")})`);
+		await page.waitScreen("/^42\\s*$/m", "command output");
 		const r = await page.evaluate(`({ state: document.getElementById('app').dataset.state, mem: KW.memActualMiB, label: document.getElementById('status-label').textContent })`);
-		const s = await page.screen();
-		console.log(`  state=${r.state} (${r.label}), allocated ${r.mem} MiB; ${s.match(/kwtest: \d+ failure\(s\)/)?.[0] ?? "no kwtest summary"}`);
-		if (r.state !== "halted" || r.mem !== 128 || !/kwtest: 0 failure/.test(s)) throw new Error(`unexpected: ${JSON.stringify(r)}`);
+		console.log(`  state=${r.state} (${r.label}), allocated ${r.mem} MiB`);
+		if (r.state !== "running" || r.mem !== 128) throw new Error(`unexpected: ${JSON.stringify(r)}`);
 	},
 };
 

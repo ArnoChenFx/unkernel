@@ -6,11 +6,13 @@
 # /init mounts the pseudo filesystems and hands over to busybox init with a
 # login-less shell on hvc0; with a disk labelled kwdata, mounted at /data,
 # the root becomes an overlay that keeps every change on it (kw-overlay).
-# It also carries
-# the kernel smoke test and benchmark (static, so they work as /init too):
+# It also carries the kernel smoke test and benchmark (static, so they work
+# as /init too), except with KW_RELEASE=1 (release bundles; see the end of
+# this file). vendor/build/initramfs/alpine-test.cpio always has them:
 #   rdinit=/usr/bin/kwtest    kernel/guest/kwtest.c, powers off (halts on a failure)
 #   rdinit=/usr/bin/kwbench   kernel/guest/kwbench.c, rough guest speed
-#   /usr/bin/glimmer          kernel/guest/glimmer.c, a small game on /dev/fb0, evdev and
+# Always in the image:
+#   /usr/bin/glimmer        kernel/guest/glimmer.c, a small game on /dev/fb0, evdev and
 #                             ALSA; glimmer --test draws a check pattern, plays a test
 #                             signal and prints input events
 #   /usr/bin/kwvsock          kernel/guest/kwvsock.c, a byte pipe over AF_VSOCK (connect or
@@ -449,15 +451,22 @@ Section "InputDevice"
 EndSection
 EOF
 
-# Kernel smoke test and benchmark (see the top of this file), and the
-# display, input and sound game and self-test (glimmer.c; it needs the CLI's
+# The display, input and sound game and self-test (glimmer.c; it needs the CLI's
 # --display or the page, and plays sound with --sound/--sound-wav or on the page),
 # the vsock pipe (kwvsock.c; it needs a host with vsock, CLI --vsock or the SDK),
 # the shm exporter (kwshm.c; it needs a host with shm, CLI --shm or the SDK)
 # the terminal server (kwtty.c, from inittab; it serves a host with vsock)
 # and the 9p mounter (kw9p.c; it needs a host serving 9p over vsock).
-for t in kwtest kwbench glimmer kwvsock kwshm kwtty kw9p; do
+for t in glimmer kwvsock kwshm kwtty kw9p; do
 	"$zig" cc -target riscv64-linux-musl -static -O2 -s -o "$stage/usr/bin/$t" "$root/kernel/guest/$t.c"
+done
+# The kernel smoke test and benchmark (see the top of this file) are not in
+# the image: they go into a second archive, below.
+tstage="$out/kwtest-root"
+rm -rf "$tstage"
+mkdir -p "$tstage/usr/bin"
+for t in kwtest kwbench; do
+	"$zig" cc -target riscv64-linux-musl -static -O2 -s -o "$tstage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
 
 # Image id, for the overlay root (overlay/root.sh): a hash of the tree (names,
@@ -467,5 +476,22 @@ id=$(tar -C "$stage" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner 
 echo "alpine-$ALPINE_VERSION-$id" > "$stage/usr/lib/kw-image"
 echo "image id: alpine-$ALPINE_VERSION-$id"
 
-python3 "$root/kernel/tools/mkcpio.py" "$stage" "$out/alpine.cpio"
-echo "initramfs: $out/alpine.cpio"
+# alpine-test.cpio is the image plus kwtest and kwbench: two archives back
+# to back, which the kernel unpacks in turn (the second adds its files).
+# alpine.cpio, which kernel/build.sh bundles, is the same, or with
+# KW_RELEASE=1 (the release workflow) the image alone. The image id above
+# leaves the test programs out, so all carry the same one. (The choice is
+# made here, not in build.sh: build.sh is part of CI's kernel cache key.)
+python3 "$root/kernel/tools/mkcpio.py" "$stage" "$out/alpine-image.cpio"
+python3 "$root/kernel/tools/mkcpio.py" "$tstage" "$out/kwtest.cpio"
+cat "$out/alpine-image.cpio" "$out/kwtest.cpio" > "$out/alpine-test.cpio"
+rm "$out/kwtest.cpio"
+if [ "${KW_RELEASE:-0}" = 1 ]; then
+	mv "$out/alpine-image.cpio" "$out/alpine.cpio"
+	echo "initramfs: $out/alpine.cpio (KW_RELEASE=1: without kwtest and kwbench)"
+else
+	rm "$out/alpine-image.cpio"
+	cp "$out/alpine-test.cpio" "$out/alpine.cpio"
+	echo "initramfs: $out/alpine.cpio (with kwtest and kwbench; KW_RELEASE=1 leaves them out)"
+fi
+echo "initramfs with kwtest and kwbench: $out/alpine-test.cpio"

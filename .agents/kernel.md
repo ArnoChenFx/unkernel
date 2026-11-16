@@ -567,8 +567,12 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
 
 ## Kernel tests
 
-- kwtest (`kernel/guest/kwtest.c`, `/usr/bin/kwtest` in the image): run as
-  `rdinit=` on both builds, with and without `--no-jit`. It powers off on
+- kwtest (`kernel/guest/kwtest.c`, `/usr/bin/kwtest` in local builds and
+  `alpine-test.cpio`, not in release bundles; kernel/README.md, alpine):
+  run as `rdinit=` on both builds, with and without `--no-jit`. Device
+  nodes come from devtmpfs when it is mounted, else they are made in
+  `/tmp`; it never opens a node in `/tmp` once `/dev` has one, because
+  the overlay root mounts `/tmp` nodev. It powers off on
   success and halts (exit 1) on failure. What it covers beyond syscalls:
   - ISA, reading `kw.isa=` from `/proc/cmdline`: the cpuinfo `isa` line
     (order, names, what must be listed), `riscv_hwprobe` `IMA_EXT_0` and

@@ -43,8 +43,9 @@ With no arguments it boots Alpine from the bundled kernel (unkernel-alpine.wasm:
 vmlinux32.wasm with the root fs and command line in custom sections), interactive
 on this terminal; Ctrl-] quits. In a source checkout, any other --initrd (a NAME
 from vendor/build/initramfs/, or a path) loads vendor/build/kernel/vmlinux32.wasm
-plus that file. The kwtest smoke test is part of Alpine:
---append "console=hvc0 rdinit=/usr/bin/kwtest" (exit 0, or 1 on a failure).
+plus that file. The kwtest smoke test is in a local build's Alpine (not in
+releases): --append "console=hvc0 rdinit=/usr/bin/kwtest" (exit 0, or 1 on a
+failure); with a release bundle add --initrd alpine-test.
 
 --kernel (or a positional path) replaces the kernel: either build, or a bundle;
 the memory type is detected from the module. A kernel with a bundled root fs

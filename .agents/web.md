@@ -521,7 +521,7 @@ Agents run these only when asked. The page is tested by hand with
 
 `headless.mjs` (`pnpm test:web`: desktop with the JIT compiling and
 cross-origin isolation asserted, phone over LAN, nojspi, fetch404, modfail,
-lowmem running kwtest), `data.mjs` (data disk, overlay root, safe mode,
+lowmem booting to the shell at 128 MiB), `data.mjs` (data disk, overlay root, safe mode,
 second tab, export/reset/import) and `net.mjs` (needs the internet). Shared
 code is in `lib.mjs`. They drive Chromium over the DevTools protocol with no
 npm dependencies and start the built server (`--dev` starts the Vite dev

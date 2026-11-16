@@ -19,8 +19,9 @@ are run only when asked; the page is tested by hand with `pnpm dev`.
 | Host file systems (`fs.ts`, `9p.ts`, `memfs.ts`, `mounts.ts`, `nodefs.ts`, `kw9p.c`) | after a kw9p change `kernel/build.sh alpine`; `pnpm test:9p`; `pnpm test:api`; `node test/9p-bench.ts` and with `--worker`, against js.md's table |
 | Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
 
-A separate static guest test program goes into the `kwtest kwbench ...` loop at
-the end of `kernel/guest/alpine.sh`. `node test/glimmer-check.mjs --run`
+A separate static guest program goes into the `glimmer kwvsock ...` loop at
+the end of `kernel/guest/alpine.sh`, or into the `kwtest kwbench` loop
+after it if it is only for tests (those stay out of release bundles). `node test/glimmer-check.mjs --run`
 boots with `--display --sound-wav`, runs `glimmer --test` and checks the
 dumped frame pixel for pixel, the injected input events and the recorded
 test signal sample for sample (`--no-sound`: without a sound card; `--worker`:
@@ -40,12 +41,14 @@ date, UTC), which it tags `v<version>` once the build passes. Its
 `release` input (on by default) unchecked makes it a smoke run. A pushed
 `v<version>` tag on main is a release of that version. It refuses any
 other ref before building, and stamps the version into package.json
-before `pnpm build`. It builds everything from source
+before `pnpm build`. It builds everything from source with `KW_RELEASE=1`, so `alpine.sh`
+leaves kwtest and kwbench out of `alpine.cpio` and the bundle
 (`kernel/build.sh toolchain kernel alpine datadisk`, clang 22 from
 apt.llvm.org; kwemu with `zig build -Dcpu=baseline` handed over as
 `KWEMU=`, so the zig cache survives runners with other CPU models), runs
-kwtest with and without the JIT, `pnpm typecheck`, the tty, http and 9p
-tests, `pnpm build`, kwtest and the api tests on the built package, then
+kwtest with and without the JIT (the bundle's kernel with `--initrd
+alpine-test`), `pnpm typecheck`, the tty, http and 9p
+tests, `pnpm build`, kwtest (the same way) and the api tests on the built package, then
 uploads `npm pack`'s tarball (`unkernel.tgz`) and the bundle. A release
 publishes the tarball to npm through trusted publishing (npmjs.com trusts
 `release.yml` of this repository; no token), always on the dist-tag

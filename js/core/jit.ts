@@ -62,6 +62,8 @@ export interface JitStats {
 	failed: number;
 	/** Total time spent compiling and instantiating, in ms. */
 	compileMs: number;
+	/** Longest single compile and instantiation, in ms (the longest the CPU could not answer an interrupt for one). */
+	maxCompileMs: number;
 	/** Total size of the compiled modules, in bytes. */
 	bytes: number;
 	/** Compiled modules the engine has garbage-collected (-1: no FinalizationRegistry, unknown). */
@@ -91,6 +93,35 @@ export interface KwemuStats {
 	words: number[];
 }
 
+/** JitStats fields in the order of a counter mirror (JitHost.mirror, a secondary CPU's). */
+const MIRROR_KEYS = ["compiled", "live", "maxLive", "freed", "failed", "compileMs", "bytes", "collected", "retained",
+	"maxRetained", "gcNudges", "refused", "maxCompileMs"] as const satisfies readonly (keyof JitStats)[];
+/** Float64 slots of one mirror: enabled, requested, the counters, the emit buffer (0: none yet). */
+export const JIT_MIRROR_WORDS = 2 + MIRROR_KEYS.length + 1;
+
+/** The counters a secondary CPU's host mirrored (JitHostOptions.mirror). */
+export function jitStatsFromMirror(m: Float64Array): JitStats {
+	const st = { enabled: m[0] === 1, requested: m[1] === 1 } as JitStats;
+	MIRROR_KEYS.forEach((k, i) => (st[k] = m[2 + i] ?? 0));
+	return st;
+}
+
+/** The emit buffer address a mirror recorded (undefined before the first compile). */
+export function jitBufFromMirror(m: Float64Array): number | undefined {
+	return m[JIT_MIRROR_WORDS - 1] || undefined;
+}
+
+/** Sum of several CPUs' counters (maxima summed too: they are per CPU). */
+export function sumJitStats(first: JitStats, rest: JitStats[]): JitStats {
+	const st = { ...first };
+	for (const o of rest) {
+		st.enabled ||= o.enabled;
+		st.requested ||= o.requested;
+		for (const k of MIRROR_KEYS) st[k] = k === "maxCompileMs" ? Math.max(st[k], o[k]) : (st[k] < 0 || o[k] < 0 ? -1 : st[k] + o[k]);
+	}
+	return st;
+}
+
 export interface JitHostOptions {
 	/** Offer the JIT (default true); false: kw_host_jit_caps() returns 0. */
 	enabled?: boolean;
@@ -103,6 +134,12 @@ export interface JitHostOptions {
 	retainedNudge?: number;
 	/** Uncollected freed modules at which compiles are refused (default RETAINED_LIMIT; Infinity: never). */
 	retainedLimit?: number;
+	/**
+	 * A secondary CPU's host (cpu.ts): copy the counters here after every
+	 * compile and free (JIT_MIRROR_WORDS, on a SharedArrayBuffer), where
+	 * CPU 0's host reads them (jitStatsFromMirror).
+	 */
+	mirror?: Float64Array;
 }
 
 const CAP_AVAILABLE = 1;
@@ -162,12 +199,24 @@ export class JitHost {
 			typeof WebAssembly.Module === "function" && typeof WebAssembly.Instance === "function";
 		const tracked = typeof FinalizationRegistry === "function";
 		this.stats = {
-			enabled, requested: false, compiled: 0, live: 0, maxLive: 0, freed: 0, failed: 0, compileMs: 0, bytes: 0,
+			enabled, requested: false, compiled: 0, live: 0, maxLive: 0, freed: 0, failed: 0, compileMs: 0, maxCompileMs: 0, bytes: 0,
 			collected: tracked ? 0 : -1, retained: tracked ? 0 : -1, maxRetained: tracked ? 0 : -1, gcNudges: 0, refused: 0,
 		};
 		if (tracked) this.#fin = new FinalizationRegistry(() => this.#collected());
 		this.#nudgeAt = opts.retainedNudge ?? RETAINED_NUDGE;
 		this.#limit = opts.retainedLimit ?? RETAINED_LIMIT;
+		this.#publish();
+	}
+
+	/** Copy the counters to the mirror, if any. */
+	#publish(): void {
+		const m = this.#opts.mirror;
+		if (!m) return;
+		const st = this.stats;
+		m[0] = st.enabled ? 1 : 0;
+		m[1] = st.requested ? 1 : 0;
+		MIRROR_KEYS.forEach((k, i) => (m[2 + i] = st[k]));
+		m[JIT_MIRROR_WORDS - 1] = this.#buf ?? 0;
 	}
 
 	/** Bind to the kernel instance's function table; call after instantiation, before _start. */
@@ -187,9 +236,12 @@ export class JitHost {
 	 * buffer, which is free outside kw_host_jit_compile, so any call from
 	 * JavaScript is safe.
 	 */
-	kwemuStats(): KwemuStats | undefined {
-		if (!this.#debugStats || !this.#cpuOfBuf || this.#buf === undefined) return undefined;
-		const cpu = this.#cpuOfBuf(BigInt(this.#buf));
+	kwemuStats(of: number | undefined = this.#buf): KwemuStats | undefined {
+		if (!this.#debugStats || !this.#cpuOfBuf || this.#buf === undefined || of === undefined) return undefined;
+		// `of`: the emit buffer of another CPU (SMP, jitBufFromMirror): its
+		// counters are copied through this CPU's buffer, which is free
+		// while this host's JavaScript runs.
+		const cpu = this.#cpuOfBuf(BigInt(of));
 		// The emit buffer (16 KiB) is free between compiles: copy the
 		// counters (4008 bytes) into it, then read them.
 		this.#debugStats(cpu, BigInt(this.#buf));
@@ -210,6 +262,7 @@ export class JitHost {
 
 	caps(): number {
 		this.stats.requested = true;
+		this.#publish();
 		if (!this.stats.enabled) return 0;
 		if (!this.#table) {
 			this.#warn("the kernel exports no __indirect_function_table; JIT off");
@@ -225,6 +278,7 @@ export class JitHost {
 		if (st.retained >= this.#limit) {
 			// Not a failure: the engine has not caught up with collecting yet.
 			if (st.refused++ === 0) this.#opts.log?.(`[jit] ${st.retained} freed modules not collected by the engine yet; refusing compiles until it catches up`);
+			this.#publish();
 			return -1;
 		}
 		const t0 = performance.now();
@@ -259,9 +313,12 @@ export class JitHost {
 			this.#warn(`compile into slot ${slot} failed: ${(e as Error)?.message ?? e}`);
 			return -1;
 		} finally {
-			st.compileMs += performance.now() - t0;
+			const ms = performance.now() - t0;
+			st.compileMs += ms;
+			if (ms > st.maxCompileMs) st.maxCompileMs = ms;
 			st.live = this.#saved.size;
 			if (st.live > st.maxLive) st.maxLive = st.live;
+			this.#publish();
 		}
 	}
 
@@ -278,6 +335,7 @@ export class JitHost {
 			this.#warn((e as Error)?.message ?? String(e));
 		} finally {
 			this.stats.live = this.#saved.size;
+			this.#publish();
 		}
 	}
 
@@ -295,6 +353,7 @@ export class JitHost {
 		// A module replaced without a free is counted as freed, so this
 		// never goes below 0; max() guards against the order of callbacks.
 		st.retained = Math.max(0, st.freed - st.collected);
+		this.#publish();
 	}
 
 	/** Make the engine count a large allocation towards its next garbage collection. */

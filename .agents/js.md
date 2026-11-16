@@ -344,8 +344,8 @@ parts that are easy to get wrong.
   `wasm_cpu_count` and `wasm_cpu_start`. `CreateKernelOptions.cpus` (CLI
   `--smp N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
   CPUs `Kernel` offers. A UP kernel ignores it with a log line, so does a
-  platform without `Platform.spawnCpu`; with more than one CPU the JIT
-  is off (log line). The memory is shared (the module's import says so).
+  platform without `Platform.spawnCpu`. The memory is shared (the
+  module's import says so).
 - `Kernel` is CPU 0, in whatever thread runs it, with every device.
   `wasm_cpu_start(cpu, idle)` calls `KernelConfig.spawnCpu` (from
   `Platform.spawnCpu`: Node `js/node/cpu.ts`, a `worker_threads` Worker
@@ -359,7 +359,7 @@ parts that are easy to get wrong.
   itself (`ServeKernelOptions.spawnCpu`). Exit terminates them.
 - `runCpu()` checks that the flag reads 2, instantiates the module with
   its own `wasm_switch_to` (its own resumers: JSPI stacks stay in their
-  thread), clocks, `random_get`, `sched_yield` (returns at once) and
+  thread), clocks, `random_get`, `sched_yield`, kwemu's JIT imports and
   `fd_write`, which posts console output and panic text to CPU 0's host
   as it comes (`CpuMessage`: no batching, because this thread may never
   return to its event loop), and enters `kw_secondary_entry(idle)`. Its
@@ -375,6 +375,30 @@ parts that are easy to get wrong.
   kernel takes that bit even with interrupts off and parks CPU 0
   (kernel.md, SMP). Its idle blocks in the kernel
   (`memory.atomic.wait32`), so it needs no event loop.
+- The JIT per CPU (kwemu.md, JIT on several harts): each CPU's thread
+  has a `JitHost` of its own (`CpuInit.jit`, `memory64`), attached to
+  its instance's `__indirect_function_table` before the kernel runs
+  there, so a CPU compiles into its own table and never sees another's
+  modules. It mirrors its counters into a `Float64Array` on a
+  `SharedArrayBuffer` (`CpuInit.jitMirror`, `JIT_MIRROR_WORDS`) after
+  every compile and free, and logs through a `log` message. CPU 0's
+  `Kernel.jitStatsPerCpu()` reads them: `stats().jit` is the sum over
+  CPUs, `stats().jitCpus` per CPU, `kwemuCpus` the -Dkwemu-stats
+  counters per CPU (copied through CPU 0's emit buffer from the emit
+  buffer address in the mirror); the CLI's `--stats` prints a line per
+  CPU. `JitStats.maxCompileMs` is the longest `new Module` +
+  `new Instance` + `table.set` (V8's lazy first-call compile is not in
+  it).
+- `sched_yield` is a Suspending import here too (the kernel yields on
+  every CPU, kernel.md, SMP): it returns through `yieldToEventLoop()`.
+  This thread otherwise never reaches its event loop (it idles in the
+  kernel), and V8 runs FinalizationRegistry callbacks and the second
+  pass of its collections (which frees a collected module's code) only
+  as tasks there. Without it a secondary reported nothing collected, so
+  after 256 frees every compile and free allocated a nudge of up to
+  4 GiB (a shootdown once waited 0.58 s for that CPU), and at 2048 it
+  would have refused every compile (2026-11-16, compile churn on CPU 1;
+  kwemu.md, Numbers).
 - A task the kernel moves to another CPU starts there on a fresh stack
   (`isNew`), and its old stack's CPU then calls `wasm_stack_drop(task)`
   (CPU 0's `Kernel` and `runCpu()` both answer it): the host forgets

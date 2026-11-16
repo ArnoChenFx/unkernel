@@ -844,7 +844,13 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 const k = (@intFromPtr(r.op) - @intFromPtr(first)) / @sizeOf(Op);
                 left += blk.ninsn - (k + 1);
             } else if (r.next != .done) break r;
-            if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+            if (irq) |p| if (p.* != 0) {
+                // Count the passes run towards the compile threshold: with
+                // frequent interrupts (IPIs on SMP) a hot self-loop would
+                // otherwise never get compiled.
+                if (jit.enabled and lim != blk.ninsn) jit.loopDone(blk, entry_left -| left);
+                return event(cpu, .interrupt, 0, 0, 0);
+            };
             // A block that branches to itself is still valid: anything that
             // could have invalidated it (a store into decoded code, FENCE.I)
             // ends the block with .stop instead of .done/.side.

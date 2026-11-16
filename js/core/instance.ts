@@ -243,9 +243,14 @@ export interface InstanceStats extends KernelStats {
 	compileMs: number;
 	block: BlockStats;
 	net?: NetStats;
+	/** JIT counters, of all CPUs together. */
 	jit: JitStats;
-	/** kwemu's counters, only from a -Dkwemu-stats kernel (`kernel/build.sh stats`). */
+	/** With more than one CPU: the JIT counters per CPU (CPU 0 first). */
+	jitCpus?: JitStats[];
+	/** kwemu's counters, only from a -Dkwemu-stats kernel (`kernel/build.sh stats`); CPU 0's. */
 	kwemu?: KwemuStats;
+	/** With more than one CPU: kwemu's counters per CPU (-Dkwemu-stats kernels). */
+	kwemuCpus?: (KwemuStats | undefined)[];
 	display?: DisplayStats;
 	evdev?: InputStats;
 	sound?: SoundStats;
@@ -604,8 +609,10 @@ export class KernelInstance implements KernelHandle {
 			uptimeMs: k.bootTime ? performance.now() - k.bootTime : 0,
 			compileMs: this.#compileMs,
 			block: { ...k.block.stats },
-			jit: { ...k.jit.stats },
+			jit: k.jitStatsAll(),
+			jitCpus: k.cpus > 1 ? k.jitStatsPerCpu() : undefined,
 			kwemu: k.jit.kwemuStats(),
+			kwemuCpus: k.cpus > 1 ? k.kwemuStatsPerCpu() : undefined,
 			net: this.net instanceof NetStack ? { ...this.net.stats } : undefined,
 			display: k.display.enabled ? { ...k.display.stats } : undefined,
 			evdev: k.evdev.enabled ? { ...k.evdev.stats } : undefined,

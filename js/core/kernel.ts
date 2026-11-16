@@ -32,7 +32,7 @@ import { BlockHost, type BlockDevice, type DiskSnapshotState } from "./block.ts"
 import type { CpuEndpoint, CpuInit, CpuMessage } from "./cpu.ts";
 import { DisplayHost, type DisplayMode, type DisplayOption } from "./display.ts";
 import { InputHost, type InputState } from "./input.ts";
-import { JitHost } from "./jit.ts";
+import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
 import { copySnapshotMemory, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot } from "./snapshot.ts";
@@ -178,8 +178,8 @@ export interface KernelConfig {
 	/**
 	 * CPUs to offer an SMP kernel (CONFIG_SMP), each one more instance of
 	 * the module in its own thread (spawnCpu). Default 1. A UP kernel
-	 * ignores it (with a log line). More than one CPU runs kwemu's
-	 * interpreter only (jit is ignored).
+	 * ignores it (with a log line). Each CPU's kwemu has its own JIT
+	 * tier (jit applies to all).
 	 */
 	cpus?: number;
 	/** Start a secondary CPU's thread (Platform.spawnCpu); without it an SMP kernel gets one CPU. */
@@ -314,6 +314,8 @@ export class Kernel {
 	cpus = 1;
 	/** The other CPUs' threads, once started. */
 	secondaries: CpuEndpoint[] = [];
+	/** Their JIT hosts' counters (CpuInit.jitMirror), in the order they started. */
+	jitMirrors: Float64Array[] = [];
 
 	constructor(opts: KernelConfig) {
 		this.opts = opts;
@@ -338,10 +340,10 @@ export class Kernel {
 		if (cpus > 1 && !smp) this.log(`[host] this kernel is not SMP: ${cpus} CPUs asked, it runs on one`);
 		else if (cpus > 1 && !opts.spawnCpu) this.log("[host] this platform cannot start CPU threads: the SMP kernel runs on one CPU");
 		else if (smp) this.cpus = cpus;
-		if (this.cpus > 1 && opts.jit !== false) this.log("[host] SMP: kwemu's JIT is off (interpreter only)");
 		// Memory and its type are read at call time: boot() may retry with
-		// the other memory type.
-		this.jit = new JitHost({ enabled: this.cpus > 1 ? false : opts.jit, memory: () => this.memory, memory64: () => this.memory64, log: this.log });
+		// the other memory type. Another CPU's host has a JitHost of its own
+		// (cpu.ts), which mirrors its counters (jitMirrors).
+		this.jit = new JitHost({ enabled: opts.jit, memory: () => this.memory, memory64: () => this.memory64, log: this.log });
 		this.netRx = [];
 		this.display = new DisplayHost({ enabled: opts.display, memory: () => this.memory, onChange: opts.onDisplay, log: this.log });
 		this.evdev = new InputHost({ enabled: !!opts.display, memory: () => this.memory, raise: () => this.raiseIrq(IRQ_INPUT), onChange: opts.onInput });
@@ -408,11 +410,27 @@ export class Kernel {
 		else if (r.value === "not-equal") queueMicrotask(done);
 	}
 
+	/** JIT counters per CPU (CPU 0 first; the others as their hosts last mirrored them). */
+	jitStatsPerCpu(): JitStats[] {
+		return [{ ...this.jit.stats }, ...this.jitMirrors.map(jitStatsFromMirror)];
+	}
+
+	/** All CPUs' JIT counters together. */
+	jitStatsAll(): JitStats {
+		return sumJitStats(this.jit.stats, this.jitMirrors.map(jitStatsFromMirror));
+	}
+
+	/** kwemu's counters per CPU (-Dkwemu-stats kernels; undefined for a CPU that has compiled nothing). */
+	kwemuStatsPerCpu(): (KwemuStats | undefined)[] {
+		return [this.jit.kwemuStats(), ...this.jitMirrors.map((m) => this.jit.kwemuStats(jitBufFromMirror(m)))];
+	}
+
 	/** wasm_cpu_start(cpu, idle): start a secondary CPU's thread. */
 	startCpu(cpu: number, idle: bigint): number {
 		const spawn = this.opts.spawnCpu;
 		if (!spawn || cpu < 1 || cpu >= this.cpus || this.result) return -ENOSYS;
 		const flag = this.exports?.__wasm_init_memory_flag;
+		const jitMirror = new Float64Array(new SharedArrayBuffer(JIT_MIRROR_WORDS * 8));
 		let ep: CpuEndpoint;
 		try {
 			ep = spawn({
@@ -420,12 +438,14 @@ export class Kernel {
 				initFlag: flag instanceof WebAssembly.Global ? Number(flag.value) : 0,
 				irqWord0: this.irqAddr ?? 0,
 				epochMs: performance.timeOrigin - this.wasi.monoOffset,
+				jit: this.jit.stats.enabled, memory64: this.memory64, jitMirror,
 			});
 		} catch (e) {
 			this.log(`[host] cannot start CPU ${cpu}: ${(e as Error)?.message ?? e}`);
 			return -ENOSYS;
 		}
 		this.secondaries.push(ep);
+		this.jitMirrors.push(jitMirror);
 		ep.listen({
 			message: (m) => this.onCpuMessage(m),
 			error: (e) => this.fatal(`CPU ${cpu}: ${(e as Error)?.stack ?? e}`),
@@ -437,6 +457,9 @@ export class Kernel {
 		switch (m.t) {
 			case "out":
 				if (!this.result) this.opts.write(m.bytes);
+				break;
+			case "log":
+				this.log(m.msg);
 				break;
 			case "err":
 				this.wasi.stderr = (this.wasi.stderr + textDecoder.decode(m.bytes)).slice(-4096);

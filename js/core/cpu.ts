@@ -7,13 +7,17 @@
 // CPU needs: task switching (its own JSPI stacks: a task's stack lives in
 // the thread that started it; a task the kernel moves starts on a fresh
 // stack on its new CPU, and wasm_stack_drop then tells the old one's host),
-// the clocks, randomness, and console and panic output, which it forwards
-// to CPU 0's host. Its idle blocks the thread in the kernel itself
-// (memory.atomic.wait32 on its word of pending interrupts), so nothing here
-// waits. Any other import is a kernel bug on this CPU: it ends the session.
+// the clocks, randomness, console and panic output, which it forwards to
+// CPU 0's host, and kwemu's JIT tier: this CPU's kwemu compiles what it
+// finds hot into this instance's own function table (jit.ts), whose
+// counters it mirrors for CPU 0's stats(). Its idle blocks the thread in
+// the kernel itself (memory.atomic.wait32 on its word of pending
+// interrupts), so nothing here waits. Any other import is a kernel bug on
+// this CPU: it ends the session.
 // Universal: no node: imports, no DOM.
 
-import { ERRNO, never } from "./wasi.ts";
+import { JitHost } from "./jit.ts";
+import { ERRNO, never, yieldToEventLoop } from "./wasi.ts";
 
 /** What CPU 0's host sends to start a CPU (structured-cloneable). */
 export interface CpuInit {
@@ -40,6 +44,12 @@ export interface CpuInit {
 	 * performance.now() - epochMs` (ms) on every thread: CPU 0's clock.
 	 */
 	epochMs: number;
+	/** Offer kwemu's JIT tier on this CPU (KernelConfig.jit). */
+	jit: boolean;
+	/** The memory is a memory64 one (the JIT's modules import it as such). */
+	memory64: boolean;
+	/** Where this CPU's JIT host mirrors its counters (JIT_MIRROR_WORDS on a SharedArrayBuffer), for CPU 0's stats(). */
+	jitMirror?: Float64Array;
 }
 
 /** Messages from a CPU to CPU 0's host. */
@@ -47,6 +57,8 @@ export type CpuMessage =
 	| { t: "running" }
 	| { t: "out"; bytes: Uint8Array }
 	| { t: "err"; bytes: Uint8Array }
+	/** A host log line (the JIT's warnings). */
+	| { t: "log"; msg: string }
 	| { t: "exit"; code: number }
 	| { t: "fatal"; msg: string }
 	| { t: "trap"; error: string };
@@ -141,8 +153,18 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 			v.setUint32(nwritten, total, true);
 			return ERRNO.SUCCESS;
 		},
-		// Only CPU 0 yields (traps.c); a stray call returns at once.
-		sched_yield: (): number => ERRNO.SUCCESS,
+		// (JSPI) Every CPU yields to its host now and then (traps.c, every
+		// 20 ms of user code): this thread's event loop runs the engine's
+		// housekeeping there, which nothing else would let it do (the
+		// thread idles in the kernel itself). V8 collects the JIT's freed
+		// modules only then: finalizers and the collector's last pass
+		// are tasks, and without them the JIT host saw nothing collected,
+		// prompted collections with ever larger allocations (one stalled
+		// this CPU for 0.58 s) and would have refused to compile.
+		sched_yield: new WebAssembly.Suspending(() => {
+			if (exited) return never();
+			return yieldToEventLoop().then(() => (exited ? never() : ERRNO.SUCCESS));
+		}),
 		proc_exit: new WebAssembly.Suspending((code: number) => {
 			if (!exited) {
 				exited = true;
@@ -152,13 +174,18 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 			return never();
 		}),
 	};
+	// This instance's own table (attached below, before the kernel runs
+	// here) and its own modules: kwemu's state for this CPU is used only
+	// by this instance.
+	const jit = new JitHost({
+		enabled: init.jit, memory: () => memory, memory64: () => init.memory64, mirror: init.jitMirror,
+		log: (msg) => port.post({ t: "log", msg: `CPU ${cpu}: ${msg}` }),
+	});
 	const unkernel: Record<string, unknown> = {
 		wasm_init_flag: (): bigint => BigInt(init.initFlag),
 		wasm_cpu_count: (): number => init.cpus,
 		wasm_cpu_start: (): number => -38, // ENOSYS: only CPU 0 starts CPUs
-		kw_host_jit_caps: (): number => 0, // the interpreter only (SMP)
-		kw_host_jit_compile: (): number => -1,
-		kw_host_jit_free: (): void => {},
+		...jit.imports(),
 		// A task started on a fresh stack on another CPU: its old one here never runs again.
 		wasm_stack_drop(task: bigint): void {
 			resumers.delete(task);
@@ -213,6 +240,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		fatal("this kernel has no kw_secondary_entry export");
 		return;
 	}
+	jit.attach(ex);
 	retFromFork = WebAssembly.promising(ex.ret_from_fork as (...args: unknown[]) => unknown) as typeof retFromFork;
 	const entry = WebAssembly.promising(ex.kw_secondary_entry as (idle: bigint) => unknown);
 	port.post({ t: "running" });

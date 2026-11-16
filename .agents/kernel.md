@@ -658,7 +658,12 @@ numbers and open issues: status.md item 8.
   `kw_irq_enable_pending()` runs the handlers with interrupts still off,
   then sets the flag; `user_mode_loop()` enables without delivering,
   since `kw_run()` returns `KW_EV_INTERRUPT` at once and the exit path
-  then honours a reschedule. Only CPU 0 yields to its host (`wasm_yield`).
+  then honours a reschedule. Every CPU yields to its own host
+  (`wasm_yield`, every 20 ms of user code, traps.c): CPU 0's serves the
+  devices, and a secondary's event loop runs the engine's housekeeping,
+  without which V8 never finishes collecting the JIT modules freed
+  there (finalizers and the collector's last pass are tasks; js.md, CPU
+  threads). Only CPU 0 also checks stdin there.
   `smp_send_stop()` parks the others (CPU 0 in `wasm_idle(-1)`, so its
   host can still take a secondary's exit). A CPU takes the stop IPI in
   `cpu_relax()` even with interrupts off, and a secondary's host raises
@@ -716,8 +721,13 @@ numbers and open issues: status.md item 8.
   refuse to start on SMP (a boot line says so). WASI's scratch buffers
   for the clock and writes are per CPU; the rest is CPU 0's.
 - **kwemu** gets a `struct kw_cpu` per CPU, with the ISA CPU 0 enabled,
-  and interprets only (the host turns the JIT off with more than one
-  CPU). Its atomics build makes AMOs, LR/SC and FENCE atomic (kwemu.md).
+  and a JIT tier per CPU: each CPU's kwemu compiles into its own
+  instance's function table through its own host (kwemu.md, JIT on
+  several harts). A `kw_cpu` is only ever used by its CPU's instance
+  (`wasm_kw_cpu` is `kw_cpus[smp_processor_id()]`, and a task that moves
+  starts afresh on the new CPU), so nothing compiled on one CPU is
+  reachable from another. Its atomics build makes AMOs, LR/SC and FENCE
+  atomic (kwemu.md).
 - **Costs** (2026-11-16, i7-10700K, Node 24, interpreter only). Each
   atomic RMW, cmpxchg or seq_cst store is a locked instruction in V8 on
   x86-64, about 4.3 ns more than the plain op, and `atomic.fence`
@@ -738,6 +748,7 @@ numbers and open issues: status.md item 8.
   loaded faults in 536 ns (3,321 when every fault waited for CPU 0's
   flush) and forks and reaps a child in 80 µs (118); exit costs 4.3 ns
   less per mapped page; one-CPU and same-CPU numbers did not move.
+  With the JIT on every CPU: kwemu.md, Numbers, SMP with the JIT.
 
 ## riscv64 user ABI
 
@@ -850,8 +861,24 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
     a thread that keeps moving arrive exactly once each; 5000 pipe and
     5000 futex round trips between two threads that keep moving keep
     their order; `/proc/kwmove` must show moves and no lost drops.
-    `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only `smp:` and
-    `move:`.
+  - `jit:` (more than one CPU online; skipped otherwise; compiled code on
+    several CPUs, kwemu.md, JIT on several harts): `hot()` and `fphot()`
+    three times each on every CPU at once (one pinned thread per CPU),
+    while the main thread sends each a signal every millisecond whose
+    handler sets FE_TOWARDZERO and raises DZ (sigreturn must undo both);
+    four threads on different CPUs increment their own byte and
+    halfword of one cache line 200000 times each beside an amoadd and
+    an LR/SC loop on the same line (no store lost); a thread in `hot()`
+    and `fphot()` whose affinity changes every 4 ms; code that CPU 1
+    calls in a loop (a compiled self-loop) rewritten 300 times by CPU 0
+    with one aligned store and `__builtin___clear_cache()`, replaced 40
+    times by `mremap()` of a prepared page over it, and made
+    non-executable 10 times by `mprotect()`: once the writer has
+    published a version, CPU 1 must never run an older one, never run
+    the code while it is not executable (it must fault), and never
+    crash.
+    `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only `smp:`,
+    `move:` and `jit:`.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).

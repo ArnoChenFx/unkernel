@@ -2012,6 +2012,373 @@ static void move_checks(void)
 	      b.released - a.released, b.resumed - a.resumed, b.moved - a.moved,
 	      b.restarted - a.restarted, b.dropped - a.dropped, b.lost - a.lost);
 }
+
+/*
+ * The JIT on SMP (more than one CPU online; kwemu.md, Several harts): each
+ * CPU's kwemu compiles what it runs hot into its own code, so these run
+ * compiled loops on several CPUs at once:
+ *  - hot() and fphot() on every CPU, each thread pinned, while the main
+ *    thread signals each of them every millisecond (the handler changes
+ *    the rounding mode and raises DZ, which sigreturn must undo): exact
+ *    results, and every thread took signals;
+ *  - plain byte and halfword stores next to AMOs and LR/SC in one cache
+ *    line, from loops that get compiled: no store may be lost;
+ *  - a thread in hot() and fphot() moved round the CPUs every 4 ms;
+ *  - code that one hart rewrites while another runs it compiled: after
+ *    the writer's __builtin___clear_cache() (riscv_flush_icache) the
+ *    runner never runs the old version again; a page replaced by
+ *    mremap() likewise (the unmap flushes); code made non-executable by
+ *    mprotect() faults.
+ */
+#define JS_MAXT 8
+#define JS_ITERS 200000
+
+static _Thread_local volatile int js_sigs;
+
+static void js_on_usr2(int sig)
+{
+	volatile double z = 0.0, d;
+
+	(void)sig;
+	fesetround(FE_TOWARDZERO);
+	d = 1.0 / z;	/* DZ: must not leak into the interrupted code */
+	(void)d;
+	js_sigs++;
+}
+
+struct js_hot {
+	pthread_t th;
+	int cpu, sigs, bad, runs;
+	volatile int done;
+};
+
+static void *js_hot_fn(void *arg)
+{
+	struct js_hot *h = arg;
+
+	if (mv_setaff(0, 1UL << h->cpu) || mv_cpu() != h->cpu)
+		h->bad++;
+	for (int r = 0; r < 3; r++) {
+		h->bad += hot(HOT_SEED) != HOT_EXPECT;
+		h->bad += fphot(HOT_SEED) != FPHOT_EXPECT;
+		h->runs++;
+	}
+	h->sigs = js_sigs;
+	h->done = 1;
+	return NULL;
+}
+
+static void js_hot_check(void)
+{
+	int n = mv.online > JS_MAXT ? JS_MAXT : mv.online, i, made = 0, bad = 0, runs = 0, minsigs = 1 << 30, left;
+	struct js_hot h[JS_MAXT];
+	struct sigaction sa = { .sa_handler = js_on_usr2 };
+	long t0 = mv_now_ms();
+
+	memset(h, 0, sizeof(h));
+	sigaction(SIGUSR2, &sa, NULL);
+	for (i = 0; i < n; i++) {
+		h[i].cpu = i;
+		made += !pthread_create(&h[i].th, NULL, js_hot_fn, &h[i]);
+	}
+	do {
+		left = 0;
+		for (i = 0; i < n; i++)
+			if (!h[i].done) {
+				pthread_kill(h[i].th, SIGUSR2);
+				left++;
+			}
+		usleep(1000);
+	} while (left && made == n);
+	for (i = 0; i < n; i++) {
+		pthread_join(h[i].th, NULL);
+		bad += h[i].bad;
+		runs += h[i].runs;
+		if (h[i].sigs < minsigs)
+			minsigs = h[i].sigs;
+	}
+	signal(SIGUSR2, SIG_DFL);
+	CHECK(made == n && !bad && runs == 3 * n && minsigs >= 3,
+	      "jit: hot() and fphot() on %d CPUs at once, 3 times each: %d bad; at least %d signals per thread, %ld ms",
+	      n, bad, minsigs, mv_now_ms() - t0);
+}
+
+static struct {
+	_Alignas(64) volatile uint8_t b[8];
+	volatile uint16_t h[4];
+	unsigned long amo, lrsc;
+	volatile int go;
+} js_line;
+
+static void *js_store_fn(void *arg)
+{
+	int i = (int)(long)arg;
+	unsigned long cpus = 0;
+
+	mv_setaff(0, 1UL << (i % mv.online));
+	while (!js_line.go)
+		;
+	for (int k = 0; k < JS_ITERS; k++) {
+		js_line.b[i]++;
+		js_line.h[i] += 3;
+		__atomic_fetch_add(&js_line.amo, 1, __ATOMIC_RELAXED);
+		if (!(k & 3)) {
+			unsigned long o = __atomic_load_n(&js_line.lrsc, __ATOMIC_RELAXED);
+
+			while (!__atomic_compare_exchange_n(&js_line.lrsc, &o, o + 1, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+				;
+		}
+		if (!(k & 8191)) {
+			int c = mv_cpu();
+
+			if (c >= 0 && c < 64)
+				cpus |= 1UL << c;
+		}
+	}
+	return (void *)cpus;
+}
+
+static void js_store_check(void)
+{
+	pthread_t th[4];
+	int i, made = 0, bad = 0;
+	unsigned long cpus = 0;
+	void *r;
+
+	memset((void *)&js_line, 0, sizeof(js_line));
+	for (i = 0; i < 4; i++)
+		made += !pthread_create(&th[i], NULL, js_store_fn, (void *)(long)i);
+	js_line.go = 1;
+	for (i = 0; i < 4; i++)
+		if (!pthread_join(th[i], &r))
+			cpus |= (unsigned long)r;
+	for (i = 0; i < 4; i++)
+		bad += js_line.b[i] != (uint8_t)JS_ITERS || js_line.h[i] != (uint16_t)(3 * JS_ITERS);
+	CHECK(made == 4 && !bad && js_line.amo == 4UL * JS_ITERS && js_line.lrsc == JS_ITERS &&
+	      cpus == (mv.online < 4 ? mv.all : 15UL),
+	      "jit: byte and halfword stores beside AMOs and LR/SC in one line, 4 threads on CPUs %#lx: %d wrong, amoadd %lu, lr/sc %lu (want %lu, %d)",
+	      cpus, bad, js_line.amo, js_line.lrsc, 4UL * JS_ITERS, JS_ITERS);
+}
+
+struct js_mig {
+	volatile int stop;
+	volatile pid_t tid;
+	int bad, rounds, moves;
+	unsigned long seen;
+};
+
+static void *js_mig_fn(void *arg)
+{
+	struct js_mig *s = arg;
+	int prev;
+
+	s->tid = syscall(SYS_gettid);
+	prev = mv_cpu();
+	while (!s->stop) {
+		int c;
+
+		s->bad += hot(HOT_SEED) != HOT_EXPECT;
+		s->bad += fphot(HOT_SEED) != FPHOT_EXPECT;
+		s->rounds++;
+		c = mv_cpu();
+		if (c >= 0 && c < 64)
+			s->seen |= 1UL << c;
+		s->moves += c != prev;
+		prev = c;
+	}
+	return NULL;
+}
+
+static void js_mig_check(void)
+{
+	struct js_mig s;
+	struct mv_stats a, b;
+	pthread_t th;
+	long end;
+	int k = 0, made;
+
+	memset(&s, 0, sizeof(s));
+	if (mv_stats_read(&a)) {
+		CHECK(0, "jit: no /proc/kwmove");
+		return;
+	}
+	made = !pthread_create(&th, NULL, js_mig_fn, &s);
+	while (made && !s.tid)
+		usleep(1000);
+	end = mv_now_ms() + 1500;
+	while (made && (mv_now_ms() < end || s.rounds < 6)) {
+		mv_setaff(s.tid, 1UL << (k++ % mv.online));
+		usleep(4000);
+	}
+	s.stop = 1;
+	if (made)
+		pthread_join(th, NULL);
+	if (mv_stats_read(&b))
+		b = a;
+	CHECK(made && !s.bad && s.rounds >= 6 && __builtin_popcountl(s.seen) >= 2 && b.moved - a.moved >= 20,
+	      "jit: hot() and fphot() %d times in a thread moved %d times (CPUs %#lx; %lu moves in /proc/kwmove): %d bad",
+	      s.rounds, k, s.seen, b.moved - a.moved, s.bad);
+}
+
+/* f(a0, a1): a1 passes of a0 += v, then return a0 (a self-loop, then ret). */
+static void js_gen(uint32_t *p, int v)
+{
+	p[0] = 0x00050513u | ((uint32_t)v << 20);	/* addi a0, a0, v */
+	p[1] = 0xfff58593u;				/* addi a1, a1, -1 */
+	p[2] = 0xfe059ce3u;				/* bne a1, zero, -8 */
+	p[3] = 0x00008067u;				/* ret */
+}
+
+#define JS_PASSES 64
+
+static struct {
+	uint32_t *volatile fn;
+	unsigned long published, calls, faults, noexec_faults, ran_noexec, stale, wrong;
+	/* odd while the code is not executable */
+	unsigned long noexec_seq;
+	int stop;
+} jx;
+static sigjmp_buf js_segv_jmp;
+
+static void js_on_segv(int sig)
+{
+	(void)sig;
+	siglongjmp(js_segv_jmp, 1);
+}
+
+/* The runner (CPU 1): calls the current code, checks the version it ran. */
+static void *js_run_fn(void *arg)
+{
+	(void)arg;
+	mv_setaff(0, 2);
+	while (!__atomic_load_n(&jx.stop, __ATOMIC_ACQUIRE)) {
+		unsigned long p0 = __atomic_load_n(&jx.published, __ATOMIC_ACQUIRE), r, p1;
+		unsigned long s0 = __atomic_load_n(&jx.noexec_seq, __ATOMIC_ACQUIRE);
+
+		if (sigsetjmp(js_segv_jmp, 1)) {
+			__atomic_fetch_add(&jx.faults, 1, __ATOMIC_RELEASE);
+			if (s0 & 1)
+				__atomic_fetch_add(&jx.noexec_faults, 1, __ATOMIC_RELEASE);
+			continue;
+		}
+		r = ((unsigned long (*)(unsigned long, unsigned long))jx.fn)(0, JS_PASSES);
+		p1 = __atomic_load_n(&jx.published, __ATOMIC_ACQUIRE);
+		/* The whole call fell into a time the code was not executable. */
+		if ((s0 & 1) && __atomic_load_n(&jx.noexec_seq, __ATOMIC_ACQUIRE) == s0)
+			jx.ran_noexec++;
+		/* Every pass ran a version from p0 to the one being written. */
+		if (r < JS_PASSES * p0)
+			jx.stale++;
+		else if (r > JS_PASSES * (p1 + 1))
+			jx.wrong++;
+		__atomic_fetch_add(&jx.calls, 1, __ATOMIC_RELEASE);
+	}
+	return NULL;
+}
+
+/* Wait until the runner made `n` more calls (its code gets compiled); 0 on a timeout. */
+static int js_wait_calls(unsigned long n)
+{
+	unsigned long c0 = __atomic_load_n(&jx.calls, __ATOMIC_ACQUIRE);
+	long end = mv_now_ms() + 5000;
+
+	while (__atomic_load_n(&jx.calls, __ATOMIC_ACQUIRE) - c0 < n)
+		if (mv_now_ms() > end)
+			return 0;
+	return 1;
+}
+
+static void js_smc_check(void)
+{
+	const int rewrites = 300, remaps = 40, noexecs = 10;
+	struct sigaction sa = { .sa_handler = js_on_segv, .sa_flags = SA_NODEFER };
+	int i, ok = 1, done_rw = 0, done_rm = 0, done_ne = 0;
+	unsigned long v = 1;
+	uint32_t *page;
+	pthread_t th;
+	long t0 = mv_now_ms();
+
+	memset(&jx, 0, sizeof(jx));
+	page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (page == MAP_FAILED) {
+		CHECK(0, "jit: cross-hart code changes: no RWX page");
+		return;
+	}
+	js_gen(page, v);
+	__builtin___clear_cache((char *)page, (char *)(page + 4));
+	jx.fn = page;
+	jx.published = v;
+	sigaction(SIGSEGV, &sa, NULL);
+	mv_setaff(0, 1);
+	if (pthread_create(&th, NULL, js_run_fn, NULL)) {
+		CHECK(0, "jit: cross-hart code changes: no thread");
+		return;
+	}
+	/* In place: one aligned store of the new addi, then the flush. */
+	for (i = 0; i < rewrites && ok; i++, done_rw++) {
+		ok = js_wait_calls(2500);
+		v++;
+		__atomic_store_n(&page[0], 0x00050513u | ((uint32_t)v << 20), __ATOMIC_RELAXED);
+		__builtin___clear_cache((char *)page, (char *)(page + 4));
+		__atomic_store_n(&jx.published, v, __ATOMIC_RELEASE);
+	}
+	/* A new page at the same address (mremap moves a prepared one over it). */
+	for (i = 0; i < remaps && ok; i++, done_rm++) {
+		uint32_t *q = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		ok = js_wait_calls(2500) && q != MAP_FAILED;
+		if (!ok)
+			break;
+		js_gen(q, ++v);
+		/* MREMAP_MAYMOVE | MREMAP_FIXED (mremap() needs _GNU_SOURCE) */
+		if ((void *)syscall(SYS_mremap, q, 4096, 4096, 1 | 2, page) != page) {
+			ok = 0;
+			break;
+		}
+		__atomic_store_n(&jx.published, v, __ATOMIC_RELEASE);
+	}
+	/* Not executable any more: the runner must fault (and then run again). */
+	for (i = 0; i < noexecs && ok; i++, done_ne++) {
+		unsigned long f0;
+		long end;
+
+		ok = js_wait_calls(2500);
+		mprotect(page, 4096, PROT_READ | PROT_WRITE);
+		f0 = __atomic_load_n(&jx.noexec_faults, __ATOMIC_ACQUIRE);
+		__atomic_fetch_add(&jx.noexec_seq, 1, __ATOMIC_RELEASE);
+		end = mv_now_ms() + 5000;
+		while (__atomic_load_n(&jx.noexec_faults, __ATOMIC_ACQUIRE) - f0 < 3 && ok)
+			ok = mv_now_ms() < end;
+		__atomic_fetch_add(&jx.noexec_seq, 1, __ATOMIC_RELEASE);
+		mprotect(page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+	}
+	__atomic_store_n(&jx.stop, 1, __ATOMIC_RELEASE);
+	pthread_join(th, NULL);
+	signal(SIGSEGV, SIG_DFL);
+	mv_setaff(0, mv.all);
+	munmap(page, 4096);
+	CHECK(ok && !jx.stale && !jx.wrong && !jx.ran_noexec && done_rw == rewrites && done_rm == remaps && done_ne == noexecs,
+	      "jit: code run on CPU 1, changed on CPU 0: %d rewrites + flush, %d mremaps, %d mprotects to no-exec; "
+	      "%lu calls: %lu stale, %lu wrong, %lu ran while not executable, %lu faults; %ld ms",
+	      done_rw, done_rm, done_ne, jx.calls, jx.stale, jx.wrong, jx.ran_noexec, jx.faults, mv_now_ms() - t0);
+}
+
+static void jit_smp_checks(void)
+{
+	mv.online = sysconf(_SC_NPROCESSORS_ONLN);
+	if (mv.online < 2) {
+		printf("ok   jit: one CPU online (SMP checks skipped)\n");
+		return;
+	}
+	if (mv.online > 63)
+		mv.online = 63;
+	mv.all = (1UL << mv.online) - 1;
+	js_hot_check();
+	js_store_check();
+	js_mig_check();
+	js_smc_check();
+	mv_setaff(0, mv.all);
+}
 #endif /* __riscv */
 
 static void *hot_thread(void *arg)
@@ -2040,6 +2407,7 @@ int main(int argc, char **argv)
 		mount("proc", "/proc", "proc", 0, NULL);
 		smp_checks();
 		move_checks();
+		jit_smp_checks();
 		goto done;
 	}
 #endif
@@ -2158,6 +2526,7 @@ int main(int argc, char **argv)
 	park_checks();
 	smp_checks();
 	move_checks();
+	jit_smp_checks();
 #endif
 
 done:

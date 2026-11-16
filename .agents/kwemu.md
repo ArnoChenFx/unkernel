@@ -86,13 +86,15 @@ harness).
   atomic load costs nothing extra. Node 24, i7-10700K, 2026-11-16, a
   loop of each on a shared memory). Without the
   option all of them stay single-hart (a plain read-modify-write; FENCE a
-  no-op op). The JIT leaves AMOs and LR/SC to the interpreter already;
-  an SMP host runs the interpreter only.
+  no-op op). The JIT runs on every hart (JIT on several harts, below).
 - **Precise state.** Ops update `kw_regs` directly. On a fault mid-block,
   pc is recomputed from the raw instruction lengths and the budget is
   refunded. `icount` and the budget are exact, because a block that does
   not fit the remaining budget is single-stepped. `*irq_pending` is polled
-  at every block end.
+  at every block end. An interpreted self-loop that an interrupt ends
+  still counts its passes towards the compile threshold (`loopDone`):
+  under a stream of IPIs (a thread flushing TLBs on another CPU) a hot
+  loop otherwise never got compiled.
 - **Memory fast path.** One compare per access: the TLB entry holds
   `tag = vpn` and `add = host - va`, and the tag is compared against the
   vpn of the access's last byte, so page-straddling accesses fall into the
@@ -594,6 +596,97 @@ left from.
 - Flushes, `kw_set_pgd` and FENCE.I only retire generations. Revalidated
   members keep their code, and the tests check that nothing is recompiled.
 
+### JIT on several harts (SMP)
+
+An SMP kernel (kernel.md, SMP) runs one instance of the module per CPU, in
+its own thread, on one shared memory. The JIT is per CPU:
+
+- **Per-CPU code.** Each CPU has its own `struct kw_cpu` (block cache,
+  TLBs, slot pool, emit buffer) and its own instance with its own
+  `__indirect_function_table`; `kw_cpu_init` on that CPU asks that CPU's
+  host for the caps, and `kw_host_jit_compile`/`free` act on that table.
+  A `kw_cpu` is used only by its own CPU (the kernel's `wasm_kw_cpu` is the
+  running CPU's, and a task that moves starts afresh on the new CPU), so
+  a slot or module of one CPU is never reachable from another. A task
+  that moves finds a cold cache there and compiles again what is hot.
+  Sharing modules between CPUs is not built: it would need a module to
+  be instantiated in every CPU's thread (a `WebAssembly.Module` can be
+  posted, an instance cannot), a slot installed in every table before
+  any CPU enters it, and a free that waits until no CPU runs the module,
+  for a gain only where several CPUs run the same hot code.
+- **Interrupts.** Compiled code polls the `irqp` it is called with, which
+  `enter` takes from the CPU's own `irq_pending` at every call (nothing
+  is baked into a module), at every self-loop back edge and member
+  entry, as on one hart. With a shared memory (caps bit 3) the load is
+  `i32.atomic.load`: a plain load in a loop that stores nothing may be
+  hoisted, and another CPU's IPI (a TLB shootdown waits for the answer)
+  would then never be seen. Nothing in compiled code waits for another
+  CPU.
+- **Compiles stall the CPU.** `new WebAssembly.Module` (and V8's lazy
+  first-call compile) run on the CPU's thread inside `kw_run`, so a CPU
+  that compiles answers an IPI only afterwards, and a CPU waiting for it
+  spins. Measured (Numbers, SMP with the JIT): a compile takes about
+  0.1 ms plus V8's first-call compile, a CPU compiling without pause
+  delays 0.1% of the answers by more than 98 µs, and a realistic
+  workload compiles a few hundred modules per CPU and run. Not
+  mitigated. The cheapest mitigation would be the lazy-TLB argument of
+  tlb.c: kwemu sets a word in `struct kw_cpu` around the host call, a
+  flusher that sees it (Dekker pairing with `smp_mb()` on both sides)
+  marks the CPU stale instead of waiting, and kwemu, seeing the mark
+  after the compile, flushes everything and goes back to `run`'s lookup
+  before it executes anything (a compile reads only `kw_cpu`, never
+  guest memory or page tables, and the block being compiled must be
+  looked up again). It needs an ABI change and covers only IPIs that
+  are TLB flushes; V8's first-call compile happens in the call into the
+  module, outside that window, unless the host compiles eagerly.
+- **Flushes** retire generations on each CPU, as on one hart: the kernel
+  sends `flush_tlb_*()` to every CPU that has the mm loaded and waits,
+  marks a CPU in lazy TLB mode stale (it flushes everything when it
+  takes the mm again, before any user code), and `riscv_flush_icache`
+  (with any flags) flushes every CPU and waits. A flushed CPU revalidates
+  each block before it runs it again (same pc, host address and raw
+  bits), and a block that was rewritten or moved to another page is
+  decoded again and its code freed (`drop`).
+- **Code changed by another hart** (its stores or `cbo.zero`) is seen by
+  a hart after that hart's FENCE.I, after
+  `riscv_flush_icache()` (any flags: it flushes every CPU and returns
+  only when all have), and after any unmap, remap or permission change
+  of the page (the shootdown completes before the call returns), as on
+  RISC-V hardware with Linux; until then the hart may keep running the
+  old instructions, decoded or compiled. That is what Linux on hardware
+  promises, so cross-modifying guests already call it: musl's and
+  glibc's `__riscv_flush_icache()` and the compilers'
+  `__builtin___clear_cache()` are that system call (JITs in the guest
+  were not checked one by one; kwtest's `jit:` rewrite check is the
+  test). `SYS_RISCV_FLUSH_ICACHE_LOCAL` is treated as a global flush,
+  which is stronger than Linux. Stores into decoded code on the same
+  hart are still seen at the next instruction. Safety holds regardless of timing: decoded blocks
+  and compiled code hold no host addresses (compiled code reaches guest
+  memory only through this CPU's data TLB, filled from the current page
+  table), so stale code only runs old guest instructions with current
+  translations. Each instruction is decoded from one load of its bits
+  (a 32-bit instruction in a page is one aligned load), so a rewrite of
+  an aligned instruction is seen whole (Ziccif) and a block may mix old
+  and new instructions only at instruction boundaries.
+- **Atomics.** AMOs, LR/SC, FENCE, FENCE.TSO and PAUSE (all `generic` in
+  an atomics build) and `cbo.*` are handed back to the interpreter, which
+  does them atomically (above); no fusion, region or helper emits any of
+  them, and the reservation lives in the CPU's `Hart` (cleared at every
+  switch by the kernel), never in compiled code. wrs.nto/wrs.sto stay
+  no-ops (the spec lets them return at once). Every guest load or store
+  is one wasm load or store of its width (`i32.store8`, `i64.store`,
+  ...); a misaligned one inside a page is one unaligned access (RVWMO
+  does not make misaligned accesses atomic), and one that straddles a
+  page is handed back. No `memory.copy` or `memory.fill` is emitted.
+- **Task switches.** Compiled code writes registers, FP registers and
+  `fcsr` back at its single exit and returns to `run` before the kernel
+  can run, so a task's state is in `kw_regs` whenever it can be switched
+  out or moved; `jit.cur` is scratch for one call.
+- **Host.** Each CPU's thread has its own `JitHost` (js.md, CPU
+  threads), whose counters CPU 0's host reads; it yields to its event
+  loop every 20 ms of user code, without which V8 never finished
+  collecting freed modules there.
+
 ### Host contract
 
 These imports exist only with `-Dkwemu-jit`. The kernel host is
@@ -601,7 +694,7 @@ These imports exist only with `-Dkwemu-jit`. The kernel host is
 
 | Import | |
 | --- | --- |
-| `kw_host_jit_caps() -> u32` | bit 0 = JIT available (0: never compile), bit 1 = 32-bit memory (lowered kernel: the code imports a 32-bit `env.memory` and wraps addresses), bit 2 = eager, bit 3 = shared memory (the code declares its `env.memory` import shared, with a maximum of 65536 pages for memory32 and 262144 for memory64; the host sets it when the kernel's memory is a SharedArrayBuffer). Called once, from `kw_cpu_init`. |
+| `kw_host_jit_caps() -> u32` | bit 0 = JIT available (0: never compile), bit 1 = 32-bit memory (lowered kernel: the code imports a 32-bit `env.memory` and wraps addresses), bit 2 = eager, bit 3 = shared memory (the code declares its `env.memory` import shared, with a maximum of 65536 pages for memory32 and 262144 for memory64, and reads `*irqp` with `i32.atomic.load`; the host sets it when the kernel's memory is a SharedArrayBuffer). Called once, from `kw_cpu_init`, by each CPU on its own host. |
 | `kw_host_jit_compile(ptr, len, slot) -> i32` | Compile the module at `ptr` (it imports `env.memory` and exports `f`) synchronously with `new WebAssembly.Module` and `table.set` its `f` into `slot` (a BigInt index for table64). 0 = installed, < 0 = failed (slot untouched, and that block is never compiled). |
 | `kw_host_jit_free(slot)` | Put back the stub that was there before the first compile, and drop the module. |
 
@@ -722,8 +815,15 @@ that long instead of the ~0.25 ms compiling takes (Rejected designs).
   (musl is built with it too). Each prints a digest that
   `test/kwemu-test.mjs` checks against the value `qemu-riscv64-static -cpu
   rv64,<ext>=true,...` prints.
-- In the kernel: kwtest's JIT and ISA checks (kernel.md), kwbench
-  `--stats`, and Alpine outputs compared with `--no-jit`.
+- `kwemu jit: compile threshold counts self-loop passes that an interrupt
+  ends`: a self-loop that rings its own doorbell every 64 passes must be
+  compiled after the threshold's worth of passes (dropping `loopDone` on
+  the interrupt path is caught).
+- In the kernel: kwtest's JIT and ISA checks (kernel.md), on an SMP
+  kernel its `jit:` checks (compiled loops on every CPU, stores beside
+  atomics, moves, code changed by another CPU), kwbench `--stats`, and
+  Alpine outputs compared with `--no-jit`. With a `-Dkwemu-stats` SMP
+  kernel the CLI's `--stats` prints kwemu's counters per CPU.
 
 ## Numbers
 
@@ -908,6 +1008,57 @@ mem and fp flat. Interpreted, `shadd` costs more than `add`, so
 dispatch-bound loops can get slightly slower with fewer instructions.
 Alpine's node with `--riscv-b-extension`: an integer JS benchmark -6.5%
 (clz/popcount/min/max loop -26%).
+
+**SMP with the JIT** (2026-11-16, Node 24.22.1, 16-core host, lowered
+kernels; kernel.md, SMP). kwbench and an Alpine shell per config in a
+random order per round, 12 rounds, medians [IQR]; "UP" is the UP build,
+"SMP 1" the SMP build on one CPU:
+
+| metric | UP | SMP 1 | SMP 2 | SMP 4 |
+| --- | ---: | ---: | ---: | ---: |
+| int loop, MIPS | 4087 [4020-4120] | 4002 [3980-4030] | 4006 [3950-4020] | 4016 [3980-4060] |
+| mem loop, MB/s | 2382 [2300-2430] | 2204 [2120-2220] | 2135 [2090-2170] | 2185 [2130-2210] |
+| fp loop, Miter/s | 55.4 [55.1-55.6] | 55.3 [53.9-55.4] | 55.0 [54.6-55.2] | 55.2 [55.0-55.3] |
+| getppid, µs | 0.13 | 0.13 | 0.13 | 0.13 |
+| clock_gettime, ns | 349 [338-374] | 416 [403-425] | 436 [429-451] | 439 [423-449] |
+| fork+exit+wait, ms | 0.13 | 0.19 | 0.23 | 0.25 |
+| spin loop, 1 thread, s | 1.097 | 1.159 | 1.157 | 1.151 |
+| spin loop, N threads (N = CPUs), s | | | 1.161 | 1.173 |
+| `kwjob 1`, s | 13.42 | 13.84 | 13.96 | 13.47 |
+| `kwjob N` (N = CPUs), s | | | 14.38 | 14.15 |
+
+Compiled code costs the same on every CPU count (int and fp within the
+IQRs; mem -7% on the SMP build, from its atomics). The kernel-side costs
+(clock, fork) are the SMP build's, as with the interpreter (kernel.md,
+Costs). Parallel compiled loops scale linearly: N threads of the spin loop
+(`kwpar`, 400M iterations each) take as long as one, 1.99x on 2 CPUs and
+3.93x on 4. `kwjob N` (N parallel copies of gzip -6, bzip2 -1 and an awk
+sqrt loop over an 8 MiB tar, digests identical in every run and with
+`--no-jit`) is 1.94x on 2 CPUs and 3.81x on 4. kwtest's compiled parts
+on CPU 1 (a `-Dkwemu-stats` kernel): 1.05 G instructions, 84% compiled
+(CPU 0 88%).
+
+- **IPI answers** (`kwipi`, scratch tool in `vendor/smp-deferred/tools`:
+  CPU 0 mprotects a touched page of the mm back and forth for 15 s, each
+  call a shootdown that waits for CPU 1): with CPU 1 in a compiled
+  self-loop the call takes p50 1.8 µs, p99 3.3, p99.99 74 (interpreted
+  2.0 / 3.8 / 210; CPU 1 making getppid calls 1.9 / 3.8 / 64; CPU 1 idle
+  and not waited for, lazy TLB, 1.3 / 2.4 / 60). Single calls of about
+  1 ms in every mode are the host's scheduling.
+- **Compile stalls.** In the same tool with CPU 1 compiling all the time
+  (8192 generated functions called in turn, each just past the threshold:
+  80,304 compiles in 60 s, 4.2 s of them in `new Module` + `new
+  Instance`), the shootdown takes p99.9 98 µs, p99.99 290 µs, at most
+  23 ms (569 calls over 1 ms, 8 over 10 ms, from collections in the
+  nudge path). Realistic workloads compile far less: `kwjob 2` 322 and
+  351 modules on CPU 0 and 1 (0.10-0.11 ms each, longest 0.37 ms);
+  4 minutes of kwstorm + kwmmstress on 2 CPUs about 5000 per CPU
+  (0.08 ms each). V8's lazy first-call compile adds about 16 µs +
+  30 µs/KiB (5.3 KiB on average here) inside the first call.
+- **Host memory** (peak RSS of the CLI process after `kwjob N` on N CPUs,
+  JIT vs `--no-jit`): 1 CPU 244 vs 193 MiB, 2 CPUs 365 vs 300, 4 CPUs 457
+  vs 394. A CPU's thread costs about 100 MiB with or without the JIT;
+  per-CPU modules add little, since each CPU keeps at most 1024.
 
 **Sizes** (2026-11-14). `kwemu.o` is about 363 KB with the JIT. Every op
 kind adds dispatch code, extension helpers are inlined into the op

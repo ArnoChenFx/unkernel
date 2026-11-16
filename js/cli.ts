@@ -18,7 +18,7 @@ import { decodeSnapshot, encodeSnapshot, type KernelSnapshot } from "./core/snap
 import { bundledBoot, moduleIsMemory64, type ExitResult } from "./core/kernel.ts";
 import type { MountsOption } from "./core/mounts.ts";
 import { NetStack } from "./core/net.ts";
-import type { KwemuStats } from "./core/jit.ts";
+import type { JitStats, KwemuStats } from "./core/jit.ts";
 import { createImageFromKwsparse, openDisk } from "./node/disk.ts";
 import { directBackend, wispBackend } from "./node/net.ts";
 import { nodeFs } from "./node/nodefs.ts";
@@ -85,8 +85,8 @@ shared memory. PCM and everything else are messages either way.
 
 --smp N gives an SMP kernel (one built with CONFIG_SMP: kw_smp.config)
 N CPUs, each another instance of the kernel in its own thread on a shared
-memory; it implies --worker and the interpreter only (--no-jit). A UP kernel
-runs on one CPU (a log line says so). An SMP kernel has no disks, display,
+memory, each with its own JIT; it implies --worker, and --stats prints the
+JIT counters per CPU. A UP kernel runs on one CPU (a log line says so). An SMP kernel has no disks, display,
 input, sound or shm yet (its drivers say so at boot), and no snapshots.
 
 --display gives the guest a display: /dev/fb0 (kwfb, 32 bpp XRGB8888), whose
@@ -552,13 +552,20 @@ function finish(res: ExitResult): never {
 			`switches ${s.switches}, idles ${s.idles}, yields ${s.yields}\n`);
 		if (s.display) process.stderr.write(`[host] display: ${s.display.attaches} attaches (opens and mode changes), ${s.display.detaches} closes\n`);
 		if (s.evdev) process.stderr.write(`[host] evdev: ${s.evdev.delivered} events delivered, ${s.evdev.dropped} dropped\n`);
-		const j = s.jit;
-		process.stderr.write(!j.requested ? "[host] jit: not in this kernel\n" : !j.enabled ? "[host] jit: off\n"
-			: `[host] jit: ${j.compiled} compiled, ${j.live} live (max ${j.maxLive}), ${j.freed} freed, ${j.failed} failed, ` +
-				`${j.compileMs.toFixed(0)} ms compiling ${(j.bytes / 1024).toFixed(0)} KiB; ` +
+		const jitLine = (who: string, j: JitStats) => process.stderr.write(!j.requested ? `[host] ${who}: not in this kernel\n` : !j.enabled ? `[host] ${who}: off\n`
+			: `[host] ${who}: ${j.compiled} compiled, ${j.live} live (max ${j.maxLive}), ${j.freed} freed, ${j.failed} failed, ` +
+				`${j.compileMs.toFixed(0)} ms compiling ${(j.bytes / 1024).toFixed(0)} KiB (longest ${j.maxCompileMs.toFixed(2)} ms); ` +
 				(j.collected < 0 ? "collection not tracked\n"
 					: `${j.collected} collected, ${j.retained} freed but uncollected (max ${j.maxRetained}), ${j.gcNudges} GC nudges, ${j.refused} refused\n`));
-		if (s.kwemu) printKwemuStats(s.kwemu);
+		jitLine("jit", s.jit);
+		s.jitCpus?.forEach((j, i) => jitLine(`jit cpu${i}`, j));
+		if (s.kwemuCpus) {
+			s.kwemuCpus.forEach((k, i) => {
+				if (!k) return;
+				process.stderr.write(`[kwemu] cpu${i}:\n`);
+				printKwemuStats(k);
+			});
+		} else if (s.kwemu) printKwemuStats(s.kwemu);
 		if (diskCount()) {
 			const b = s.block;
 			process.stderr.write(`[host] block: ${b.reads} reads (${(b.bytesRead / 1048576).toFixed(1)} MiB), ` +

@@ -1590,6 +1590,33 @@ test "kwemu jit: compile threshold counts retired instructions, self-loop passes
     try checkJitSlots(&m);
 }
 
+test "kwemu jit: compile threshold counts self-loop passes that an interrupt ends" {
+    var m = try Machine.init();
+    defer m.deinit();
+    jitMode(&m, .threshold, 4000);
+    // 5-insn self-loop that rings the doorbell every 64th pass (IPIs on SMP
+    // end interpreted self-loops that often):
+    //   x5 += 1; x9 = x5 & 63; x9 = x9 == 0; sw x9,0(x7); j loop
+    const data = m.frame();
+    m.map(0x70000, data, R | W | U | A | D);
+    const word: *u32 = @ptrCast(@alignCast(m.bytes(data).ptr));
+    m.cpu.irq_pending = word;
+    m.regs.x[7] = 0x70000;
+    _ = m.code(0x10000, &.{ addi(5, 5, 1), itype(0x13, 7, 9, 5, 63), itype(0x13, 3, 9, 9, 1), sw(9, 7, 0), jal(0, -16) });
+    // 64 passes per run, so 320 instructions: the threshold is reached
+    // in the 13th run, and only if the passes before each interrupt count.
+    for (1..41) |i| {
+        word.* = 0;
+        try t.expectEqual(@as(u32, EV_INTERRUPT), m.run(1 << 40));
+        try t.expectEqual(@as(u64, 64 * i), m.regs.x[5]);
+        try t.expectEqual(@as(u64, 5 * 64 * i), m.cpu.icount);
+        try t.expectEqual(@as(u64, 0x10000), m.regs.pc);
+        if (i == 12) try t.expectEqual(@as(u64, 0), jitStat(&m, "compiles"));
+    }
+    if (jit_on) try t.expectEqual(@as(u64, 1), jitStat(&m, "compiles"));
+    try checkJitSlots(&m);
+}
+
 test "kwemu jit: resetCache frees every slot" {
     var m = try Machine.init();
     defer m.deinit();

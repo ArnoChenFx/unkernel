@@ -1,4 +1,4 @@
-From bd63eb2865c44fd2b1a236ff9ade3b704c7e1617 Mon Sep 17 00:00:00 2001
+From b9ce96ff68930cb65635f560516defa8f73d84d0 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -52,7 +52,10 @@ CPU uses any more), and the uaccess walk and copy have no poll point
 between them, so pages freed after a shootdown are never copied
 into. kwemu gets its own state per CPU (8 MiB from memblock
 for the secondaries), the WASI clock and write buffers are per CPU,
-and only CPU 0 yields to its host. Parking (KW_PARK) is off.
+and every CPU yields to its own host every 20 ms of user code: CPU 0's
+serves the devices, the others' event loops run the engine's
+housekeeping (collecting the modules kwemu's JIT freed on that CPU).
+Parking (KW_PARK) is off.
 
 kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
 ---
@@ -87,11 +90,11 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/kernel/smp.c               | 169 ++++++++++++++++
  arch/wasm/kernel/sys_riscv.c         |   6 +-
  arch/wasm/kernel/time.c              |  54 ++++-
- arch/wasm/kernel/traps.c             |  27 ++-
- arch/wasm/kernel/wasi.c              |  36 +++-
+ arch/wasm/kernel/traps.c             |  26 ++-
+ arch/wasm/kernel/wasi.c              |  41 +++-
  arch/wasm/mm/fault.c                 |  39 +++-
  arch/wasm/mm/tlb.c                   | 236 +++++++++++++++++++++-
- 35 files changed, 1390 insertions(+), 55 deletions(-)
+ 35 files changed, 1395 insertions(+), 54 deletions(-)
  create mode 100644 arch/wasm/configs/kw_smp.config
  create mode 100644 arch/wasm/include/asm/kwcpu.h
  create mode 100644 arch/wasm/include/asm/smp.h
@@ -1770,7 +1773,7 @@ index 52a4707efc1..dc8e6f8c3e4 100644
  }
 +#endif
 diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
-index f1deec5f5b3..a6fd18c756f 100644
+index f1deec5f5b3..b439f07ef39 100644
 --- a/arch/wasm/kernel/traps.c
 +++ b/arch/wasm/kernel/traps.c
 @@ -16,12 +16,11 @@
@@ -1800,21 +1803,20 @@ index f1deec5f5b3..a6fd18c756f 100644
  
  int show_unhandled_signals = 1;
  
-@@ -96,7 +100,12 @@ static void do_user_interrupt(struct pt_regs *regs)
+@@ -96,6 +100,12 @@ static void do_user_interrupt(struct pt_regs *regs)
  {
  	u64 now = wasm_cpu_clock_get_monotonic();
  
--	if (now - last_yield_ns >= KW_YIELD_NS) {
 +	/*
-+	 * SMP: only CPU 0's host has an event loop to serve (the devices);
-+	 * the others never yield.
++	 * SMP: every CPU yields to its own host. CPU 0's serves the devices;
++	 * the others' event loops run the engine's housekeeping, without
++	 * which modules the JIT freed are never collected (finalizers and
++	 * the collector's last pass run as tasks there).
 +	 */
-+	if ((!IS_ENABLED(CONFIG_SMP) || !smp_processor_id()) &&
-+	    now - last_yield_ns >= KW_YIELD_NS) {
+ 	if (now - last_yield_ns >= KW_YIELD_NS) {
  		wasm_yield();
  		last_yield_ns = wasm_cpu_clock_get_monotonic();
- 	}
-@@ -121,8 +130,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+@@ -121,8 +131,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
  		if (unlikely(READ_ONCE(kw_park_users)))
  			kw_park_user();
  
@@ -1835,7 +1837,7 @@ index f1deec5f5b3..a6fd18c756f 100644
  		local_irq_disable();
  
 diff --git a/arch/wasm/kernel/wasi.c b/arch/wasm/kernel/wasi.c
-index f96cf96b2cf..bdd5d6ee26b 100644
+index f96cf96b2cf..62c43ddb405 100644
 --- a/arch/wasm/kernel/wasi.c
 +++ b/arch/wasm/kernel/wasi.c
 @@ -4,12 +4,13 @@
@@ -1905,6 +1907,18 @@ index f96cf96b2cf..bdd5d6ee26b 100644
  }
  
  ssize_t wasm_console_read(u8 *buf, size_t count)
+@@ -231,6 +247,11 @@ void wasm_idle(long long timeout_ns)
+ void wasm_yield(void)
+ {
+ 	wasi_sched_yield();
++#ifdef CONFIG_SMP
++	/* Only CPU 0's host has stdin (and takes the console interrupt). */
++	if (smp_processor_id())
++		return;
++#endif
+ 	/* A host that cannot raise WASM_IRQ_CONSOLE by itself (plain WASI). */
+ 	if (wasi_stdin_ready())
+ 		wasi_raise_console_irq();
 diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
 index 4dada661636..6b5275b2f03 100644
 --- a/arch/wasm/mm/fault.c

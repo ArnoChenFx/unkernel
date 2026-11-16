@@ -1201,6 +1201,20 @@ const Emit = struct {
         e.uleb(alignment);
         e.uleb(off);
     }
+    /// Push *irqp (the CPU's word of pending interrupts). With a shared
+    /// memory another CPU sets it (an IPI: a TLB shootdown waits for the
+    /// answer), so the load is atomic (i32.atomic.load, a plain load on
+    /// x86-64 and arm64): an engine may hoist a plain load out of a loop
+    /// that stores nothing, which would leave a compiled self-loop deaf.
+    fn irqWord(e: *Emit) void {
+        e.get(l_irq);
+        e.addr();
+        if (e.shared) {
+            e.ops(&.{ 0xfe, 0x10 }); // i32.atomic.load
+            e.uleb(2);
+            e.uleb(0);
+        } else e.mem(W.i32_load, 2, 0);
+    }
     fn open(e: *Emit, kind: u8, bt: u8) void {
         e.op(kind);
         e.op(bt);
@@ -1399,9 +1413,7 @@ fn emitModule(cpu: *Cpu, b: *const Block, rg: ?*Region, limit: *usize) Error!usi
 /// Self-loop back edge: stop (pc = block start, done) on a pending
 /// interrupt or when the budget does not cover another pass.
 fn backEdge(e: *Emit, b: *const Block) void {
-    e.get(l_irq);
-    e.addr();
-    e.mem(W.i32_load, 2, 0);
+    e.irqWord();
     e.get(l_jl);
     e.k64(b.ninsn);
     e.op(W.i64_lt_u);
@@ -3898,9 +3910,7 @@ fn targetIf(e: *Emit, rg: *Region, t: usize) void {
 fn toMember(e: *Emit, rg: *Region, t: usize) void {
     if (t == rg.cur) {
         const b = rg.block(t);
-        e.get(l_irq);
-        e.addr();
-        e.mem(W.i32_load, 2, 0);
+        e.irqWord();
         e.get(l_jl);
         e.k64(b.ninsn);
         e.op(W.i64_lt_u);
@@ -3931,9 +3941,7 @@ fn toMember(e: *Emit, rg: *Region, t: usize) void {
 fn checkedEntry(e: *Emit, rg: *Region, m: usize) void {
     const b = rg.block(m);
     const at = blocks_off + @as(u64, rg.idx[m]) * @sizeOf(Block);
-    e.get(l_irq);
-    e.addr();
-    e.mem(W.i32_load, 2, 0);
+    e.irqWord();
     e.get(l_jl);
     e.k64(b.ninsn);
     e.op(W.i64_lt_u);

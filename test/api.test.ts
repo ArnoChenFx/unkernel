@@ -437,7 +437,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal(on.st.refused, 0);
 		assert.ok(on.st.collected >= 0 && on.st.retained === on.st.freed - on.st.collected, JSON.stringify(on.st));
 		assert.deepEqual({ ...off.st, compileMs: 0 }, {
-			enabled: false, requested: true, compiled: 0, live: 0, maxLive: 0, freed: 0, failed: 0, compileMs: 0, bytes: 0,
+			enabled: false, requested: true, compiled: 0, live: 0, maxLive: 0, freed: 0, failed: 0, compileMs: 0, maxCompileMs: 0, bytes: 0,
 			collected: 0, retained: 0, maxRetained: 0, gcNudges: 0, refused: 0,
 		});
 		assert.ok(on.sum && on.sum === off.sum, `same sha256 with and without the JIT: ${on.sum} vs ${off.sum}`);

@@ -175,6 +175,25 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    minutes on 2 and 4 CPUs beside kwstorm with no error; with the flush
    on return from lazy mode removed it reports stale reads and writes
    within seconds. The scratch tools are in `vendor/smp-deferred/tools`.
+   Step 4, the JIT on SMP (2026-11-16; kwemu.md, JIT on several harts):
+   each CPU's kwemu compiles into its own instance's table through a
+   JIT host of its own in that CPU's thread, so the JIT now runs with
+   any number of CPUs (it was off because only CPU 0's host had one).
+   Every CPU now yields to its host every 20 ms of user code, without
+   which V8 never finished collecting freed modules on a secondary (the
+   JIT host nudged with up to 4 GiB allocations, a shootdown once waited
+   0.58 s, and compiles would have been refused after 2048 frees);
+   compiled code reads the interrupt word atomically; an interpreted
+   self-loop that an interrupt ends counts towards the compile
+   threshold (under a stream of IPIs hot loops never compiled). kwtest
+   with the JIT passes on 2 CPUs (20 of 20) and 4 (10 of 10), with its
+   new `jit:` checks (compiled loops on every CPU under signals, stores
+   beside atomics, moves, code changed by another CPU), and so do the
+   4-minute kwstorm + kwmmstress and kwstorm + kwtlb runs on 2 and 4
+   CPUs. Parallel compiled loops scale 1.99x on 2 CPUs and 3.93x on 4,
+   gzip/bzip2/awk jobs 1.94x and 3.81x; compiled code runs as fast as
+   on the UP build (kwemu.md, Numbers). Shootdown answers from a CPU in
+   compiled code take 1.8 µs at the median.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -191,8 +210,17 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      input and sound paths likewise.
    - Parking and snapshots: off (`KW_PARK` depends on `!SMP`; kernel.md,
      Parking lists what they would need).
-   - The JIT: off with more than one CPU (per-CPU tables, atomic AMOs in
-     compiled code, cross-hart code tracking).
+   - JIT on SMP, what is left: a synchronous compile delays that CPU's
+     answer to IPIs (not mitigated; kwemu.md, JIT on several harts,
+     describes the cheapest fix); modules are not shared between CPUs,
+     so a task that moves compiles its hot code again; FENCE and PAUSE
+     are handed back to the interpreter on SMP (an atomic RMW in
+     compiled code would do); under host oversubscription a CPU that
+     waits for another (a shootdown, a cross-CPU call) spins while that
+     CPU's thread is descheduled (kwtest's move ping-pong took 19 s
+     instead of 0.26 s while a `make -j16` and the JIT fuzz ran beside
+     it; seen with the JIT, though nothing in the cause is specific to
+     it).
    - Browsers: not tried. They need cross-origin isolation, a worker for
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message

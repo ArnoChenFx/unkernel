@@ -88,10 +88,30 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    medians of 15 alternating runs): page faults +21% (458 to 562 ns) and
    kwbench's fork of an 8 MiB process +31%, both from the kernel's
    atomic RMW instructions (kwemu built with atomics alone costs
-   nothing, and making `atomic_read`/`atomic_set` plain did not help);
-   sharing the memory adds nothing measurable beyond that. Syscalls,
-   pipes, futex wake and user code are within noise. The lowered kernel
-   is 41 KB smaller (9 KB gzip). Open: `__wasm_init_memory_flag` sits
+   nothing); sharing the memory adds nothing measurable beyond that.
+   Syscalls, pipes, futex wake and user code are within noise. The
+   lowered kernel is 41 KB smaller (9 KB gzip).
+   Where the cost is (2026-11-16, i7-10700K, Node 24): V8 compiles every
+   atomic RMW, cmpxchg and seq_cst atomic store to a locked instruction,
+   about 4 ns each (0.2 for the plain op, 7 ns for `atomic.fence`, +0.1
+   for an atomic load), shared memory or not. Counted per site by
+   wrapping each atomic instruction of the lowered module in an
+   exported counter, an anonymous write fault did 20 locked ops, its
+   munmap 10 per page and a fork+exit of an 8 MiB process about 8,750
+   (4 per page: refcount and mapcount, copied and dropped); count × 4
+   ns is the whole slowdown. Plain `atomic_read`/`atomic_set` (they are
+   relaxed) and no `folio_ref_add(folio, 0)` (two patches) bring the
+   fault to 16 locked ops and 469 ns, from 482 (414 without atomics;
+   medians of 15 runs of a 400k-fault loop). Of the rest, 8 per fault
+   and 8 per munmapped page are UP vmstat (`zone_page_state_add` and
+   friends, two `atomic_long_add`s per update), which an SMP config keeps
+   in per-cpu diffs instead: with those plain (an experiment, not in the
+   tree) a fault costs +7% and munmap +11% over base. The other 8
+   (mmap_lock trylock and unlock, LRU-batch refcount, freeze and flags,
+   `SetPageAnonExclusive`) are needed on SMP, which also adds spinlocks
+   (PTE lock, pcp lock: about 4 more locked ops per fault). Fork stays
+   at +33% unless folios grow beyond a page.
+   Open: `__wasm_init_memory_flag` sits
    after `_end`, in memory the kernel hands out, so a second instance
    (a secondary CPU) would read a stale flag; browsers were not tried
    (block, display and sound views of a shared memory are unchecked).

@@ -625,7 +625,8 @@ its own thread, on one shared memory. The JIT is per CPU:
 - **Compiles stall the CPU.** `new WebAssembly.Module` (and V8's lazy
   first-call compile) run on the CPU's thread inside `kw_run`, so a CPU
   that compiles answers an IPI only afterwards, and a CPU waiting for it
-  spins. Measured (Numbers, SMP with the JIT): a compile takes about
+  spins for 20 µs and then blocks (kernel.md, SMP, Waiting for another
+  CPU). Measured (Numbers, SMP with the JIT): a compile takes about
   0.1 ms plus V8's first-call compile, a CPU compiling without pause
   delays 0.1% of the answers by more than 98 µs, and a realistic
   workload compiles a few hundred modules per CPU and run. Not

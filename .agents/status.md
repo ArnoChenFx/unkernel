@@ -219,6 +219,31 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    writeback) and as fast as CPU 0 with it off. The SMP build on one CPU
    read and wrote sequentially at UP's rates and created small files
    about 25% slower (its general cost, step 2).
+   Step 6, waits under host load (2026-11-16; kernel.md, SMP, Waiting
+   for another CPU; study in `vendor/smp-deferred/load/README.md`): a
+   CPU that waits for another (a spinlock, a cross-CPU call's answer,
+   `smp_cond_load_*()`) spins 20 µs and then blocks its thread until an
+   unlock or `csd_unlock()` kicks it, an IPI arrives or 100 µs pass, and
+   a long spin takes its expired timer. Before, on a busy host, a CPU
+   spinning for another whose thread the host had descheduled looked
+   busy itself and was descheduled more, also while holding locks.
+   Beside 24 spinning host processes in the same session (16-thread
+   host; lowered kernels, JIT; 3 interleaved runs each, medians) against
+   the same kernel without the change: kwtest's move ping-pong 543 to
+   495 ms on 2 CPUs and 10.0 s (0.66-18.7) to 0.58 s on 4; a cross-CPU
+   pipe ping-pong of 2000 round trips 5.8 to 0.28 s (2 CPUs) and 4.0 to
+   0.30 s (4); 500 fork+exit+wait 3.1 to 0.17 s and 1.2 to 0.17 s;
+   200k `close(dup(0))` from N threads (a contended kernel spinlock) 0.23
+   to 0.13 s and 8.1 to 0.17 s; a CPU-bound loop that measures the
+   guest's share of the host 0.59-0.68 s before and 0.91-0.94 after,
+   now that the waiting threads give the host back its time. On an idle
+   host (10 rounds): move ping-pong 192 to 198 ms on 2 CPUs and 268 to
+   265 on 4, fork+exit+wait of an 8 MiB process 202 µs either way, and
+   compiled loops scale 1.99x/1.98x on 2 CPUs and 3.91x/3.92x on 4.
+   kwtest (1, 2 and 4 CPUs with the JIT, 2 without), 2 minutes of
+   kwstorm with kwmmstress and with kwtlb on 2 and 4 CPUs, the block
+   scenario of step 5, glimmer-check and the api tests on 2 CPUs pass;
+   the UP build is the same binary.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -245,12 +270,17 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      describes the cheapest fix); modules are not shared between CPUs,
      so a task that moves compiles its hot code again; FENCE and PAUSE
      are handed back to the interpreter on SMP (an atomic RMW in
-     compiled code would do); under host oversubscription a CPU that
-     waits for another (a shootdown, a cross-CPU call) spins while that
-     CPU's thread is descheduled (kwtest's move ping-pong took 19 s
-     instead of 0.26 s while a `make -j16` and the JIT fuzz ran beside
-     it; seen with the JIT, though nothing in the cause is specific to
-     it).
+     compiled code would do).
+   - Under host load (after step 6): a synchronous TLB shootdown to a
+     CPU running user code still waits until that CPU's host thread runs
+     again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);
+     nothing in the guest can shorten it, so fewer guest CPUs than free
+     host cores is the remedy (a CLI warning for `--smp` above
+     `os.availableParallelism()` is not built). With 8 CPUs, ticket
+     locks still convoy behind a descheduled waiter; an unfair lock
+     (deferred `load-2-unfair-lock.patch`, off by default, costs 1.7-2x
+     under extreme contention on an idle host) removes that. Bare
+     `cpu_relax()` loops (seqcount retries) do not take the timer.
    - Browsers: not tried. They need cross-origin isolation, a worker for
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message
@@ -273,8 +303,12 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
        KVM's `halt_poll_ns` does, before its host thread sleeps. With
        200 on two CPUs fork+exit+wait 110.5 to 67.8 µs, of an 8 MiB
        process 194.7 to 156.6 µs; a fixed 100 µs poll slowed fork+exec
-       loops instead. A policy choice: it burns host CPU (not measured)
-       for wakeup latency.
+       loops instead. A policy choice: it burns host CPU (1-4 points of
+       a host core for light guest activity, an idle guest about none)
+       for wakeup latency, and on a busy host it makes things worse (a
+       polling thread looks busy to the host; alone as bad as no step
+       6, with it pipe ping-pong 1.5-3x slower). Rebased onto the load
+       study's patch 1 as `load/load-3-idle-poll.patch`.
      - Rejected: `sched_fork_local=1` (a fork child starts on its
        parent's CPU) made two parallel fork+exec loops on two CPUs take
        0.65 s against 0.39; `smp_rmb()`/`smp_wmb()` as compiler barriers

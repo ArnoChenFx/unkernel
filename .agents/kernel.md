@@ -43,8 +43,9 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   tree in the worktree `vendor/src/linux-smp` (branch `kw-smp`), whose
   new patches follow `kw_defconfig`: the shared-memory build, the atomic
   tweaks, then percpu-km, `ARCH_TASKS_STAY_ON_CPU` (sched with the
-  exit-to-user hook, kthread and workqueue) and the arch and driver SMP
-  patches. There
+  exit-to-user hook, kthread and workqueue), the csd wait hooks
+  (kernel/smp.c), the arch and driver SMP patches, and the waits that
+  block (below, SMP, Waiting for another CPU). There
   `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
@@ -536,7 +537,8 @@ third-party implementation.
 - SMP: each CPU has a word of pending bits. CPU 0's is `wasm_host_irqs`
   (the host's device bits arrive there only, so device interrupts run on
   CPU 0; the host sets them with `Atomics.or`), the others are
-  `kw_irq_words[]`; IPIs are bits 24-26 (`KW_IPI_*`, irq.h). The timer is
+  `kw_irq_words[]`; IPIs are bits 24-27 (`KW_IPI_*`, irq.h; 27, the
+  kick, has no handler: it only ends a blocked wait). The timer is
   a per-CPU clockevent (IRQ 0 is a percpu-devid interrupt) with a per-CPU
   expiry. Polling widens: a CPU also takes what is pending when it
   enables interrupts (`arch_local_irq_restore()` checks the word) and in
@@ -714,8 +716,48 @@ numbers and open issues: status.md item 8.
   tables in the same batch).
 - **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
   on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
-  Spinlocks are asm-generic's ticket locks, rwlocks queued
-  (`ARCH_USE_QUEUED_RWLOCKS`), RCU is TREE_RCU.
+  Spinlocks are asm-generic's ticket locks with the wait out of line
+  (asm/spinlock.h, below), rwlocks queued (`ARCH_USE_QUEUED_RWLOCKS`),
+  RCU is TREE_RCU.
+- **Waiting for another CPU** (wait.c). A CPU's host thread may be
+  descheduled by the host at any time, so a CPU that spins for another
+  (a lock holder, a cross-CPU call's answer, a task leaving another CPU)
+  burns host time while that CPU is not running and looks busy to the
+  host, which then deschedules it more often, also while it holds a
+  lock: under host load that convoy made cross-CPU work 10-50x slower
+  than the guest's lost share of the host explains (study and numbers
+  in `vendor/smp-deferred/load/README.md`). So every such wait spins
+  for `kw_spin_us=` (20 µs, counted from its 256th spin; the clock is
+  not read before) and then blocks the thread in
+  `memory.atomic.wait32` on the CPU's own pending word until the word
+  changes, for at most `kw_spin_sleep_us=` (100 µs) at a time; both are
+  boot parameters and writable in `/sys/module/kernel/parameters/`,
+  and `kw_spin_us=0` spins as before. The waits: the ticket lock's slow
+  path (`kw_ticket_wait()`), csd waits (`arch_csd_lock_wait()`, a hook
+  in kernel/smp.c) and `smp_cond_load_relaxed()` (asm/barrier.h; so
+  qrwlock and `try_to_wake_up()`'s wait for `p->on_cpu`). A spinlock
+  unlock (one atomic 16-bit add on the owner half, then a read of
+  `kw_lock_sleepers`) and `csd_unlock()` (`arch_csd_unlocked()`) kick
+  the CPUs blocked on that lock or csd with `KW_IPI_KICK`: the waiter
+  publishes its key (per-CPU) and the sleeper count, both seq_cst,
+  before it reads the lock again, and the releaser reads the count and
+  the keys after its release, so either the waiter sees the release or
+  the releaser kicks it, and `memory.atomic.wait32` compares the word
+  first. `smp_cond_load_relaxed()` waits have no kick: the timeout or
+  any interrupt ends their block. Any IPI ends a block (the sender
+  notifies the word), so a blocked CPU still answers shootdowns. With
+  interrupts on, a waiter never blocks over something already pending
+  (`cpu_relax()` takes it); with them off it blocks until something new
+  arrives (a reschedule IPI it cannot take yet does not keep it
+  spinning), never over a kick or the stop IPI. A kick that comes after
+  its waiter stopped waiting is cleared before the CPU waits again. The
+  block is not a JSPI suspension (CPU 0 blocks too: every CPU of an
+  SMP kernel runs in a worker; an SMP kernel on one CPU never waits for
+  another). Every 256 spins a waiter with interrupts on also takes its
+  timer if it expired: otherwise a spinning CPU sees only its pending
+  word and its tick starves (an RCU stall was seen that way). Bare
+  `cpu_relax()` loops (seqcount retries) still spin
+  without the timer check.
 - **Devices** stay on CPU 0 (their imports answer only there; another
   CPU's host ends the session when one is called there, js.md). hvc_wasm:
   CPU 0's console interrupt pulls the input into a FIFO and records the

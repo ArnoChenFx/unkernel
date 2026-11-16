@@ -371,7 +371,8 @@ parts that are easy to get wrong.
   CPU and ends the session ("fatal", naming it). After an exit, a trap or
   a fatal error it also sets the stop IPI (bit 26) in CPU 0's word
   (`CpuInit.irqWord0`) and notifies it: CPU 0's host takes the message
-  only once CPU 0 suspends, and CPU 0 may be spinning for this CPU; the
+  only once CPU 0 suspends, and CPU 0 may be spinning or blocked
+  (`memory.atomic.wait32`, which the notify ends) waiting for this CPU; the
   kernel takes that bit even with interrupts off and parks CPU 0
   (kernel.md, SMP). Its idle blocks in the kernel
   (`memory.atomic.wait32`), so it needs no event loop.

@@ -1,4 +1,4 @@
-From fa6d2504f722a3034022bf7fad2129559dfb529a Mon Sep 17 00:00:00 2001
+From 929d494fce78dcc83895252855652fa9e0d580e6 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:04 +0000
 Subject: [PATCH] wasm: kwinput on SMP

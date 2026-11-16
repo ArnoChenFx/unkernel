@@ -11,7 +11,9 @@
 //   (fetchOver() over a Wisp stream), as apk.ts does for apk's indexes.
 //   https URLs, and redirects to them, are fetched as http: the pinned
 //   SHA-256 is what makes that safe, so every file has one. Up to
-//   MAX_REDIRECTS redirects are followed.
+//   MAX_REDIRECTS redirects are followed. A file whose site sends
+//   Access-Control-Allow-Origin (`cors`, e.g. releases.fx.sh, https only)
+//   is fetched directly with fetch() instead.
 // - Files are kept in the Cache API (CACHE_NAME), keyed by their http URL,
 //   and checked against the SHA-256 on every use; a cached copy that does
 //   not match is deleted. Entries are not expired: a file is pinned by its
@@ -94,6 +96,11 @@ export interface FileSpec {
 	sha256: string;
 	/** Size in bytes, for the progress when the server sends no length. */
 	size?: number;
+	/**
+	 * The site sends Access-Control-Allow-Origin: fetch() it directly (https
+	 * as given) instead of plain http over Wisp. For https-only sites.
+	 */
+	cors?: boolean;
 }
 
 export type FileSource = "cache" | "downloaded";
@@ -132,9 +139,9 @@ export async function getFile(f: FileSpec, opts: {
 		await cache!.delete(key).catch(() => {});
 	}
 
-	const backend = wispBackend(opts.servers?.length ? opts.servers : [...DEFAULT_WISP_SERVERS]);
+	const backend = f.cors ? null : wispBackend(opts.servers?.length ? opts.servers : [...DEFAULT_WISP_SERVERS]);
 	try {
-		const res = await httpGet(backend, f.url, { signal: opts.signal });
+		const res = backend ? await httpGet(backend, f.url, { signal: opts.signal }) : await fetch(f.url, { signal: opts.signal });
 		if (!res.ok || !res.body) {
 			await res.body?.cancel();
 			throw new Error(`HTTP ${res.status}`);
@@ -163,7 +170,7 @@ export async function getFile(f: FileSpec, opts: {
 		}
 		return { bytes, source: "downloaded", checked: sum !== null };
 	} finally {
-		backend.close();
+		backend?.close();
 	}
 }
 

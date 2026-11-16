@@ -421,7 +421,9 @@ fetched by the page before its window opens (`download.ts`, described at
 its top): the sites send no CORS headers and the page is cross-origin
 isolated, so it speaks plain http over its own Wisp connection, as apk.ts
 does, follows redirects as http (a site that redirects to https only
-fails), checks the SHA-256 and keeps the file in the Cache API
+fails; a download with `cors`, for a site that sends
+Access-Control-Allow-Origin such as releases.fx.sh, is a direct `fetch()`
+instead), checks the SHA-256 and keeps the file in the Cache API
 (`kw-files-v1`), then pushes it with one `vm.exec()` (through a `.part`
 file, size checked). It skips a file that is in the guest already at that
 size, or whose `unless` passes in the demo's directory. A failure is a toast

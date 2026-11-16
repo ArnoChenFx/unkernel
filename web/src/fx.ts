@@ -35,7 +35,7 @@
 //   composer) and ⌘ with arrows or Backspace become fx's own sequences
 //   (encodeXtermKeyEvent), as libfx's xterm adapter does.
 // - libfx and fx-term.wasm (4 MB) load on first use, as their own chunk and
-//   asset; the offline copy leaves the wasm out (vite.config.ts).
+//   asset.
 import type { WTerm } from "@wterm/dom";
 import type { FxTerminal, FxTerminalAdapter, FxWorkspace } from "libfx/browser";
 import { KW } from "./kw.ts";

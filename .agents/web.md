@@ -36,14 +36,13 @@ panel), `About.tsx`
 which `vite.config.ts` defines: the Linux release read from the committed
 kernel's banner, the kernel's release tag and the page's commit (empty
 where git is missing or the clone is too shallow). `web/public/vm-sw.js` is the page's
-service worker (the offline copy and the preview's relay), `web/server/vm.ts` the preview's server fallback.
+service worker (the preview's relay), `web/server/vm.ts` the preview's server fallback.
 `web/public/manifest.webmanifest` makes the page installable (standalone, black); its icons
 `icon-192.png`, `icon-512.png` (the whole logo at 6x and 16x), `icon-maskable-512.png` (inside the
 border, corners filled, opaque) and `apple-touch-icon.png` are `assets/logo.svg` rendered at 32 px
 and scaled nearest neighbour (`magick -filter point`).
 `web/vite.config.ts` holds the COOP/COEP headers (Nitro route rules, plus
-the dev server's own responses), `__KW_BUILD__` and the asset list
-`/kw-assets.json`.
+the dev server's own responses) and `__KW_BUILD__`.
 
 ## The page's kernel: a local build in dev, the newest release in a build
 
@@ -234,62 +233,35 @@ with Resume and Boot fresh) before the kernel starts.
   seconds, which makes it unrestorable.
 - Checked by hand only (no browser test).
 
-## Offline and updates
+## Service worker and updates
 
-In a production build on a secure context, the page's service worker
-(`public/vm-sw.js`, registered by `sw.ts` at scope `/`) keeps an offline
-copy in the Cache API `kw-app-v1`. It never touches other caches
-(`kw-apk-index-v1` is apk.ts's).
+The page's one service worker (`public/vm-sw.js`, registered by `sw.ts`)
+has scope `/vm/`, in dev and in a build alike, and serves only the guest
+preview (below). It does not control the page: `/`, `/assets/` (the
+kernel among them) and everything else the page loads go to the network
+and the HTTP cache, so a reload always runs the newest deploy. There is no
+offline copy: a cache-first page stays old whenever caching a new build
+fails.
 
-- Answers: a navigation to `/` (any query) gets the cached page at once,
-  and the worker fetches `/` in the background (`refresh()`). Other
-  navigations go to the network, with the cached page as the offline
-  fallback. The page's own GETs under `/assets/` (the hashed build files,
-  the kernel among them) come from the cache. A miss is fetched and cached.
-  Everything else goes to the network: once the worker has seen that a
-  client is not a preview (`pageClients`, kept until the worker stops),
-  it leaves that client's other requests alone, as if there were no
-  worker. A request it does pass on and that fails reaches the page as a
-  network error (`Response.error()`), not as an uncaught error in the
-  worker. A new build's precache fetches 4 files at a time, since the
-  page may be loading the kernel meanwhile. The kernel's fetch asks `no-cache`
-  (js/core/load.ts); the worker answers from the cache anyway, which is
-  correct because the names are hashed.
-- Updates: when the fetched `/` differs from the cached one, the worker
-  reads `/kw-assets.json` (every file under `assets/`, emitted by the
-  `unkernel:asset-list` plugin in vite.config.ts) and caches every file
-  missing from it, then stores the list and then the page. So the cached
-  page always has all its files, and a load from it never needs the
-  network. A list that does not name the page's entry script (two deploys
-  mixed) aborts, and the next load tries again. The cache keeps the
-  current build's files and the previous list's (`/kw-assets.json?prev`:
-  an older tab may still load a chunk); older ones are deleted.
-- The page asks: boot.ts calls `watchUpdates()` once the kernel has
-  downloaded (on a first visit the worker's precache then comes from the
-  HTTP cache, since `/assets/` is immutable, not a second download), and
-  again when the tab is shown after an hour. It posts `{t: "kw-check",
-  entry}` with its own entry script. The worker answers `update` only
-  when its own network check (just now, or within 10 s) found a build
-  other than the asking page's and has cached all of it. `offline`
-  means the page's own build is the cached one. The System tab's
-  "Offline copy" row shows the result. On `update`, `ui.updateReady()`
-  shows `↑ update` (`#bar-update`) in the status line, plus a toast. Its
-  click (`ui.confirmUpdate()`) asks first while the system runs or a
-  session is suspended (a new kernel cannot resume it), then reboots
-  with the disks saved (`ui.reboot()`). The page never reloads by itself.
-- The first visit after a deploy runs the old build; the next load runs
-  the new one. A shift-reload bypasses the worker and loads from the network.
-- Under `pnpm dev` the scope stays `/vm/`, so nothing of Vite's is cached.
-  The worker checks its own scope (`APP`), and activation deletes
-  `kw-app-*` caches there. Pages from before the offline copy registered
-  the same script at `/vm/`; `sw.ts` unregisters that registration once
-  `/` is active. `/vm-sw.js` and `/kw-assets.json` are `no-cache`.
-- Checked by hand only, plus a scratch run on 2026-11-15 (headless
-  Chromium, two builds on one port). Load 1 downloaded the kernel (5.6 MB
-  on the wire). Load 2 took it from the worker, with 0 bytes on the wire.
-  With the server stopped and the network off, the page booted to a shell
-  prompt. After a new deploy, the old build loaded, then `#bar-update`
-  showed, and a reload ran the new build. No browser test.
+- Its own updates: `register()` with an unchanged script URL does not
+  look for a new one, and loads of `/` are outside the scope, so the
+  browser's own check on navigation never runs. `sw.ts` therefore calls
+  `registration.update()` on every load (the first `serviceWorker()` call,
+  when the preview attaches) and again when the tab is shown after an
+  hour. `/vm-sw.js` is `no-cache` and registered with
+  `updateViaCache: "none"`. A new script activates at once (`skipWaiting`,
+  `clients.claim`), so the relay's messages must stay compatible.
+- Legacy scope `/`: earlier builds registered the same script at `/` and
+  answered `/` and `/assets/` from the Cache API `kw-app-v1`. The browser
+  checks that registration's script on each navigation to `/`, so it gets
+  the new `vm-sw.js`, which then answers nothing outside `/vm/` (as at
+  any scope), deletes `kw-app-*` caches on
+  activation, and (`LEGACY` in the worker) answers the old page's
+  `{t: "kw-check"}` with `update`,
+  so that page's status line offers a reload. The load that brought the
+  new script still ran the old cached page; the next one comes from the
+  network, and its `boot.ts` calls `dropLegacyScope()`, which unregisters
+  `/`. Activation never deletes other caches (`kw-apk-index-v1` is apk.ts's).
 
 ## Guest preview
 
@@ -311,9 +283,8 @@ and a link that opens the URL in a new tab. It is no URL parameter, so it
 has no Options control.
 
 - Relay: `public/vm-sw.js`, a plain script served at `/vm-sw.js`, outside
-  the TypeScript build: the page's one service worker (scope `/` in a
-  production build, `/vm/` under the dev server; Offline and updates). The
-  relay is stateless, because
+  the TypeScript build: the page's one service worker (scope `/vm/`;
+  Service worker and updates). The relay is stateless, because
   browsers stop idle service workers. For each request it posts
   `{t: "kw-vm-fetch", vmId, port, method, path, headers, body}` (path
   includes the query, body is an ArrayBuffer or null) with a
@@ -331,11 +302,10 @@ has no Options control.
   gets a 308 to the slash.
 - Page side (`preview.ts`): boot.ts calls `attachPreview(vm)` once the
   kernel runs, and `attachPreview(null)` at exit; requests then get 503. The
-  first call registers the worker (`sw.ts`, shared with the offline copy),
-  only where `navigator.serviceWorker`
+  first call registers the worker (`sw.ts`), only where `navigator.serviceWorker`
   exists (secure contexts). The window waits until the worker is
   active. It does not use `navigator.serviceWorker.ready`, which never
-  resolves under the dev server, whose scope `/vm/` does not control the page. Requests go
+  resolves, because the scope `/vm/` does not control the page. Requests go
   to `vm.fetch("http://localhost:<port><path>", {method, headers, body,
   redirect: "manual", signal})` (the SDK's, js.md, which follows no
   redirects and does not decode bodies). preview.ts needs only its
@@ -355,11 +325,10 @@ has no Options control.
   guest page's cross-origin subresources load only if they send CORP or
   CORS. A redirect to `/x` or to `http://localhost:<port>/x` is rewritten
   under the prefix.
-- Root-relative URLs: a preview document's same-origin requests outside
-  `/vm/` (`/style.css`, even `/assets/x.js`) go to the vmId and port of the
-  client's URL with the path as it is; the worker looks up each request's
-  client first. Navigations
-  outside `/vm/` (a link to `/about`) are not relayed. They reach the
+- Root-relative URLs: the worker answers only `/vm/<id>/<port>[/…]`.
+  Nothing outside it is relayed, so a preview document's `/style.css`
+  reaches the unkernel server, not the guest: guest pages must use
+  relative URLs. Navigations outside `/vm/` (a link to `/about`) reach the
   server, which sends the page, and `main.tsx` sends them back under the
   prefix (`previewEscape()`: the iframe's `data-kw-preview`, or in a tab the
   referrer) instead of booting a second kernel.

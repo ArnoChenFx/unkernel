@@ -7,8 +7,7 @@
 // current or under the pointer), and the prefix and what it takes while it
 // is armed. Right: the special views as icons, inverted while shown (a
 // monitor for the guest's display while a program has it open, a globe for
-// the preview while it is open; Preview.tsx has its close), "update" once the service worker has a
-// newer build of the page ready (sw.ts), ^A, faint, which opens the Keys tab (hidden
+// the preview while it is open; Preview.tsx has its close), ^A, faint, which opens the Keys tab (hidden
 // while the prefix is armed), the data disk's used space (opens System),
 // kernel memory (opens Environment), Suspend (a pause icon while the system
 // runs; a play icon, Resume, once suspended), Reboot, the dialog's tabs as icons (Kernel log, Errors
@@ -156,7 +155,6 @@ export function Bar() {
 	const label = useStore((s) => s.label);
 	const state = useStore((s) => s.state);
 	const suspended = useStore((s) => s.suspended);
-	const update = useStore((s) => s.update);
 	const errors = useStore((s) => s.errors.length);
 	const panel = useStore((s) => (s.panelOpen ? s.tab : null));
 	const display = useStore((s) => s.display);
@@ -205,10 +203,6 @@ export function Bar() {
 					<Seg id="bar-preview" on={preview.shown && !(covers && panel)} title={`Preview of the guest's port ${preview.port}: ${preview.shown ? "hide" : "show"} it`} hint="p" onClick={togglePreview}>
 						<PreviewIcon />
 					</Seg>
-				)}
-				{update && (
-					<Seg id="bar-update" title="A new version of the page is ready: reload into it (asks first while the system runs)" label="Update the page"
-						onClick={() => void ui.confirmUpdate()} className="gap-1 text-ok">↑<span className="max-sm:hidden">update</span></Seg>
 				)}
 				{!prefix && <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
 				{disk && (

@@ -6,8 +6,8 @@
 // response headers. The page is static: the kernel
 // (kernel/unkernel-alpine.wasm, the newest GitHub release's, which
 // scripts/kernel.ts fetches before anything else) is a Vite asset. The page's service worker
-// (the offline copy, the guest preview) is public/vm-sw.js, the preview's
-// server fallback server/vm.ts.
+// (the guest preview's relay) is public/vm-sw.js, the preview's server
+// fallback server/vm.ts.
 //
 // Build settings (environment variables): KW_KERNEL, KW_KERNEL_RELEASE,
 // GITHUB_TOKEN pick the kernel (scripts/kernel.ts; the dev server runs
@@ -84,19 +84,6 @@ export default defineConfig({
 				});
 			},
 		},
-		{
-			// /kw-assets.json: every file of the build under /assets/ (the kernel among
-			// them), which the service worker (public/vm-sw.js) caches before it serves
-			// a new build's page, so the cached page always has its files.
-			name: "unkernel:asset-list",
-			apply: "build",
-			generateBundle(_, bundle) {
-				if (this.environment.name !== "client") return;
-				// libfx's wasm (src/fx.ts: fx-term, 4 MB; fx-core, never fetched) needs the network anyway: not precached, cached on first use.
-				const files = Object.keys(bundle).filter((f) => f.startsWith("assets/") && !/^assets\/fx-(term|core)[-.]/.test(f)).map((f) => `/${f}`).sort();
-				this.emitFile({ type: "asset", fileName: "kw-assets.json", source: `${JSON.stringify({ files })}\n` });
-			},
-		},
 		react(),
 		tailwindcss(),
 		nitro({
@@ -114,10 +101,8 @@ export default defineConfig({
 						"cross-origin-embedder-policy": "require-corp",
 					},
 				},
-				// Checked for updates on every registration; not cached by the CDN.
+				// Checked for updates on every load (src/sw.ts); not cached by the CDN.
 				"/vm-sw.js": { headers: { "cache-control": "no-cache" } },
-				// The service worker's update check reads it with each new page.
-				"/kw-assets.json": { headers: { "cache-control": "no-cache" } },
 			},
 		}),
 	],

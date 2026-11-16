@@ -11,8 +11,7 @@
 //     It downloads unless the file is that release's, by sha256.
 // The download happens here, at build time, because GitHub sends release
 // assets without CORS, so a browser cannot fetch them. The file is a Vite
-// asset (src/sdk.ts), so it gets a hashed /assets/ name that the service
-// worker's offline copy lists. web/kernel/release.json records the release
+// asset (src/sdk.ts), so it gets a hashed /assets/ name. web/kernel/release.json records the release
 // that was downloaded last; a file that does not match it is "local".
 //
 // Environment:

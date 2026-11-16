@@ -110,7 +110,7 @@ export function createUi(cfg: Config) {
 		fx: cfg.fx ? "on" : "off",
 	};
 	const $ = initStore({
-		state: "checking", label: LABEL.checking, suspended: false, update: false,
+		state: "checking", label: LABEL.checking, suspended: false,
 		splash: { title: "Starting", msg: "Loading the page scripts…", hidden: false, error: false, details: false },
 		checks: [], errors: [], fatal: null,
 		panelOpen: false, tab: "status", toast: null,
@@ -244,20 +244,6 @@ export function createUi(cfg: Config) {
 			const state = $.get().state;
 			if ((state === "running" || state === "booting") &&
 				!await ui.ask({ title: "reboot", msg: "The running system and its unsaved state are lost.", ok: "Reboot", danger: true })) return;
-			reboot();
-		},
-		/** A newer build of the page is cached (sw.ts): show "update" in the status line, once. */
-		updateReady() {
-			if ($.get().update) return;
-			$.set({ update: true });
-			ui.toast("A new version of the page is ready: update in the status line reloads into it");
-		},
-		/** The status line's "update": reload into the cached newer build, asking first while the system runs. */
-		async confirmUpdate() {
-			const s = $.get();
-			const lost = s.suspended ? " The suspended session cannot be resumed by the new version." : "";
-			if ((s.state === "running" || s.state === "booting" || s.suspended) &&
-				!await ui.ask({ title: "update", msg: `Reload into the new version of the page? The running system restarts; the data disk is saved first.${lost}`, ok: "Reload" })) return;
 			reboot();
 		},
 		/** Suspend from a shortcut or the dialog: asks first (boot.ts does it: KW.suspend). */

@@ -24,7 +24,7 @@ import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.
 import { writeReadme } from "./readme.ts";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
-import { watchUpdates } from "./sw.ts";
+import { dropLegacyScope } from "./sw.ts";
 import { takeResumeRequest } from "./ui.ts";
 import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from "./windows.ts";
 import {
@@ -647,14 +647,7 @@ export function start(): void {
 			dataDisks = await dataSpec();
 		}
 		const module = await loading;
-		// The offline copy and the update check (sw.ts): only now, so that on a first visit the
-		// service worker caches the kernel from the HTTP cache rather than downloading it again.
-		watchUpdates((s) => {
-			if ("error" in s) ui.check("offline", "Offline copy", "warn", "not updated", s.error);
-			else ui.check("offline", "Offline copy", s.offline || s.update ? "pass" : "info", s.update ? "newer version ready" : s.offline ? "this version" : "not yet",
-				s.update ? "a reload starts the new version (update in the status line)" : s.offline ? "the page and the kernel load from this browser, also without a network" : "");
-			if (!("error" in s) && s.update) ui.updateReady();
-		});
+		dropLegacyScope(); // an older build's offline copy (sw.ts)
 		if (ui.stageState("compile") !== "active") ui.stage("compile", "active"); // no progress events (e.g. a cached module)
 		ui.stage("compile", "done", `${WebAssembly.Module.imports(module).length} imports, ${WebAssembly.Module.exports(module).length} exports`);
 		setLive(null);

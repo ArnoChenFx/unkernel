@@ -62,7 +62,7 @@ export function attachPreview(handle: GuestFetcher | null): void {
 	vmId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
 	if (previewSupported()) {
 		navigator.serviceWorker.addEventListener("message", onRelay);
-		navigator.serviceWorker.startMessages(); // under the dev server this page is not controlled (the scope is /vm/)
+		navigator.serviceWorker.startMessages(); // this page is not controlled (the scope is /vm/)
 		sw = serviceWorker().then(() => {});
 		sw.catch((e: Error) => console.warn(`[preview] the service worker failed: ${e.message}`));
 	}

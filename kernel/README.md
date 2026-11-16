@@ -764,12 +764,10 @@ from source). Everything is self-hosted except the Wisp fallback.
   runs the local build's copy), a Vite asset (`/assets/unkernel-alpine-<hash>.wasm` in the
   build; the runtime takes the initramfs and command line from its custom
   sections). The page has no other kernel, root fs or disk.
-* **Offline and updates.** On https (or localhost) a service worker keeps
-  the page and its kernel in the browser. Every load after the first
-  starts without waiting on the network, and works offline (with no guest
-  network then). A new deploy is fetched in the background. Once all of it
-  is cached, `↑ update` shows in the status line, and a reload starts it.
-  `web/public/vm-sw.js`, `web/src/sw.ts`; .agents/web.md (Offline and updates).
+* **Updates.** The page and its kernel always load from the network (the
+  kernel through the HTTP cache, revalidated), so a reload runs the newest
+  deploy. The service worker (`web/public/vm-sw.js`, scope `/vm/`)
+  serves only the guest preview; .agents/web.md (Service worker and updates).
 * **Memory.** The default is auto (the SDK's `autoMemoryMiB()`): 512 MiB on desktops and 256 MiB on
   phones, or less if `navigator.deviceMemory` is low. If the browser refuses
   the allocation, the runtime retries with 384, 256, 192, 128, 96 and then

@@ -58,8 +58,6 @@ export interface UiState {
 	label: string;
 	/** Suspend saved the system and the kernel stopped (halted): the page offers Resume (components/Overlays.tsx, Bar.tsx). */
 	suspended: boolean;
-	/** The service worker has a newer build of the page cached (sw.ts): the status line shows "update" (Bar.tsx). */
-	update: boolean;
 	splash: { title: string; msg: string; hidden: boolean; error: boolean; details: boolean };
 	checks: Check[];
 	/** KW.errors, copied on each change. */

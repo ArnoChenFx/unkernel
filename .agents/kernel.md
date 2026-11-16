@@ -668,20 +668,39 @@ numbers and open issues: status.md item 8.
   cross-CPU call).
 - **MM.** `switch_mm()` adds the CPU to `mm_cpumask(next)` before
   `kw_set_pgd()` and removes it from the previous mm (still referenced:
-  lazy TLB refcount). `flush_tlb_*()`, `update_mmu_cache_range()` and
-  the flush of `ptep_set_access_flags()` run `kw_flush_tlb_*` here and,
+  lazy TLB refcount). `flush_tlb_*()` runs `kw_flush_tlb_*` here and,
   through `smp_call_function_many()` with wait, on every other CPU in the
-  mask; `riscv_flush_icache` flushes every CPU (`kw_flush_icache_all()`).
+  mask that uses the mm; `riscv_flush_icache` flushes every CPU
+  (`kw_flush_icache_all()`). A CPU in lazy TLB mode (`enter_lazy_tlb()`:
+  idle, a kthread, a task past `exit_mm()`) keeps the mm loaded and its
+  mask bit, but a flush does not wait for it (its host thread may be
+  asleep): it sets that CPU's `kw_tlb_stale` instead, and `switch_mm()`
+  back to that mm flushes everything first (Dekker pairing of
+  `kw_tlb_lazy` and `kw_tlb_stale` with `smp_mb()` on both sides; a
+  switch to another mm drops everything anyway). Unlike on x86 this
+  holds when page tables are freed too: a lazy CPU runs no user code and
+  no uaccess walk for the mm, and kwemu walks the table only while it
+  runs user code and caches no table entries. `update_mmu_cache_range()`
+  and the flush after `ptep_set_access_flags()`
+  (`flush_tlb_fix_spurious_fault()`) flush only this CPU: they follow a
+  PTE that gained access with the same page, and kwemu fills a TLB entry
+  only from a PTE that allows the access (separate read, write and exec
+  TLBs, no negative entries, a miss walks), so another CPU at worst
+  walks again; every change that takes access away or moves the page
+  flushes every CPU first (`ptep_clear_flush()`, `flush_tlb_*()`).
   The software A/D update in fault.c is a `cmpxchg` (as a hardware
   walker's, without the PTE lock), so pgtable.h makes every
   read-modify-write of a present PTE atomic on SMP
   (`ptep_get_and_clear`, `ptep_set_wrprotect`,
-  `ptep_test_and_clear_young`, `ptep_set_access_flags` keeping D). The
-  uaccess walk and copy (`kw_user_addr()`) have no poll point between
-  them, and pages and page tables are freed only after the mmu_gather
-  flush, which waits for every CPU's answer, so a CPU never copies into a
-  freed page (gup-fast's argument; the default mmu_gather, without
-  `MMU_GATHER_RCU_TABLE_FREE`, frees page tables in the same batch).
+  `ptep_test_and_clear_young`, `ptep_set_access_flags` keeping D), except
+  `ptep_get_and_clear_full()` in the teardown of a whole mm
+  (`exit_mmap()`: mm_users is 0, so nothing sets A or D), a plain read
+  and clear as on x86. The uaccess walk and copy (`kw_user_addr()`) have
+  no poll point between them, and pages and page tables are freed only
+  after the mmu_gather flush, which waits for every CPU that uses the mm,
+  so a CPU never copies into a freed page (gup-fast's argument; the
+  default mmu_gather, without `MMU_GATHER_RCU_TABLE_FREE`, frees page
+  tables in the same batch).
 - **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
   on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
   Spinlocks are asm-generic's ticket locks, rwlocks queued
@@ -699,6 +718,26 @@ numbers and open issues: status.md item 8.
 - **kwemu** gets a `struct kw_cpu` per CPU, with the ISA CPU 0 enabled,
   and interprets only (the host turns the JIT off with more than one
   CPU). Its atomics build makes AMOs, LR/SC and FENCE atomic (kwemu.md).
+- **Costs** (2026-11-16, i7-10700K, Node 24, interpreter only). Each
+  atomic RMW, cmpxchg or seq_cst store is a locked instruction in V8 on
+  x86-64, about 4.3 ns more than the plain op, and `atomic.fence`
+  (`smp_mb()`, `smp_rmb()`, `smp_wmb()`, and acquire and release, which
+  asm-generic builds from a fence) about 8.9 ns. A fork and its exit take
+  about 4 locked ops per mapped page that no barrier change removes
+  (folio refcount and mapcount, raised at fork, dropped at exit). A
+  wakeup that has to wake a sleeping host thread costs about 12 µs more
+  than one on the same CPU when the target is a secondary
+  (`memory.atomic.wait32`) and 20 µs more for CPU 0 (its host's
+  `poll_oneoff`): kwwake, a pipe ping-pong with 200 µs gaps, woke a
+  task on its own CPU in 7.3 µs, on CPU 1 in 19 µs, on CPU 0 in 28 µs
+  (medians of 500). A fork whose child starts on the other CPU pays two
+  of those (the child's start, the parent's wakeup at its exit). Lazy
+  TLB, the local flush for a PTE that gained access and the plain
+  teardown clear (MM above) measured with kwfork (11 alternating rounds,
+  medians): a process moved to CPU 1 while CPU 0 idles with its mm
+  loaded faults in 536 ns (3,321 when every fault waited for CPU 0's
+  flush) and forks and reaps a child in 80 µs (118); exit costs 4.3 ns
+  less per mapped page; one-CPU and same-CPU numbers did not move.
 
 ## riscv64 user ABI
 

@@ -81,7 +81,10 @@ harness).
   load whose value SC compare-and-swaps against (an ABA store in between
   goes unnoticed, as in QEMU), everything is seq_cst (so aq/rl hold), and
   FENCE (also FENCE.TSO and PAUSE) is a generic op that does a seq_cst
-  read-modify-write, a locked instruction on x86-64 V8. Without the
+  read-modify-write, a locked instruction on x86-64 V8 (about 4.3 ns
+  over the plain op, against 8.9 ns for `atomic.fence`, an mfence; an
+  atomic load costs nothing extra. Node 24, i7-10700K, 2026-11-16, a
+  loop of each on a shared memory). Without the
   option all of them stay single-hart (a plain read-modify-write; FENCE a
   no-op op). The JIT leaves AMOs and LR/SC to the interpreter already;
   an SMP host runs the interpreter only.

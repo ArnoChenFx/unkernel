@@ -89,8 +89,12 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		fatal(`the data-segment flag at ${init.initFlag} is not 2: a new instance would initialise the memory again`);
 		return;
 	}
-	const u8 = () => new Uint8Array(memory.buffer);
-	const dv = () => new DataView(memory.buffer);
+	// The memory never grows (initial == maximum), so one view of each kind
+	// serves every call: a new DataView per clock read cost about 150 ns.
+	const u8View = new Uint8Array(memory.buffer);
+	const dvView = new DataView(memory.buffer);
+	const u8 = () => u8View;
+	const dv = () => dvView;
 	const resumers = new Map<bigint, (task: bigint) => void>();
 	let exited = false;
 	let retFromFork!: (prev: bigint, next: bigint) => Promise<unknown>;

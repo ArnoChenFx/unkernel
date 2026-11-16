@@ -1,4 +1,4 @@
-From 300c20d998a7bac849754c65f9302303193e0135 Mon Sep 17 00:00:00 2001
+From bd63eb2865c44fd2b1a236ff9ade3b704c7e1617 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -41,11 +41,16 @@ on CPU 0 when the session ends there. The timer is a per-CPU
 clockevent on a percpu-devid IRQ 0.
 
 TLB flushes reach the other CPUs in mm_cpumask (kept by switch_mm())
-by IPI and wait for them; riscv_flush_icache flushes every CPU. The
-software A/D update is a cmpxchg, so every read-modify-write of a
-present PTE is atomic, and the uaccess walk and copy have no poll
-point between them, so pages freed after a shootdown are never
-copied into. kwemu gets its own state per CPU (8 MiB from memblock
+by IPI and wait for them, except a CPU in lazy TLB mode (idle or a
+kthread, with the mm still loaded), which is marked stale and flushes
+when it switches back to that mm; a PTE that only gained access is
+flushed on this CPU alone, since kwemu caches only translations that
+allowed the access. riscv_flush_icache flushes every CPU. The software
+A/D update is a cmpxchg, so every read-modify-write of a present PTE
+is atomic (but for the clear in the teardown of a whole mm, which no
+CPU uses any more), and the uaccess walk and copy have no poll point
+between them, so pages freed after a shootdown are never copied
+into. kwemu gets its own state per CPU (8 MiB from memblock
 for the secondaries), the WASI clock and write buffers are per CPU,
 and only CPU 0 yields to its host. Parking (KW_PARK) is off.
 
@@ -60,8 +65,9 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/include/asm/irqflags.h     |  71 ++++++-
  arch/wasm/include/asm/kw_emu.h       |  11 +-
  arch/wasm/include/asm/kwcpu.h        |  23 +++
+ arch/wasm/include/asm/mmu_context.h  |   5 +
  arch/wasm/include/asm/park.h         |  17 ++
- arch/wasm/include/asm/pgtable.h      |  45 +++++
+ arch/wasm/include/asm/pgtable.h      |  70 +++++++
  arch/wasm/include/asm/processor.h    |  24 +++
  arch/wasm/include/asm/smp.h          |  34 ++++
  arch/wasm/include/asm/thread_info.h  |   3 +
@@ -84,8 +90,8 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/kernel/traps.c             |  27 ++-
  arch/wasm/kernel/wasi.c              |  36 +++-
  arch/wasm/mm/fault.c                 |  39 +++-
- arch/wasm/mm/tlb.c                   | 155 +++++++++++++-
- 34 files changed, 1279 insertions(+), 55 deletions(-)
+ arch/wasm/mm/tlb.c                   | 236 +++++++++++++++++++++-
+ 35 files changed, 1390 insertions(+), 55 deletions(-)
  create mode 100644 arch/wasm/configs/kw_smp.config
  create mode 100644 arch/wasm/include/asm/kwcpu.h
  create mode 100644 arch/wasm/include/asm/smp.h
@@ -412,6 +418,22 @@ index 00000000000..f245df77cb8
 +#endif
 +
 +#endif /* _ASM_WASM_KWCPU_H */
+diff --git a/arch/wasm/include/asm/mmu_context.h b/arch/wasm/include/asm/mmu_context.h
+index 1cc64c5d496..b89ef7b6009 100644
+--- a/arch/wasm/include/asm/mmu_context.h
++++ b/arch/wasm/include/asm/mmu_context.h
+@@ -15,6 +15,11 @@ static inline void activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	switch_mm(prev, next, NULL);
+ }
+ 
++#ifdef CONFIG_SMP
++#define enter_lazy_tlb enter_lazy_tlb
++void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk);
++#endif
++
+ void kw_mm_release(struct mm_struct *mm);
+ 
+ #define destroy_context destroy_context
 diff --git a/arch/wasm/include/asm/park.h b/arch/wasm/include/asm/park.h
 index 2aa5ffd70d1..55f55c238c3 100644
 --- a/arch/wasm/include/asm/park.h
@@ -447,10 +469,10 @@ index 2aa5ffd70d1..55f55c238c3 100644
  
  #endif /* _ASM_WASM_PARK_H */
 diff --git a/arch/wasm/include/asm/pgtable.h b/arch/wasm/include/asm/pgtable.h
-index 78f4b6ab5f4..794b0c30b15 100644
+index 78f4b6ab5f4..841c27fd516 100644
 --- a/arch/wasm/include/asm/pgtable.h
 +++ b/arch/wasm/include/asm/pgtable.h
-@@ -348,6 +348,50 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+@@ -348,6 +348,75 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
  #define update_mmu_cache(vma, addr, ptep) \
  	update_mmu_cache_range(NULL, vma, addr, ptep, 1)
  
@@ -465,6 +487,25 @@ index 78f4b6ab5f4..794b0c30b15 100644
 +				       unsigned long address, pte_t *ptep)
 +{
 +	return __pte(xchg(&pte_val(*ptep), 0));
++}
++
++/*
++ * The teardown of a whole mm (exit_mmap(), tlb->fullmm): no task uses the
++ * mm any more and none can start to (mm_users is 0), so nothing sets A or D
++ * behind our back and a plain read and clear is enough (as on x86).
++ */
++#define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
++static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
++					    unsigned long address,
++					    pte_t *ptep, int full)
++{
++	pte_t pte;
++
++	if (!full)
++		return ptep_get_and_clear(mm, address, ptep);
++	pte = READ_ONCE(*ptep);
++	WRITE_ONCE(pte_val(*ptep), 0);
++	return pte;
 +}
 +
 +#define __HAVE_ARCH_PTEP_SET_WRPROTECT
@@ -497,11 +538,17 @@ index 78f4b6ab5f4..794b0c30b15 100644
 +#define __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
 +int ptep_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 +			  pte_t *ptep, pte_t entry, int dirty);
++
++/* This CPU only: a wider PTE needs no other CPU's flush (mm/tlb.c). */
++void kw_flush_tlb_fix_spurious_fault(struct vm_area_struct *vma,
++				     unsigned long addr);
++#define flush_tlb_fix_spurious_fault(vma, address, ptep) \
++	kw_flush_tlb_fix_spurious_fault(vma, address)
 +#else
  #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
  static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
  				       unsigned long address, pte_t *ptep)
-@@ -364,6 +408,7 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
+@@ -364,6 +433,7 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
  {
  	set_pte(ptep, pte_wrprotect(*ptep));
  }
@@ -1954,10 +2001,10 @@ index 4dada661636..6b5275b2f03 100644
  						   (addr & PAGE_MASK) + PAGE_SIZE);
  			}
 diff --git a/arch/wasm/mm/tlb.c b/arch/wasm/mm/tlb.c
-index d4509d6b89e..627103eb6a1 100644
+index d4509d6b89e..f0d1a12c122 100644
 --- a/arch/wasm/mm/tlb.c
 +++ b/arch/wasm/mm/tlb.c
-@@ -1,23 +1,42 @@
+@@ -1,23 +1,45 @@
  /* SPDX-License-Identifier: GPL-2.0-only */
  /*
 - * The kwemu software CPU: one per (single) kernel CPU. Its translation cache
@@ -1968,10 +2015,13 @@ index d4509d6b89e..627103eb6a1 100644
 + * SMP: each CPU's kwemu belongs to its own thread, so another CPU's TLB is
 + * flushed by an IPI to it (smp_call_function_many(), waiting for the
 + * answer), to the CPUs in the mm's mm_cpumask: those whose kwemu has that
-+ * page table loaded (switch_mm() keeps it so). Pages and page tables are
-+ * freed only after such a flush (mmu_gather), and the software uaccess
-+ * walk (fault.c) has no poll point between its walk and the end of its
-+ * copy, so a CPU that is copying cannot answer before it is done.
++ * page table loaded (switch_mm() keeps it so), except those in lazy TLB
++ * mode, which flush when they use the mm again (below). Pages and page
++ * tables are freed only after such a flush (mmu_gather), and the software
++ * uaccess walk (fault.c) has no poll point between its walk and the end of
++ * its copy, so a CPU that is copying cannot answer before it is done.
++ * A PTE that only gains access needs no other CPU's flush
++ * (update_mmu_cache_range()).
   */
  
  #include <linux/init.h>
@@ -2003,7 +2053,7 @@ index d4509d6b89e..627103eb6a1 100644
  
  static int __init kw_cpu_setup(void)
  {
-@@ -36,15 +55,126 @@ static int __init kw_cpu_setup(void)
+@@ -36,15 +58,204 @@ static int __init kw_cpu_setup(void)
  }
  early_initcall(kw_cpu_setup);
  
@@ -2022,11 +2072,56 @@ index d4509d6b89e..627103eb6a1 100644
 +}
 +#endif
 +
++#ifdef CONFIG_SMP
++/*
++ * Lazy TLB: running a kthread or idle, a CPU keeps the user mm it had
++ * (kw_loaded_mm, still in that mm's mm_cpumask) without using it. A flush
++ * does not wait for such a CPU (an idle one would have to wake its host
++ * thread): it marks the CPU stale instead, and the CPU flushes when it
++ * switches back to that mm (as x86 does). The pairing:
++ *   flusher:          stale = 1; smp_mb(); lazy?  skip : IPI
++ *   back to the mm:   lazy = 0;  smp_mb(); stale? flush
++ * so either the flusher sees the CPU in use and waits for it, or the CPU
++ * sees the mark. A lazy CPU runs no user code and does no uaccess walk
++ * (its task has no mm; kthread_use_mm() goes through switch_mm()), and
++ * kwemu walks the table only when it runs user code and caches no table
++ * entries, so page tables may be freed without its answer as well (x86
++ * still waits then, for its hardware's speculative walks). Switching to
++ * another mm drops everything anyway (kw_set_pgd()).
++ */
++static DEFINE_PER_CPU(int, kw_tlb_lazy);
++static DEFINE_PER_CPU(int, kw_tlb_stale);
++
++void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
++{
++	if (mm != &init_mm)
++		this_cpu_write(kw_tlb_lazy, 1);
++}
++#endif
++
  void switch_mm(struct mm_struct *prev, struct mm_struct *next,
  	       struct task_struct *task)
  {
++#ifdef CONFIG_SMP
++	if (next == kw_loaded_mm) {
++		if (this_cpu_read(kw_tlb_lazy)) {
++			this_cpu_write(kw_tlb_lazy, 0);
++			smp_mb();
++			if (this_cpu_read(kw_tlb_stale)) {
++				this_cpu_write(kw_tlb_stale, 0);
++				kw_flush_tlb_all(wasm_kw_cpu);
++			}
++		}
++		return;
++	}
++	/* In use from here: a flusher that sees the mask bit below waits. */
++	this_cpu_write(kw_tlb_lazy, 0);
++	smp_mb();
++	this_cpu_write(kw_tlb_stale, 0);
++#else
  	if (next == kw_loaded_mm)
  		return;
++#endif
 +#ifdef CONFIG_SMP
 +	/*
 +	 * In the mask before the page table is loaded: a flush from now on
@@ -2066,11 +2161,24 @@ index d4509d6b89e..627103eb6a1 100644
 +			unsigned long end)
 +{
 +	struct kw_flush f = { .mm = mm, .start = start, .end = end };
-+	int self = get_cpu();
++	int self = get_cpu(), cpu;
++	cpumask_t wait;
 +
 +	kw_flush_local(&f);
-+	if (cpumask_any_but(mm_cpumask(mm), self) < nr_cpu_ids)
-+		smp_call_function_many(mm_cpumask(mm), kw_flush_local, &f, true);
++	cpumask_clear(&wait);
++	for_each_cpu(cpu, mm_cpumask(mm)) {
++		if (cpu == self)
++			continue;
++		if (READ_ONCE(per_cpu(kw_tlb_lazy, cpu))) {
++			WRITE_ONCE(per_cpu(kw_tlb_stale, cpu), 1);
++			smp_mb();
++			if (READ_ONCE(per_cpu(kw_tlb_lazy, cpu)))
++				continue;
++		}
++		__cpumask_set_cpu(cpu, &wait);
++	}
++	if (!cpumask_empty(&wait))
++		smp_call_function_many(&wait, kw_flush_local, &f, true);
 +	put_cpu();
 +}
 +
@@ -2097,10 +2205,30 @@ index d4509d6b89e..627103eb6a1 100644
 +	kw_flush_mm(vma->vm_mm, start, end);
 +}
 +
++/*
++ * A PTE that became present, writable, young or dirty with the same page
++ * (the cases that end here, and the spurious-fault flush) needs no other
++ * CPU's flush: kwemu caches only translations that allowed the access
++ * when they were filled, never a non-present or narrower entry that would
++ * hide the new one (separate read and write TLBs; a miss walks the table),
++ * so another CPU at worst walks again. Every change that removes access or
++ * moves the page flushes first (ptep_clear_flush(), flush_tlb_*()). The
++ * local flush only mirrors riscv's update_mmu_cache_range().
++ */
 +void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
 +			    unsigned long addr, pte_t *ptep, unsigned int nr)
 +{
-+	kw_flush_mm(vma->vm_mm, addr, addr + (unsigned long)nr * PAGE_SIZE);
++	if (vma->vm_mm == kw_loaded_mm)
++		kw_flush_tlb_range(wasm_kw_cpu, addr,
++				   addr + (unsigned long)nr * PAGE_SIZE);
++}
++
++void kw_flush_tlb_fix_spurious_fault(struct vm_area_struct *vma,
++				     unsigned long addr)
++{
++	if (vma->vm_mm == kw_loaded_mm)
++		kw_flush_tlb_range(wasm_kw_cpu, addr & PAGE_MASK,
++				   (addr & PAGE_MASK) + PAGE_SIZE);
 +}
 +
 +/*
@@ -2117,7 +2245,7 @@ index d4509d6b89e..627103eb6a1 100644
 +		if (old == new)
 +			return 0;
 +	} while (!try_cmpxchg(&pte_val(*ptep), &old, new));
-+	flush_tlb_fix_spurious_fault(vma, address, ptep);
++	kw_flush_tlb_fix_spurious_fault(vma, address);
 +	return 1;
 +}
 +
@@ -2130,7 +2258,7 @@ index d4509d6b89e..627103eb6a1 100644
  void flush_tlb_all(void)
  {
  	kw_flush_tlb_all(wasm_kw_cpu);
-@@ -78,11 +208,30 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+@@ -78,11 +289,30 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
  				   addr + (unsigned long)nr * PAGE_SIZE);
  }
  

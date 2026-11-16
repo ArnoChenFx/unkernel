@@ -363,6 +363,10 @@ parts that are easy to get wrong.
   `fd_write`, which posts console output and panic text to CPU 0's host
   as it comes (`CpuMessage`: no batching, because this thread may never
   return to its event loop), and enters `kw_secondary_entry(idle)`. Its
+  imports share one `Uint8Array` and one `DataView` made at start (the
+  memory never grows): a new `DataView` per `clock_time_get` made
+  `clock_gettime` on CPU 1 cost 500 ns against CPU 0's 365
+  (2026-11-16; 358 with the shared view). Its
   `proc_exit` posts the exit; any device import is a kernel bug on that
   CPU and ends the session ("fatal", naming it). After an exit, a trap or
   a fatal error it also sets the stop IPI (bit 26) in CPU 0's word

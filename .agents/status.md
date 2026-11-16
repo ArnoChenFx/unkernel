@@ -156,6 +156,25 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    0, which a CPU takes even while spinning with interrupts off, so the
    session ends with that CPU's code (a panic and a poweroff on CPU 1
    were run; the spinning case only by reading the code).
+   TLB flushes and clocks (2026-11-16; kernel.md, SMP, MM and Costs):
+   a flush no longer waits for a CPU in lazy TLB mode (it flushes when
+   it uses the mm again), a PTE that only gained access is flushed on
+   this CPU alone, the teardown of a whole mm clears PTEs without
+   atomics, and a secondary's host keeps one view of the memory. kwfork
+   (11 alternating rounds, medians, interpreter only), before and
+   after: with the process moved to CPU 1 and CPU 0 idle, an anonymous
+   fault 3,321 to 536 ns, `fork()` 42.5 to 23.4 µs, fork+exit+wait 118
+   to 80 µs, `clock_gettime` 500 to 358 ns; exit 4.3 ns less per mapped
+   page everywhere (8 MiB fork+exit+wait 173 to 163 µs on one CPU, 211
+   to 202 on two); every other one- and two-CPU number moved by less
+   than 3%, within the rounds' spread. kwtlb (threads that move between
+   CPUs and check every access against a mutator that mprotects,
+   munmaps, mremaps, replaces a memfd mapping and forks, plus a phase
+   where one thread fills CPU a's TLB, moves away so a idles, changes
+   the mapping and comes back or wakes a sibling asleep on a) ran 4
+   minutes on 2 and 4 CPUs beside kwstorm with no error; with the flush
+   on return from lazy mode removed it reports stale reads and writes
+   within seconds. The scratch tools are in `vendor/smp-deferred/tools`.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -180,6 +199,28 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      from the sender's host would do instead).
    - `pnpm build` does not bundle `js/node/cpu-entry.ts` yet (source
      checkouts only), and `kernel/build.sh` has no SMP target.
+   - Deferred fork and wakeup changes, measured 2026-11-16 (kwfork,
+     9 alternating rounds; patches and a README with their base in
+     `vendor/smp-deferred/`, which is gitignored like all of vendor):
+     - Cheaper barriers: `smp_load_acquire()` and `smp_store_release()`
+       as wasm atomic loads and stores instead of a plain access and
+       `atomic.fence`, and `smp_mb__{before,after}_atomic()` as compiler
+       barriers. Fences per fork 558 to 230. Waits for a decision on
+       supported hosts: the RMW half counts on V8 compiling an atomic
+       RMW as a full barrier, which holds on x86-64 and on arm64 with
+       LSE but not on arm64 without it; it also adds one clang warning
+       (a misaligned atomic in `objpool.h`).
+     - Adaptive idle polling (`kw_idle_poll_us=`, off by default): an
+       idle CPU polls its pending word for up to that long, adapting as
+       KVM's `halt_poll_ns` does, before its host thread sleeps. With
+       200 on two CPUs fork+exit+wait 110.5 to 67.8 µs, of an 8 MiB
+       process 194.7 to 156.6 µs; a fixed 100 µs poll slowed fork+exec
+       loops instead. A policy choice: it burns host CPU (not measured)
+       for wakeup latency.
+     - Rejected: `sched_fork_local=1` (a fork child starts on its
+       parent's CPU) made two parallel fork+exec loops on two CPUs take
+       0.65 s against 0.39; `smp_rmb()`/`smp_wmb()` as compiler barriers
+       hold only on x86-64 hosts.
 9. **Listening-port detection** for the preview chip and CLI
    auto-forward: a `kwtty ports` subcommand in C that re-reads
    `/proc/net/tcp` every 3 s (a stdin byte rescans at once) and prints

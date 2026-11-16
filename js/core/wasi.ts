@@ -442,7 +442,10 @@ export class WasiHost {
 					if (s.tag === EVENTTYPE_CLOCK) wait = Math.min(wait, Number(s.deadline! - w.clockNs(s.clock!)) / 1e6);
 				return new Promise<number>((resolve) => {
 					let timer: ReturnType<typeof setTimeout> | null = null;
+					let settled = false;
 					const done = () => {
+						if (settled) return;
+						settled = true;
 						if (timer !== null) clearTimeout(timer);
 						k.idleWake = null;
 						k.poller?.awake();
@@ -452,6 +455,8 @@ export class WasiHost {
 					};
 					k.idleWake = done;
 					if (wait !== Infinity) timer = setTimeout(done, Math.max(0, wait));
+					// SMP: an IPI from another CPU (a change of wasm_host_irqs).
+					k.watchIrqWord(done, wait === Infinity ? 60000 : Math.max(0, wait));
 				});
 			}),
 			// (JSPI) Let the event loop run while user code is busy.

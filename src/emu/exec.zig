@@ -528,8 +528,9 @@ pub fn decode(inst: u32, pc: u64, isa: u64) Decoded {
             };
             return R.op(h, inst, rd, rs1, rs2, imm);
         },
-        // FENCE, FENCE.TSO and PAUSE (Zihintpause) are no-ops; FENCE.I is generic.
-        0x0f => return if (f3 == 0) .{ .op = .{ .h = .nop, .raw = inst } } else generic(inst, pc, false),
+        // FENCE, FENCE.TSO and PAUSE (Zihintpause) are no-ops on one hart
+        // (core.smp: a barrier, in core.exec); FENCE.I is generic.
+        0x0f => return if (f3 == 0 and !core.smp) .{ .op = .{ .h = .nop, .raw = inst } } else generic(inst, pc, false),
         0x43, 0x47, 0x4b, 0x4f => { // FMADD FMSUB FNMSUB FNMADD
             if (f3 == 5 or f3 == 6) return generic(inst, pc, false);
             const k = ((inst & 0x7f) - 0x43) >> 2;

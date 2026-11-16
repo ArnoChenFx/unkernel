@@ -111,10 +111,46 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    `SetPageAnonExclusive`) are needed on SMP, which also adds spinlocks
    (PTE lock, pcp lock: about 4 more locked ops per fault). Fork stays
    at +33% unless folios grow beyond a page.
-   Open: `__wasm_init_memory_flag` sits
-   after `_end`, in memory the kernel hands out, so a second instance
-   (a secondary CPU) would read a stale flag; browsers were not tried
-   (block, display and sound views of a shared memory are unchecked).
+   Step 2, an SMP kernel in Node (2026-11-16; kernel.md, SMP; js.md, CPU
+   threads): `kw_smp.config` builds it, and `node js/cli.ts --kernel
+   <its vmlinux32.wasm> --smp 2` boots Alpine to a shell on two CPUs
+   (worker mode, interpreter only). kwtest passes on 2 CPUs (40 of 40
+   runs) and 4 CPUs, with its new `smp:` check; the park check is
+   skipped there. Two spinning processes take 1.22 s against 2.42 s on
+   one CPU, two loops of 500 fork+exec 0.66 s against 1.21 s, and four
+   parallel `wget`s through kwnet check out. Cost on one CPU against the
+   UP build (Node, kwbench and the page-fault tool, medians of 7
+   alternating runs, interpreter only): user code, syscalls and memory
+   copies unchanged; `clock_gettime` +17%, anonymous fault +40%, COW
+   fault +33%, munmap +18%, fork+exit+wait +46%, fork of an 8 MiB
+   process +58% (atomics, spinlocks, per-CPU offsets, the interrupt
+   check on every enable); on two CPUs fork costs +85-92% (the child
+   starts on the other CPU: two cross-CPU wakeups).
+   Open, roughly in order:
+   - Tasks never move after their first run, so a busy CPU is never
+     relieved (fork spreads new ones); moving a task preempted in user
+     mode needs parking's fresh entry (`kw_park_resume()`): park it at the
+     top of `user_mode_loop()`, mark it `TIF_NEVER_RUN`, drop the pin, let
+     the balancer move it and resume it on a fresh stack there; a task in
+     a syscall stays. `taskset` to another CPU fails (EBUSY).
+   - Devices: kwblk, kwfb, kwinput, kwsnd and kwshm refuse to start on
+     SMP. kwblk needs `queue_rq` from any CPU funneled to CPU 0 (a queue
+     and a work item, as kwnet does) and completions back; the display,
+     input and sound paths likewise.
+   - Parking and snapshots: off (`KW_PARK` depends on `!SMP`; kernel.md,
+     Parking lists what they would need).
+   - The JIT: off with more than one CPU (per-CPU tables, atomic AMOs in
+     compiled code, cross-hart code tracking).
+   - Browsers: not tried. They need cross-origin isolation, a worker for
+     CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
+     `Atomics.waitAsync` for CPU 0's idle (check each engine; a message
+     from the sender's host would do instead).
+   - A secondary CPU's exit or panic reaches the owner only through CPU
+     0's thread, which takes messages when it suspends; if CPU 0 spins
+     waiting for the stopped CPU (an IPI with interrupts off), the
+     session hangs until `--timeout`.
+   - `pnpm build` does not bundle `js/node/cpu-entry.ts` yet (source
+     checkouts only), and `kernel/build.sh` has no SMP target.
 9. **Listening-port detection** for the preview chip and CLI
    auto-forward: a `kwtty ports` subcommand in C that re-reads
    `/proc/net/tcp` every 3 s (a stdin byte rescans at once) and prints

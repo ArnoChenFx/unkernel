@@ -45,7 +45,14 @@
 //! `exec` for the rest.
 
 const std = @import("std");
+const builtin = @import("builtin");
 pub const fpu = @import("fpu.zig");
+
+/// Several harts share the memory (a wasm build with atomics, for an SMP
+/// kernel: zig build -Dkwemu-atomics): AMOs are atomic read-modify-writes,
+/// SC is a compare-and-swap against the value LR read, and FENCE is a full
+/// barrier. Otherwise one hart owns the memory and plain accesses suffice.
+pub const smp = builtin.cpu.arch.isWasm() and std.Target.wasm.featureSetHas(builtin.cpu.features, .atomics);
 const F32 = fpu.F32;
 const F64 = fpu.F64;
 
@@ -151,7 +158,18 @@ pub const Hart = extern struct {
     /// Enabled optional extensions (bits of `Ext`, a subset of
     /// `implemented`); set by kw_set_isa.
     isa: u64 = implemented,
+    /// The value LR read at `resv` (smp: SC succeeds only if it is still there).
+    resv_val: u64 = 0,
+    /// Target of the atomic read-modify-write that makes FENCE a barrier (smp).
+    fence_word: u32 = 0,
+    _pad2: u32 = 0,
 };
+
+/// A full barrier (smp): a seq_cst read-modify-write, which V8 compiles to
+/// a locked instruction on x86-64.
+inline fn fullFence(h: *Hart) void {
+    _ = @atomicRmw(u32, &h.fence_word, .Add, 0, .seq_cst);
+}
 
 /// Whether extension `e` is enabled on this hart (see `enabled`).
 pub inline fn has(h: *const Hart, comptime e: Ext) bool {
@@ -1280,9 +1298,10 @@ pub fn Interp(comptime M: type) type {
                     };
                 },
                 0x0f => switch (f3) { // MISC-MEM
-                    // FENCE / FENCE.TSO / PAUSE: single hart and coherent
-                    // memory, so a no-op.
-                    0 => {},
+                    // FENCE / FENCE.TSO / PAUSE: a no-op on a single hart
+                    // with coherent memory; a full barrier when harts share
+                    // it (the decoder sends it here only then).
+                    0 => if (smp) fullFence(h),
                     // FENCE.I tells a memory with a decoded-code cache.
                     1 => if (@hasDecl(M, "fenceI")) m.fenceI(),
                     // cbo.clean / cbo.flush (Zicbom), cbo.zero (Zicboz)
@@ -1384,6 +1403,7 @@ pub fn Interp(comptime M: type) type {
                     return if (T == u32) sx32(v) else v;
                 }
             }.f;
+            if (smp) return amoShared(r, h, m, T, inst, f5, rd, rs2, addr);
             switch (f5) {
                 0x02 => { // LR
                     if (rs2 != 0) return ill(h, inst) != .trap;
@@ -1406,6 +1426,67 @@ pub fn Interp(comptime M: type) type {
                 },
             }
             return true;
+        }
+
+        /// amo() when harts share the memory (smp): every AMO is one
+        /// atomic instruction, LR an atomic load whose value SC
+        /// compare-and-swaps against (an ABA store between them goes
+        /// unnoticed, as in QEMU's emulation), and all of them are
+        /// seq_cst, which covers the aq and rl bits.
+        noinline fn amoShared(r: *Regs, h: *Hart, m: *M, comptime T: type, inst: u32, f5: u32, rd: u32, rs2: u32, addr: u64) Error!bool {
+            const S = std.meta.Int(.signed, @bitSizeOf(T));
+            const src: T = @truncate(r.x[rs2]);
+            const old: T = switch (f5) {
+                0x02 => blk: { // LR
+                    if (rs2 != 0) return ill(h, inst) != .trap;
+                    const p = try readPtr(m, T, addr);
+                    const v = @atomicLoad(T, p, .seq_cst);
+                    h.resv = addr;
+                    h.resv_val = v;
+                    break :blk v;
+                },
+                0x03 => { // SC
+                    var ok = false;
+                    if (h.resv == addr) {
+                        const p = shared(T, try m.rmwPtr(T, addr));
+                        ok = @cmpxchgStrong(T, p, @truncate(h.resv_val), src, .seq_cst, .seq_cst) == null;
+                    }
+                    r.x[rd] = @intFromBool(!ok);
+                    h.resv = no_resv;
+                    return true;
+                },
+                else => blk: {
+                    const p = shared(T, try m.rmwPtr(T, addr));
+                    const ps: *S = @ptrCast(p);
+                    break :blk switch (f5) {
+                        0x01 => @atomicRmw(T, p, .Xchg, src, .seq_cst),
+                        0x00 => @atomicRmw(T, p, .Add, src, .seq_cst),
+                        0x04 => @atomicRmw(T, p, .Xor, src, .seq_cst),
+                        0x0c => @atomicRmw(T, p, .And, src, .seq_cst),
+                        0x08 => @atomicRmw(T, p, .Or, src, .seq_cst),
+                        0x10 => @bitCast(@atomicRmw(S, ps, .Min, @bitCast(src), .seq_cst)),
+                        0x14 => @bitCast(@atomicRmw(S, ps, .Max, @bitCast(src), .seq_cst)),
+                        0x18 => @atomicRmw(T, p, .Min, src, .seq_cst),
+                        0x1c => @atomicRmw(T, p, .Max, src, .seq_cst),
+                        else => unreachable,
+                    };
+                },
+            };
+            r.x[rd] = if (T == u32) sx32(old) else old;
+            return true;
+        }
+
+        /// The host pointer behind a guest read of `addr` (aligned, in-page),
+        /// for an atomic load: the memory's readPtr, else its rmwPtr.
+        inline fn readPtr(m: *M, comptime T: type, addr: u64) Error!*T {
+            if (@hasDecl(M, "readPtr")) return shared(T, try m.readPtr(T, addr));
+            return shared(T, try m.rmwPtr(T, addr));
+        }
+
+        /// An aligned pointer for the atomic builtins (AMO addresses are
+        /// checked for alignment, and pages are aligned on the host).
+        inline fn shared(comptime T: type, p: anytype) *T {
+            return @ptrFromInt(@intFromPtr(p));
         }
 
         noinline fn fpMem(r: *Regs, h: *Hart, m: *M, inst: u32) Error!bool {

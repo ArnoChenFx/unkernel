@@ -338,6 +338,41 @@ parts that are easy to get wrong.
 - A worker's WebSocket sends the page's origin, so the Wisp allow list
   works as inline; Node workers send `NODE_WISP_HEADERS`.
 
+## CPU threads (SMP kernels, `js/core/cpu.ts`)
+
+- An SMP kernel (kernel.md, SMP) imports `wasm_init_flag`,
+  `wasm_cpu_count` and `wasm_cpu_start`. `CreateKernelOptions.cpus` (CLI
+  `--smp N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
+  CPUs `Kernel` offers. A UP kernel ignores it with a log line, so does a
+  platform without `Platform.spawnCpu`; with more than one CPU the JIT
+  is off (log line). The memory is shared (the module's import says so).
+- `Kernel` is CPU 0, in whatever thread runs it, with every device.
+  `wasm_cpu_start(cpu, idle)` calls `KernelConfig.spawnCpu` (from
+  `Platform.spawnCpu`: Node `js/node/cpu.ts`, a `worker_threads` Worker
+  on `cpu-entry.ts`, unref'd) with a `CpuInit`: the compiled module, the
+  shared memory, the idle task, the CPU count, the address of
+  `__wasm_init_memory_flag` (the module's export) and `epochMs`, so that
+  the CPU's monotonic clock, `performance.timeOrigin +
+  performance.now() - epochMs`, is CPU 0's (one clock across Node's
+  threads: a worker's value never ran ahead of the main thread's,
+  2026-11-16). In worker mode the kernel worker starts the CPU threads
+  itself (`ServeKernelOptions.spawnCpu`). Exit terminates them.
+- `runCpu()` checks that the flag reads 2, instantiates the module with
+  its own `wasm_switch_to` (its own resumers: JSPI stacks stay in their
+  thread), clocks, `random_get`, `sched_yield` (returns at once) and
+  `fd_write`, which posts console output and panic text to CPU 0's host
+  as it comes (`CpuMessage`: no batching, because this thread may never
+  return to its event loop), and enters `kw_secondary_entry(idle)`. Its
+  `proc_exit` posts the exit; any device import is a kernel bug on that
+  CPU and ends the session ("fatal", naming it). Its idle blocks in the
+  kernel (`memory.atomic.wait32`), so it needs no event loop.
+- CPU 0's host sets IRQ bits with `Atomics.or` (`Kernel.setIrqBits`),
+  and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
+  `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's
+  `memory.atomic.notify` (an IPI) ends; the wait's `done` runs once.
+- Not done: a browser `spawnCpu`, and `pnpm build` bundling
+  `cpu-entry.ts` (from source only); status.md item 8.
+
 ## vsock (`js/core/vsock.ts`)
 
 - The host side of kwvsock (kernel.md). `VsockDevice` (`Kernel.vsock`) is

@@ -717,6 +717,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 			memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,
 			memory64: opts.memory64,
 			jit: opts.jit,
+			cpus: opts.cpus,
 			consoleSize: opts.consoleSize,
 			statsIntervalMs: STATS_INTERVAL_MS,
 			compileMs,

@@ -23,7 +23,7 @@ const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
 pub const Regs = core.Regs;
-pub const abi_version: u32 = 6;
+pub const abi_version: u32 = 7;
 pub const cpu_size: usize = 8 << 20;
 
 pub const Event = extern struct {
@@ -534,6 +534,11 @@ pub const Cpu = extern struct {
     }
 
     /// In-page read-modify-write (aligned atomics). W implies R in a valid PTE.
+    /// For an atomic load (LR when harts share the memory): read permission, in-page.
+    pub inline fn readPtr(self: *Cpu, comptime T: type, va: u64) core.Error!*allowzero align(1) T {
+        return @ptrFromInt(@as(usize, @intCast(try self.readHost(va))));
+    }
+
     pub inline fn rmwPtr(self: *Cpu, comptime T: type, va: u64) core.Error!*allowzero align(1) T {
         return @ptrFromInt(@as(usize, @intCast(try self.writeHost(va, @sizeOf(T)))));
     }

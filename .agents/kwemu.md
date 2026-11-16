@@ -72,6 +72,19 @@ harness).
   entries carry `code_flag`, which sends stores to the slow path. A store
   into a marked chunk retires the page's generations and ends the current
   block, so SMC takes effect at the next instruction.
+- **Several harts** (an SMP kernel, kernel.md, SMP; ABI 7): each CPU has
+  its own `struct kw_cpu` on one shared memory, and code tracking is per
+  `kw_cpu`, so another hart's store into code is seen after a flush here
+  (riscv's `flush_icache` syscall flushes every CPU), as on hardware.
+  Built with `-Dkwemu-atomics` (`core.smp`), AMOs are wasm atomic
+  read-modify-writes (min/max as compare-and-swap loops), LR is an atomic
+  load whose value SC compare-and-swaps against (an ABA store in between
+  goes unnoticed, as in QEMU), everything is seq_cst (so aq/rl hold), and
+  FENCE (also FENCE.TSO and PAUSE) is a generic op that does a seq_cst
+  read-modify-write, a locked instruction on x86-64 V8. Without the
+  option all of them stay single-hart (a plain read-modify-write; FENCE a
+  no-op op). The JIT leaves AMOs and LR/SC to the interpreter already;
+  an SMP host runs the interpreter only.
 - **Precise state.** Ops update `kw_regs` directly. On a fault mid-block,
   pc is recomputed from the raw instruction lengths and the budget is
   refunded. `icount` and the budget are exact, because a block that does

@@ -42,6 +42,8 @@ export interface ServeKernelOptions {
 	readFile?: Platform["readFile"];
 	/** The device kinds the worker builds from specs (the binding's registry). */
 	devices?: DeviceRegistry;
+	/** Starts the threads of an SMP kernel's other CPUs (Platform.spawnCpu), from this worker. */
+	spawnCpu?: Platform["spawnCpu"];
 }
 
 /** How long the exit waits for saves in flight before it is reported anyway. */
@@ -217,6 +219,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				defaultKernel: () => { throw new BootError("boot", "the worker was not told where the kernel is"); },
 				readFile: options.readFile,
 				devices: options.devices,
+				spawnCpu: options.spawnCpu,
 			}, {
 				disks: spec.disks,
 				net: spec.net,
@@ -231,6 +234,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				memoryFallbackMiB: spec.memoryFallbackMiB,
 				memory64: spec.memory64,
 				jit: spec.jit,
+				cpus: spec.cpus,
 				consoleSize: spec.consoleSize,
 				restore: spec.restore,
 				// The owner sends the size its display function returns; the kernel asks at the first open.

@@ -37,6 +37,8 @@ export interface WorkerBootSpec {
 	memoryFallbackMiB?: number[];
 	memory64?: boolean;
 	jit?: boolean;
+	/** CPUs for an SMP kernel (CreateKernelOptions.cpus); the worker starts their threads itself. */
+	cpus?: number;
 	consoleSize?: { cols: number; rows: number };
 	/** Disk and network specs (devices.ts), built by the worker's registry. */
 	disks?: DiskSpec[];

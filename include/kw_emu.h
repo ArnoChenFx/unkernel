@@ -35,6 +35,15 @@
  *    the icache. (Rewriting a currently mapped exec page in place with no
  *    flush at all may keep running the old code until one of those, as an
  *    incoherent icache would.)
+ *
+ * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
+ * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
+ * built with wasm atomics (zig build -Dkwemu-atomics) makes guest AMOs
+ * atomic read-modify-writes, SC a compare-and-swap against the value LR
+ * read, and FENCE a full barrier; without atomics they assume one hart.
+ * Guest stores are tracked only by the struct kw_cpu that runs them: code
+ * another CPU rewrites is seen after a flush on this one (riscv's
+ * flush_icache syscall, FENCE.I alone is local), as on hardware.
  */
 #ifndef KW_EMU_H
 #define KW_EMU_H
@@ -49,7 +58,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 6
+#define KW_ABI_VERSION 7
 
 struct kw_regs {
 	uint64_t x[32];   /* x[0] is ignored and reads as zero */

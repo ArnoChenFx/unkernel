@@ -1029,8 +1029,14 @@ switching, no block or net device, no JIT).
   and saves only on flush (ext4 commits every 5 s), so a tab closed mid-way
   loses at most the unflushed tail. An export or import of the data disk is
   held in memory as a whole.
-* No SMP. linux-wasm's NOMMU mode (programs as Wasm modules), its Wasm
-  binfmt and its wasm32 build are not part of this port.
+* SMP is experimental: a second build (`arch/wasm/configs/kw_smp.config`,
+  built by hand, `.agents/kernel.md`, SMP) runs one kernel instance per
+  CPU in worker threads on a shared memory (CLI `--smp N`; Node only,
+  interpreter only). It has no disks, display, input, sound, shm or
+  snapshots yet, and a task stays on the CPU it first ran on. The
+  released kernel is UP. linux-wasm's NOMMU mode (programs as Wasm
+  modules), its Wasm binfmt and its wasm32 build are not part of this
+  port.
 * Kernel stack overflow is not detected (16 KiB shadow stacks). A wasm
   trap in kernel code ends the session.
 * `vmap()` of scattered pages returns NULL. No current user in this config

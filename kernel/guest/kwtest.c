@@ -1411,7 +1411,13 @@ static void park_checks(void)
 	char wake[PK_N] = { 'r', 'p', 0, 0, 'e', 0 };
 
 	if (park_read(&first)) {
-		CHECK(0, "park: no /proc/kwpark");
+		struct utsname u;
+
+		/* An SMP kernel has no parking (kernel.md, Parking). */
+		if (!uname(&u) && strstr(u.version, " SMP "))
+			CHECK(1, "park: skipped (SMP kernel: no parking)");
+		else
+			CHECK(0, "park: no /proc/kwpark");
 		return;
 	}
 	shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -1456,6 +1462,76 @@ static void park_checks(void)
 	      "read, poll, nanosleep, futex restarted, epoll_wait EINTR %d times, hot() in user mode: %d/%d children ok",
 	      n, p.users, p.kthreads, n ? us_sum / n : 0, us_max, shared[1], ok_children, PK_N);
 	munmap((void *)shared, 4096);
+}
+
+/*
+ * SMP (more than one CPU online): threads on several CPUs hammer shared
+ * counters through AMOs (amoadd), LR/SC (a compare-and-swap loop) and a
+ * pthread mutex (LR/SC plus futex wait and wake across CPUs); every
+ * increment must count, and the threads must have run on more than one
+ * CPU (tasks stay on the CPU they first ran on).
+ */
+#define SMP_THREADS 3
+#define SMP_ITERS 300000
+static struct {
+	unsigned amo, lrsc, locked;
+	pthread_mutex_t lock;
+	volatile int go;
+} smp_shared = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void *smp_worker(void *arg)
+{
+	unsigned long cpus = 0;
+	unsigned cpu;
+	int i;
+
+	while (!smp_shared.go)
+		;
+	for (i = 0; i < SMP_ITERS; i++) {
+		unsigned old = __atomic_load_n(&smp_shared.lrsc, __ATOMIC_RELAXED);
+
+		__atomic_fetch_add(&smp_shared.amo, 1, __ATOMIC_RELAXED);
+		while (!__atomic_compare_exchange_n(&smp_shared.lrsc, &old, old + 1, 1,
+						    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+			;
+		if (!(i & 15)) {
+			pthread_mutex_lock(&smp_shared.lock);
+			smp_shared.locked++;
+			pthread_mutex_unlock(&smp_shared.lock);
+		}
+		if (!(i & 4095) && !syscall(SYS_getcpu, &cpu, NULL, NULL) && cpu < 64)
+			cpus |= 1UL << cpu;
+	}
+	return (void *)cpus;
+}
+
+static void smp_checks(void)
+{
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	unsigned long cpus = 0;
+	pthread_t th[SMP_THREADS];
+	int i, made = 0;
+	void *r;
+
+	if (online < 2) {
+		printf("ok   smp: one CPU online (skipped)\n");
+		return;
+	}
+	/* This thread works too: new threads go to the least busy CPU. */
+	for (i = 1; i < SMP_THREADS; i++)
+		made += !pthread_create(&th[i], NULL, smp_worker, NULL);
+	smp_shared.go = 1;
+	cpus = (unsigned long)smp_worker(NULL);
+	made++;
+	for (i = 1; i < SMP_THREADS; i++)
+		if (!pthread_join(th[i], &r))
+			cpus |= (unsigned long)r;
+	CHECK(made == SMP_THREADS && smp_shared.amo == SMP_THREADS * SMP_ITERS &&
+	      smp_shared.lrsc == SMP_THREADS * SMP_ITERS &&
+	      smp_shared.locked == SMP_THREADS * (SMP_ITERS / 16) && __builtin_popcountl(cpus) >= 2,
+	      "smp: %ld CPUs; %d threads on CPUs %#lx: amoadd %u, lr/sc %u, mutex %u (want %u, %u, %u)",
+	      online, made, cpus, smp_shared.amo, smp_shared.lrsc, smp_shared.locked,
+	      SMP_THREADS * SMP_ITERS, SMP_THREADS * SMP_ITERS, SMP_THREADS * (SMP_ITERS / 16));
 }
 #endif /* __riscv */
 
@@ -1592,6 +1668,7 @@ int main(int argc, char **argv)
 	shm_checks();
 	fb_checks();
 	park_checks();
+	smp_checks();
 #endif
 
 	printf("kwtest: %d failure(s)\n", failures);

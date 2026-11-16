@@ -35,7 +35,7 @@ const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--initrd al
        [--size COLSxROWS] [--stats] [--disk image.ext4|URL]... [--snapshot]
        [--data FILE [--data-template FILE.kwsparse.gz]]
        [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
-       [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]]
+       [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]] [--smp N]
        [--mount HOSTDIR:GUESTPATH[:ro]]... [--forward HOSTPORT:GUESTPORT]...
        [--restore FILE]
 
@@ -82,6 +82,12 @@ through shared memory (read by the worker while the kernel runs);
 --worker=messages sends them as messages instead (handled when the kernel
 yields, up to 20 ms while the guest is busy), --worker=shared insists on
 shared memory. PCM and everything else are messages either way.
+
+--smp N gives an SMP kernel (one built with CONFIG_SMP: kw_smp.config)
+N CPUs, each another instance of the kernel in its own thread on a shared
+memory; it implies --worker and the interpreter only (--no-jit). A UP kernel
+runs on one CPU (a log line says so). An SMP kernel has no disks, display,
+input, sound or shm yet (its drivers say so at boot), and no snapshots.
 
 --display gives the guest a display: /dev/fb0 (kwfb, 32 bpp XRGB8888), whose
 memory exists while a program has it open; 640x480, or --display=WxH (the
@@ -184,7 +190,13 @@ const timeout = Number(opt("timeout", "0"));
 const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;
 const workerArg = args.find((a) => a === "--worker" || a.startsWith("--worker="));
-const worker = !!workerArg;
+const smpCpus = Number(opt("smp", "1"));
+if (!Number.isInteger(smpCpus) || smpCpus < 1 || smpCpus > 32) {
+	process.stderr.write("[host] --smp N: 1 to 32 CPUs\n");
+	process.exit(1);
+}
+// SMP: every CPU in a worker, CPU 0 in the kernel worker.
+const worker = !!workerArg || smpCpus > 1;
 const workerTransport = workerArg?.slice(9);
 if (workerTransport && workerTransport !== "shared" && workerTransport !== "messages") {
 	process.stderr.write("[host] --worker=shared|messages\n");
@@ -383,7 +395,7 @@ async function forward(sock: Socket, guestPort: number): Promise<void> {
 }
 try {
 	const common = {
-		kernel: module, initrd, cmdline, memoryMiB, consoleSize, log, jit: !flag("no-jit"), onOutput: (bytes: Uint8Array) => process.stdout.write(bytes),
+		kernel: module, initrd, cmdline, memoryMiB, consoleSize, log, jit: !flag("no-jit"), cpus: smpCpus, onOutput: (bytes: Uint8Array) => process.stdout.write(bytes),
 		display: displaySize ?? flag("display"),
 		onDisplay: (m: DisplayMode | null) => log(m ? `[host] display: ${m.width}x${m.height}, stride ${m.stride}` : "[host] display: closed"),
 		onInput: (s: InputState) => log(`[host] evdev: keyboard ${s.keyboard ? "open" : "closed"}, mouse ${s.mouse ? "open" : "closed"}, tablet ${s.tablet ? "open" : "closed"}`),

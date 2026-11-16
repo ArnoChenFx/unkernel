@@ -39,6 +39,12 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   `kw_defconfig` patch. Each patch need not build on its own; the whole
   series must.
 - Keep `-N` (no `n/m` counter) on export.
+- The SMP work (status.md item 8) is on the `smp` branch with its kernel
+  tree in the worktree `vendor/src/linux-smp` (branch `kw-smp`), whose
+  new patches follow `kw_defconfig`: the shared-memory build, the atomic
+  tweaks, then percpu-km, `ARCH_TASKS_STAY_ON_CPU` (sched, kthread and
+  workqueue) and the arch and driver SMP patches. There
+  `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
   built with `KSRC=/path/x KOUT=vendor/build/kernel-x kernel/build.sh kernel`.
@@ -83,7 +89,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 6. `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 7. `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it, in both copies, on any change to
   the layout or the semantics. A new `KW_ISA_*` bit is an ABI change;
   implementing an extension that already has a bit is not. Host imports
@@ -146,7 +152,8 @@ patch re-export.
   initialised by the start function `__wasm_init_memory`) make variables
   build a UP kernel that boots on a shared memory; kwemu must then be
   built with `zig build -Dkwemu-atomics=true`, and the host detects the
-  shared import (status.md, SMP). Guest RAM is below
+  shared import (status.md, SMP). An SMP kernel (SMP below) always links
+  that way. Guest RAM is below
   4 GiB, which makes the lowering exact.
 
 ## Tasks: JSPI on one thread
@@ -156,7 +163,8 @@ patch re-export.
   promise and resumes the next one, or starts a fresh stack through the
   promising export `ret_from_fork`. `__stack_pointer` and `current` are
   wasm globals, saved in locals across the switch (`entry.S`).
-- The kernel is UP with `ARCH_NO_PREEMPT`.
+- The kernel is UP with `ARCH_NO_PREEMPT` (the SMP build, SMP below, has
+  one such thread per CPU).
 - Suspending imports: `unkernel.wasm_switch_to` and the WASI
   `poll_oneoff`, `sched_yield` and `proc_exit`. They suspend only when the
   host returns a promise. The console read path uses a zero-timeout
@@ -286,7 +294,11 @@ Every cycle resumes every task through the fresh-stack path, so kwtest's
   answered its first shell command 215 ms after reading the file, about
   what a cold boot to the prompt takes (210 ms): the gain is the state,
   not the time.
-- **SMP** (not done; UP is assumed in three places): `kw_park_final` must
+- **SMP**: `KW_PARK` depends on `!SMP`, so an SMP kernel has no
+  `/proc/kwpark`, no `kw_resume` export (the host's `snapshot()` rejects:
+  "cannot resume one") and no handler for IRQ 8; kwtest's `park:` check
+  is skipped when `uname -v` says SMP. Parking there would need (UP is
+  assumed in three places): `kw_park_final` must
   become a count of CPUs that reached `arch_cpu_idle()` with interrupts
   off (the last one runs the check); `kw_unpark_all()` must not mark a
   task whose old stack still runs on another CPU (a spurious wakeup into
@@ -317,6 +329,8 @@ Module `wasi_snapshot_preview1` (kernel `wasi.c`, host `js/core/wasi.ts`):
   the bounce buffer.
 
 Module `unkernel`: `wasm_switch_to`, `wasm_snapshot_point` (park.c),
+`wasm_init_flag`, `wasm_cpu_count` and `wasm_cpu_start` (SMP kernels
+only; SMP below),
 `wasm_driver_block_info`/`submit`/`reap`
 (kwblk), `wasm_driver_net_init`/`send`/`rx_len`/`recv` (kwnet; `net_init`
 < 0 means no device), `wasm_driver_console_size` (`rows << 16 | cols`, 0 =
@@ -510,12 +524,118 @@ third-party implementation.
   busy loop the clock ran every 0.6 ms p90 with the JIT, 1.3 ms without;
   2026-11-14). Keep a clock read at the slice end if `do_user_interrupt`
   changes.
+- SMP: each CPU has a word of pending bits. CPU 0's is `wasm_host_irqs`
+  (the host's device bits arrive there only, so device interrupts run on
+  CPU 0; the host sets them with `Atomics.or`), the others are
+  `kw_irq_words[]`; IPIs are bits 24-26 (`KW_IPI_*`, irq.h). The timer is
+  a per-CPU clockevent (IRQ 0 is a percpu-devid interrupt) with a per-CPU
+  expiry. Polling widens: a CPU also takes what is pending when it
+  enables interrupts (`arch_local_irq_restore()` checks the word) and in
+  `cpu_relax()` with interrupts on, so a CPU spinning on a lock still
+  answers the holder's TLB shootdown.
 - irq_work runs from the timer tick: `arch_irq_work_has_interrupt()` is
   false, since nothing could raise the interrupt (otherwise irq_work never
   runs and every Tiny SRCU `synchronize_srcu()` hangs: inotify `close()`,
   systemd).
 - A single long stay in the kernel (one big syscall) still delays these
   checks until it returns. See status.md.
+
+## SMP (`CONFIG_SMP`, `arch/wasm/configs/kw_smp.config`)
+
+A second build of the same tree: `make kw_defconfig kw_smp.config` (SMP,
+`NR_CPUS` 8), which also links with `--shared-memory` (arch Makefile),
+with kwemu built by `zig build -Dkwemu-jit=true -Dkwemu-atomics=true`.
+The build script has no target for it yet: run make by hand into a
+`KOUT` of its own with the script's make variables and `KWEMU=` that
+kwemu, then lower it as `lower` does. The UP build does not change
+(every SMP piece is `#ifdef CONFIG_SMP` or compiles away). Status,
+numbers and open issues: status.md item 8.
+
+- **Model.** One instance of the module per CPU, each in its own host
+  thread, all on one shared memory. `current`, `__stack_pointer`,
+  `kw_irq_flags` (the interrupt flag) and `kw_irq_word` (the address of
+  the CPU's pending word) are wasm globals, so per CPU;
+  `raw_smp_processor_id()` is `current_thread_info()->cpu`. The host
+  offers `wasm_cpu_count()` CPUs; `kw_smp_init_cpus()` (setup_arch)
+  makes them possible and present, capped by `nr_cpus=`, and takes
+  kwemu's 8 MiB state for each from memblock (CPU 0's stays static).
+  `__cpu_up()` calls `wasm_cpu_start(cpu, idle)`: the host starts a
+  thread with a new instance, which enters the export
+  `kw_secondary_entry(idle)` (entry.S), then `kw_secondary_start()`
+  (smp.c); `__cpu_up()` waits up to 30 s for it to come online.
+- **The data-segment flag.** With a shared memory every instance's start
+  function initialises the passive data segments unless the word
+  `__wasm_init_memory_flag` is 2. wasm-ld places it after all data, past
+  `_end`, in memory the kernel would hand out, and C cannot name it
+  (wasm-ld asserts on a reference). The module exports its address, so
+  the host answers `wasm_init_flag()` from that export and setup_arch
+  memblock-reserves the word; a secondary's host checks that it reads 2
+  before it instantiates.
+- **Tasks stay on the CPU they first ran on** (a JSPI stack belongs to
+  the thread that created it): `ARCH_TASKS_STAY_ON_CPU` (init/Kconfig).
+  `__ret_from_fork()` calls `migrate_disable()` at a task's first run and
+  never undoes it, which the scheduler honours everywhere (`cpus_ptr`
+  becomes that CPU; `sched_getaffinity()` still shows the user's mask).
+  A fork child starts unpinned (`copy_thread()` resets the copied pin),
+  so new tasks spread at fork, but a task never moves after its first
+  run: nothing rebalances a busy CPU. An affinity change that excludes
+  the task's CPU fails with EBUSY (kernel/sched/core.c) instead of
+  waiting for a `migrate_enable()` that never comes (`taskset -c 1` from
+  a shell on CPU 0 fails). New kthreads first run only to report that
+  they exist and are bound afterwards (per-CPU threads of a CPU not yet
+  online, a per-CPU workqueue pool's first worker), so kernel/kthread.c
+  and kernel/workqueue.c call `arch_kthread_restart_point(fn, arg)`
+  before such a sleep (the creation wait, the park before the thread
+  function, an idle worker) and `arch_kthread_restart_cancel()` after it.
+  In between the task may migrate; woken on another CPU than its stack's,
+  `__switch_to()` starts it on a fresh stack there and `__ret_from_fork()`
+  runs `kthread_exit(fn(arg))`. The old stack stays suspended in the
+  other thread until that host's entry for the task is replaced. A
+  workqueue rescuer bound to another CPU's pool runs there anyway.
+- **IPIs and idle.** `kw_irq_raise(cpu, bits)` (irq.c) ORs the bits into
+  the target's word and does `memory.atomic.notify`. A secondary idles in
+  `memory.atomic.wait32` on its word with the timer's timeout (it blocks
+  its thread; no JSPI); CPU 0 idles in `poll_oneoff` as on UP, and its
+  host also ends that wait on `Atomics.waitAsync` of `wasm_host_irqs`.
+  `kw_irq_enable_pending()` runs the handlers with interrupts still off,
+  then sets the flag; `user_mode_loop()` enables without delivering,
+  since `kw_run()` returns `KW_EV_INTERRUPT` at once and the exit path
+  then honours a reschedule. Only CPU 0 yields to its host (`wasm_yield`).
+  `smp_send_stop()` parks the others (CPU 0 in `wasm_idle(-1)`, so its
+  host can still take a secondary's exit).
+- **MM.** `switch_mm()` adds the CPU to `mm_cpumask(next)` before
+  `kw_set_pgd()` and removes it from the previous mm (still referenced:
+  lazy TLB refcount). `flush_tlb_*()`, `update_mmu_cache_range()` and
+  the flush of `ptep_set_access_flags()` run `kw_flush_tlb_*` here and,
+  through `smp_call_function_many()` with wait, on every other CPU in the
+  mask; `riscv_flush_icache` flushes every CPU (`kw_flush_icache_all()`).
+  The software A/D update in fault.c is a `cmpxchg` (as a hardware
+  walker's, without the PTE lock), so pgtable.h makes every
+  read-modify-write of a present PTE atomic on SMP
+  (`ptep_get_and_clear`, `ptep_set_wrprotect`,
+  `ptep_test_and_clear_young`, `ptep_set_access_flags` keeping D). The
+  uaccess walk and copy (`kw_user_addr()`) have no poll point between
+  them, and pages and page tables are freed only after the mmu_gather
+  flush, which waits for every CPU's answer, so a CPU never copies into a
+  freed page (gup-fast's argument; the default mmu_gather, without
+  `MMU_GATHER_RCU_TABLE_FREE`, frees page tables in the same batch).
+- **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
+  on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
+  Spinlocks are asm-generic's ticket locks, rwlocks queued
+  (`ARCH_USE_QUEUED_RWLOCKS`), RCU is TREE_RCU.
+- **Devices** stay on CPU 0 (their imports answer only there). hvc_wasm:
+  CPU 0's console interrupt pulls the input into a FIFO and records the
+  window size, and khvcd reads those on any CPU; output works on every
+  CPU (each CPU's host forwards `fd_write`). kwnet: NAPI runs on CPU 0
+  (its interrupt); another CPU's frames wait in a queue that a work item
+  on CPU 0 sends, and `ndo_open` raises IRQ 2 on CPU 0 instead of
+  looking itself. kwvsock: its work items run on CPU 0, and another CPU's
+  packets wait in `tx_queue`. kwblk, kwfb, kwinput, kwsnd and kwshm
+  refuse to start on SMP (a boot line says so). WASI's scratch buffers
+  for the clock and writes are per CPU; the rest is CPU 0's.
+- **kwemu** gets a `struct kw_cpu` per CPU, with the ISA CPU 0 enabled,
+  and interprets only (the host turns the JIT off with more than one
+  CPU). Its atomics build makes AMOs, LR/SC and FENCE atomic (kwemu.md).
 
 ## riscv64 user ABI
 
@@ -613,6 +733,9 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
     after `munmap`.
   - `config:` checks the options below, and `input handlers` that no
     input handler besides evdev and sysrq is registered.
+  - `smp:` (more than one CPU online; skipped otherwise): three threads,
+    the main one among them, count to 900000 through amoadd, an LR/SC
+    loop and a pthread mutex, and must have run on at least two CPUs.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).

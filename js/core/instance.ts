@@ -7,6 +7,7 @@
 // `worker: true` the kernel runs in a worker (worker-host.ts) instead.
 
 import type { BlockDevice, BlockStats } from "./block.ts";
+import type { CpuEndpoint, CpuInit } from "./cpu.ts";
 import type { DisplayFrame, DisplayHost, DisplayMode, DisplayOption, DisplayStats } from "./display.ts";
 import type { Evdev, InputHost, InputState, InputStats } from "./input.ts";
 import type { JitStats, KwemuStats } from "./jit.ts";
@@ -109,6 +110,14 @@ export interface CreateKernelOptions {
 	 * interpreter only.
 	 */
 	jit?: boolean;
+	/**
+	 * CPUs to give an SMP kernel (a kernel built with CONFIG_SMP; kernel.md,
+	 * SMP): each runs in its own thread on a shared memory, so it needs a
+	 * platform that starts CPU threads (Platform.spawnCpu: Node) and, in
+	 * browsers, cross-origin isolation. Default 1. A UP kernel ignores it
+	 * (with a log line). With more than one CPU the JIT is off.
+	 */
+	cpus?: number;
 	/**
 	 * A display: the guest gets /dev/fb0 (kwfb, XRGB8888), and frame() /
 	 * display read what it draws. true = 640x480; or a size; or a function
@@ -253,6 +262,8 @@ export interface Platform {
 	defaultMemoryFallbackMiB?: number[];
 	/** Start a worker running serveKernel() (worker-serve.ts); without it there is no worker mode. */
 	spawnWorker?: () => WorkerEndpoint;
+	/** Start a thread running a secondary CPU of an SMP kernel (cpu.ts, runCpu()); without it the kernel gets one CPU. */
+	spawnCpu?: (init: CpuInit) => CpuEndpoint;
 	/** A relative kernel or initrd location as an absolute URL, for the worker (Node: a path -> file: URL). */
 	absoluteUrl?: (src: string) => string | undefined;
 	/** The device kinds this platform builds from specs (devices.ts). */
@@ -732,6 +743,8 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,
 		memory64: opts.memory64,
 		jit: opts.jit,
+		cpus: opts.cpus,
+		spawnCpu: platform.spawnCpu,
 		restore: opts.restore,
 		display: opts.display,
 		onDisplay: opts.onDisplay,

@@ -65,8 +65,9 @@ pub fn build(b: *std.Build) void {
     const fp_fuzz = b.option(u32, "kwemu-fp-fuzz", "kwemu: random operand sets per op in the F/D JIT differential test (default: 0 = 4096)") orelse 0;
     // wasm atomics + bulk memory in the wasm64 objects, so that a kernel
     // linked with --shared-memory (wasm-ld refuses objects without both)
-    // can include kwemu. kwemu itself stays single-threaded: guest
-    // AMO/LR/SC are not made atomic by this.
+    // can include kwemu. With them (core.smp) guest AMOs are atomic
+    // read-modify-writes, SC a compare-and-swap against the value LR read,
+    // and FENCE a full barrier, for an SMP kernel's harts on one memory.
     const atomics = b.option(bool, "kwemu-atomics", "kwemu: build the wasm64 objects with the atomics and bulk-memory features, for a shared-memory kernel (default: false)") orelse false;
     const kw_opts_mod = kwOptions(b, tail_call, stats, jit, jit_threshold, jit_grow, fp_fuzz);
     const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, tail_call, stats, true, jit_threshold, jit_grow, fp_fuzz);

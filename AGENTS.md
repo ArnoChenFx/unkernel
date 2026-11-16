@@ -79,6 +79,11 @@ Details are in the area files.
 - Every kernel thread needs a `kw_park_point()` in its loop, or parking
   (and so snapshots) fails with EBUSY naming it (kernel.md, Parking).
 - JIT output must match the interpreter exactly (kwemu.md).
+- SMP kernels: a task never leaves the CPU it first ran on (its JSPI
+  stack is that thread's), host imports other than clocks, randomness,
+  console output and task switching answer on CPU 0 alone, and a kernel
+  thread that is bound to another CPU after it ran needs a restart point
+  (kernel.md, SMP).
 - `kw_defconfig` is maintained by hand. Kconfig drops options silently, so
   check `$KOUT/.config` after a change.
 - `js/core` stays universal: no `node:` imports, no unguarded DOM APIs
@@ -118,6 +123,7 @@ Run the quick check for what you changed. The full matrix in
 | Host file systems (9p, `kw9p`) | `pnpm test:9p`; `pnpm test:api` (after a kw9p change, `kernel/build.sh alpine` first) |
 | Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh alpine` first) |
 | Network | `pnpm test:net` |
+| SMP (`CONFIG_SMP`, `js/core/cpu.ts`; kernel.md, SMP) | build it by hand (kernel.md, SMP); kwtest with `--kernel <its vmlinux32.wasm> --smp 2` (and once without `--smp`); `zig build test -Dkwemu-atomics=true` after a kwemu change |
 | Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
 
 The optional checks boot the same bundle as `pnpm test:api`, which already

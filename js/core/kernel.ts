@@ -19,8 +19,17 @@
 // Every
 // import except the suspending ones (wasm_switch_to, poll_oneoff,
 // sched_yield, proc_exit) must return synchronously.
+//
+// An SMP kernel (CONFIG_SMP: it imports wasm_cpu_start, and its memory is
+// shared) runs this instance as CPU 0, with every device, and asks for
+// the other CPUs through wasm_cpu_start: each is another instance of the
+// module on the same memory in its own thread (cpu.ts, started by
+// KernelConfig.spawnCpu). Other CPUs set IPI bits in wasm_host_irqs, so
+// the host sets its own bits there atomically, and an idle wait also ends
+// on a change of that word (Atomics.waitAsync, the kernel's notify).
 
 import { BlockHost, type BlockDevice, type DiskSnapshotState } from "./block.ts";
+import type { CpuEndpoint, CpuInit, CpuMessage } from "./cpu.ts";
 import { DisplayHost, type DisplayMode, type DisplayOption } from "./display.ts";
 import { InputHost, type InputState } from "./input.ts";
 import { JitHost } from "./jit.ts";
@@ -47,6 +56,7 @@ const IRQ_SHM = 7;
 /** Park every task and call wasm_snapshot_point (snapshot()). */
 const IRQ_SNAPSHOT = 8;
 const EBUSY = 16;
+const ENOSYS = 38;
 
 const textDecoder = new TextDecoder();
 
@@ -165,6 +175,15 @@ export interface KernelConfig {
 	 * rejects otherwise.
 	 */
 	restore?: KernelSnapshot;
+	/**
+	 * CPUs to offer an SMP kernel (CONFIG_SMP), each one more instance of
+	 * the module in its own thread (spawnCpu). Default 1. A UP kernel
+	 * ignores it (with a log line). More than one CPU runs kwemu's
+	 * interpreter only (jit is ignored).
+	 */
+	cpus?: number;
+	/** Start a secondary CPU's thread (Platform.spawnCpu); without it an SMP kernel gets one CPU. */
+	spawnCpu?: (init: CpuInit) => CpuEndpoint;
 }
 
 /**
@@ -291,6 +310,10 @@ export class Kernel {
 	netMac: Uint8Array | null = null;
 	/** The snapshot() in progress. */
 	snapshotWaiter: { resolve: (s: KernelSnapshot) => void; reject: (e: Error) => void; stop: boolean } | null = null;
+	/** CPUs offered to the kernel (1 unless an SMP kernel and KernelConfig.cpus > 1). */
+	cpus = 1;
+	/** The other CPUs' threads, once started. */
+	secondaries: CpuEndpoint[] = [];
 
 	constructor(opts: KernelConfig) {
 		this.opts = opts;
@@ -310,9 +333,15 @@ export class Kernel {
 		}));
 		this.stats = { switches: 0, idles: 0, yields: 0 };
 		this.block = new BlockHost(this, opts.disks ?? []);
+		const smp = WebAssembly.Module.imports(opts.module).some((i) => i.module === "unkernel" && i.name === "wasm_cpu_start");
+		const cpus = Math.max(1, Math.floor(opts.cpus ?? 1));
+		if (cpus > 1 && !smp) this.log(`[host] this kernel is not SMP: ${cpus} CPUs asked, it runs on one`);
+		else if (cpus > 1 && !opts.spawnCpu) this.log("[host] this platform cannot start CPU threads: the SMP kernel runs on one CPU");
+		else if (smp) this.cpus = cpus;
+		if (this.cpus > 1 && opts.jit !== false) this.log("[host] SMP: kwemu's JIT is off (interpreter only)");
 		// Memory and its type are read at call time: boot() may retry with
 		// the other memory type.
-		this.jit = new JitHost({ enabled: opts.jit, memory: () => this.memory, memory64: () => this.memory64, log: this.log });
+		this.jit = new JitHost({ enabled: this.cpus > 1 ? false : opts.jit, memory: () => this.memory, memory64: () => this.memory64, log: this.log });
 		this.netRx = [];
 		this.display = new DisplayHost({ enabled: opts.display, memory: () => this.memory, onChange: opts.onDisplay, log: this.log });
 		this.evdev = new InputHost({ enabled: !!opts.display, memory: () => this.memory, raise: () => this.raiseIrq(IRQ_INPUT), onChange: opts.onInput });
@@ -325,6 +354,7 @@ export class Kernel {
 		void this.exited.then(() => {
 			this.vsock.close();
 			this.shm.close();
+			for (const c of this.secondaries) c.terminate();
 		});
 		this.exports = undefined;
 		this.irqAddr = undefined;
@@ -333,20 +363,97 @@ export class Kernel {
 	/** Queue an Ethernet frame for the guest's kwnet device. */
 	receiveFrame(frame: Uint8Array): void {
 		this.netRx.push(frame);
-		if (this.irqAddr !== undefined) {
-			const dv = this.dv();
-			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) | (1 << IRQ_NET), true);
-		}
+		this.setIrqBits(1 << IRQ_NET);
 		this.wake();
 	}
 
 	/** Set a host IRQ bit in wasm_host_irqs (once instantiated) and wake the kernel. */
 	raiseIrq(bit: number): void {
-		if (this.irqAddr !== undefined && !this.result) {
-			const dv = this.dv();
-			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) | (1 << bit), true);
-		}
+		if (!this.result) this.setIrqBits(1 << bit);
 		this.wake();
+	}
+
+	/**
+	 * OR `bits` into wasm_host_irqs (once instantiated); with a shared
+	 * memory atomically, since other CPUs set IPI bits there too.
+	 */
+	setIrqBits(bits: number): void {
+		if (this.irqAddr === undefined) return;
+		if (this.sharedMemory) Atomics.or(new Int32Array(this.memory.buffer), this.irqAddr >> 2, bits);
+		else {
+			const dv = this.dv();
+			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) | bits, true);
+		}
+	}
+
+	/** Clear `bits` in wasm_host_irqs, as setIrqBits() sets them. */
+	clearIrqBits(bits: number): void {
+		if (this.irqAddr === undefined) return;
+		if (this.sharedMemory) Atomics.and(new Int32Array(this.memory.buffer), this.irqAddr >> 2, ~bits);
+		else {
+			const dv = this.dv();
+			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) & ~bits, true);
+		}
+	}
+
+	/**
+	 * With other CPUs running, an idle wait also ends when wasm_host_irqs
+	 * changes from 0 (an IPI: the sender notifies). Calls `done` once that
+	 * happens, at once if it already did, or after `timeoutMs`.
+	 */
+	watchIrqWord(done: () => void, timeoutMs: number): void {
+		if (!this.secondaries.length || this.irqAddr === undefined) return;
+		const r = Atomics.waitAsync(new Int32Array(this.memory.buffer), this.irqAddr >> 2, 0, timeoutMs);
+		if (r.async) void r.value.then(done);
+		else if (r.value === "not-equal") queueMicrotask(done);
+	}
+
+	/** wasm_cpu_start(cpu, idle): start a secondary CPU's thread. */
+	startCpu(cpu: number, idle: bigint): number {
+		const spawn = this.opts.spawnCpu;
+		if (!spawn || cpu < 1 || cpu >= this.cpus || this.result) return -ENOSYS;
+		const flag = this.exports?.__wasm_init_memory_flag;
+		let ep: CpuEndpoint;
+		try {
+			ep = spawn({
+				cpu, idle, module: this.opts.module, memory: this.memory, cpus: this.cpus,
+				initFlag: flag instanceof WebAssembly.Global ? Number(flag.value) : 0,
+				epochMs: performance.timeOrigin - this.wasi.monoOffset,
+			});
+		} catch (e) {
+			this.log(`[host] cannot start CPU ${cpu}: ${(e as Error)?.message ?? e}`);
+			return -ENOSYS;
+		}
+		this.secondaries.push(ep);
+		ep.listen({
+			message: (m) => this.onCpuMessage(m),
+			error: (e) => this.fatal(`CPU ${cpu}: ${(e as Error)?.stack ?? e}`),
+		});
+		return 0;
+	}
+
+	onCpuMessage(m: CpuMessage): void {
+		switch (m.t) {
+			case "out":
+				if (!this.result) this.opts.write(m.bytes);
+				break;
+			case "err":
+				this.wasi.stderr = (this.wasi.stderr + textDecoder.decode(m.bytes)).slice(-4096);
+				break;
+			case "exit":
+				this.wasi.exit(m.code);
+				this.wake();
+				break;
+			case "fatal":
+				this.fatal(m.msg);
+				this.wake();
+				break;
+			case "trap":
+				this.log(`[host] wasm trap: ${m.error}`);
+				this.exit({ code: 254, reason: m.error, kind: "trap", error: m.error });
+				this.wake();
+				break;
+		}
 	}
 
 	netImports(): Record<string, unknown> {
@@ -413,10 +520,7 @@ export class Kernel {
 		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
 		if (!bytes.length) return;
 		this.input.push(bytes);
-		if (this.irqAddr !== undefined) {
-			const dv = this.dv();
-			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) | (1 << IRQ_CONSOLE), true);
-		}
+		this.setIrqBits(1 << IRQ_CONSOLE);
 		this.wake();
 	}
 
@@ -429,10 +533,7 @@ export class Kernel {
 		const size = ((Math.min(rows, 0xffff) << 16) | Math.min(cols, 0xffff)) >>> 0;
 		if (!cols || !rows || size === this.consoleSize) return;
 		this.consoleSize = size;
-		if (this.irqAddr !== undefined) {
-			const dv = this.dv();
-			dv.setUint32(this.irqAddr, dv.getUint32(this.irqAddr, true) | (1 << IRQ_CONSOLE), true);
-		}
+		this.setIrqBits(1 << IRQ_CONSOLE);
 		this.wake();
 	}
 
@@ -452,16 +553,11 @@ export class Kernel {
 			return Promise.all(disks.map((d) => d.saving?.catch(() => {}))).then(() => true);
 		}
 		const marks = disks.map((d) => d.flushSeq ?? 0);
-		const irq = this.irqAddr;
-		const dv = this.dv();
-		dv.setUint32(irq, dv.getUint32(irq, true) | (1 << IRQ_SYNC), true);
+		this.setIrqBits(1 << IRQ_SYNC);
 		this.wake();
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
-				if (!this.result) {
-					const dv = this.dv();
-					dv.setUint32(irq, dv.getUint32(irq, true) & ~(1 << IRQ_SYNC), true);
-				}
+				if (!this.result) this.clearIrqBits(1 << IRQ_SYNC);
 				resolve(false);
 			}, timeout);
 			void Promise.all(disks.map((d, i) => d.whenFlushed!(marks[i]!))).then(() => {
@@ -617,6 +713,13 @@ export class Kernel {
 				k.u8()[Number(buf) + n] = 0;
 			},
 			wasm_driver_console_size: (): number => k.consoleSize,
+			// SMP (CONFIG_SMP kernels import these).
+			wasm_init_flag(): bigint {
+				const flag = k.exports?.__wasm_init_memory_flag;
+				return flag instanceof WebAssembly.Global ? BigInt(flag.value) : 0n;
+			},
+			wasm_cpu_count: (): number => k.cpus,
+			wasm_cpu_start: (cpu: number, idle: bigint): number => k.startCpu(cpu, idle),
 			wasm_snapshot_point: (result: number, blocker: bigint, freeMap: bigint, freeBits: bigint): number => k.snapshotPoint(result, blocker, freeMap, freeBits),
 
 			// (JSPI) Park prev, run next. Resolves with the task that later

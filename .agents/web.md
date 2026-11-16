@@ -17,7 +17,7 @@ parameters, documented at its top), `store.ts` (the UI state, read with
 drive, plus `rebootUrl()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
-it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
+it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
 `preview.ts` (the guest preview's page side), `fx.ts` (the fx coding
@@ -162,6 +162,12 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   them in the Cache API (`kw-apk-index-v1`), revalidated after 1 h. The
   pushed file's mtime is the time the mirror last confirmed it. Off with
   `?net=0`.
+- `/root/README` (intro notes) comes from the page, not the image:
+  `readme.ts` writes it through `vm.exec()` once user space runs. A stamp
+  (`/var/lib/kw-readme`, the sha256 of the copy written) keeps it from
+  overwriting a README the user edited or bringing back one they deleted;
+  an unedited copy is replaced when the text changes. Keep its shortcuts
+  and claims in step with the page.
 - The safe-mode explanation comes from watching the console for
   `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md).
 - A guest `reboot` (halt code 2) reloads the page once the last data-disk

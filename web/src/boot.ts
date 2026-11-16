@@ -21,6 +21,7 @@ import { KW } from "./kw.ts";
 import { forgetDemo, launchFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.ts";
+import { writeReadme } from "./readme.ts";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { watchUpdates } from "./sw.ts";
@@ -342,6 +343,8 @@ export function start(): void {
 	void guestReady.then(launchFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
 	if (cfg.net) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
+	// Intro notes in /root/README, once per data disk (readme.ts).
+	void guestReady.then((vm) => writeReadme(vm, (m) => ui.log(m, "h")), () => {});
 	KW.preview = { open: openPreview, close: closePreview, url: previewUrl };
 	// Paste, the key bar, the touch controls and the shortcuts act on the current window.
 	KW.term = {

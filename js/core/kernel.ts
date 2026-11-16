@@ -418,6 +418,7 @@ export class Kernel {
 			ep = spawn({
 				cpu, idle, module: this.opts.module, memory: this.memory, cpus: this.cpus,
 				initFlag: flag instanceof WebAssembly.Global ? Number(flag.value) : 0,
+				irqWord0: this.irqAddr ?? 0,
 				epochMs: performance.timeOrigin - this.wasi.monoOffset,
 			});
 		} catch (e) {
@@ -720,6 +721,11 @@ export class Kernel {
 			},
 			wasm_cpu_count: (): number => k.cpus,
 			wasm_cpu_start: (cpu: number, idle: bigint): number => k.startCpu(cpu, idle),
+			// The task started on a fresh stack on another CPU: its old one
+			// here never runs again (kernel process.c, kw_stack_drain()).
+			wasm_stack_drop(task: bigint): void {
+				k.resumers.delete(task);
+			},
 			wasm_snapshot_point: (result: number, blocker: bigint, freeMap: bigint, freeBits: bigint): number => k.snapshotPoint(result, blocker, freeMap, freeBits),
 
 			// (JSPI) Park prev, run next. Resolves with the task that later

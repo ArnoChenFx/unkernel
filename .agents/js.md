@@ -364,8 +364,17 @@ parts that are easy to get wrong.
   as it comes (`CpuMessage`: no batching, because this thread may never
   return to its event loop), and enters `kw_secondary_entry(idle)`. Its
   `proc_exit` posts the exit; any device import is a kernel bug on that
-  CPU and ends the session ("fatal", naming it). Its idle blocks in the
-  kernel (`memory.atomic.wait32`), so it needs no event loop.
+  CPU and ends the session ("fatal", naming it). After an exit, a trap or
+  a fatal error it also sets the stop IPI (bit 26) in CPU 0's word
+  (`CpuInit.irqWord0`) and notifies it: CPU 0's host takes the message
+  only once CPU 0 suspends, and CPU 0 may be spinning for this CPU; the
+  kernel takes that bit even with interrupts off and parks CPU 0
+  (kernel.md, SMP). Its idle blocks in the kernel
+  (`memory.atomic.wait32`), so it needs no event loop.
+- A task the kernel moves to another CPU starts there on a fresh stack
+  (`isNew`), and its old stack's CPU then calls `wasm_stack_drop(task)`
+  (CPU 0's `Kernel` and `runCpu()` both answer it): the host forgets
+  that resumer, whose stack never runs again (kernel.md, SMP).
 - CPU 0's host sets IRQ bits with `Atomics.or` (`Kernel.setIrqBits`),
   and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
   `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's

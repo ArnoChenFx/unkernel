@@ -1033,8 +1033,9 @@ switching, no block or net device, no JIT).
   built by hand, `.agents/kernel.md`, SMP) runs one kernel instance per
   CPU in worker threads on a shared memory (CLI `--smp N`; Node only,
   interpreter only). It has no disks, display, input, sound, shm or
-  snapshots yet, and a task stays on the CPU it first ran on. The
-  released kernel is UP. linux-wasm's NOMMU mode (programs as Wasm
+  snapshots yet. A task moves to another CPU only on its way back to
+  user mode (the load balancer, `taskset`); one asleep in a system call
+  stays where it is until it returns. The released kernel is UP. linux-wasm's NOMMU mode (programs as Wasm
   modules), its Wasm binfmt and its wasm32 build are not part of this
   port.
 * Kernel stack overflow is not detected (16 KiB shadow stacks). A wasm

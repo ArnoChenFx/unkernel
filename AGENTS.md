@@ -79,11 +79,12 @@ Details are in the area files.
 - Every kernel thread needs a `kw_park_point()` in its loop, or parking
   (and so snapshots) fails with EBUSY naming it (kernel.md, Parking).
 - JIT output must match the interpreter exactly (kwemu.md).
-- SMP kernels: a task never leaves the CPU it first ran on (its JSPI
-  stack is that thread's), host imports other than clocks, randomness,
-  console output and task switching answer on CPU 0 alone, and a kernel
-  thread that is bound to another CPU after it ran needs a restart point
-  (kernel.md, SMP).
+- SMP kernels: a task moves to another CPU only where its JSPI stack
+  (that CPU thread's) can be dropped and it can start on a fresh one: a
+  user task on its way to user mode, a kernel thread at a restart point.
+  Host imports other than clocks, randomness, console output and task
+  switching answer on CPU 0 alone, and a kernel thread that is bound to
+  another CPU after it ran needs a restart point (kernel.md, SMP).
 - `kw_defconfig` is maintained by hand. Kconfig drops options silently, so
   check `$KOUT/.config` after a change.
 - `js/core` stays universal: no `node:` imports, no unguarded DOM APIs

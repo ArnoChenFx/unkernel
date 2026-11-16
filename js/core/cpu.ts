@@ -5,9 +5,10 @@
 // (a worker the platform starts: Platform.spawnCpu, js/node/cpu.ts). CPU 0
 // (Kernel, kernel.ts) keeps every device; this side serves only what any
 // CPU needs: task switching (its own JSPI stacks: a task's stack lives in
-// the thread that first ran it, and the kernel never moves the task), the
-// clocks, randomness, and console and panic output, which it forwards to
-// CPU 0's host. Its idle blocks the thread in the kernel itself
+// the thread that started it; a task the kernel moves starts on a fresh
+// stack on its new CPU, and wasm_stack_drop then tells the old one's host),
+// the clocks, randomness, and console and panic output, which it forwards
+// to CPU 0's host. Its idle blocks the thread in the kernel itself
 // (memory.atomic.wait32 on its word of pending interrupts), so nothing here
 // waits. Any other import is a kernel bug on this CPU: it ends the session.
 // Universal: no node: imports, no DOM.
@@ -27,6 +28,13 @@ export interface CpuInit {
 	cpus: number;
 	/** Address of __wasm_init_memory_flag: it must read 2 (the data is initialised) before the start function runs. */
 	initFlag: number;
+	/**
+	 * Address of CPU 0's word of pending interrupts (wasm_host_irqs). When
+	 * this CPU ends the session (exit, trap), it raises the stop IPI there:
+	 * CPU 0 may be spinning for this one, and its host takes the exit only
+	 * once CPU 0 suspends.
+	 */
+	irqWord0: number;
 	/**
 	 * The guest's monotonic clock reads `performance.timeOrigin +
 	 * performance.now() - epochMs` (ms) on every thread: CPU 0's clock.
@@ -56,12 +64,25 @@ export interface CpuPort {
 
 const CLOCK_REALTIME = 0;
 const CLOCK_THREAD_CPUTIME = 3;
+/** KW_IPI_STOP (kernel asm/irq.h). */
+const IPI_STOP = 1 << 26;
 
 /** Run CPU `init.cpu` on this thread until the session ends (the owner terminates the thread). */
 export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 	const { cpu, memory, module } = init;
-	const fatal = (msg: string) => port.post({ t: "fatal", msg: `CPU ${cpu}: ${msg}` });
 	const i32 = new Int32Array(memory.buffer);
+	// The session ends here: stop CPU 0 (the stop IPI, which the kernel
+	// takes even while spinning with interrupts off), which may wait for
+	// this CPU and then never take the message.
+	const stopCpu0 = () => {
+		if (!init.irqWord0) return;
+		Atomics.or(i32, init.irqWord0 >> 2, IPI_STOP);
+		Atomics.notify(i32, init.irqWord0 >> 2);
+	};
+	const fatal = (msg: string) => {
+		port.post({ t: "fatal", msg: `CPU ${cpu}: ${msg}` });
+		stopCpu0();
+	};
 	// The start function initialises the data only while this reads 0
 	// (CPU 0's instance did, and the kernel keeps the word reserved).
 	if (!init.initFlag || Atomics.load(i32, init.initFlag >> 2) !== 2) {
@@ -77,6 +98,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		if (exited) return;
 		exited = true;
 		port.post({ t: "trap", error: `CPU ${cpu}: ${(e as Error)?.stack ?? String(e)}` });
+		stopCpu0();
 	};
 
 	const wasi: Record<string, unknown> = {
@@ -121,6 +143,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 			if (!exited) {
 				exited = true;
 				port.post({ t: "exit", code });
+				stopCpu0();
 			}
 			return never();
 		}),
@@ -132,6 +155,10 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		kw_host_jit_caps: (): number => 0, // the interpreter only (SMP)
 		kw_host_jit_compile: (): number => -1,
 		kw_host_jit_free: (): void => {},
+		// A task started on a fresh stack on another CPU: its old one here never runs again.
+		wasm_stack_drop(task: bigint): void {
+			resumers.delete(task);
+		},
 		wasm_dump_stacktrace(buf: bigint, max: bigint): void {
 			const s = new TextEncoder().encode(new Error().stack ?? "");
 			const n = Math.min(s.length, Number(max) - 1);

@@ -1,0 +1,354 @@
+From f0052b5a78ea3919c54af2f2c0207938d088dab6 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 16:06:57 +0000
+Subject: [PATCH] sched: let an arch hold tasks on their CPU except where they
+ can restart
+
+On wasm a task's stack lives in the host thread of the CPU that started
+it, which alone can resume it. ARCH_TASKS_STAY_ON_CPU says that the
+arch holds every task with migrate_disable() from its first run, and
+lets it go only where it can drop the stack and start the task again
+on a fresh one on another CPU. The scheduler already keeps held tasks
+on their CPU everywhere.
+
+For a user task that point is the reschedule on its way to user mode,
+where its state is all in pt_regs and task_struct: the exit-to-user
+loop calls arch_exit_to_user_mode_schedule() there instead of
+schedule() (the default). The arch releases the task with
+sched_stay_release(), which enables migration as migrate_enable()
+would and, if an affinity change excluded the CPU meanwhile, has the
+stopper move the task as soon as it is off the CPU. A task that then
+starts on a fresh stack finishes the switch with
+sched_stay_switch_tail(): schedule_tail() without the child TID store
+and without recalculating TIF_SIGPENDING, which the restart of an
+interrupted system call may still need.
+
+An affinity change that excludes the CPU of a held task would install a
+pending migration and wait for a migrate_enable() that may come only
+after the task's next sleep. If the arch can move the task later
+(arch_stay_may_move(): a user task, or a kthread moving itself), record
+the mask and return; arch_stay_move() makes the task release itself
+soon. Otherwise fail with EBUSY. A stopper that finds a held task a
+waiter wants elsewhere also asks it to move.
+---
+ include/linux/irq-entry-common.h |  22 +++++
+ include/linux/sched.h            |  16 ++++
+ init/Kconfig                     |  18 ++++
+ kernel/entry/common.c            |   2 +-
+ kernel/sched/core.c              | 155 ++++++++++++++++++++++++++++++-
+ 5 files changed, 208 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
+index c74b5c87e10..291968435a6 100644
+--- a/include/linux/irq-entry-common.h
++++ b/include/linux/irq-entry-common.h
+@@ -129,6 +129,28 @@ static inline void arch_exit_to_user_mode_work(struct pt_regs *regs,
+ }
+ #endif
+ 
++/**
++ * arch_exit_to_user_mode_schedule - Architecture specific reschedule on
++ *				     exit to user mode.
++ *
++ * Invoked from exit_to_user_mode_loop() with interrupts enabled, instead
++ * of schedule(), when a reschedule is due. The task's state is all in its
++ * pt_regs and task_struct here, and the loop then handles whatever work is
++ * pending. An architecture whose tasks stay on their CPU
++ * (ARCH_TASKS_STAY_ON_CPU) can let the task move to another CPU here, and
++ * there start the exit to user mode again on a fresh stack.
++ *
++ * Defaults to schedule().
++ */
++static __always_inline void arch_exit_to_user_mode_schedule(void);
++
++#ifndef arch_exit_to_user_mode_schedule
++static __always_inline void arch_exit_to_user_mode_schedule(void)
++{
++	schedule();
++}
++#endif
++
+ /**
+  * arch_exit_to_user_mode_prepare - Architecture specific preparation for
+  *				    exit to user mode.
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 78bfc0e32e5..87d612da100 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1942,6 +1942,22 @@ extern int dl_task_check_affinity(struct task_struct *p, const struct cpumask *m
+ extern void force_compatible_cpus_allowed_ptr(struct task_struct *p);
+ extern void relax_compatible_cpus_allowed_ptr(struct task_struct *p);
+ 
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++/* Tasks held on their CPU by their stack (init/Kconfig, ARCH_TASKS_STAY_ON_CPU). */
++extern bool sched_stay_release(void);
++extern void sched_stay_switch_tail(struct task_struct *prev);
++/*
++ * Arch, called with p->pi_lock and its runqueue's lock held. May @p, held,
++ * be given an affinity that excludes its CPU (and move later)? If so,
++ * arch_stay_move() then asks it to reach sched_stay_release() soon.
++ */
++extern bool arch_stay_may_move(struct task_struct *p);
++extern void arch_stay_move(struct task_struct *p);
++#else
++static inline bool arch_stay_may_move(struct task_struct *p) { return false; }
++static inline void arch_stay_move(struct task_struct *p) { }
++#endif
++
+ extern int yield_to(struct task_struct *p, bool preempt);
+ extern void set_user_nice(struct task_struct *p, long nice);
+ extern int task_prio(const struct task_struct *p);
+diff --git a/init/Kconfig b/init/Kconfig
+index ad592fdf29a..1040f0fc2be 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -967,6 +967,23 @@ config ARCH_HAS_PTE_PROTNONE
+ config ARCH_SUPPORTS_NUMA_BALANCING
+ 	bool
+ 
++#
++# For architectures whose tasks can move to another CPU only at certain
++# points (wasm: a task's stack lives in the host thread of the CPU that
++# ran it, and only that thread can resume it). The arch holds every task
++# on its CPU with migrate_disable() from its first run on, and releases it
++# where it can drop the stack and start the task again on a fresh one
++# elsewhere: a user task at the reschedule on its way to user mode
++# (arch_exit_to_user_mode_schedule(), which calls sched_stay_release()),
++# a kthread at a restart point (arch_kthread_restart_point(),
++# linux/kthread.h). An affinity change that excludes the CPU of a held
++# user task is recorded without waiting, and the task moves on its next
++# way to user mode (arch_stay_move()); for a held kthread it fails with
++# EBUSY instead of waiting for a migrate_enable() that may never come.
++#
++config ARCH_TASKS_STAY_ON_CPU
++	bool
++
+ #
+ # For architectures that prefer to flush all TLBs after a number of pages
+ # are unmapped instead of sending one IPI per page to flush. The architecture
+@@ -974,6 +991,7 @@ config ARCH_SUPPORTS_NUMA_BALANCING
+ # written after the unmap. Details are in mm/rmap.c near the check for
+ # should_defer_flush. The architecture should also consider if the full flush
+ # and the refill costs are offset by the savings of sending fewer IPIs.
++#
+ config ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ 	bool
+ 
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index e3d381fd3d2..ea0c89b36f8 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -52,7 +52,7 @@ static __always_inline unsigned long __exit_to_user_mode_loop(struct pt_regs *re
+ 
+ 		if (ti_work & (_TIF_NEED_RESCHED | _TIF_NEED_RESCHED_LAZY)) {
+ 			if (!rseq_grant_slice_extension(ti_work, TIF_SLICE_EXT_DENY))
+-				schedule();
++				arch_exit_to_user_mode_schedule();
+ 		}
+ 
+ 		if (ti_work & _TIF_UPROBE)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 1754d9f95f2..dd8f5225b63 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2660,8 +2660,12 @@ static int migration_cpu_stop(void *data)
+ 	 * we're holding p->pi_lock.
+ 	 */
+ 	if (task_rq(p) == rq) {
+-		if (is_migration_disabled(p))
++		if (is_migration_disabled(p)) {
++			/* Held by its stack: it moves where it can (sched_stay_release()). */
++			if (IS_ENABLED(CONFIG_ARCH_TASKS_STAY_ON_CPU) && pending)
++				arch_stay_move(p);
+ 			goto out;
++		}
+ 
+ 		if (pending) {
+ 			p->migration_pending = NULL;
+@@ -2775,6 +2779,102 @@ int push_cpu_stop(void *arg)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++/*
++ * The move sched_stay_release() asks of the stopper. One per CPU: the
++ * stopper runs it as soon as the task is off the CPU, before anything else
++ * there can ask again.
++ */
++static DEFINE_PER_CPU(struct migration_arg, stay_move_arg);
++static DEFINE_PER_CPU(struct cpu_stop_work, stay_move_work);
++
++/*
++ * ARCH_TASKS_STAY_ON_CPU: current, held on this CPU by its stack (migration
++ * disabled since its first run), is about to call schedule() at a point
++ * where the arch can resume it on any CPU on a fresh stack. Let it move
++ * until it runs again, as migrate_enable() would; if an affinity change
++ * excluded this CPU while it was held (__set_cpus_allowed_ptr_locked()),
++ * have the stopper move it as soon as it is off the CPU. Returns false if
++ * current is not held once (nothing changed). When current runs again, the
++ * arch holds it with migrate_disable().
++ */
++bool sched_stay_release(void)
++{
++	struct task_struct *p = current;
++	struct affinity_context ac = {
++		.new_mask  = &p->cpus_mask,
++		.flags     = SCA_MIGRATE_ENABLE,
++	};
++	struct set_affinity_pending *pending, *complete = NULL;
++	struct task_struct *push_task = NULL;
++	struct migration_arg *arg = NULL;
++	struct cpu_stop_work *work = NULL;
++	struct rq_flags rf;
++	struct rq *rq;
++	int cpu;
++
++	if (WARN_ON_ONCE(p->migration_disabled != 1))
++		return false;
++
++	guard(preempt)();
++	cpu = smp_processor_id();
++	/*
++	 * Unlocked: an affinity change that races with this check still sees
++	 * the task held, so it records the mask and has the arch bring the
++	 * task back here (arch_stay_move()) before it returns to user mode.
++	 */
++	if (likely(p->cpus_ptr == &p->cpus_mask && cpumask_test_cpu(cpu, &p->cpus_mask)))
++		goto release;
++
++	/* As migrate_enable() and affine_move_task() would, under one lock. */
++	rq = task_rq_lock(p, &rf);
++	if (p->cpus_ptr != &p->cpus_mask)
++		do_set_cpus_allowed(p, &ac);
++	pending = p->migration_pending;
++	if (cpumask_test_cpu(cpu, &p->cpus_mask)) {
++		if ((p->migration_flags & MDF_PUSH) && !rq->push_busy) {
++			rq->push_busy = true;
++			push_task = get_task_struct(p);
++		}
++		if (pending && !pending->stop_pending) {
++			p->migration_pending = NULL;
++			complete = pending;
++		}
++	} else if (pending) {
++		/* A waiter's request: its stop work moves the task. */
++		if (!pending->stop_pending) {
++			pending->stop_pending = true;
++			arg = &pending->arg;
++			work = &pending->stop_work;
++		}
++		p->migration_flags &= ~MDF_PUSH;
++	} else {
++		/* Recorded while it was held, with nobody waiting. */
++		int dest = cpumask_any_and_distribute(cpu_active_mask, &p->cpus_mask);
++
++		if (dest < nr_cpu_ids) {
++			arg = this_cpu_ptr(&stay_move_arg);
++			*arg = (struct migration_arg) { .task = p, .dest_cpu = dest };
++			work = this_cpu_ptr(&stay_move_work);
++		}
++		p->migration_flags &= ~MDF_PUSH;
++	}
++	task_rq_unlock(rq, p, &rf);
++	/* The stopper runs once current is off the CPU, so after the release. */
++	if (push_task)
++		stop_one_cpu_nowait(cpu, push_cpu_stop, p, &rq->push_work);
++	if (arg)
++		stop_one_cpu_nowait(cpu, migration_cpu_stop, arg, work);
++	if (complete)
++		complete_all(&complete->done);
++release:
++	barrier();
++	p->migration_disabled = 0;
++	this_rq()->nr_pinned--;
++	return true;
++}
++#endif
++
+ static inline void mm_update_cpus_allowed(struct mm_struct *mm, const cpumask_t *affmask);
+ 
+ /*
+@@ -3128,6 +3228,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
+ 	const struct cpumask *cpu_valid_mask = cpu_active_mask;
+ 	bool kthread = p->flags & PF_KTHREAD;
++	bool stay = false;
+ 	unsigned int dest_cpu;
+ 	int ret = 0;
+ 
+@@ -3166,9 +3267,22 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 			goto out;
+ 		}
+ 
+-		if (WARN_ON_ONCE(p == current &&
+-				 is_migration_disabled(p) &&
+-				 !cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
++		if (IS_ENABLED(CONFIG_ARCH_TASKS_STAY_ON_CPU) &&
++		    is_migration_disabled(p) &&
++		    !cpumask_test_cpu(task_cpu(p), ctx->new_mask)) {
++			/*
++			 * Held on its CPU by its stack (sched_stay_release()).
++			 * A user task moves on its way back to user mode, a
++			 * kernel thread only where the arch can restart it.
++			 */
++			if (!arch_stay_may_move(p)) {
++				ret = -EBUSY;
++				goto out;
++			}
++			stay = true;
++		} else if (WARN_ON_ONCE(p == current &&
++					is_migration_disabled(p) &&
++					!cpumask_test_cpu(task_cpu(p), ctx->new_mask))) {
+ 			ret = -EBUSY;
+ 			goto out;
+ 		}
+@@ -3187,6 +3301,21 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+ 
+ 	do_set_cpus_allowed(p, ctx);
+ 
++	if (stay) {
++		/*
++		 * Record the mask and return: waiting for the move could take
++		 * as long as a sleep in a system call. The task leaves at its
++		 * next return to user mode (or at once, if it is there), and
++		 * sched_getaffinity() shows the new mask meanwhile.
++		 */
++		struct set_affinity_pending *pending = p->migration_pending;
++
++		if (pending)
++			pending->arg.dest_cpu = dest_cpu;
++		arch_stay_move(p);
++		goto out;
++	}
++
+ 	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
+ 
+ out:
+@@ -5467,6 +5596,24 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
+ 	calculate_sigpending();
+ }
+ 
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++/*
++ * A task that switched out in schedule() after sched_stay_release() starts
++ * again on a fresh stack (on another CPU): finish the switch as that
++ * schedule() would have. Unlike schedule_tail(), no child TID store and no
++ * recalculation of TIF_SIGPENDING: the exit to user mode that follows
++ * must still see a signal pending when the system call it returns from
++ * asks for a restart.
++ */
++void sched_stay_switch_tail(struct task_struct *prev)
++	__releases(__rq_lockp(this_rq()))
++{
++	finish_task_switch(prev);
++	trace_sched_exit_tp(true);
++	preempt_enable();
++}
++#endif
++
+ /*
+  * context_switch - switch to the new MM and the new thread's register state.
+  */
+-- 
+2.56.0
+

@@ -1533,6 +1533,485 @@ static void smp_checks(void)
 	      online, made, cpus, smp_shared.amo, smp_shared.lrsc, smp_shared.locked,
 	      SMP_THREADS * SMP_ITERS, SMP_THREADS * SMP_ITERS, SMP_THREADS * (SMP_ITERS / 16));
 }
+
+/*
+ * Moving tasks (SMP, more than one CPU online): a user task moves to
+ * another CPU where it is switched out on its way to user mode, and starts
+ * there on a fresh kernel stack (kernel.md, SMP). Its registers, FP state
+ * (rounding mode, flags) and TLS must survive, as must signals and
+ * wakeups; busy threads started on one CPU must spread; affinity changes
+ * must take effect, for the caller itself, a busy thread and one asleep
+ * in a system call.
+ */
+static long mv_now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000L + t.tv_nsec / 1000000;
+}
+
+static int mv_cpu(void)
+{
+	unsigned cpu = 999;
+
+	return syscall(SYS_getcpu, &cpu, NULL, NULL) ? -1 : (int)cpu;
+}
+
+static int mv_setaff(pid_t tid, unsigned long mask)
+{
+	return syscall(SYS_sched_setaffinity, tid, sizeof(mask), &mask) ? -errno : 0;
+}
+
+static unsigned long mv_getaff(pid_t tid)
+{
+	unsigned long mask = 0;
+
+	return syscall(SYS_sched_getaffinity, tid, sizeof(mask), &mask) < 0 ? 0 : mask;
+}
+
+/* The CPU a thread is on (or last ran on): /proc/self/task/TID/stat field 39. */
+static int mv_task_cpu(pid_t tid)
+{
+	char path[64], buf[512], *p;
+	int fd, n, field = 2;
+
+	snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	p = strrchr(buf, ')');
+	if (!p)
+		return -1;
+	for (p++; *p && field < 39; p++)
+		if (*p == ' ')
+			field++;
+	return field == 39 ? atoi(p) : -1;
+}
+
+struct mv_stats {
+	unsigned long released, resumed, moved, restarted, dropped, lost;
+};
+
+static int mv_stats_read(struct mv_stats *s)
+{
+	FILE *f = fopen("/proc/kwmove", "r");
+	int n;
+
+	if (!f)
+		return -1;
+	n = fscanf(f, "released %lu resumed %lu moved %lu restarted %lu dropped %lu lost %lu",
+		   &s->released, &s->resumed, &s->moved, &s->restarted, &s->dropped, &s->lost);
+	fclose(f);
+	return n == 6 ? 0 : -1;
+}
+
+static struct {
+	unsigned long all;	/* the online CPUs */
+	long online;
+	volatile int go;
+	volatile long deadline, midpoint;
+} mv;
+
+/* Threads started on CPU 0 widen their affinity and spin: they must spread. */
+struct mv_spread {
+	pthread_t th;
+	unsigned long seen;
+	int last, moves, bad, rounds;
+};
+
+static void *mv_spread_fn(void *arg)
+{
+	struct mv_spread *s = arg;
+	int prev = 0;	/* they start on CPU 0 */
+
+	s->last = -1;
+	while (!mv.go)
+		;
+	if (mv_setaff(0, mv.all))
+		s->bad++;
+	while (mv_now_ms() < mv.deadline) {
+		int c;
+
+		s->bad += fphot(HOT_SEED) != FPHOT_EXPECT;
+		c = mv_cpu();
+		if (c >= 0 && c < 64)
+			s->seen |= 1UL << c;
+		if (c != prev)
+			s->moves++;
+		/* Where it is at the midpoint, while all of them still run. */
+		if (s->last < 0 && mv_now_ms() >= mv.midpoint)
+			s->last = c;
+		prev = c;
+		s->rounds++;
+	}
+	return NULL;
+}
+
+static void mv_spread_check(void)
+{
+	int n = mv.online * 2 > 8 ? 8 : mv.online * 2, i, made = 0, bad = 0, moves = 0, rounds = 0;
+	unsigned long seen = 0, last = 0;
+	struct mv_spread s[8];
+	char per[64] = "", *q = per;
+	int count[8] = { 0 };
+
+	memset(s, 0, sizeof(s));
+	mv.go = 0;
+	/* All start on CPU 0 (they inherit this thread's affinity). */
+	if (mv_setaff(0, 1) || mv_cpu() != 0)
+		bad++;
+	for (i = 0; i < n; i++)
+		made += !pthread_create(&s[i].th, NULL, mv_spread_fn, &s[i]);
+	mv_setaff(0, mv.all);
+	mv.midpoint = mv_now_ms() + 1200;
+	mv.deadline = mv.midpoint + 800;
+	mv.go = 1;
+	for (i = 0; i < n; i++) {
+		pthread_join(s[i].th, NULL);
+		seen |= s[i].seen;
+		if (s[i].last >= 0 && s[i].last < 8) {
+			last |= 1UL << s[i].last;
+			count[s[i].last]++;
+		}
+		bad += s[i].bad;
+		moves += s[i].moves;
+		rounds += s[i].rounds;
+	}
+	for (i = 0; i < mv.online && i < 8; i++)
+		q += snprintf(q, per + sizeof(per) - q, "%s%d", i ? "/" : "", count[i]);
+	CHECK(made == n && !bad && seen == mv.all && last == mv.all && moves > 0,
+	      "move: spread: %d threads started on CPU 0 ran on CPUs %#lx, %s per CPU after 1.2 s, %d CPU changes in %d fphot rounds (%d bad)",
+	      made, seen, per, moves, rounds, bad);
+}
+
+/*
+ * This thread moves itself round the CPUs (sched_setaffinity, which takes
+ * effect on the way back to user mode) between steps of a computation kept
+ * in registers, in FE_UPWARD with FE_DIVBYZERO raised; the result must
+ * match the same computation without moves.
+ */
+#define MV_BOUNCES 300
+
+static int mv_bounce(int moves, unsigned long *hp, double *dp, int *tlsp, int *missp)
+{
+	unsigned long h = 0xcbf29ce484222325UL;
+	volatile double zero = 0.0;
+	double d = 1.0, f = 3.0;
+	int i, miss = 0, fpbad = 0;
+	int *addr = &tls_var;
+
+	tls_var = 0;
+	feclearexcept(FE_ALL_EXCEPT);
+	fesetround(FE_UPWARD);
+	f = f / zero;	/* FE_DIVBYZERO, sticky */
+	for (i = 0; i < MV_BOUNCES; i++) {
+		if (moves) {
+			int t = i % mv.online;
+
+			if (mv_setaff(0, 1UL << t) || mv_cpu() != t)
+				miss++;
+		}
+		d = d * 1.0000001 + i * 0.3;
+		h = (h ^ (unsigned long)(long)(d * 16.0)) * 0x100000001b3UL + (unsigned long)i;
+		tls_var += i;
+		if (fegetround() != FE_UPWARD || !fetestexcept(FE_DIVBYZERO))
+			fpbad++;
+	}
+	fesetround(FE_TONEAREST);
+	feclearexcept(FE_ALL_EXCEPT);
+	mv_setaff(0, mv.all);
+	*hp = h;
+	*dp = d;
+	*tlsp = tls_var;
+	*missp = miss;
+	return fpbad + (addr != &tls_var) + (f < 0);
+}
+
+static void mv_bounce_check(void)
+{
+	unsigned long h0, h1;
+	double d0, d1;
+	int t0, t1, m0, m1, bad;
+
+	bad = mv_bounce(0, &h0, &d0, &t0, &m0);
+	bad += mv_bounce(1, &h1, &d1, &t1, &m1);
+	CHECK(!bad && !m1 && h0 == h1 && !memcmp(&d0, &d1, sizeof(d0)) && t0 == t1,
+	      "move: %d self-moves round %ld CPUs: %d missed, registers, FP state and TLS %s (h %#lx/%#lx)",
+	      MV_BOUNCES, mv.online, m1, !bad && h0 == h1 && !memcmp(&d0, &d1, sizeof(d0)) && t0 == t1 ? "kept" : "BAD",
+	      h0, h1);
+}
+
+/* Another thread's affinity: a busy one moves within its slice, a sleeping one when it wakes. */
+static struct {
+	volatile pid_t tid;
+	volatile int stop, cpu_after;
+	int pipe[2];
+} mv_t;
+
+static void *mv_busy_fn(void *arg)
+{
+	(void)arg;
+	mv_t.tid = syscall(SYS_gettid);
+	while (!mv_t.stop) {
+		volatile unsigned long x = 0;
+
+		for (int i = 0; i < 2000000 && !mv_t.stop; i++)
+			x += i;
+	}
+	return NULL;
+}
+
+static void *mv_sleep_fn(void *arg)
+{
+	char c;
+
+	(void)arg;
+	mv_t.tid = syscall(SYS_gettid);
+	read(mv_t.pipe[0], &c, 1);
+	mv_t.cpu_after = mv_cpu();
+	return NULL;
+}
+
+static void mv_other_check(void)
+{
+	pthread_t th;
+	long worst = 0, set_worst = 0, t0, t;
+	int i, moved = 0, err = 0, target = 0, cpu;
+	unsigned long aff;
+
+	mv_t.tid = 0;
+	mv_t.stop = 0;
+	if (pthread_create(&th, NULL, mv_busy_fn, NULL))
+		err++;
+	while (!err && !mv_t.tid)
+		;
+	for (i = 0; i < 6 && !err; i++) {
+		cpu = mv_task_cpu(mv_t.tid);
+		target = (cpu + 1) % mv.online;
+		t0 = mv_now_ms();
+		err += mv_setaff(mv_t.tid, 1UL << target) != 0;
+		t = mv_now_ms() - t0;
+		set_worst = t > set_worst ? t : set_worst;
+		while (mv_task_cpu(mv_t.tid) != target && mv_now_ms() - t0 < 2000)
+			usleep(1000);
+		t = mv_now_ms() - t0;
+		worst = t > worst ? t : worst;
+		moved += mv_task_cpu(mv_t.tid) == target;
+	}
+	mv_t.stop = 1;
+	pthread_join(th, NULL);
+	CHECK(!err && moved == 6 && set_worst < 100 && worst < 1000,
+	      "move: sched_setaffinity on a busy thread: %d/6 moved, call took <= %ld ms, move <= %ld ms",
+	      moved, set_worst, worst);
+
+	/* Asleep in read(): the call returns at once, the move happens at the wakeup. */
+	mv_t.tid = 0;
+	mv_t.cpu_after = -1;
+	err = pipe(mv_t.pipe) != 0;
+	if (!err && pthread_create(&th, NULL, mv_sleep_fn, NULL))
+		err++;
+	while (!err && !mv_t.tid)
+		;
+	usleep(50000);
+	cpu = err ? 0 : mv_task_cpu(mv_t.tid);
+	target = (cpu + 1) % mv.online;
+	t0 = mv_now_ms();
+	if (!err)
+		err += mv_setaff(mv_t.tid, 1UL << target) != 0;
+	t = mv_now_ms() - t0;
+	aff = err ? 0 : mv_getaff(mv_t.tid);
+	if (!err) {
+		write(mv_t.pipe[1], "x", 1);
+		pthread_join(th, NULL);
+		close(mv_t.pipe[0]);
+		close(mv_t.pipe[1]);
+	}
+	CHECK(!err && t < 100 && aff == 1UL << target && mv_t.cpu_after == target,
+	      "move: sched_setaffinity on a thread asleep in read() on CPU %d: returned in %ld ms, mask %#lx, woke on CPU %d (want %d)",
+	      cpu, t, aff, mv_t.cpu_after, target);
+}
+
+/* Queued RT signals to a thread that keeps moving: none lost, none twice. */
+#define MV_SIGS 2000
+static volatile unsigned long mv_sig_count, mv_sig_sum;
+
+static void mv_on_rt(int sig, siginfo_t *si, void *uc)
+{
+	(void)sig;
+	(void)uc;
+	mv_sig_count++;
+	mv_sig_sum += (unsigned long)si->si_value.sival_int;
+}
+
+static void *mv_sig_fn(void *arg)
+{
+	unsigned long i = 0;
+
+	(void)arg;
+	mv_t.tid = syscall(SYS_gettid);
+	while (!mv_t.stop) {
+		volatile unsigned long x = 0;
+
+		mv_setaff(0, 1UL << (i++ % mv.online));
+		for (int k = 0; k < 20000; k++)
+			x += k;
+	}
+	mv_setaff(0, mv.all);
+	return NULL;
+}
+
+static void mv_signal_check(void)
+{
+	struct sigaction sa = { .sa_sigaction = mv_on_rt, .sa_flags = SA_SIGINFO | SA_RESTART };
+	pthread_t th;
+	int i, err = 0, retries = 0;
+	long t0;
+
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGRTMIN, &sa, NULL);
+	mv_sig_count = mv_sig_sum = 0;
+	mv_t.tid = 0;
+	mv_t.stop = 0;
+	if (pthread_create(&th, NULL, mv_sig_fn, NULL))
+		err++;
+	while (!err && !mv_t.tid)
+		;
+	for (i = 0; i < MV_SIGS && !err; i++) {
+		siginfo_t si;
+
+		memset(&si, 0, sizeof(si));
+		si.si_signo = SIGRTMIN;
+		si.si_code = SI_QUEUE;
+		si.si_pid = getpid();
+		si.si_uid = getuid();
+		si.si_value.sival_int = i;
+		while (syscall(SYS_rt_tgsigqueueinfo, getpid(), mv_t.tid, SIGRTMIN, &si)) {
+			if (errno != EAGAIN || ++retries > 100000) {
+				err++;
+				break;
+			}
+			usleep(200);
+		}
+	}
+	t0 = mv_now_ms();
+	while (mv_sig_count < MV_SIGS && mv_now_ms() - t0 < 5000)
+		usleep(1000);
+	usleep(50000);
+	mv_t.stop = 1;
+	pthread_join(th, NULL);
+	signal(SIGRTMIN, SIG_DFL);
+	CHECK(!err && mv_sig_count == MV_SIGS && mv_sig_sum == (unsigned long)MV_SIGS * (MV_SIGS - 1) / 2,
+	      "move: %d queued signals to a thread moving between CPUs: %lu delivered, sum %lu (want %lu)",
+	      MV_SIGS, mv_sig_count, mv_sig_sum, (unsigned long)MV_SIGS * (MV_SIGS - 1) / 2);
+}
+
+/* Pipe and futex ping-pong between two threads that keep moving. */
+#define MV_PP 5000
+static struct {
+	int ab[2], ba[2];
+	volatile int word;
+	int bad[2];
+} mv_pp;
+
+static void mv_pp_move(unsigned *seed)
+{
+	*seed = *seed * 1103515245 + 12345;
+	mv_setaff(0, 1UL << ((*seed >> 16) % mv.online));
+}
+
+static void *mv_pp_fn(void *arg)
+{
+	int side = (int)(long)arg, i, v;
+	unsigned seed = 7 + side;
+
+	/* Pipes: side 0 sends i, side 1 answers i + 1. */
+	for (i = 0; i < MV_PP; i++) {
+		if (side == 0) {
+			if (write(mv_pp.ab[1], &i, 4) != 4 || read(mv_pp.ba[0], &v, 4) != 4 || v != i + 1)
+				mv_pp.bad[side]++;
+		} else {
+			if (read(mv_pp.ab[0], &v, 4) != 4 || v != i || (v = i + 1, write(mv_pp.ba[1], &v, 4) != 4))
+				mv_pp.bad[side]++;
+		}
+		if (i % (31 + 6 * side) == 0)
+			mv_pp_move(&seed);
+	}
+	/* Futex: the word says whose turn it is. */
+	for (i = 0; i < MV_PP; i++) {
+		while (__atomic_load_n(&mv_pp.word, __ATOMIC_ACQUIRE) != side)
+			syscall(SYS_futex, &mv_pp.word, FUTEX_WAIT_PRIVATE, !side, NULL, NULL, 0);
+		__atomic_store_n(&mv_pp.word, !side, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &mv_pp.word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+		if (i % (29 + 8 * side) == 0)
+			mv_pp_move(&seed);
+	}
+	mv_setaff(0, mv.all);
+	return NULL;
+}
+
+static void mv_pingpong_check(void)
+{
+	pthread_t th[2];
+	int made = 0;
+	long t0 = mv_now_ms();
+
+	memset(&mv_pp, 0, sizeof(mv_pp));
+	if (pipe(mv_pp.ab) || pipe(mv_pp.ba)) {
+		CHECK(0, "move: ping-pong: no pipes");
+		return;
+	}
+	made += !pthread_create(&th[0], NULL, mv_pp_fn, (void *)0L);
+	made += !pthread_create(&th[1], NULL, mv_pp_fn, (void *)1L);
+	if (made == 2) {
+		pthread_join(th[0], NULL);
+		pthread_join(th[1], NULL);
+	}
+	close(mv_pp.ab[0]);
+	close(mv_pp.ab[1]);
+	close(mv_pp.ba[0]);
+	close(mv_pp.ba[1]);
+	CHECK(made == 2 && !mv_pp.bad[0] && !mv_pp.bad[1] && mv_pp.word == 0,
+	      "move: %d pipe and %d futex round trips between threads that keep moving: %d/%d bad, %ld ms",
+	      MV_PP, MV_PP, mv_pp.bad[0], mv_pp.bad[1], mv_now_ms() - t0);
+}
+
+static void move_checks(void)
+{
+	struct mv_stats a, b;
+
+	mv.online = sysconf(_SC_NPROCESSORS_ONLN);
+	if (mv.online < 2) {
+		printf("ok   move: one CPU online (skipped)\n");
+		return;
+	}
+	if (mv.online > 63)
+		mv.online = 63;
+	mv.all = (1UL << mv.online) - 1;
+	if (mv_stats_read(&a)) {
+		CHECK(0, "move: no /proc/kwmove");
+		return;
+	}
+	mv_spread_check();
+	mv_bounce_check();
+	mv_other_check();
+	mv_signal_check();
+	mv_pingpong_check();
+	mv_setaff(0, mv.all);
+	if (mv_stats_read(&b)) {
+		CHECK(0, "move: no /proc/kwmove");
+		return;
+	}
+	CHECK(b.moved > a.moved && b.lost == a.lost,
+	      "move: /proc/kwmove during these checks: released %lu, resumed in place %lu, moved %lu, kthreads restarted %lu, stacks dropped %lu, lost %lu",
+	      b.released - a.released, b.resumed - a.resumed, b.moved - a.moved,
+	      b.restarted - a.restarted, b.dropped - a.dropped, b.lost - a.lost);
+}
 #endif /* __riscv */
 
 static void *hot_thread(void *arg)
@@ -1555,6 +2034,15 @@ int main(int argc, char **argv)
 		printf("%#lx\n", fphot(HOT_SEED));	/* FPHOT_EXPECT, see fphot() */
 		return 0;
 	}
+#ifdef __riscv
+	/* Only the SMP checks (`rdinit=/usr/bin/kwtest -- smp` repeats them faster). */
+	if (argc > 1 && !strcmp(argv[1], "smp")) {
+		mount("proc", "/proc", "proc", 0, NULL);
+		smp_checks();
+		move_checks();
+		goto done;
+	}
+#endif
 
 	write(1, msg, sizeof(msg) - 1);
 
@@ -1669,8 +2157,10 @@ int main(int argc, char **argv)
 	fb_checks();
 	park_checks();
 	smp_checks();
+	move_checks();
 #endif
 
+done:
 	printf("kwtest: %d failure(s)\n", failures);
 	fflush(stdout);
 	if (getpid() == 1) {

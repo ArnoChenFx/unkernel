@@ -74,11 +74,9 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    isolation and a secure context), one kernel instance per worker,
    per-CPU kwemu state and JIT tables, wasm atomics for AMOs and LR/SC,
    and TLB shootdowns through the polled IRQ bits. JSPI-suspended stacks
-   cannot move between threads; to evaluate: a task preempted in user
-   mode restarts on another CPU through a fresh entry, while tasks inside
-   a syscall stay pinned. Parking's user resume (`kw_park_resume()`,
-   kernel.md, Parking) is that entry; parking itself assumes UP in three
-   places listed there.
+   cannot move between threads, so a task moves only where its stack can
+   be dropped and it can start on a fresh one (step 3); parking assumes
+   UP in the places listed in kernel.md, Parking.
    Step 1, toolchain (2026-11-16, on the `smp` branches): the UP kernel
    builds with atomics and links with `--shared-memory` (kernel.md,
    Memory model), survives Binaryen's lowering, and passes kwtest (JIT
@@ -126,13 +124,48 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    process +58% (atomics, spinlocks, per-CPU offsets, the interrupt
    check on every enable); on two CPUs fork costs +85-92% (the child
    starts on the other CPU: two cross-CPU wakeups).
+   Step 3, moving tasks (2026-11-16; kernel.md, SMP): a user task may
+   move at the reschedule on its way to user mode (after a system call,
+   a fault or a slice end) and starts on a fresh stack on its new CPU,
+   so the load balancer and affinity changes now move tasks; one asleep
+   in a system call stays until it returns. `sched_setaffinity()` (and
+   `taskset`) records the mask at once and the task moves on its way to
+   user mode (a busy thread within 10 ms in kwtest). A workqueue rescuer
+   moves to the per-CPU pool it serves (it used to run that CPU's work
+   items on its own, with a warning). kwtest's new `move:` checks pass
+   on 2 CPUs (20 of 20 runs) and 4 CPUs (10 of 10); a migration storm
+   (threads changing their own and each other's affinity while doing
+   system calls, faults, forks, queued signals and FP work, 4.3 min per
+   session on 2 and 4 CPUs, 24,000 and 62,000 moves, step 2's
+   kwmmstress alongside) found no error, lost signal or kernel warning.
+   Balance on 2 CPUs (Node, 3 runs each, interpreter only; one busy
+   process 0.61 s): four busy processes started from one shell 1.26-1.30
+   s against step 2's 1.24-1.92 s (fork placement is luck there), four
+   started on CPU 0 and then let go 1.30-1.35 s against 1.86-1.97 s,
+   four threads 1.23-1.24 s against 1.29-1.84 s; fork+exec loops
+   unchanged (fork places the children). In an Alpine boot to a shell
+   no user task moved (10-18 preemptions on the way to user mode, all
+   resumed in place), and kthreads restarted on another CPU 6 times on 2
+   CPUs, 21 on 4. Cost (kwbench, the page-fault tool and a pipe and
+   spin benchmark, 14 rounds in random order against step 2's kernels,
+   interpreter only): on one CPU and on two every metric moved by -7%
+   to +4% (`getppid` 0.11 µs either way, a slice-bound spin -1% and
+   -3%), within the noise of the UP pair, whose code is the same
+   (-2% to +5%). A secondary
+   CPU's exit, trap or fatal error now also raises the stop IPI on CPU
+   0, which a CPU takes even while spinning with interrupts off, so the
+   session ends with that CPU's code (a panic and a poweroff on CPU 1
+   were run; the spinning case only by reading the code).
    Open, roughly in order:
-   - Tasks never move after their first run, so a busy CPU is never
-     relieved (fork spreads new ones); moving a task preempted in user
-     mode needs parking's fresh entry (`kw_park_resume()`): park it at the
-     top of `user_mode_loop()`, mark it `TIF_NEVER_RUN`, drop the pin, let
-     the balancer move it and resume it on a fresh stack there; a task in
-     a syscall stays. `taskset` to another CPU fails (EBUSY).
+   - A task asleep in a system call stays on its CPU until it returns,
+     and so does one preempted in the kernel (`cond_resched()`): their
+     stacks are live. An interruptible sleeper could be moved the way
+     parking does it (TIF_NOTIFY_SIGNAL ends the sleep, the call
+     restarts on the way out, where the task may move), at the price of
+     a spurious restart (EINTR for the calls that do not restart);
+     not done. `sched_exec()` asks the stopper to move an exec'ing task,
+     which is held there, so exec does not balance (fork does); it could
+     record the CPU and move at the exit of `execve()`.
    - Devices: kwblk, kwfb, kwinput, kwsnd and kwshm refuse to start on
      SMP. kwblk needs `queue_rq` from any CPU funneled to CPU 0 (a queue
      and a work item, as kwnet does) and completions back; the display,
@@ -145,10 +178,6 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message
      from the sender's host would do instead).
-   - A secondary CPU's exit or panic reaches the owner only through CPU
-     0's thread, which takes messages when it suspends; if CPU 0 spins
-     waiting for the stopped CPU (an IPI with interrupts off), the
-     session hangs until `--timeout`.
    - `pnpm build` does not bundle `js/node/cpu-entry.ts` yet (source
      checkouts only), and `kernel/build.sh` has no SMP target.
 9. **Listening-port detection** for the preview chip and CLI

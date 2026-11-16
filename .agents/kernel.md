@@ -42,8 +42,9 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 - The SMP work (status.md item 8) is on the `smp` branch with its kernel
   tree in the worktree `vendor/src/linux-smp` (branch `kw-smp`), whose
   new patches follow `kw_defconfig`: the shared-memory build, the atomic
-  tweaks, then percpu-km, `ARCH_TASKS_STAY_ON_CPU` (sched, kthread and
-  workqueue) and the arch and driver SMP patches. There
+  tweaks, then percpu-km, `ARCH_TASKS_STAY_ON_CPU` (sched with the
+  exit-to-user hook, kthread and workqueue) and the arch and driver SMP
+  patches. There
   `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
@@ -307,8 +308,10 @@ Every cycle resumes every task through the fresh-stack path, so kwtest's
   The free-page walk then needs every CPU's per-cpu lists drained (each
   CPU drains its own before it counts itself, or the last one drains all
   of them, since the others are idle).
-  `kw_park_resume()`'s user path is the fresh entry that status.md's SMP
-  item needs for moving a task preempted in user mode to another CPU.
+  Moving a user task to another CPU (SMP below) uses the same kind of
+  fresh entry as `kw_park_resume()`'s user path, from the reschedule in
+  the exit loop instead of the top of `user_mode_loop()`; a resumed
+  parked task would also have to set `thread.stack_cpu`.
 
 ## Host interface
 
@@ -329,8 +332,8 @@ Module `wasi_snapshot_preview1` (kernel `wasi.c`, host `js/core/wasi.ts`):
   the bounce buffer.
 
 Module `unkernel`: `wasm_switch_to`, `wasm_snapshot_point` (park.c),
-`wasm_init_flag`, `wasm_cpu_count` and `wasm_cpu_start` (SMP kernels
-only; SMP below),
+`wasm_init_flag`, `wasm_cpu_count`, `wasm_cpu_start` and
+`wasm_stack_drop` (SMP kernels only; SMP below),
 `wasm_driver_block_info`/`submit`/`reap`
 (kwblk), `wasm_driver_net_init`/`send`/`rx_len`/`recv` (kwnet; `net_init`
 < 0 means no device), `wasm_driver_console_size` (`rows << 16 | cols`, 0 =
@@ -571,27 +574,82 @@ numbers and open issues: status.md item 8.
   the host answers `wasm_init_flag()` from that export and setup_arch
   memblock-reserves the word; a secondary's host checks that it reads 2
   before it instantiates.
-- **Tasks stay on the CPU they first ran on** (a JSPI stack belongs to
-  the thread that created it): `ARCH_TASKS_STAY_ON_CPU` (init/Kconfig).
-  `__ret_from_fork()` calls `migrate_disable()` at a task's first run and
-  never undoes it, which the scheduler honours everywhere (`cpus_ptr`
-  becomes that CPU; `sched_getaffinity()` still shows the user's mask).
-  A fork child starts unpinned (`copy_thread()` resets the copied pin),
-  so new tasks spread at fork, but a task never moves after its first
-  run: nothing rebalances a busy CPU. An affinity change that excludes
-  the task's CPU fails with EBUSY (kernel/sched/core.c) instead of
-  waiting for a `migrate_enable()` that never comes (`taskset -c 1` from
-  a shell on CPU 0 fails). New kthreads first run only to report that
-  they exist and are bound afterwards (per-CPU threads of a CPU not yet
-  online, a per-CPU workqueue pool's first worker), so kernel/kthread.c
-  and kernel/workqueue.c call `arch_kthread_restart_point(fn, arg)`
-  before such a sleep (the creation wait, the park before the thread
-  function, an idle worker) and `arch_kthread_restart_cancel()` after it.
-  In between the task may migrate; woken on another CPU than its stack's,
-  `__switch_to()` starts it on a fresh stack there and `__ret_from_fork()`
-  runs `kthread_exit(fn(arg))`. The old stack stays suspended in the
-  other thread until that host's entry for the task is replaced. A
-  workqueue rescuer bound to another CPU's pool runs there anyway.
+- **Tasks move only where their stack can be dropped** (a JSPI stack
+  belongs to the thread that created it): `ARCH_TASKS_STAY_ON_CPU`
+  (init/Kconfig; process.c has the arch side). `thread.stack_cpu` is the
+  CPU whose host holds the task's stack. `__ret_from_fork()` holds the
+  task there with `migrate_disable()` from its first run, which the
+  scheduler honours everywhere (`cpus_ptr` becomes that CPU once it
+  switches out; `sched_getaffinity()` shows the user's mask). A fork
+  child starts unheld (`copy_thread()` resets the copied hold), so new
+  tasks spread at fork. A held task is let go (`sched_stay_release()`,
+  kernel/sched/core.c: `migrate_enable()` plus a move to an allowed CPU
+  if its affinity excludes this one) at two kinds of point:
+  - **A user task at the reschedule on its way to user mode.** The
+    generic exit loop calls `arch_exit_to_user_mode_schedule()` instead
+    of `schedule()` (irq-entry-common.h; the default is `schedule()`),
+    which is `kw_exit_to_user_schedule()`: after a system call, a fault
+    or an interrupt (a slice end), once the system call's exit work
+    (tracing, a ptrace stop, audit) is done. The task's state is then
+    all in `pt_regs` and task_struct. Switched in on its stack's CPU,
+    it returns from `schedule()` (the usual resume) and is held again.
+    Switched in elsewhere (the balancer pulled it, an affinity change
+    sent it), `__switch_to()` starts it on a fresh stack, and
+    `kw_user_resume()` finishes the switch (`sched_stay_switch_tail()`:
+    `schedule_tail()` without the child TID store and without
+    recalculating TIF_SIGPENDING, so a system call that returned
+    -ERESTARTSYS still restarts) and runs `irqentry_exit_to_user_mode()`
+    from the top. What the old pass had still to do (a signal,
+    notify-resume, another reschedule) is in the TIF flags, which only
+    the task clears; `regs->cause` and a0 are as it left them; the LR/SC
+    reservation is cleared at every switch anyway. Equivalent to the old
+    stack's path with rseq off (this config) and no CONTEXT_TRACKING_USER;
+    with rseq on, the syscall and interrupt exits differ in
+    `rseq_*_exit_to_user_mode()` and would need a look. Tasks preempted
+    or asleep in the kernel (a system call, `cond_resched()`, a signal
+    stop) stay held: their stack is live.
+  - **A kthread at a restart point.** New kthreads first run only to
+    report that they exist and are bound afterwards (per-CPU threads of
+    a CPU not yet online, a per-CPU workqueue pool's first worker), so
+    kernel/kthread.c and kernel/workqueue.c call
+    `arch_kthread_restart_point(fn, arg)` before such a sleep (the
+    creation wait, the park before the thread function, an idle worker)
+    and `arch_kthread_restart_cancel()` after it. Woken on another CPU,
+    the thread starts there in `kthread_exit(fn(arg))`. A workqueue
+    rescuer that must serve another CPU's per-CPU pool leaves the
+    request queued and calls `arch_kthread_move(cpu, rescuer_thread,
+    rescuer)`: its affinity becomes that CPU, it releases itself and
+    starts again there (otherwise it would run that CPU's work items on
+    its own: `process_one_work()` warns).
+
+  The CPU that holds a moved task's old stack learns it from a per-CPU
+  list (`kw_stack_drop()`, 32 entries) and, at its next switch or idle,
+  before it could switch to that task (or a new task at the same
+  address) again, calls `wasm_stack_drop(task)`; its host forgets the
+  stack. A full list only leaks that stack until the task next starts
+  fresh on that CPU. A task picked again on its own CPU resumes its
+  stack rather than starting fresh: preemptions are frequent and moves
+  rare (`/proc/kwmove`, below), and a fresh start costs a new JSPI stack
+  while the old one waits for garbage collection.
+
+  Affinity: `sched_setaffinity()` that excludes the CPU of a held task
+  records the mask and returns at once (no waiting for a move that may
+  come only after a long sleep in a system call). For a user task
+  `arch_stay_move()` sets TIF_KW_MOVE (`ARCH_EXIT_TO_USER_MODE_WORK`,
+  asm/entry-common.h) and kicks it: it moves on its next way to user
+  mode, at once if it runs in user mode, at the end of the call for
+  itself (`taskset -c 1 cmd`, `pthread_setaffinity_np()` on itself), at
+  the wakeup if it sleeps in a system call. A task let go meanwhile moves
+  the upstream way (stopper or `move_queued_task()`). A held kthread gets
+  EBUSY, unless it is moving itself (`arch_kthread_move()`).
+  `/proc/kwmove` (SMP only) counts user tasks switched out where they may
+  move (`released`), resumed on their CPU (`resumed`) or started on
+  another (`moved`), kthreads started again elsewhere (`restarted`), and
+  stacks dropped (`dropped`, `lost`). An Alpine boot to a shell
+  (2026-11-16) released 10-18 times, all resumed in place, and
+  restarted 6 kthreads on 2 CPUs, 21 on 4. Held tasks never call
+  `migrate_enable()` before they exit, so `rq->nr_pinned` (used only by
+  CPU hot-unplug, which this arch lacks) only grows.
 - **IPIs and idle.** `kw_irq_raise(cpu, bits)` (irq.c) ORs the bits into
   the target's word and does `memory.atomic.notify`. A secondary idles in
   `memory.atomic.wait32` on its word with the timer's timeout (it blocks
@@ -602,7 +660,12 @@ numbers and open issues: status.md item 8.
   since `kw_run()` returns `KW_EV_INTERRUPT` at once and the exit path
   then honours a reschedule. Only CPU 0 yields to its host (`wasm_yield`).
   `smp_send_stop()` parks the others (CPU 0 in `wasm_idle(-1)`, so its
-  host can still take a secondary's exit).
+  host can still take a secondary's exit). A CPU takes the stop IPI in
+  `cpu_relax()` even with interrupts off, and a secondary's host raises
+  it on CPU 0 when the session ends there (exit, trap, fatal; js.md):
+  CPU 0's host takes that CPU's message only once CPU 0 suspends, and
+  CPU 0 may be spinning for the CPU that ended (a lock it held, a
+  cross-CPU call).
 - **MM.** `switch_mm()` adds the CPU to `mm_cpumask(next)` before
   `kw_set_pgd()` and removes it from the previous mm (still referenced:
   lazy TLB refcount). `flush_tlb_*()`, `update_mmu_cache_range()` and
@@ -736,6 +799,20 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
   - `smp:` (more than one CPU online; skipped otherwise): three threads,
     the main one among them, count to 900000 through amoadd, an LR/SC
     loop and a pthread mutex, and must have run on at least two CPUs.
+  - `move:` (more than one CPU online; skipped otherwise; SMP above):
+    2 threads per CPU (at most 8) started on CPU 0 and then allowed
+    everywhere run `fphot()` for 2 s and must sit evenly on every CPU at
+    1.2 s; the main thread moves itself round the CPUs 300 times between
+    steps of a computation in registers, in FE_UPWARD with FE_DIVBYZERO
+    raised, and must match the same run without moves (and its TLS);
+    `sched_setaffinity` on a thread busy in user mode must return at once
+    and move it within 1 s (6 times), on a thread asleep in `read()`
+    return at once and move it at the wakeup; 2000 queued RT signals to
+    a thread that keeps moving arrive exactly once each; 5000 pipe and
+    5000 futex round trips between two threads that keep moving keep
+    their order; `/proc/kwmove` must show moves and no lost drops.
+    `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only `smp:` and
+    `move:`.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).

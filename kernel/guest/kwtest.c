@@ -998,20 +998,42 @@ static void input_handler_checks(void)
 	      evdev ? "ok" : "MISSING", other[0] ? other : " none");
 }
 /*
+ * A path for the char device maj:min: devtmpfs's node dev when it is there,
+ * else one made at tmp (as /init, /dev may have no devtmpfs). The node in
+ * /dev comes first because a shell on the overlay root (the page with its
+ * data disk) has /tmp mounted nodev, where opening a device node fails with
+ * EACCES. *made says whether tmp was made (the caller unlinks it). NULL if
+ * neither works.
+ */
+static const char *chrdev_node(const char *dev, const char *tmp, unsigned int maj, unsigned int min, int *made)
+{
+	struct stat st;
+
+	*made = 0;
+	if (!stat(dev, &st) && S_ISCHR(st.st_mode) && st.st_rdev == makedev(maj, min))
+		return dev;
+	unlink(tmp);   /* left over from a run that was killed */
+	if (mknod(tmp, S_IFCHR | 0600, makedev(maj, min)))
+		return NULL;
+	*made = 1;
+	return tmp;
+}
+
+/*
  * AF_VSOCK (kwvsock, net/vmw_vsock/kwvsock.c). The guest's CID comes from
- * /dev/vsock (made in /tmp from /proc/misc, since /dev may have no
- * devtmpfs here). With a host device (the CLI default) it is 3, and a connect to
- * host port 9, where nothing listens, is refused (the host answers the
- * request with RST: ECONNRESET). Without one (the default) there is no
- * transport: VMADDR_CID_ANY, and connect fails with ENODEV.
+ * /dev/vsock (its minor from /proc/misc; chrdev_node). With a host device
+ * (the CLI's and the page's default) it is 3, and a connect to host port 9,
+ * where nothing listens, is refused (the host answers the request with RST:
+ * ECONNRESET). Without one (CLI --no-vsock) there is no transport:
+ * VMADDR_CID_ANY, and connect fails with ENODEV.
  */
 static void vsock_checks(void)
 {
 	struct sockaddr_vm a = { .svm_family = AF_VSOCK, .svm_cid = VMADDR_CID_HOST, .svm_port = 9 };
-	const char *node = "/tmp/.kwtest-vsock";
+	const char *node;
 	unsigned int cid = VMADDR_CID_ANY, minor;
 	char buf[4096], *p;
-	int fd = open("/proc/misc", O_RDONLY), n, s, rc, err = 0;
+	int fd = open("/proc/misc", O_RDONLY), n, s, rc, err = 0, made;
 
 	n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
 	if (fd >= 0)
@@ -1020,9 +1042,11 @@ static void vsock_checks(void)
 	p = strstr(buf, " vsock\n");
 	while (p && p > buf && p[-1] != '\n')
 		p--;
-	if (p && sscanf(p, "%u vsock", &minor) == 1 && !mknod(node, S_IFCHR | 0600, makedev(10, minor))) {
+	if (p && sscanf(p, "%u vsock", &minor) == 1 &&
+	    (node = chrdev_node("/dev/vsock", "/tmp/.kwtest-vsock", 10, minor, &made))) {
 		fd = open(node, O_RDONLY);
-		unlink(node);
+		if (made)
+			unlink(node);
 		if (fd >= 0) {
 			ioctl(fd, IOCTL_VM_SOCKETS_GET_LOCAL_CID, &cid);
 			close(fd);
@@ -1184,7 +1208,7 @@ static int open_err(const char *path)
 }
 
 /*
- * kwfb (drivers/video/fbdev/kwfb.c): /dev/fb0 (made in /tmp, char 29:0)
+ * kwfb (drivers/video/fbdev/kwfb.c): /dev/fb0 (char 29:0; chrdev_node)
  * exists only with a host display (CLI --display). One program at a time:
  * while an open file exists a second open fails with EBUSY, also once its
  * opener has closed it but a forked child still holds the shared file, and
@@ -1193,8 +1217,8 @@ static int open_err(const char *path)
  */
 static void fb_checks(void)
 {
-	const char *node = "/tmp/.kwtest-fb0";
-	int fd = open("/proc/fb", O_RDONLY), n, a, b, go[2] = { -1, -1 }, status = 0;
+	const char *node;
+	int fd = open("/proc/fb", O_RDONLY), n, a, b, go[2] = { -1, -1 }, status = 0, made;
 	int a_err, busy_open, busy_child, after_child, busy_map, after_map;
 	char buf[256], c = 0;
 	void *map = MAP_FAILED;
@@ -1208,8 +1232,11 @@ static void fb_checks(void)
 		CHECK(1, "kwfb: no host display (skipped; CLI --display adds one)");
 		return;
 	}
-	a = mknod(node, S_IFCHR | 0600, makedev(29, 0)) ? -1 : open(node, O_RDWR);
+	node = chrdev_node("/dev/fb0", "/tmp/.kwtest-fb0", 29, 0, &made);
+	a = node ? open(node, O_RDWR) : -1;
 	a_err = a < 0 ? errno : 0;
+	if (!node)
+		node = "/tmp/.kwtest-fb0";   /* so the opens below fail and report */
 	busy_open = open_err(node);
 	/* The child shares the file; it outlives the parent's close. */
 	pipe(go);
@@ -1238,7 +1265,8 @@ static void fb_checks(void)
 	if (map != MAP_FAILED)
 		munmap(map, 4096);
 	after_map = open_err(node);
-	unlink(node);
+	if (made)
+		unlink(node);
 	CHECK(a >= 0 && busy_open == EBUSY && busy_child == EBUSY && WIFEXITED(status) && !after_child &&
 	      map != MAP_FAILED && busy_map == EBUSY && !after_map,
 	      "kwfb: first open %s; second open: %s, held by a forked child: %s, after its exit: %s; mmap %s, "

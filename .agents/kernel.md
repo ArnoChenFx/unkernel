@@ -139,7 +139,14 @@ patch re-export.
 - uaccess (`copy_{to,from}_user`, `clear_user`, futex ops) walks the user
   page tables in software and faults pages in. `get_user`/`put_user` and
   `strn*_user` are the generic ones on top of that.
-- Kernel memory is not shared (no SharedArrayBuffer). Guest RAM is below
+- Kernel memory is not shared (no SharedArrayBuffer) by default. The
+  arch Makefile's experimental `KW_ATOMICS=1` (wasm atomics, so the
+  `__atomic_*` builtins become atomic instructions) and
+  `KW_SHARED_MEMORY=1` (also `--shared-memory`: passive data segments,
+  initialised by the start function `__wasm_init_memory`) make variables
+  build a UP kernel that boots on a shared memory; kwemu must then be
+  built with `zig build -Dkwemu-atomics=true`, and the host detects the
+  shared import (status.md, SMP). Guest RAM is below
   4 GiB, which makes the lowering exact.
 
 ## Tasks: JSPI on one thread

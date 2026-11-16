@@ -79,6 +79,22 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    a syscall stay pinned. Parking's user resume (`kw_park_resume()`,
    kernel.md, Parking) is that entry; parking itself assumes UP in three
    places listed there.
+   Step 1, toolchain (2026-11-16, on the `smp` branches): the UP kernel
+   builds with atomics and links with `--shared-memory` (kernel.md,
+   Memory model), survives Binaryen's lowering, and passes kwtest (JIT
+   and `--no-jit`, lowered and wasm64) and a snapshot round trip on a
+   shared `WebAssembly.Memory` in Node. The JIT declares its memory
+   import shared (caps bit 3, kwemu.md). Cost on one CPU (Node, kwbench
+   medians of 15 alternating runs): page faults +21% (458 to 562 ns) and
+   kwbench's fork of an 8 MiB process +31%, both from the kernel's
+   atomic RMW instructions (kwemu built with atomics alone costs
+   nothing, and making `atomic_read`/`atomic_set` plain did not help);
+   sharing the memory adds nothing measurable beyond that. Syscalls,
+   pipes, futex wake and user code are within noise. The lowered kernel
+   is 41 KB smaller (9 KB gzip). Open: `__wasm_init_memory_flag` sits
+   after `_end`, in memory the kernel hands out, so a second instance
+   (a secondary CPU) would read a stale flag; browsers were not tried
+   (block, display and sound views of a shared memory are unchecked).
 9. **Listening-port detection** for the preview chip and CLI
    auto-forward: a `kwtty ports` subcommand in C that re-reads
    `/proc/net/tcp` every 3 s (a stdin byte rescans at once) and prints

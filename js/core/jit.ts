@@ -107,6 +107,7 @@ export interface JitHostOptions {
 
 const CAP_AVAILABLE = 1;
 const CAP_MEM32 = 2;
+const CAP_SHARED = 8;
 /** kwemu's emit buffer is 16 KiB; anything much larger is not from kwemu. */
 const MAX_MODULE = 1 << 20;
 /** Failure messages logged before going quiet. */
@@ -214,7 +215,8 @@ export class JitHost {
 			this.#warn("the kernel exports no __indirect_function_table; JIT off");
 			return 0;
 		}
-		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32);
+		const shared = typeof SharedArrayBuffer !== "undefined" && this.#opts.memory().buffer instanceof SharedArrayBuffer;
+		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0);
 	}
 
 	compile(ptr: bigint | number, len: bigint | number, slot: number): number {
@@ -235,8 +237,10 @@ export class JitHost {
 			const mem = this.#opts.memory();
 			if (!(n > 0 && n <= MAX_MODULE && p >= 0 && p + n <= mem.buffer.byteLength)) throw new Error(`bad module range ${p}+${n}`);
 			// The Module constructor copies the bytes, so a view into the
-			// kernel's memory is enough.
-			const module = new WebAssembly.Module(new Uint8Array(mem.buffer, p, n));
+			// kernel's memory is enough, unless the memory is shared (the JS
+			// API takes no shared views; V8 accepts them, others need not).
+			const view = new Uint8Array(mem.buffer, p, n);
+			const module = new WebAssembly.Module(mem.buffer instanceof ArrayBuffer ? view : view.slice());
 			const f = new WebAssembly.Instance(module, { env: { memory: mem } }).exports.f;
 			if (typeof f !== "function") throw new Error("the module exports no function f");
 			const idx = this.#big ? BigInt(slot) : slot;

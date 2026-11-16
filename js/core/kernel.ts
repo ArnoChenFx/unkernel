@@ -274,6 +274,8 @@ export class Kernel {
 	shm: ShmDevice;
 	memory!: WebAssembly.Memory;
 	memory64 = false;
+	/** The module imports a shared memory (a kernel linked with --shared-memory). */
+	sharedMemory = false;
 	wasi!: WasiHost;
 	exports: WebAssembly.Exports | undefined;
 	/** Address of wasm_host_irqs, once instantiated. */
@@ -386,7 +388,7 @@ export class Kernel {
 		const p = Number(ptr);
 		let end = p;
 		while (end < p + max && u8[end] !== 0) end++;
-		return textDecoder.decode(u8.subarray(p, end));
+		return textDecoder.decode(u8.slice(p, end)); // a copy: TextDecoder may refuse a shared memory's view
 	}
 
 	fatal(msg: string): void {
@@ -682,11 +684,11 @@ export class Kernel {
 		this.exit({ code: 254, reason: String(e), kind: "trap", error: e });
 	}
 
-	/** A fixed-size memory of `pages` 64 KiB pages, 64-bit (BigInt sizes) or 32-bit. */
-	static newMemory(pages: number, memory64: boolean): WebAssembly.Memory {
+	/** A fixed-size memory of `pages` 64 KiB pages, 64-bit (BigInt sizes) or 32-bit, shared or not. */
+	static newMemory(pages: number, memory64: boolean, shared = false): WebAssembly.Memory {
 		return memory64
-			? new WebAssembly.Memory({ initial: BigInt(pages), maximum: BigInt(pages), address: "i64" } as unknown as WebAssembly.MemoryDescriptor)
-			: new WebAssembly.Memory({ initial: pages, maximum: pages });
+			? new WebAssembly.Memory({ initial: BigInt(pages), maximum: BigInt(pages), address: "i64", shared } as unknown as WebAssembly.MemoryDescriptor)
+			: new WebAssembly.Memory({ initial: pages, maximum: pages, shared });
 	}
 
 	/**
@@ -702,7 +704,7 @@ export class Kernel {
 			const pages = Math.ceil((mib * 1024 * 1024) / 65536);
 			try {
 				if (!this.memory64 && pages > 65536) throw new RangeError("more than 4 GiB needs the wasm64 (memory64) kernel");
-				const memory = Kernel.newMemory(pages, this.memory64);
+				const memory = Kernel.newMemory(pages, this.memory64, this.sharedMemory);
 				if (failures.length) this.log(`[host] allocated ${mib} MiB after failing: ${failures.join("; ")}`);
 				this.onStage("memory", { mib, requestedMiB: memoryMiB, failures, memory64: this.memory64 });
 				return memory;
@@ -738,7 +740,7 @@ export class Kernel {
 		this.memory64 = restore ? restore.memory64 : guessed ? moduleIsMemory64(module) : !!this.opts.memory64;
 		if (restore) {
 			// No fallback sizes: the kernel sized RAM from this memory at boot.
-			this.memory = Kernel.newMemory(restore.memory.byteLength / 65536, this.memory64);
+			this.memory = Kernel.newMemory(restore.memory.byteLength / 65536, this.memory64, this.sharedMemory);
 			this.onStage("memory", { mib: memoryMiB, requestedMiB: memoryMiB, failures: [], memory64: this.memory64 });
 		} else {
 			this.memory = this.allocateMemory(memoryMiB, initrd?.length ?? 0);
@@ -751,22 +753,36 @@ export class Kernel {
 		});
 
 		this.onStage("instantiate");
-		let instance: WebAssembly.Instance;
-		try {
-			instance = await WebAssembly.instantiate(module, this.imports());
-		} catch (e) {
-			// Wrong memory type (a module without target_features): retry once
-			// with the other one, same size.
-			if (!guessed || !(e instanceof WebAssembly.LinkError)) throw e;
-			const pages = this.memory.buffer.byteLength / 65536;
+		// The JS API does not show whether the memory import is shared (a
+		// kernel linked with --shared-memory): retry once with the other
+		// sharing when the engine says that is the mismatch; and, for a
+		// guessed memory type (a module without target_features), once with
+		// the other type.
+		let instance: WebAssembly.Instance | undefined;
+		let flippedShared = false, flippedType = !guessed;
+		while (!instance) {
 			try {
-				this.memory = Kernel.newMemory(pages, !this.memory64);
-				this.memory64 = !this.memory64;
-			} catch {
-				throw e;
+				instance = await WebAssembly.instantiate(module, this.imports());
+			} catch (e) {
+				if (!(e instanceof WebAssembly.LinkError)) throw e;
+				const pages = this.memory.buffer.byteLength / 65536;
+				let memory64 = this.memory64, shared = this.sharedMemory;
+				if (!flippedShared && /\bshared\b/i.test(e.message)) {
+					flippedShared = true;
+					shared = !shared;
+				} else if (!flippedType) {
+					flippedType = true;
+					memory64 = !memory64;
+				} else throw e;
+				try {
+					this.memory = Kernel.newMemory(pages, memory64, shared);
+				} catch {
+					throw e;
+				}
+				if (memory64 !== this.memory64) this.log(`[host] memory type guess was wrong (${e.message}); using a ${memory64 ? "64" : "32"}-bit memory`);
+				this.memory64 = memory64;
+				this.sharedMemory = shared;
 			}
-			this.log(`[host] memory type guess was wrong (${e.message}); using a ${this.memory64 ? "64" : "32"}-bit memory`);
-			instance = await WebAssembly.instantiate(module, this.imports());
 		}
 		const ex = (this.exports = instance.exports);
 		const addr = (name: string) => {

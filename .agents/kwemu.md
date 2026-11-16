@@ -585,7 +585,7 @@ These imports exist only with `-Dkwemu-jit`. The kernel host is
 
 | Import | |
 | --- | --- |
-| `kw_host_jit_caps() -> u32` | bit 0 = JIT available (0: never compile), bit 1 = 32-bit memory (lowered kernel: the code imports a 32-bit `env.memory` and wraps addresses), bit 2 = eager. Called once, from `kw_cpu_init`. |
+| `kw_host_jit_caps() -> u32` | bit 0 = JIT available (0: never compile), bit 1 = 32-bit memory (lowered kernel: the code imports a 32-bit `env.memory` and wraps addresses), bit 2 = eager, bit 3 = shared memory (the code declares its `env.memory` import shared, with a maximum of 65536 pages for memory32 and 262144 for memory64; the host sets it when the kernel's memory is a SharedArrayBuffer). Called once, from `kw_cpu_init`. |
 | `kw_host_jit_compile(ptr, len, slot) -> i32` | Compile the module at `ptr` (it imports `env.memory` and exports `f`) synchronously with `new WebAssembly.Module` and `table.set` its `f` into `slot` (a BigInt index for table64). 0 = installed, < 0 = failed (slot untouched, and that block is never compiled). |
 | `kw_host_jit_free(slot)` | Put back the stub that was there before the first compile, and drop the module. |
 

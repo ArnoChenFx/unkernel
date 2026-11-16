@@ -9,7 +9,8 @@
 //     exactly as many instructions (instret) as the wasm64 interpreter
 //   * wasm32+jit: the JIT harness lowered with Binaryen
 //     (wasm-opt --memory64-lowering --table64-lowering, as the kernel is;
-//     --enable-memory64 because Zig emits no target_features section);
+//     --enable-memory64 because Zig emits no target_features section, and
+//     bulk memory and threads for a -Dkwemu-atomics build);
 //     skipped with a note if vendor/toolchain/binaryen is missing ($WASM_OPT
 //     overrides the path)
 // usage: node test/kwemu-test.mjs <zig-out prefix> [--bench-only]
@@ -38,7 +39,7 @@ let jit32Module = null, jit32Note = "";
   else {
     const dir = await mkdtemp(join(tmpdir(), "kwemu-jit32-"));
     const out = join(dir, "kwemu-harness-jit32.wasm");
-    const p = spawnSync(wasmOpt, ["-g", "--enable-memory64", "--memory64-lowering", "--table64-lowering", jitPath, "-o", out], { encoding: "utf8" });
+    const p = spawnSync(wasmOpt, ["-g", "--enable-memory64", "--enable-bulk-memory", "--enable-threads", "--memory64-lowering", "--table64-lowering", jitPath, "-o", out], { encoding: "utf8" });
     if (p.status !== 0) jit32Note = `FAIL wasm-opt lowering: ${p.stderr}`;
     else jit32Module = await WebAssembly.compile(await readFile(out));
     await rm(dir, { recursive: true, force: true });

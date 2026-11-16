@@ -14,7 +14,9 @@
 //!   kw_host_jit_caps() -> u32
 //!       bit 0: JIT available; bit 1: the memory is 32-bit (memory64-lowered
 //!       module: the generated code imports a 32-bit memory and wraps every
-//!       address); bit 2: eager (compile on the first entry; tests).
+//!       address); bit 2: eager (compile on the first entry; tests);
+//!       bit 3: the memory is shared (the generated code declares its
+//!       import shared, with the largest maximum of its type).
 //!       Called once, by kw_cpu_init.
 //!   kw_host_jit_compile(ptr, len, slot: u32) -> i32
 //!       Compile the `len` bytes at `ptr` (a module importing env.memory and
@@ -79,6 +81,7 @@ pub const code_side = 128;
 pub const cap_available: u32 = 1;
 pub const cap_mem32: u32 = 2;
 pub const cap_eager: u32 = 4;
+pub const cap_shared: u32 = 8;
 /// Most blocks in one compiled region (see "regions" below).
 pub const max_members = 16;
 
@@ -1066,6 +1069,8 @@ const Emit = struct {
     pos: usize = 0,
     ok: bool = true,
     mem32: bool,
+    /// The kernel's memory is shared (cap_shared): the import says so.
+    shared: bool = false,
     /// Open blocks/loops/ifs; the exit block is the outermost.
     nest: u32 = 0,
     /// The frm == RNE test for dynamic rounding modes has been emitted (frm
@@ -1256,7 +1261,7 @@ fn emitModule(cpu: *Cpu, b: *const Block, rg: ?*Region, limit: *usize) Error!usi
     const live = use.read | use.write;
     const flive = use.fread | use.fwrite;
 
-    var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = cpu.priv.jit.caps & cap_mem32 != 0 };
+    var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = cpu.priv.jit.caps & cap_mem32 != 0, .shared = cpu.priv.jit.caps & cap_shared != 0 };
     e.rg = rg;
     e.fma_inline = fma_inline; // a region's members set their own
     e.aes_inline = aes_inline;
@@ -1284,9 +1289,15 @@ fn emitModule(cpu: *Cpu, b: *const Block, rg: ?*Region, limit: *usize) Error!usi
     // type 0: (i64 i64 i64 i64) -> i64 (f); type 1: (i64 i64 i64) -> i64 (the helpers)
     e.ops(&.{ 0x01, 0x10, 0x02, 0x60, 0x04, W.i64_t, W.i64_t, W.i64_t, W.i64_t, 0x01, W.i64_t });
     e.ops(&.{ 0x60, 0x03, W.i64_t, W.i64_t, W.i64_t, 0x01, W.i64_t });
-    // import env.memory: memory64 (flags 4) or memory32, min 0
-    e.ops(&.{ 0x02, 0x0f, 0x01, 0x03, 'e', 'n', 'v', 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02 });
-    e.ops(&.{ if (e.mem32) 0x00 else 0x04, 0x00 });
+    // import env.memory: memory64 (flags 4) or memory32, min 0; a shared
+    // memory (flags | 3) needs a maximum, which an import matches when the
+    // memory's is not larger: 65536 pages (4 GiB) for memory32, 262144
+    // (16 GiB, the kernel's --max-memory) for memory64.
+    e.ops(&.{ 0x02, if (e.shared) 0x12 else 0x0f, 0x01, 0x03, 'e', 'n', 'v', 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02 });
+    if (e.shared)
+        e.ops(&.{ if (e.mem32) 0x03 else 0x07, 0x00, 0x80, 0x80, if (e.mem32) 0x04 else 0x10 })
+    else
+        e.ops(&.{ if (e.mem32) 0x00 else 0x04, 0x00 });
     // functions: f (type 0), then the helpers (type 1)
     e.ops(&.{ 0x03, @intCast(1 + nfn), @intCast(nfn), 0x00 });
     for (1..nfn) |_| e.op(0x01);

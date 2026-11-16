@@ -324,8 +324,11 @@ export class WasiHost {
 			},
 			random_get(buf: number, len: number): number {
 				const u8 = w.u8();
-				for (let off = 0; off < len; off += 65536)
-					crypto.getRandomValues(u8.subarray(buf + off, buf + Math.min(len, off + 65536)));
+				// Through a copy: getRandomValues refuses a shared memory's view in browsers.
+				for (let off = 0; off < len; off += 65536) {
+					const n = Math.min(len - off, 65536);
+					u8.set(crypto.getRandomValues(new Uint8Array(n)), buf + off);
+				}
 				return ERRNO.SUCCESS;
 			},
 
@@ -337,7 +340,7 @@ export class WasiHost {
 				for (const [p, len] of w.iovecs(iovs, n)) {
 					if (!len) continue;
 					if (f.type === "stdout") k.opts.write(u8.slice(p, p + len));
-					else w.stderr = (w.stderr + decoder.decode(u8.subarray(p, p + len))).slice(-4096);
+					else w.stderr = (w.stderr + decoder.decode(u8.slice(p, p + len))).slice(-4096);
 					total += len;
 				}
 				w.dv().setUint32(nwritten, total, true);
@@ -405,7 +408,7 @@ export class WasiHost {
 				if (!d) return ERRNO.BADF;
 				if (d.type !== "dir") return ERRNO.NOTDIR;
 				if (oflags & (OFLAGS_CREAT | OFLAGS_TRUNC)) return ERRNO.ROFS;
-				const name = decoder.decode(w.u8().subarray(path, path + pathLen)).replace(/^(\.?\/)+/, "");
+				const name = decoder.decode(w.u8().slice(path, path + pathLen)).replace(/^(\.?\/)+/, "");
 				const data = d.files.get(name);
 				if (!data) return ERRNO.NOENT;
 				if (oflags & OFLAGS_DIRECTORY) return ERRNO.NOTDIR;

@@ -45,7 +45,8 @@ pub fn build(b: *std.Build) void {
     // ---- kwemu: the CPU core as a library for the real kernel -----------------
     // wasm64 relocatable object + static archive with the C ABI of
     // include/kw_emu.h; conservative wasm features (mvp + memory64): no
-    // threads/atomics/TLS/bulk-memory/sign-ext/nontrapping-fptoint.
+    // threads/atomics/TLS/bulk-memory/sign-ext/nontrapping-fptoint, unless
+    // -Dkwemu-atomics (below).
     const lib_optimize = b.option(std.builtin.OptimizeMode, "lib-optimize", "Optimization mode for libkwemu (default: ReleaseFast)") orelse .ReleaseFast;
     // Tail-call threaded dispatch (one function per op, return_call_indirect
     // chains). Adds the wasm `tail_call` feature to the object, so the
@@ -62,13 +63,23 @@ pub fn build(b: *std.Build) void {
     // Operand sets per op of the randomized F/D differential unit test
     // (interpreter vs JIT, wasm64 unit tests only); 0 = its small default.
     const fp_fuzz = b.option(u32, "kwemu-fp-fuzz", "kwemu: random operand sets per op in the F/D JIT differential test (default: 0 = 4096)") orelse 0;
+    // wasm atomics + bulk memory in the wasm64 objects, so that a kernel
+    // linked with --shared-memory (wasm-ld refuses objects without both)
+    // can include kwemu. kwemu itself stays single-threaded: guest
+    // AMO/LR/SC are not made atomic by this.
+    const atomics = b.option(bool, "kwemu-atomics", "kwemu: build the wasm64 objects with the atomics and bulk-memory features, for a shared-memory kernel (default: false)") orelse false;
     const kw_opts_mod = kwOptions(b, tail_call, stats, jit, jit_threshold, jit_grow, fp_fuzz);
     const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, tail_call, stats, true, jit_threshold, jit_grow, fp_fuzz);
     const wasm64 = b.resolveTargetQuery(.{
         .cpu_arch = .wasm64,
         .os_tag = .freestanding,
         .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
-        .cpu_features_add = if (tail_call) std.Target.wasm.featureSet(&.{.tail_call}) else .empty,
+        .cpu_features_add = blk: {
+            var f: std.Target.Cpu.Feature.Set = .empty;
+            if (tail_call) f.addFeatureSet(std.Target.wasm.featureSet(&.{.tail_call}));
+            if (atomics) f.addFeatureSet(std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }));
+            break :blk f;
+        },
     });
     const kw_h_wasm = kwHeader(b, wasm64, lib_optimize);
     const kw_h_native = kwHeader(b, native, optimize);

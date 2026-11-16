@@ -1,0 +1,151 @@
+From c25117ee5cc30faef20cb23536facdd69d5f5606 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 20:16:02 +0000
+Subject: [PATCH] wasm: kwblk on SMP
+
+The host's block imports answer on CPU 0 alone, and its interrupt
+arrives there, while blk-mq calls ->queue_rq() on the submitting CPU in
+atomic context. A request started on another CPU now waits in a list
+and raises the block interrupt on CPU 0, whose handler submits the
+waiting requests in order before it reaps; CPU 0 submits its own
+directly, behind any that wait. Every request is thus submitted and
+ended on CPU 0, and blk_mq_end_request() there wakes the submitter
+wherever it sleeps. The UP build is unchanged.
+---
+ drivers/block/kwblk.c | 85 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 72 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/block/kwblk.c b/drivers/block/kwblk.c
+index 0b7ca9a6682..33e84984526 100644
+--- a/drivers/block/kwblk.c
++++ b/drivers/block/kwblk.c
+@@ -22,6 +22,16 @@
+  * JSPI import, so the data copies of asynchronous requests happen while the
+  * kernel idles or yields; the request's pages stay pinned until it ends.
+  *
++ * SMP: the host's imports answer on CPU 0 alone, and its interrupts arrive
++ * there, while blk-mq calls ->queue_rq() on the submitting CPU in atomic
++ * context. Another CPU's requests wait in a list (kwblk_pending) and raise
++ * the block interrupt on CPU 0, whose handler submits them, in order,
++ * before it reaps; CPU 0 submits its own directly once that list is empty.
++ * So every request is submitted and ended on CPU 0 (blk_mq_end_request()
++ * there wakes the submitter wherever it sleeps). The host copies data
++ * while other CPUs run, as a DMA engine would: the request owns its pages
++ * until it ends.
++ *
+  * Disks are named wda, wdb, ... and probed once at boot from the host's list.
+  */
+ 
+@@ -92,6 +102,54 @@ struct kwblk_dev {
+ static int kwblk_major;
+ static unsigned int kwblk_ndevs;
+ 
++/* Hand @rq to the host, or end it if the host finished it at once. */
++static void kwblk_submit(struct request *rq)
++{
++	int ret = wasm_driver_block_submit(blk_mq_rq_to_pdu(rq));
++
++	if (ret <= 0)
++		blk_mq_end_request(rq, errno_to_blk_status(ret));
++	/* else: completion arrives through WASM_IRQ_BLOCK */
++}
++
++#ifdef CONFIG_SMP
++/* Started requests from other CPUs, for CPU 0 to submit (rq->queuelist). */
++static LIST_HEAD(kwblk_pending);
++static DEFINE_SPINLOCK(kwblk_pending_lock);
++
++/* Another CPU: queue @rq for CPU 0 and raise the block interrupt there. */
++static void kwblk_defer(struct request *rq)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&kwblk_pending_lock, flags);
++	list_add_tail(&rq->queuelist, &kwblk_pending);
++	spin_unlock_irqrestore(&kwblk_pending_lock, flags);
++	kw_irq_raise(0, BIT(WASM_IRQ_BLOCK));
++}
++
++/* CPU 0: submit the queued requests, in order. Returns whether there were any. */
++static bool kwblk_submit_pending(void)
++{
++	struct request *rq, *next;
++	unsigned long flags;
++	LIST_HEAD(list);
++
++	if (list_empty(&kwblk_pending))
++		return false;
++	/* Interrupts off throughout: a nested handler would overtake these. */
++	spin_lock_irqsave(&kwblk_pending_lock, flags);
++	list_splice_init(&kwblk_pending, &list);
++	spin_unlock(&kwblk_pending_lock);
++	list_for_each_entry_safe(rq, next, &list, queuelist) {
++		list_del_init(&rq->queuelist);
++		kwblk_submit(rq);
++	}
++	local_irq_restore(flags);
++	return true;
++}
++#endif
++
+ static blk_status_t kwblk_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 				   const struct blk_mq_queue_data *bd)
+ {
+@@ -101,7 +159,6 @@ static blk_status_t kwblk_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	struct req_iterator iter;
+ 	struct bio_vec bv;
+ 	unsigned int n = 0;
+-	int ret;
+ 
+ 	req->dev = kd->index;
+ 	req->sector = blk_rq_pos(rq);
+@@ -147,10 +204,15 @@ static blk_status_t kwblk_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	req->nr_segs = n;
+ 
+ 	blk_mq_start_request(rq);
+-	ret = wasm_driver_block_submit(req);
+-	if (ret <= 0)
+-		blk_mq_end_request(rq, errno_to_blk_status(ret));
+-	/* else: completion arrives through WASM_IRQ_BLOCK */
++#ifdef CONFIG_SMP
++	if (smp_processor_id()) {
++		kwblk_defer(rq);
++		return BLK_STS_OK;
++	}
++	/* Behind the requests that wait for CPU 0. */
++	kwblk_submit_pending();
++#endif
++	kwblk_submit(rq);
+ 	return BLK_STS_OK;
+ }
+ 
+@@ -159,6 +221,10 @@ static irqreturn_t kwblk_irq(int irq, void *dev_id)
+ 	struct kwblk_req *req;
+ 	bool any = false;
+ 
++#ifdef CONFIG_SMP
++	/* Raised by the host (completions) or by another CPU (requests). */
++	any = kwblk_submit_pending();
++#endif
+ 	while ((req = wasm_driver_block_reap())) {
+ 		blk_mq_end_request(blk_mq_rq_from_pdu(req),
+ 				   errno_to_blk_status(req->status));
+@@ -251,14 +317,7 @@ static int __init kwblk_init(void)
+ 	u32 i;
+ 	int err;
+ 
+-	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
+-	if (IS_ENABLED(CONFIG_SMP)) {
+-		memset(&info, 0, sizeof(info));
+-		if (wasm_driver_block_info(0, &info) >= 0)
+-			pr_warn("kwblk: disks are not supported on SMP kernels yet\n");
+-		return -ENODEV;
+-	}
+-
++	/* An initcall: on CPU 0 (kernel_init), where the imports answer. */
+ 	kwblk_major = register_blkdev(0, "kwblk");
+ 	if (kwblk_major < 0)
+ 		return kwblk_major;
+-- 
+2.56.0
+

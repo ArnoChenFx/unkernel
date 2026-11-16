@@ -1032,8 +1032,8 @@ switching, no block or net device, no JIT).
 * SMP is experimental: a second build (`arch/wasm/configs/kw_smp.config`,
   built by hand, `.agents/kernel.md`, SMP) runs one kernel instance per
   CPU in worker threads on a shared memory (CLI `--smp N`; Node only),
-  each CPU with its own JIT. It has no disks, display, input, sound, shm or
-  snapshots yet. A task moves to another CPU only on its way back to
+  each CPU with its own JIT. It has every device, all served by CPU 0
+  (disk I/O from other CPUs is handed to it), but no snapshots yet. A task moves to another CPU only on its way back to
   user mode (the load balancer, `taskset`); one asleep in a system call
   stays where it is until it returns. The released kernel is UP. linux-wasm's NOMMU mode (programs as Wasm
   modules), its Wasm binfmt and its wasm32 build are not part of this

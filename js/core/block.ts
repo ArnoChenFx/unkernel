@@ -9,7 +9,10 @@
 // settles the status is written into the request, the request is queued for
 // wasm_driver_block_reap() and WASM_IRQ_BLOCK is raised. The host only
 // touches kernel memory while the kernel is suspended (any JSPI import), and
-// the request's pages stay pinned until the kernel reaps it.
+// the request's pages stay pinned until the kernel reaps it. On an SMP
+// kernel every request comes through CPU 0 (kwblk hands other CPUs'
+// requests to it), so this runs in CPU 0's thread while the other CPUs
+// may run on, as beside a DMA engine.
 //
 // Backends (all share one interface, BlockDevice):
 //   * FileDisk (node/disk.ts): a disk image file, pread/pwrite (Node).
@@ -262,8 +265,8 @@ export class BlockHost {
 	raise(): void {
 		const k = this.k;
 		if (k.irqAddr === undefined) return;
-		const dv = k.dv();
-		dv.setUint32(k.irqAddr, dv.getUint32(k.irqAddr, true) | (1 << IRQ_BLOCK), true);
+		// Atomically on a shared memory: other CPUs set bits there too.
+		k.setIrqBits(1 << IRQ_BLOCK);
 		k.wake();
 	}
 }

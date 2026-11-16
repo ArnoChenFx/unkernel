@@ -86,8 +86,8 @@ shared memory. PCM and everything else are messages either way.
 --smp N gives an SMP kernel (one built with CONFIG_SMP: kw_smp.config)
 N CPUs, each another instance of the kernel in its own thread on a shared
 memory, each with its own JIT; it implies --worker, and --stats prints the
-JIT counters per CPU. A UP kernel runs on one CPU (a log line says so). An SMP kernel has no disks, display,
-input, sound or shm yet (its drivers say so at boot), and no snapshots.
+JIT counters per CPU. A UP kernel runs on one CPU (a log line says so). An SMP kernel has every device
+(their host side and their I/O stay with CPU 0), but no snapshots.
 
 --display gives the guest a display: /dev/fb0 (kwfb, 32 bpp XRGB8888), whose
 memory exists while a program has it open; 640x480, or --display=WxH (the

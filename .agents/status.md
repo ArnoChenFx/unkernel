@@ -194,6 +194,31 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    gzip/bzip2/awk jobs 1.94x and 3.81x; compiled code runs as fast as
    on the UP build (kwemu.md, Numbers). Shootdown answers from a CPU in
    compiled code take 1.8 µs at the median.
+   Step 5, the host devices on SMP (2026-11-16; kernel.md, SMP,
+   Devices): kwblk, kwshm, kwfb, kwinput and kwsnd now work on SMP; every
+   device import still runs on CPU 0. kwblk hands another CPU's requests
+   to CPU 0 through a list and IRQ 3; the others call their imports
+   through `kw_host_call()` (a work item on CPU 0 while the caller
+   sleeps), and kwsnd's timer is pinned to CPU 0. The UP build is the same
+   binary but for one `WARN_ON_ONCE` line number in kwblk. Checked on 2
+   and 4 CPUs with the JIT (and without): kwtest with `--display --shm`
+   (also pinned to CPU 1, so its kwfb and kwshm checks call from there),
+   glimmer-check (also with glimmer pinned to CPU 1 and 3), the api tests
+   (`UNKERNEL_TEST_CPUS`), an ext4 root disk, the data disk with the
+   overlay root across a reboot, a read-only disk beside two writable
+   ones, and 200 s of verified parallel I/O from threads that move
+   between CPUs (O_DIRECT and buffered, fsync, dropped caches) beside
+   parallel dd/sha256sum jobs, fsync loops and kwstorm; `e2fsck -fn`
+   clean afterwards. Cost (rough, on a host loaded by other work,
+   2026-11-16): a synchronous 4 KiB O_DIRECT read or write took about 30
+   to 40 µs from CPU 0 (as on UP) and 80 to 90 µs from CPU 1 (two
+   cross-thread wakeups); reading 2000 small files cold took 2.3x as
+   long from CPU 1, a 256 MiB sequential read 0.7x the rate; a 256 MiB
+   buffered write with fsync ran 2-5x slower from CPU 1 while dirty
+   throttling was on (balance_dirty_pages waits on each round of
+   writeback) and as fast as CPU 0 with it off. The SMP build on one CPU
+   read and wrote sequentially at UP's rates and created small files
+   about 25% slower (its general cost, step 2).
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -204,10 +229,15 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      not done. `sched_exec()` asks the stopper to move an exec'ing task,
      which is held there, so exec does not balance (fork does); it could
      record the CPU and move at the exit of `execve()`.
-   - Devices: kwblk, kwfb, kwinput, kwsnd and kwshm refuse to start on
-     SMP. kwblk needs `queue_rq` from any CPU funneled to CPU 0 (a queue
-     and a work item, as kwnet does) and completions back; the display,
-     input and sound paths likewise.
+   - Console output from different CPUs reaches the host out of order:
+     CPU 0's writes go out per microtask, another CPU's as messages
+     (js.md, CPU threads), so lines printed by programs on different CPUs
+     interleave (200 alternating `echo`s on 4 CPUs: 154 of 400 lines out
+     of place; the step-4 kernel likewise). A console test that parses
+     output now and then fails on 4 CPUs for that reason.
+   - Device I/O is serialised on CPU 0 and pays two cross-thread wakeups
+     per request from another CPU (step 5); adaptive idle polling
+     (below) or completing on the submitting CPU would cut that.
    - Parking and snapshots: off (`KW_PARK` depends on `!SMP`; kernel.md,
      Parking lists what they would need).
    - JIT on SMP, what is left: a synchronous compile delays that CPU's

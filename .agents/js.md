@@ -403,6 +403,17 @@ parts that are easy to get wrong.
   (`isNew`), and its old stack's CPU then calls `wasm_stack_drop(task)`
   (CPU 0's `Kernel` and `runCpu()` both answer it): the host forgets
   that resumer, whose stack never runs again (kernel.md, SMP).
+- Devices stay with CPU 0's `Kernel`: the kernel calls every device
+  import there (kernel.md, SMP, Devices), and the host reads and writes
+  their memory (block data, pixels, shm pages, PCM) while other CPUs run.
+  Every IRQ bit goes through `Kernel.setIrqBits` (`BlockHost.raise()`
+  too): a plain read-modify-write of `wasm_host_irqs` would drop an IPI
+  another CPU sets meanwhile. Copies already guard the APIs that refuse a
+  shared view in browsers (`TextDecoder`, `getRandomValues`, the JIT's
+  `WebAssembly.Module`); the device paths hand on copies too (block
+  writes gather into a new buffer, PCM chunks and worker frames are
+  copied, shm `read()` copies), except `InlineShmFile.views()` and
+  `DisplayHost.pixels()`, which are views of the memory by design.
 - CPU 0's host sets IRQ bits with `Atomics.or` (`Kernel.setIrqBits`),
   and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
   `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's

@@ -27,6 +27,14 @@ dumped frame pixel for pixel, the injected input events and the recorded
 test signal sample for sample (`--no-sound`: without a sound card; `--worker`:
 the same through the CLI's `--worker`, with input and frames in shared
 memory; run it also with `--worker=messages` after a worker-mode change).
+An SMP kernel (kernel.md, SMP) runs the same checks: kwtest with `--smp
+2` and `--smp 4` (add `--display --shm` for its kwfb and kwshm checks),
+`UNKERNEL_TEST_KERNEL=<a bundle of it> UNKERNEL_TEST_CPUS=2 node --test
+test/api.test.ts` (the snapshot tests skip), and `node
+test/glimmer-check.mjs --run --kernel <it> --initrd <an image> --smp 2`.
+Console output from different CPUs can reach the host out of order
+(status.md, SMP), which now and then breaks a test that parses the
+console on 4 CPUs.
 Emulator guests print
 `name: N checks, 0 failures`.
 

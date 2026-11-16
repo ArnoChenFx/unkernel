@@ -8,6 +8,7 @@
 //   UNKERNEL_DIST=1 node --test test/api.test.ts       # the built package ("unkernel" -> dist/)
 //   UNKERNEL_TEST_WISP=1 ...                           # also the default Wisp server (internet)
 //   UNKERNEL_TEST_KERNEL=path ...                      # another bundle instead of the bundled kernel
+//   UNKERNEL_TEST_CPUS=n ...                           # CPUs for an SMP kernel under test (snapshot tests skipped)
 //   UNKERNEL_TEST_CONCURRENCY=n ...                    # tests at once (default: the number of cores; 1 = in order)
 //
 // The tests run concurrently, each kernel stopped by its own test's cleanup. A
@@ -29,6 +30,9 @@ type Instance = Awaited<ReturnType<typeof createKernel>>;
 /** The kernel under test: UNKERNEL_TEST_KERNEL (a bundle, e.g. from a build of your own), else the bundled one. */
 const testKernel = process.env.UNKERNEL_TEST_KERNEL ? path.resolve(process.env.UNKERNEL_TEST_KERNEL) : undefined;
 const kernelFile = testKernel ?? fileURLToPath(bundledKernelUrl);
+/** UNKERNEL_TEST_CPUS: CPUs to offer an SMP kernel under test; it has no snapshots. */
+const testCpus = Number(process.env.UNKERNEL_TEST_CPUS) || undefined;
+const noSnapshots = (testCpus ?? 1) > 1 && "SMP: no snapshots";
 
 const PROMPT = /⇒/; // Alpine's shell prompt (kernel/guest/alpine.sh)
 const CONCURRENCY = Number(process.env.UNKERNEL_TEST_CONCURRENCY) || availableParallelism();
@@ -45,7 +49,7 @@ type BootOptions = NonNullable<Parameters<typeof createKernel>[0]>;
 // A failed assertion must not leave a kernel running (it would keep the test process alive).
 // Each test stops its own kernels: a shared afterEach would stop the kernels of tests still running.
 const boot = async (t: { after(fn: () => unknown): void }, opts: BootOptions) => {
-	const vm = await createKernel({ kernel: testKernel, ...opts });
+	const vm = await createKernel({ kernel: testKernel, cpus: testCpus, ...opts });
 	t.after(() => vm.stop({ reason: "test cleanup" }));
 	return vm;
 };
@@ -53,7 +57,7 @@ const boot = async (t: { after(fn: () => unknown): void }, opts: BootOptions) =>
 function sharedKernel(opts: () => BootOptions) {
 	const k = {} as { vm: Instance } & ReturnType<typeof screen>;
 	before(async () => {
-		k.vm = await createKernel({ kernel: testKernel, ...opts() });
+		k.vm = await createKernel({ kernel: testKernel, cpus: testCpus, ...opts() });
 		Object.assign(k, screen(k.vm));
 	});
 	after(async () => { await k.vm?.stop({ reason: "test cleanup" }); });
@@ -1413,7 +1417,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm.exited;
 	});
 
-	test("snapshot() of a running machine, resumed by createKernel({ restore }) in a new instance (console only)", async (t) => {
+	test("snapshot() of a running machine, resumed by createKernel({ restore }) in a new instance (console only)", { skip: noSnapshots }, async (t) => {
 		const vm = await boot(t, { vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.KernelInstance);
 		const a = screen(vm);
@@ -1435,7 +1439,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await assert.rejects(boot(t, { restore: snap, log: () => {} }), /snapshot: the snapshot has no vsock device, but this machine is given one/);
 	});
 
-	test("snapshot() leaves out the free pages: after a memory-heavy workload the file stays small, and tmpfs and a running process survive", async (t) => {
+	test("snapshot() leaves out the free pages: after a memory-heavy workload the file stays small, and tmpfs and a running process survive", { skip: noSnapshots }, async (t) => {
 		const vm = await boot(t, { vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.KernelInstance);
 		const a = screen(vm);
@@ -1456,7 +1460,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await b.waitFor(new RegExp(`got-${sum}-1`));
 	});
 
-	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key", async (t) => {
+	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key", { skip: noSnapshots }, async (t) => {
 		const opts = (events: string[], chunks: number[], modes: Array<string | null>, inputs: string[]) => ({
 			log: () => {}, vsock: false, display: { width: 320, height: 240 },
 			onDisplay: (m: { width: number; height: number } | null) => modes.push(m && `${m.width}x${m.height}`),
@@ -1499,7 +1503,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 	});
 
 	test("snapshot() with network and vsock: the guest's old sessions end, new connections, exec() and fetch() work",
-		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
+		{ skip: noSnapshots || (!kernelHasVsock && "the kernel under test has no kwvsock") }, async (t) => {
 		const http = createServer((_req, res) => res.end("hello after restore\n"));
 		await new Promise<void>((r) => http.listen(0, "127.0.0.1", r));
 		t.after(() => http.close());
@@ -1553,7 +1557,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 	});
 
 	test("snapshot() with host file systems: the mounts and a process's open files on them survive; a file deleted on the host meanwhile answers ESTALE; refused without the mounts and in worker mode",
-		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
+		{ skip: noSnapshots || (!kernelHasVsock && "the kernel under test has no kwvsock") }, async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
 		writeFileSync(path.join(dir, "held.txt"), "");
@@ -1606,7 +1610,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm2.exited).code, 0);
 	});
 
-	test("snapshot() with a data disk: resumes with the saved and the unsaved writes; refused once the disk changed", async (t) => {
+	test("snapshot() with a data disk: resumes with the saved and the unsaved writes; refused once the disk changed", { skip: noSnapshots }, async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
 		const module = await WebAssembly.compile(readFileSync(kernelFile));
@@ -1646,7 +1650,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await assert.rejects(boot(t, { kernel: module, vsock: false, restore: snap, disks: [disk()], log: () => {} }), /was written after the snapshot/);
 	});
 
-	test("worker mode: snapshot() in the worker, resumed inline and in a worker (transferRestore detaches the memory)", async (t) => {
+	test("worker mode: snapshot() in the worker, resumed inline and in a worker (transferRestore detaches the memory)", { skip: noSnapshots }, async (t) => {
 		const vm = await boot(t, { worker: true, vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.WorkerKernel);
 		const a = screen(vm);
@@ -1673,7 +1677,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm3.exited).code, 0);
 	});
 
-	test("worker mode: snapshot() with a data disk, resumed in a worker and saved again, then inline; refused once the disk changed", async (t) => {
+	test("worker mode: snapshot() with a data disk, resumed in a worker and saved again, then inline; refused once the disk changed", { skip: noSnapshots }, async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
 		const module = await WebAssembly.compile(readFileSync(kernelFile));

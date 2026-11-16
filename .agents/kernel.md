@@ -307,7 +307,13 @@ Every cycle resumes every task through the fresh-stack path, so kwtest's
   `irqentry_enter()` so that RCU watches, which matters with TREE_RCU.
   The free-page walk then needs every CPU's per-cpu lists drained (each
   CPU drains its own before it counts itself, or the last one drains all
-  of them, since the others are idle).
+  of them, since the others are idle). The SMP device paths (SMP below,
+  Devices) add little: their state is in memory, and the work items they
+  queue on CPU 0 (kwsnd's start/stop, `kw_host_call()`) run before a
+  kworker parks at idle; but the consistent point must also find kwblk's
+  `kwblk_pending` empty (another CPU's request raises IRQ 3, which CPU 0
+  takes before it idles, so the check belongs after that), and the host's
+  block queue check stays as it is.
   Moving a user task to another CPU (SMP below) uses the same kind of
   fresh entry as `kw_park_resume()`'s user path, from the reschedule in
   the exit loop instead of the top of `user_mode_loop()`; a resumed
@@ -501,7 +507,7 @@ third-party implementation.
 
 - IRQs are bits in `wasm_host_irqs`, written by the host and polled
   (`asm/irq.h`): console = 1 (input or a window resize), net = 2, block =
-  3, sync = 4 (`ksys_sync()` from a work item; requests coalesce; host
+  3 (completions; on SMP also another CPU's requests for CPU 0), sync = 4 (`ksys_sync()` from a work item; requests coalesce; host
   `Kernel.requestSync()`), input = 5 (kwinput events queued), vsock = 6
   (kwvsock packets queued, or room again after a refused send), shm = 7
   (kwshm requests queued), snapshot = 8 (a park cycle that ends in
@@ -710,16 +716,43 @@ numbers and open issues: status.md item 8.
   on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
   Spinlocks are asm-generic's ticket locks, rwlocks queued
   (`ARCH_USE_QUEUED_RWLOCKS`), RCU is TREE_RCU.
-- **Devices** stay on CPU 0 (their imports answer only there). hvc_wasm:
+- **Devices** stay on CPU 0 (their imports answer only there; another
+  CPU's host ends the session when one is called there, js.md). hvc_wasm:
   CPU 0's console interrupt pulls the input into a FIFO and records the
   window size, and khvcd reads those on any CPU; output works on every
   CPU (each CPU's host forwards `fd_write`). kwnet: NAPI runs on CPU 0
   (its interrupt); another CPU's frames wait in a queue that a work item
   on CPU 0 sends, and `ndo_open` raises IRQ 2 on CPU 0 instead of
   looking itself. kwvsock: its work items run on CPU 0, and another CPU's
-  packets wait in `tx_queue`. kwblk, kwfb, kwinput, kwsnd and kwshm
-  refuse to start on SMP (a boot line says so). WASI's scratch buffers
-  for the clock and writes are per CPU; the rest is CPU 0's.
+  packets wait in `tx_queue`. kwblk: blk-mq calls `->queue_rq()` on the
+  submitting CPU in atomic context; a request started on another CPU
+  waits in `kwblk_pending` and raises IRQ 3 on CPU 0, whose handler
+  submits the waiting ones in order before it reaps, and CPU 0 submits
+  its own directly behind them. So every request is submitted and ended
+  on CPU 0 (`blk_mq_end_request()` there wakes the submitter where it
+  sleeps): all disk I/O is serialised on CPU 0, as it is on the host's
+  thread anyway (cost in status.md, SMP). The other devices' imports are
+  called from process context through `kw_host_call(fn, arg)` (smp.c): at
+  once on CPU 0, else `work_on_cpu(0, ...)` while the caller sleeps (a
+  task in the kernel stays on its CPU, so the check holds). kwshm: its
+  request work item is queued on CPU 0; attach and detach go through
+  `kw_host_call()` with `kwshm_lock` held, which the call does not take
+  (the work item that does take it sleeps on it in another kworker of
+  CPU 0's pool). kwfb: the mode and attach calls (open, release, mode
+  change, under `info->lock`). kwinput: the open/close callbacks update
+  the open mask inside the call, which serialises them (CPU 0 runs each
+  to its end). kwsnd: open, prepare and close send their event through
+  it; the timer is pinned to CPU 0 (`HRTIMER_MODE_REL_PINNED`), and a
+  trigger (atomic) on another CPU leaves its start or stop in the stream
+  and queues a work item on CPU 0 (`system_highpri_wq`), which sends it
+  and starts the timer. Whatever sends an event first sends those left
+  (between two prepares a stream starts and stops at most once), and
+  the tick sends a start before its frames, so the host sees them in
+  order. The host reads and writes these devices' memory (block data,
+  pixels, shm pages, PCM, input events) while other CPUs run, as a DMA
+  engine would: block data belongs to its request until it ends, and
+  framebuffer tearing is as on UP. WASI's scratch buffers for the clock
+  and writes are per CPU; the rest is CPU 0's.
 - **kwemu** gets a `struct kw_cpu` per CPU, with the ISA CPU 0 enabled,
   and a JIT tier per CPU: each CPU's kwemu compiles into its own
   instance's function table through its own host (kwemu.md, JIT on

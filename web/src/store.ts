@@ -94,6 +94,8 @@ export interface UiState {
 	wins: Win[];
 	/** The guest preview panel (preview.ts, components/Preview.tsx): the guest port shown, whether it is shown or hidden, and whether it fills the stage ([□]); null: closed. */
 	preview: { port: number; shown: boolean; fill: boolean } | null;
+	/** fx, the coding agent (fx.ts, components/Fx.tsx): running, and shown or hidden; null: not running. */
+	fx: { shown: boolean } | null;
 	/** The demo launcher (components/Launcher.tsx) covers the page. */
 	launcher: boolean;
 	/** The Options as chosen (components/Options.tsx), read by rebootUrl(). */
@@ -112,6 +114,7 @@ export interface Options {
 	data: "on" | "off";
 	root: "overlay" | "safe";
 	worker: "on" | "off";
+	fx: "on" | "off";
 }
 
 type Listener = () => void;

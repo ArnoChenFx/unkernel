@@ -24,6 +24,36 @@ const readSplit = (): number => {
 	return v >= 0.1 && v <= 0.9 ? v : SPLIT;
 };
 
+/**
+ * A docked panel's left edge sets its share of the row (pointer capture: an
+ * iframe under the pointer does not take the moves); kept in localStorage
+ * under `key` when the drag ends. Preview and fx (Fx.tsx) use it.
+ */
+export function dragSplit(e: ReactPointerEvent<HTMLElement>, split: number, setSplit: (v: number) => void, setDragging: (on: boolean) => void, key: string): void {
+	if (e.button !== 0) return;
+	e.preventDefault();
+	const el = e.currentTarget, row = el.closest("section")!.parentElement!;
+	el.setPointerCapture(e.pointerId);
+	setDragging(true);
+	let last = split;
+	const move = (ev: PointerEvent) => {
+		const r = row.getBoundingClientRect();
+		const lo = Math.min(0.5, MIN_PX / r.width), hi = Math.max(0.5, 1 - MIN_PX / r.width);
+		last = Math.min(hi, Math.max(lo, (r.right - ev.clientX) / r.width));
+		setSplit(last);
+	};
+	const up = () => {
+		el.removeEventListener("pointermove", move);
+		el.removeEventListener("pointerup", up);
+		el.removeEventListener("pointercancel", up);
+		setDragging(false);
+		store(key, last.toFixed(3));
+	};
+	el.addEventListener("pointermove", move);
+	el.addEventListener("pointerup", up);
+	el.addEventListener("pointercancel", up);
+}
+
 export function Preview() {
 	const p = useStore((s) => s.preview);
 	const narrow = useNarrow();
@@ -49,31 +79,7 @@ export function Preview() {
 	const prefix = url.slice(0, -1);
 	const fill = p.fill, docked = !narrow && !fill;
 
-	/** The left edge sets the split (pointer capture: the iframe does not take the moves). */
-	const resize = (e: ReactPointerEvent<HTMLElement>) => {
-		if (e.button !== 0) return;
-		e.preventDefault();
-		const el = e.currentTarget, row = el.closest("section")!.parentElement!;
-		el.setPointerCapture(e.pointerId);
-		setDragging(true);
-		let last = split;
-		const move = (ev: PointerEvent) => {
-			const r = row.getBoundingClientRect();
-			const lo = Math.min(0.5, MIN_PX / r.width), hi = Math.max(0.5, 1 - MIN_PX / r.width);
-			last = Math.min(hi, Math.max(lo, (r.right - ev.clientX) / r.width));
-			setSplit(last);
-		};
-		const up = () => {
-			el.removeEventListener("pointermove", move);
-			el.removeEventListener("pointerup", up);
-			el.removeEventListener("pointercancel", up);
-			setDragging(false);
-			store("previewSplit", last.toFixed(3));
-		};
-		el.addEventListener("pointermove", move);
-		el.addEventListener("pointerup", up);
-		el.addEventListener("pointercancel", up);
-	};
+	const resize = (e: ReactPointerEvent<HTMLElement>) => dragSplit(e, split, setSplit, setDragging, "previewSplit");
 	const submit = (e: FormEvent) => {
 		e.preventDefault();
 		if (Number(field) === port) setNonce((n) => n + 1);

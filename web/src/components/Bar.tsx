@@ -12,12 +12,14 @@
 // while the prefix is armed), the data disk's used space (opens System),
 // kernel memory (opens Environment), Suspend (a pause icon while the system
 // runs; a play icon, Resume, once suspended), Reboot, the dialog's tabs as icons (Kernel log, Errors
-// with their count, only while there are any), the About triangle (About.tsx),
+// with their count, only while there are any), fx (fx.ts: starts the agent in its side
+// panel, then hides and shows it; inverted while shown), the About triangle (About.tsx),
 // and last System, which also shows the state in its colour. Below sm, all but
-// the views and Errors move into a ⋯ menu (More). The windows and icons
+// the views, Errors and fx move into a ⋯ menu (More). The windows and icons
 // are buttons, so phones get around by tapping; on touch the line is taller
 // and its buttons wider (--bar-h, style.css).
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { toggleFx } from "../fx.ts";
 import { KW } from "../kw.ts";
 import { previewCovers, togglePreview, useNarrow } from "../preview.ts";
 import { PREFIX, PREFIX_SHORT, closeWindow, newWindow, selectWindow, toggleDisplay } from "../shortcuts.ts";
@@ -170,6 +172,7 @@ export function Bar() {
 	const term = !panel && !picture && !covers;
 	const tab = (t: Tab) => () => ui.togglePanel(t);
 	const canOpen = wins.length < MAX_WINDOWS && state !== "halted" && state !== "error";
+	const fx = useStore((s) => s.fx);
 
 	return (
 		<footer id="bar" aria-label="Status line" className="relative flex min-h-[calc(var(--bar-h)+var(--sb))] flex-none items-stretch gap-2 border-t border-line bg-surface pr-[max(4px,var(--sr),var(--sc))] pb-(--sb) pl-[max(var(--sl),var(--sc))] font-mono text-[12px] leading-none select-none">
@@ -188,7 +191,7 @@ export function Bar() {
 				{prefix && (
 					<>
 						<span className="flex flex-none items-center bg-warn px-1.5 font-semibold text-black">{PREFIX_SHORT}</span>
-						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · y copy · s suspend · r reboot · ? keys · esc cancel</span>
+						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · f fx · y copy · s suspend · r reboot · ? keys · esc cancel</span>
 					</>
 				)}
 			</div>
@@ -227,6 +230,8 @@ export function Bar() {
 						<span className={`inline-flex items-center gap-1 ${panel === "errors" ? "" : "text-err"}`}><ErrIcon />{errors > 0 && errors}</span>
 					</Seg>
 				)}
+				<Seg id="bar-fx" on={!!fx?.shown} title={fx ? `fx, the coding agent: ${fx.shown ? "hide" : "show"} it` : "fx, the coding agent: start it in a side panel, working on this VM"}
+					label="fx coding agent" hint="f" onClick={toggleFx} className="font-semibold">fx</Seg>
 				<About hint={<Hint k="a" />} className="max-sm:hidden" />
 				<More />
 				{/* System: the icon is red on an error and dim once halted (style.css);

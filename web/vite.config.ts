@@ -58,6 +58,8 @@ export default defineConfig({
 	build: { target: "esnext" },
 	// The SDK's worker mode (?worker=1): js/web/worker.ts starts a module worker.
 	worker: { format: "es" },
+	// libfx names fx-term.wasm with new URL(..., import.meta.url), which pre-bundling would break.
+	optimizeDeps: { exclude: ["libfx"] },
 	plugins: [
 		{
 			// The kernel first: fetched before the build resolves it, and
@@ -90,7 +92,8 @@ export default defineConfig({
 			apply: "build",
 			generateBundle(_, bundle) {
 				if (this.environment.name !== "client") return;
-				const files = Object.keys(bundle).filter((f) => f.startsWith("assets/")).map((f) => `/${f}`).sort();
+				// libfx's wasm (src/fx.ts: fx-term, 4 MB; fx-core, never fetched) needs the network anyway: not precached, cached on first use.
+				const files = Object.keys(bundle).filter((f) => f.startsWith("assets/") && !/^assets\/fx-(term|core)[-.]/.test(f)).map((f) => `/${f}`).sort();
 				this.emitFile({ type: "asset", fileName: "kw-assets.json", source: `${JSON.stringify({ files })}\n` });
 			},
 		},

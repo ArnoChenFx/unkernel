@@ -70,6 +70,8 @@ export default {
 	desc: "The fx coding agent: its x86_64 Linux binary, run under qemu-user on the riscv64 guest",
 	icon: "𝒇x",
 	colors: ["#3f3f46", "#09090b"],
+	// Left out of the launcher: the status line's fx button runs fx in the page (fx.ts). ?demo=fx still runs this.
+	hidden: true,
 	needs: { net: true },
 	files: { "fx.sh": { content: FX_SH, mode: 0o755 } },
 	downloads: [

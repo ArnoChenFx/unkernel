@@ -150,6 +150,21 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.ok(userspace, "onUserspace fired");
 		});
 
+		// Four processes (spread over the CPUs of an SMP kernel at fork) print
+		// 200 lines in turn, passing a token through FIFOs (each held open
+		// read-write by its reader, so a token is never lost to a writer that
+		// has not closed yet): the host must see them in that order (cpu.ts,
+		// ConsoleOrder).
+		test("lines printed in turn by several processes arrive in order", async () => {
+			const { vm, s, waitFor } = k;
+			const at = s.text.length;
+			vm.write("cd /tmp && mkfifo t0 t1 t2 t3 && for c in 0 1 2 3; do (exec 3<>t$c; i=$c; while [ $i -lt 200 ]; do read x <&3; echo ord-$i; i=$((i+4)); " +
+				"[ $((i-3)) -lt 200 ] && echo > t$(((c+1)%4)); done) & done; echo > t0; wait; rm t0 t1 t2 t3; cd; echo ord-end-$((6*7))\n");
+			await waitFor(/ord-end-42/, at);
+			const got = [...s.text.slice(at).matchAll(/^ord-(\d+)\r?$/gm)].map((m) => Number(m[1]));
+			assert.deepEqual(got, Array.from({ length: 200 }, (_, i) => i));
+		});
+
 		// The device not offered: the guest has no /dev/kwshm.
 		if (!worker && kernelHasShm) test("shm: no /dev/kwshm without the option", async () => {
 			const { vm, s, waitFor } = k;

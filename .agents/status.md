@@ -272,6 +272,27 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    CPUs with the parameter flipped every 50 ms, the block scenario of
    step 5, glimmer-check and the api tests on 2 CPUs pass; the UP build
    is the same binary.
+   Console order (2026-11-17; js.md, CPU threads): console output from
+   different CPUs used to reach the host in arrival order, since CPU 0's
+   host takes another CPU's messages only when CPU 0 suspends, while
+   its own writes go out at once. Every write now takes a number inside
+   `fd_write` (so in the order the kernel's locks gave the calls) and
+   CPU 0's host writes by number; the kernel is unchanged. A reproducer
+   (lines printed in turn by tasks pinned to every CPU, through the tty
+   and through `/dev/kmsg`, and 64 KiB writes on CPU 1 racing short
+   lines; 3 runs at 2, 4 and 8 CPUs) had 0-62 of 400 tty lines and
+   6-108 of 400 printk lines out of place and 1-169 short lines inside
+   a long write before, none in any run after (also with
+   `--worker=messages`); the console's kernel lines after sysrq `t`,
+   `l` and `m` from CPUs 1-3 against the guest's `dmesg`: 113 and 199
+   of about 450 out of place before, 0 after. The api tests on 4 CPUs
+   failed in 3 of 3 runs before and passed 7 of 7 after; a new api test
+   checks the order. Echo latency and output speed did not move (3
+   alternating rounds, Node, 2 CPUs; before, then after): median echo
+   0.43-0.46 and 0.45-0.54 ms in worker mode, 0.28-0.29 and 0.28-0.33
+   ms inline (UP 0.17-0.18 and 0.16-0.18); `seq 1 20000` on CPU 0
+   0.36-0.39 and 0.36-0.46 s in worker mode, on CPU 1 6.2-6.3 s either
+   way.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -282,12 +303,12 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      not done. `sched_exec()` asks the stopper to move an exec'ing task,
      which is held there, so exec does not balance (fork does); it could
      record the CPU and move at the exit of `execve()`.
-   - Console output from different CPUs reaches the host out of order:
-     CPU 0's writes go out per microtask, another CPU's as messages
-     (js.md, CPU threads), so lines printed by programs on different CPUs
-     interleave (200 alternating `echo`s on 4 CPUs: 154 of 400 lines out
-     of place; the step-4 kernel likewise). A console test that parses
-     output now and then fails on 4 CPUs for that reason.
+   - Console output of a secondary CPU is slow: each of its writes is
+     a message that CPU 0's host handles on its own (`seq 1 20000`
+     pinned to CPU 1: 6.1-6.3 s inline and in worker mode, against
+     0.36-0.46 s on CPU 0 in worker mode and 2.1-2.3 s inline; Node,
+     2026-11-17). A shared ring that CPU 0's host drains in one go would
+     batch them.
    - Device I/O is serialised on CPU 0 and pays two cross-thread wakeups
      per request from another CPU (step 5); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.

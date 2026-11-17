@@ -339,7 +339,7 @@ export class WasiHost {
 				let total = 0;
 				for (const [p, len] of w.iovecs(iovs, n)) {
 					if (!len) continue;
-					if (f.type === "stdout") k.opts.write(u8.slice(p, p + len));
+					if (f.type === "stdout") k.consoleWrite(u8.slice(p, p + len));
 					else w.stderr = (w.stderr + decoder.decode(u8.slice(p, p + len))).slice(-4096);
 					total += len;
 				}

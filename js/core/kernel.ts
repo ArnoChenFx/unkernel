@@ -29,7 +29,7 @@
 // on a change of that word (Atomics.waitAsync, the kernel's notify).
 
 import { BlockHost, type BlockDevice, type DiskSnapshotState } from "./block.ts";
-import type { CpuEndpoint, CpuInit, CpuMessage } from "./cpu.ts";
+import { ConsoleOrder, type CpuEndpoint, type CpuInit, type CpuMessage } from "./cpu.ts";
 import { DisplayHost, type DisplayMode, type DisplayOption } from "./display.ts";
 import { InputHost, type InputState } from "./input.ts";
 import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
@@ -316,6 +316,8 @@ export class Kernel {
 	secondaries: CpuEndpoint[] = [];
 	/** Their JIT hosts' counters (CpuInit.jitMirror), in the order they started. */
 	jitMirrors: Float64Array[] = [];
+	/** Once another CPU started: every CPU's console writes in the kernel's order (cpu.ts). */
+	consoleOrder: ConsoleOrder | null = null;
 
 	constructor(opts: KernelConfig) {
 		this.opts = opts;
@@ -329,6 +331,7 @@ export class Kernel {
 		this.result = undefined;
 		this.exited = new Promise((r) => (this.exit = (res) => {
 			if (this.result) return; // first exit wins
+			this.consoleOrder?.flush();
 			this.result = res;
 			try { this.onStage("exit", res); } catch {}
 			r(res);
@@ -431,6 +434,8 @@ export class Kernel {
 		if (!spawn || cpu < 1 || cpu >= this.cpus || this.result) return -ENOSYS;
 		const flag = this.exports?.__wasm_init_memory_flag;
 		const jitMirror = new Float64Array(new SharedArrayBuffer(JIT_MIRROR_WORDS * 8));
+		// CPU 0's writes so far went out directly; from here on every CPU numbers its own.
+		this.consoleOrder ??= new ConsoleOrder((bytes) => this.opts.write(bytes));
 		let ep: CpuEndpoint;
 		try {
 			ep = spawn({
@@ -439,6 +444,7 @@ export class Kernel {
 				irqWord0: this.irqAddr ?? 0,
 				epochMs: performance.timeOrigin - this.wasi.monoOffset,
 				jit: this.jit.stats.enabled, memory64: this.memory64, jitMirror,
+				conSeq: this.consoleOrder.counter,
 			});
 		} catch (e) {
 			this.log(`[host] cannot start CPU ${cpu}: ${(e as Error)?.message ?? e}`);
@@ -453,10 +459,16 @@ export class Kernel {
 		return 0;
 	}
 
+	/** Console output of CPU 0 (fd_write 1), in order with the other CPUs' (ConsoleOrder). */
+	consoleWrite(bytes: Uint8Array): void {
+		if (this.consoleOrder) this.consoleOrder.local(bytes);
+		else this.opts.write(bytes);
+	}
+
 	onCpuMessage(m: CpuMessage): void {
 		switch (m.t) {
 			case "out":
-				if (!this.result) this.opts.write(m.bytes);
+				if (!this.result) this.consoleOrder!.put(m.seq, m.bytes);
 				break;
 			case "log":
 				this.log(m.msg);

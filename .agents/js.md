@@ -367,7 +367,19 @@ parts that are easy to get wrong.
   thread), clocks, `random_get`, `sched_yield`, kwemu's JIT imports and
   `fd_write`, which posts console output and panic text to CPU 0's host
   as it comes (`CpuMessage`: no batching, because this thread may never
-  return to its event loop), and enters `kw_secondary_entry(idle)`. Its
+  return to its event loop), and enters `kw_secondary_entry(idle)`.
+  CPU 0's host takes those messages only when CPU 0 suspends, so
+  console writes are numbered to keep the kernel's order
+  (`ConsoleOrder`, cpu.ts): from the first CPU start every CPU takes a
+  number from one shared counter (`CpuInit.conSeq`) inside its
+  `fd_write`, while the kernel still holds the lock that orders the
+  writes (hp->lock, the console lock), and CPU 0's host writes by
+  number. Its own write goes out at once unless an earlier one is
+  still on the way; then it waits for that message (at CPU 0's next
+  suspension, when worker mode posts CPU 0's output anyway). At exit
+  what waits goes out without the missing numbers. Panic text (fd 2)
+  comes from one CPU and is not numbered; `log` lines are host
+  messages, not console output. Its
   imports share one `Uint8Array` and one `DataView` made at start (the
   memory never grows): a new `DataView` per `clock_time_get` made
   `clock_gettime` on CPU 1 cost 500 ns against CPU 0's 365

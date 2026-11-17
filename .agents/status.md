@@ -275,9 +275,10 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    Console order (2026-11-17; js.md, CPU threads): console output from
    different CPUs used to reach the host in arrival order, since CPU 0's
    host takes another CPU's messages only when CPU 0 suspends, while
-   its own writes go out at once. Every write now takes a number inside
-   `fd_write` (so in the order the kernel's locks gave the calls) and
-   CPU 0's host writes by number; the kernel is unchanged. A reproducer
+   its own writes go out at once. Every write now gets its place inside
+   `fd_write` (so in the order the kernel's locks gave the calls): first
+   a number that CPU 0's host wrote by, now a record in the console ring
+   (Console speed, below); the kernel is unchanged. A reproducer
    (lines printed in turn by tasks pinned to every CPU, through the tty
    and through `/dev/kmsg`, and 64 KiB writes on CPU 1 racing short
    lines; 3 runs at 2, 4 and 8 CPUs) had 0-62 of 400 tty lines and
@@ -292,7 +293,40 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    0.43-0.46 and 0.45-0.54 ms in worker mode, 0.28-0.29 and 0.28-0.33
    ms inline (UP 0.17-0.18 and 0.16-0.18); `seq 1 20000` on CPU 0
    0.36-0.39 and 0.36-0.46 s in worker mode, on CPU 1 6.2-6.3 s either
-   way.
+   way (most of that was the measuring script, see below).
+   Console speed (2026-11-17; js.md, CPU threads): the 6 s of `seq 1
+   20000` on CPU 1 were mostly the measuring script, which flattened a
+   growing string once per chunk; CPU 1's output reached the owner as
+   one chunk per write (two per line), CPU 0's in a few batched
+   chunks. The guest itself wrote 40000 lines on CPU 1 in 0.62 s
+   against 0.35 s on CPU 0 (a `postMessage` per write). What was real:
+   400k messages per `seq 1 200000` for the owner (the page took 38 s
+   for it in headless Chromium), output from CPU 1 held until CPU 0's
+   next suspension (10 ms at the median while CPU 0 runs user code), and
+   a queue only CPU 0's suspensions drained. Every CPU's console output
+   now goes into one shared ring (`console-ring.ts`), read by the owner
+   with the shared transport and by CPU 0's host otherwise; the kernel
+   is unchanged. Node, 2 CPUs (4 alike), before, then after, host load
+   1-3.3 from another agent's builds, one run each, with a consumer of
+   constant per-chunk cost: `seq 1 200000` on CPU 1 with CPU 0 idle
+   4.06 and 2.41 s shared, 4.16 and 2.45 s messages, 4.48 and 2.57 s
+   inline, against CPU 0's 2.36-2.47 s in worker mode (3.55-3.57 s
+   inline, where every write of CPU 0's is a chunk, as before and as on
+   UP); with CPU 0 spinning in user code or in a 1-byte `dd`, 3.4-3.7
+   and 2.4-2.6 s. CPU 1's output after it was written, CPU 0 spinning,
+   median: 10.8-12.1 and 0.05 ms shared, 10.6-11.8 and 0.09-0.23 ms
+   messages, 10.0-10.2 and 0.05-0.21 ms inline. Echo of a shell on CPU 1
+   with CPU 0 spinning: 10.0-10.4 and 0.22-0.44 ms shared, 30.1-30.7 and
+   10.1-10.4 ms messages (the input still waits for CPU 0's suspension
+   there), 20.1-20.3 and 0.19-0.50 ms inline. UP unchanged (`seq 1
+   200000` 3.16 and 3.11 s worker, 3.49 and 3.28 s inline). 27 MB from
+   CPU 1 with CPU 0 spinning: RSS rose by 26-40 MiB before and 22-27
+   MiB after. The order reproducer (3 runs at 2, 4 and 8 CPUs, shared,
+   messages and inline), the sysrq dmesg check and a panic on CPU 1 with
+   CPU 0 spinning (exit 253, panic line out) pass; a stress of the
+   ring's full paths with worker threads (4 KiB and 16 KiB rings, a
+   reader busy 30 of every 40 ms) lost and reordered nothing, and a
+   reader stuck for 0.6 s made "post" writers drop rather than wait.
    Uaccess races (2026-11-17, after step 7; kernel.md, Memory model and
    SMP, MM): a system call could fail with EFAULT on a valid address
    (kwmmstress's `getcpu()` once). `kw_user_addr()` gave up after three
@@ -339,12 +373,6 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      not done. `sched_exec()` asks the stopper to move an exec'ing task,
      which is held there, so exec does not balance (fork does); it could
      record the CPU and move at the exit of `execve()`.
-   - Console output of a secondary CPU is slow: each of its writes is
-     a message that CPU 0's host handles on its own (`seq 1 20000`
-     pinned to CPU 1: 6.1-6.3 s inline and in worker mode, against
-     0.36-0.46 s on CPU 0 in worker mode and 2.1-2.3 s inline; Node,
-     2026-11-17). A shared ring that CPU 0's host drains in one go would
-     batch them.
    - Device I/O is serialised on CPU 0 and pays two cross-thread wakeups
      per request from another CPU (step 5); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.

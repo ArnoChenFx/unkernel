@@ -802,8 +802,9 @@ numbers and open issues: status.md item 8.
   CPU's host ends the session when one is called there, js.md). hvc_wasm:
   CPU 0's console interrupt pulls the input into a FIFO and records the
   window size, and khvcd reads those on any CPU; output works on every
-  CPU (each CPU's host forwards `fd_write`; the host keeps the order
-  in which the kernel made the calls, js.md, CPU threads). kwnet: NAPI runs on CPU 0
+  CPU (each CPU's `fd_write` puts it into one ring shared by every
+  CPU and the host, in the order the kernel made the calls; js.md, CPU
+  threads). kwnet: NAPI runs on CPU 0
   (its interrupt); another CPU's frames wait in a queue that a work item
   on CPU 0 sends, and `ndo_open` raises IRQ 2 on CPU 0 instead of
   looking itself. kwvsock: its work items run on CPU 0, and another CPU's

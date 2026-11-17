@@ -9,12 +9,12 @@ import { runCpu, type CpuInit, type CpuMessage } from "../core/cpu.ts";
 
 /** The dedicated worker's global (the page's tsconfig has no webworker lib). */
 const scope = globalThis as unknown as {
-	postMessage(msg: CpuMessage): void;
+	postMessage(msg: CpuMessage, transfer?: ArrayBuffer[]): void;
 	addEventListener(type: "message", fn: (e: MessageEvent<CpuInit>) => void, opts: { once: true }): void;
 };
 scope.addEventListener("message", (e) => {
 	const init = e.data;
-	const post = (msg: CpuMessage) => scope.postMessage(msg);
+	const post = (msg: CpuMessage, transfer?: ArrayBuffer[]) => scope.postMessage(msg, transfer);
 	// runCpu() reports its own failures; this catches anything it did not
 	// (a browser's worker reports no unhandled rejection to its owner).
 	runCpu(init, { post }).catch((err: unknown) => post({ t: "fatal", msg: `CPU ${init.cpu}: ${(err as Error)?.stack ?? err}` }));

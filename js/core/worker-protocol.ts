@@ -66,6 +66,12 @@ export interface WorkerBootSpec {
 	 */
 	shared?: SharedArrayBuffer;
 	/**
+	 * With the shared transport and more than one CPU: the console ring
+	 * (console-ring.ts) the owner reads; every CPU writes its console output
+	 * there instead of "output" messages.
+	 */
+	console?: SharedArrayBuffer;
+	/**
 	 * Resume this snapshot instead of booting (CreateKernelOptions.restore);
 	 * its memory is transferred. The worker builds the disks and devices from
 	 * the spec and checks them against it, as inline.

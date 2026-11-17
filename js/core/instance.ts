@@ -179,6 +179,13 @@ export interface CreateKernelOptions {
 	onProgress?: (p: BootProgress) => void;
 	/** Aborts the downloads; once booted, stops the kernel (stop()). */
 	signal?: AbortSignal;
+	/**
+	 * @internal Worker mode with the shared transport: the console ring the
+	 * owner reads (KernelConfig.consoleRing; console-ring.ts).
+	 */
+	consoleRing?: SharedArrayBuffer;
+	/** @internal KernelConfig.flushOutput (the worker's batched "output" messages). */
+	flushOutput?: () => void;
 }
 
 export interface VsockOption {
@@ -760,6 +767,8 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		cpus: opts.cpus,
 		spawnCpu: platform.spawnCpu,
 		whyNoCpus: platform.whyNoCpus,
+		consoleRing: opts.consoleRing,
+		flushOutput: opts.flushOutput,
 		restore: opts.restore,
 		display: opts.display,
 		onDisplay: opts.onDisplay,

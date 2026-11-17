@@ -238,6 +238,8 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				memory64: spec.memory64,
 				jit: spec.jit,
 				cpus: spec.cpus,
+				consoleRing: spec.console,
+				flushOutput: flush,
 				consoleSize: spec.consoleSize,
 				restore: spec.restore,
 				// The owner sends the size its display function returns; the kernel asks at the first open.

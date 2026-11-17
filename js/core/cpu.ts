@@ -8,9 +8,9 @@
 // CPU needs: task switching (its own JSPI stacks: a task's stack lives in
 // the thread that started it; a task the kernel moves starts on a fresh
 // stack on its new CPU, and wasm_stack_drop then tells the old one's host),
-// the clocks, randomness, console and panic output, which it forwards to
-// CPU 0's host (console writes numbered, so that CPU 0's host puts them in
-// the kernel's order: ConsoleOrder), and kwemu's JIT tier: this CPU's kwemu compiles what it
+// the clocks, randomness, console output (into the console ring that every
+// CPU shares, console-ring.ts), panic text (posted to CPU 0's host), and
+// kwemu's JIT tier: this CPU's kwemu compiles what it
 // finds hot into this instance's own function table (jit.ts), whose
 // counters it mirrors for CPU 0's stats(). Its idle blocks the thread in
 // the kernel itself (memory.atomic.wait32 on its word of pending
@@ -18,6 +18,7 @@
 // this CPU: it ends the session.
 // Universal: no node: imports, no DOM.
 
+import { ConsoleRing, type ConsoleBatch, type ConsoleFull } from "./console-ring.ts";
 import { JitHost } from "./jit.ts";
 import { ERRNO, never, yieldToEventLoop } from "./wasi.ts";
 
@@ -52,14 +53,16 @@ export interface CpuInit {
 	memory64: boolean;
 	/** Where this CPU's JIT host mirrors its counters (JIT_MIRROR_WORDS on a SharedArrayBuffer), for CPU 0's stats(). */
 	jitMirror?: Float64Array;
-	/** The console write counter every CPU numbers its writes from (ConsoleOrder.counter). */
-	conSeq: Int32Array;
+	/** The console ring every CPU writes its console output into (console-ring.ts). */
+	console: SharedArrayBuffer;
+	/** What a full ring makes this CPU do: wait for the reader, or post the records to CPU 0's host. */
+	consoleFull: ConsoleFull;
 }
 
 /** Messages from a CPU to CPU 0's host. */
 export type CpuMessage =
 	| { t: "running" }
-	/** Console output, numbered from CpuInit.conSeq (ConsoleOrder). */
+	/** Console output taken out of a full ring ("post"), with its batch number (ConsoleOrder). */
 	| { t: "out"; seq: number; bytes: Uint8Array }
 	| { t: "err"; bytes: Uint8Array }
 	/** A host log line (the JIT's warnings). */
@@ -76,29 +79,22 @@ export interface CpuEndpoint {
 
 /** This CPU's way to CPU 0's host. */
 export interface CpuPort {
-	post(msg: CpuMessage): void;
+	post(msg: CpuMessage, transfer?: ArrayBuffer[]): void;
 }
 
 /**
- * Console output from every CPU, put in the order the kernel wrote it. Each
- * CPU's host writes the console as the kernel calls fd_write, but only CPU
- * 0's host has the output: another CPU posts its bytes there, and CPU 0's
- * host takes those messages only once CPU 0 suspends (idle, or its 20 ms
- * yield), so they used to come after whatever CPU 0 wrote meanwhile. So
- * every write takes a number from one shared counter inside the import,
- * that is, while the kernel still holds the lock that orders the writes
- * (hp->lock for tty output, the console lock for printk), and CPU 0's host
- * writes them by number: its own write goes out at once when nothing
- * earlier is still on the way, otherwise it waits here for the messages
- * before it (which come at CPU 0's next suspension, when worker mode would
- * post CPU 0's output anyway). At exit, what waits goes out in order
- * without the numbers that never came. Panic text (fd 2) is one CPU's
- * (panic_cpu) and is not ordered.
+ * Console batches by number, for CPU 0's host where it reads the console
+ * ring itself (inline and the messages transport; console-ring.ts). It takes
+ * batches out of the ring on its own thread, and another CPU that finds the
+ * ring full takes one out and posts it, which CPU 0's host gets only once
+ * CPU 0 suspends. Every take numbers its batch under the ring's lock, so
+ * batches are written by number: one that comes early waits here for those
+ * before it. At exit, what waits goes out in order without the numbers that
+ * never came. Panic text (fd 2) is one CPU's (panic_cpu) and is not
+ * ordered.
  */
 export class ConsoleOrder {
-	/** The next number to take (Atomics.add), shared with every CPU (CpuInit.conSeq). */
-	readonly counter = new Int32Array(new SharedArrayBuffer(4));
-	/** The next number to write (wraps as an int32, as the counter does). */
+	/** The next number to write (wraps as an int32, as the ring's counter does). */
 	private next = 0;
 	private held = new Map<number, Uint8Array>();
 	private emit: (bytes: Uint8Array) => void;
@@ -107,12 +103,12 @@ export class ConsoleOrder {
 		this.emit = emit;
 	}
 
-	/** A write of CPU 0's: number it and write it, or hold it behind earlier ones. */
-	local(bytes: Uint8Array): void {
-		this.put(Atomics.add(this.counter, 0, 1), bytes);
+	/** Nothing waits for an earlier batch. */
+	get empty(): boolean {
+		return this.held.size === 0;
 	}
 
-	/** Write number `seq` (from any CPU) once every earlier one is written. */
+	/** Write batch `seq` once every earlier one is written. */
 	put(seq: number, bytes: Uint8Array): void {
 		if (seq !== this.next) {
 			// One that flush() gave up on: write it now rather than never.
@@ -183,6 +179,9 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 	const u8 = () => u8View;
 	const dv = () => dvView;
 	const resumers = new Map<bigint, (task: bigint) => void>();
+	const ring = new ConsoleRing(init.console);
+	// "post": a batch out of the full ring, for CPU 0's host (transferred).
+	const postBatch = (b: ConsoleBatch) => port.post({ t: "out", seq: b.seq, bytes: b.bytes }, [b.bytes.buffer as ArrayBuffer]);
 	let exited = false;
 	let retFromFork!: (prev: bigint, next: bigint) => Promise<unknown>;
 	const trap = (e: unknown) => {
@@ -214,7 +213,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 			}
 			return ERRNO.SUCCESS;
 		},
-		// The console (1, numbered: ConsoleOrder) and panic text (2), forwarded to CPU 0's host.
+		// The console (1) into the shared ring, in the kernel's order; panic text (2) to CPU 0's host.
 		fd_write(fd: number, iovs: number, n: number, nwritten: number): number {
 			if (fd !== 1 && fd !== 2) return ERRNO.BADF;
 			const v = dv(), m = u8();
@@ -222,8 +221,8 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 			for (let i = 0; i < n; i++) {
 				const p = v.getUint32(iovs + 8 * i, true), len = v.getUint32(iovs + 8 * i + 4, true);
 				if (!len) continue;
-				const bytes = m.slice(p, p + len);
-				port.post(fd === 1 ? { t: "out", seq: Atomics.add(init.conSeq, 0, 1), bytes } : { t: "err", bytes });
+				if (fd === 1) ring.write(m, p, len, init.consoleFull, postBatch);
+				else port.post({ t: "err", bytes: m.slice(p, p + len) });
 				total += len;
 			}
 			v.setUint32(nwritten, total, true);

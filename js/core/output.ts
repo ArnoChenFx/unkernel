@@ -9,7 +9,9 @@ const OUTPUT_BACKLOG = 1 << 20;
 
 export class ConsoleOutput {
 	#listeners = new Set<(bytes: Uint8Array) => void>();
+	/** Chunks from #backlogHead on are kept (dropping from the front by index: Array.shift() of a long array copies it). */
 	#backlog: Uint8Array[] | null = [];
+	#backlogHead = 0;
 	#backlogBytes = 0;
 	#stream: ReadableStream<Uint8Array> | undefined;
 	#controller: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -27,10 +29,17 @@ export class ConsoleOutput {
 		if (this.#controller) {
 			this.#controller.enqueue(bytes);
 		} else if (this.#backlog) {
-			this.#backlog.push(bytes);
+			const b = this.#backlog;
+			b.push(bytes);
 			this.#backlogBytes += bytes.length;
-			while (this.#backlogBytes > OUTPUT_BACKLOG && this.#backlog.length > 1)
-				this.#backlogBytes -= this.#backlog.shift()!.length;
+			while (this.#backlogBytes > OUTPUT_BACKLOG && b.length - this.#backlogHead > 1) {
+				this.#backlogBytes -= b[this.#backlogHead]!.length;
+				b[this.#backlogHead++] = undefined!;
+			}
+			if (this.#backlogHead > 1024 && this.#backlogHead * 2 > b.length) {
+				b.splice(0, this.#backlogHead);
+				this.#backlogHead = 0;
+			}
 		}
 	}
 
@@ -44,7 +53,7 @@ export class ConsoleOutput {
 	/** The one output stream: the backlog first, then everything as it comes; closed once the kernel exits. */
 	get stream(): ReadableStream<Uint8Array> {
 		if (!this.#stream) {
-			const backlog = this.#backlog ?? [];
+			const backlog = this.#backlog?.slice(this.#backlogHead) ?? [];
 			this.#backlog = null;
 			this.#stream = new ReadableStream<Uint8Array>({
 				start: (c) => {

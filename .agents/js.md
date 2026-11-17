@@ -244,7 +244,20 @@ parts that are easy to get wrong.
   `resize`, `evdev` or (while a frame buffer exists) `frame-want`.
 - Console output from a worker is posted once per microtask, so only when
   the kernel suspends. Posting every write made `seq 1 200000` take 38 s
-  instead of 6 s; keep the batching.
+  instead of 6 s; keep the batching. With more than one CPU and the shared
+  transport it does not come this way: the owner reads the console ring
+  (CPU threads, below).
+- `ConsoleOutput` (`output.ts`, the `output` stream and `onOutput()` of
+  both modes) keeps up to 1 MiB for a stream nobody has read yet. It
+  drops old chunks by index: `Array.shift()` on that array (some 300k
+  chunks of a line or less) copied it every time, so once 1 MiB was out
+  every chunk cost about 100 µs. A UP kernel inline in the CLI (which
+  only uses `onOutput`) took 95 s for `seq 1 300000` instead of 6.3 s
+  (2026-11-17).
+- Measuring console speed: keep a consumer's per-chunk cost constant.
+  Appending each chunk to one string and slicing its end flattens the
+  whole string every chunk, which made `seq 1 200000` on CPU 1 (one
+  chunk per write then) look like 270 s.
 - Device specs (`js/core/devices.ts`): disks and the network as plain,
   structured-cloneable data tagged with `kind` (`DEVICE_SPEC_VERSION` 1).
   A `DeviceRegistry` builds them (`Platform.devices`, passed to
@@ -316,6 +329,9 @@ parts that are easy to get wrong.
   Frames: a SharedArrayBuffer per display size, three XRGB slots as a
   triple buffer (the worker never touches the front slot). A failed
   allocation falls back to credits. Sound, vsock and shm stay messages.
+  With more than one CPU, console output comes through a SharedArrayBuffer
+  of its own, the console ring (CPU threads, below), sent in the boot spec
+  as `console`.
   - Sharing the kernel's own memory is ruled out: the module imports an
     unshared memory (a shared one is a LinkError), the posted compiled
     Module cannot be rewritten, kwemu's JIT modules import the same memory,
@@ -368,20 +384,8 @@ parts that are easy to get wrong.
 - `runCpu()` checks that the flag reads 2, instantiates the module with
   its own `wasm_switch_to` (its own resumers: JSPI stacks stay in their
   thread), clocks, `random_get`, `sched_yield`, kwemu's JIT imports and
-  `fd_write`, which posts console output and panic text to CPU 0's host
-  as it comes (`CpuMessage`: no batching, because this thread may never
-  return to its event loop), and enters `kw_secondary_entry(idle)`.
-  CPU 0's host takes those messages only when CPU 0 suspends, so
-  console writes are numbered to keep the kernel's order
-  (`ConsoleOrder`, cpu.ts): from the first CPU start every CPU takes a
-  number from one shared counter (`CpuInit.conSeq`) inside its
-  `fd_write`, while the kernel still holds the lock that orders the
-  writes (hp->lock, the console lock), and CPU 0's host writes by
-  number. Its own write goes out at once unless an earlier one is
-  still on the way; then it waits for that message (at CPU 0's next
-  suspension, when worker mode posts CPU 0's output anyway). At exit
-  what waits goes out without the missing numbers. Panic text (fd 2)
-  comes from one CPU and is not numbered; `log` lines are host
+  `fd_write`, and enters `kw_secondary_entry(idle)`. Panic text (fd 2,
+  one CPU's) goes to CPU 0's host as a message; `log` lines are host
   messages, not console output. Its
   imports share one `Uint8Array` and one `DataView` made at start (the
   memory never grows): a new `DataView` per `clock_time_get` made
@@ -396,6 +400,39 @@ parts that are easy to get wrong.
   kernel takes that bit even with interrupts off and parks CPU 0
   (kernel.md, SMP). Its idle blocks in the kernel
   (`memory.atomic.wait32`), so it needs no event loop.
+- Console output with more than one CPU (`js/core/console-ring.ts`,
+  described at its top): every CPU's console writes, CPU 0's too, go into
+  one shared ring of 256 KiB (`CpuInit.console`), each write a record
+  whose space it reserves inside `fd_write`, while the kernel still holds
+  the lock that orders the writes (hp->lock, the console lock), so the
+  ring's order is the kernel's. A reader takes every committed record in
+  one chunk.
+  - Worker mode with the shared transport (the CLI's `--smp`, the page):
+    the owner reads it (`WorkerKernel`, `ConsoleRingReader`), woken by
+    `Atomics.waitAsync` on any commit when it found nothing last time,
+    else when an eighth of the ring is full or after 2 ms (a poll of 4 ms
+    where a thread has no `Atomics.waitAsync`). It needs nothing from CPU
+    0, so a full ring makes a writer wait (`Atomics.wait`, "wait"): the
+    owner never waits for the kernel, so that cannot deadlock. At exit
+    the owner takes what is left before it closes the output.
+  - Inline and `--worker=messages`: CPU 0's host reads it (`Kernel`):
+    the same loop while its thread is free, a take in its clock import
+    (`Kernel.poller`, at most every 1 ms unless 16 KiB wait; the messages
+    transport posts that at once, `KernelConfig.flushOutput`), and its own
+    writes go out at once (directly while the ring is empty and no batch
+    is on its way, else through the ring, which it then empties). A
+    writer may not wait for CPU 0 there: CPU 0 may spin for a lock that
+    writer holds. So another CPU that finds the ring full takes the
+    records out and posts them as a batch ("post"); every take numbers its
+    batch and `ConsoleOrder` (cpu.ts) writes batches by number. At most 16
+    may be on their way; then the writer waits up to 50 ms for CPU 0's
+    host to take one, and if it took none, drops (logged) without waiting
+    until it takes one again.
+  - Measured (2026-11-17, Node, 2 CPUs; status.md, SMP, console speed):
+    `seq 1 200000` on CPU 1 as fast as on CPU 0 in every mode; output of
+    a task on CPU 1 reaches the host about 0.1-0.3 ms after it was
+    written also while CPU 0 runs user code (before: at CPU 0's next
+    yield, 10 ms at the median).
 - The JIT per CPU (kwemu.md, JIT on several harts): each CPU's thread
   has a `JitHost` of its own (`CpuInit.jit`, `memory64`), attached to
   its instance's `__indirect_function_table` before the kernel runs

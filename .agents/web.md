@@ -250,6 +250,15 @@ other options.
   CPUs row warns, from `stats().cpus`. A failure after the kernel started
   (a CPU's trap or fatal error) ends the session like any other, with a
   hint to set CPUs to 1.
+- The console with several CPUs: every CPU's output comes through the
+  console ring the page itself reads (js.md, CPU threads), not through
+  the kernel worker, so the terminal gets a few hundred chunks for
+  `seq 1 200000` instead of one message per write, and output from a task
+  on CPU 1 is not held up while CPU 0 runs user code. Headless Chromium,
+  `?smp=2` (2026-11-17, before, then after): `seq 1 200000` on CPU 1
+  37.7-38.4 s and 2.8 s (CPU 0: 2.3-2.5 s); echo of a shell on CPU 1
+  while CPU 0 spins, median 9.4 and 0.57 ms; lines printed in turn on
+  CPUs 0 and 1 in order either way; the default load unchanged.
 - No Suspend: the SMP kernel cannot park. `KW.suspend` stays unset (so
   the status line has no pause icon), the dialog footer has no
   `#suspend`, and Ctrl-A s says why. A suspended session (always a UP

@@ -9,5 +9,5 @@ import { runCpu, type CpuInit } from "../core/cpu.ts";
 const port = parentPort;
 if (!port) throw new Error("unkernel: a CPU runs only in a worker thread (cpu.ts)");
 port.once("message", (init: CpuInit) => {
-	void runCpu(init, { post: (msg) => port.postMessage(msg) });
+	void runCpu(init, { post: (msg, transfer) => port.postMessage(msg, transfer) });
 });

@@ -157,8 +157,8 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		// Four processes (spread over the CPUs of an SMP kernel at fork) print
 		// 200 lines in turn, passing a token through FIFOs (each held open
 		// read-write by its reader, so a token is never lost to a writer that
-		// has not closed yet): the host must see them in that order (cpu.ts,
-		// ConsoleOrder).
+		// has not closed yet): the host must see them in that order (the
+		// console ring, console-ring.ts).
 		test("lines printed in turn by several processes arrive in order", async () => {
 			const { vm, s, waitFor } = k;
 			const at = s.text.length;

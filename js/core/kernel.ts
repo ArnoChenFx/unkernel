@@ -26,9 +26,13 @@
 // module on the same memory in its own thread (cpu.ts, started by
 // KernelConfig.spawnCpu). Other CPUs set IPI bits in wasm_host_irqs, so
 // the host sets its own bits there atomically, and an idle wait also ends
-// on a change of that word (Atomics.waitAsync, the kernel's notify).
+// on a change of that word (Atomics.waitAsync, the kernel's notify). Every
+// CPU's console output, this one's too, goes into one shared ring
+// (console-ring.ts), read by the owner in worker mode with the shared
+// transport (KernelConfig.consoleRing) and by this host otherwise.
 
 import { BlockHost, type BlockDevice, type DiskSnapshotState } from "./block.ts";
+import { ConsoleRing, ConsoleRingReader, newConsoleRing, type ConsoleFull } from "./console-ring.ts";
 import { ConsoleOrder, type CpuEndpoint, type CpuInit, type CpuMessage } from "./cpu.ts";
 import { DisplayHost, type DisplayMode, type DisplayOption } from "./display.ts";
 import { InputHost, type InputState } from "./input.ts";
@@ -186,6 +190,20 @@ export interface KernelConfig {
 	spawnCpu?: (init: CpuInit) => CpuEndpoint;
 	/** Why spawnCpu cannot work on this thread (Platform.whyNoCpus), checked once; a reason gives an SMP kernel one CPU. */
 	whyNoCpus?: () => string | undefined;
+	/**
+	 * With more than one CPU: the console ring (console-ring.ts) another
+	 * thread reads (worker mode's owner), so `write` is not called for
+	 * console output. Without it this host reads a ring of its own and
+	 * calls `write`.
+	 */
+	consoleRing?: SharedArrayBuffer;
+	/**
+	 * When this host reads the ring: called after console output was
+	 * written from inside the kernel's clock import (the kernel runs on), so
+	 * that a host which batches `write` until the kernel suspends can send it
+	 * now (worker mode with the messages transport).
+	 */
+	flushOutput?: () => void;
 }
 
 /**
@@ -318,8 +336,15 @@ export class Kernel {
 	secondaries: CpuEndpoint[] = [];
 	/** Their JIT hosts' counters (CpuInit.jitMirror), in the order they started. */
 	jitMirrors: Float64Array[] = [];
-	/** Once another CPU started: every CPU's console writes in the kernel's order (cpu.ts). */
+	/** With more than one CPU: the console ring every CPU writes (console-ring.ts). */
+	conRing: ConsoleRing | null = null;
+	/** What a full ring makes a CPU do: "wait" when another thread reads it, else this host reads it. */
+	conFull: ConsoleFull = "wait";
+	/** This host reads the ring (no KernelConfig.consoleRing): batches in order (cpu.ts). */
+	conReader: ConsoleRingReader | null = null;
 	consoleOrder: ConsoleOrder | null = null;
+	/** Ring bytes dropped that were reported. */
+	conDropped = 0;
 
 	constructor(opts: KernelConfig) {
 		this.opts = opts;
@@ -333,7 +358,7 @@ export class Kernel {
 		this.result = undefined;
 		this.exited = new Promise((r) => (this.exit = (res) => {
 			if (this.result) return; // first exit wins
-			this.consoleOrder?.flush();
+			this.consoleFlush(true);
 			this.result = res;
 			try { this.onStage("exit", res); } catch {}
 			r(res);
@@ -349,6 +374,7 @@ export class Kernel {
 			if (why) this.log(`[host] cannot start CPU threads here (${why}): the SMP kernel runs on one CPU`);
 			else this.cpus = cpus;
 		}
+		if (this.cpus > 1) this.initConsoleRing();
 		// Memory and its type are read at call time: boot() may retry with
 		// the other memory type. Another CPU's host has a JitHost of its own
 		// (cpu.ts), which mirrors its counters (jitMirrors).
@@ -440,8 +466,6 @@ export class Kernel {
 		if (!spawn || cpu < 1 || cpu >= this.cpus || this.result) return -ENOSYS;
 		const flag = this.exports?.__wasm_init_memory_flag;
 		const jitMirror = new Float64Array(new SharedArrayBuffer(JIT_MIRROR_WORDS * 8));
-		// CPU 0's writes so far went out directly; from here on every CPU numbers its own.
-		this.consoleOrder ??= new ConsoleOrder((bytes) => this.opts.write(bytes));
 		let ep: CpuEndpoint;
 		try {
 			ep = spawn({
@@ -450,7 +474,7 @@ export class Kernel {
 				irqWord0: this.irqAddr ?? 0,
 				epochMs: performance.timeOrigin - this.wasi.monoOffset,
 				jit: this.jit.stats.enabled, memory64: this.memory64, jitMirror,
-				conSeq: this.consoleOrder.counter,
+				console: this.conRing!.buffer, consoleFull: this.conReader ? "post" : "wait",
 			});
 		} catch (e) {
 			this.log(`[host] cannot start CPU ${cpu}: ${(e as Error)?.message ?? e}`);
@@ -465,16 +489,87 @@ export class Kernel {
 		return 0;
 	}
 
-	/** Console output of CPU 0 (fd_write 1), in order with the other CPUs' (ConsoleOrder). */
-	consoleWrite(bytes: Uint8Array): void {
-		if (this.consoleOrder) this.consoleOrder.local(bytes);
-		else this.opts.write(bytes);
+	/**
+	 * Console output of CPU 0 (fd_write 1): mem[p, p + len). With other
+	 * CPUs, into the ring, behind what they wrote before. Where this host
+	 * reads the ring, its write goes out at once as on one CPU: directly
+	 * when nothing another CPU wrote waits (the ring is empty and no batch
+	 * is on its way: a write that reserves after this look overlaps this
+	 * one), else through the ring, which it then empties.
+	 */
+	consoleWrite(mem: Uint8Array, p: number, len: number): void {
+		const r = this.conRing;
+		if (r === null || (this.conReader !== null && r.quiet && this.consoleOrder!.empty)) {
+			this.opts.write(mem.slice(p, p + len));
+			return;
+		}
+		r.write(mem, p, len, this.conFull, this.conDeliver);
+		this.conReader?.take();
+	}
+
+	/**
+	 * More than one CPU: set up the console ring. Read by another thread
+	 * (KernelConfig.consoleRing): CPU 0 waits like the others when it is
+	 * full. Read here: a reader loop for the idle times, a take after each
+	 * of CPU 0's writes, and one in every clock read (the poller) at most
+	 * every POLL_MS unless the ring fills; CPU 0 also takes the records out
+	 * itself when it is full.
+	 */
+	initConsoleRing(): void {
+		const theirs = this.opts.consoleRing;
+		this.conRing = new ConsoleRing(theirs ?? newConsoleRing());
+		if (theirs) return;
+		const ring = this.conRing;
+		this.conFull = "take";
+		this.consoleOrder = new ConsoleOrder((bytes) => this.opts.write(bytes));
+		const reader = (this.conReader = new ConsoleRingReader(ring, this.conDeliver));
+		const POLL_MS = 1, POLL_BYTES = 1 << 14;
+		let last = 0;
+		this.poller ??= {
+			poll: () => {
+				if (!ring.pending) return;
+				const now = performance.now();
+				if (now - last < POLL_MS && ring.used < POLL_BYTES) return;
+				last = now;
+				if (reader.take()) this.opts.flushOutput?.();
+			},
+			idle: () => {
+				reader.take();
+				return false;
+			},
+			awake: () => {},
+		};
+		reader.start();
+	}
+
+	/** A batch this host took out of the ring (or one another CPU posted, "out"): in order. */
+	conDeliver = (b: { seq: number; bytes: Uint8Array }): void => {
+		if (this.result) return;
+		this.consoleOrder?.put(b.seq, b.bytes);
+		const d = this.conRing?.dropped ?? 0;
+		if (d !== this.conDropped) {
+			this.log(`[host] console: ${d - this.conDropped} bytes from other CPUs dropped (CPU 0 did not read them)`);
+			this.conDropped = d;
+		}
+	};
+
+	/** At exit (`end`) or before a suspension: take what the ring holds (when this host reads it). */
+	consoleFlush(end = false): void {
+		const reader = this.conReader;
+		if (!reader) return;
+		const b = reader.ring.take(true);
+		if (b) this.conDeliver(b);
+		if (!end) return;
+		this.consoleOrder?.flush();
+		reader.stop();
+		reader.ring.close();
 	}
 
 	onCpuMessage(m: CpuMessage): void {
 		switch (m.t) {
 			case "out":
-				if (!this.result) this.consoleOrder!.put(m.seq, m.bytes);
+				this.conRing?.batchTaken();
+				this.conDeliver(m);
 				break;
 			case "log":
 				this.log(m.msg);

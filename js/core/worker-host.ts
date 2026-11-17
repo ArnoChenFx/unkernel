@@ -27,6 +27,7 @@ import type { CreateKernelOptions, InstanceStats, KernelHandle, Platform, BootPr
 import type { ExitResult } from "./kernel.ts";
 import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
+import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput } from "./output.ts";
 import type { KernelSnapshot } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
@@ -133,6 +134,8 @@ export interface WorkerKernelOptions {
 	shm?: boolean;
 	/** The shared transport's control block (worker-shared.ts), also sent in the boot spec; absent: messages. */
 	shared?: SharedArrayBuffer;
+	/** The console ring (console-ring.ts), also sent in the boot spec: read here. */
+	console?: SharedArrayBuffer;
 }
 
 /**
@@ -185,6 +188,7 @@ export class WorkerKernel implements KernelHandle {
 	#sound: SoundBridge | undefined;
 	#soundState: SoundState | undefined;
 	#shared: SharedOwner | undefined;
+	#console: ConsoleRingReader | undefined;
 	#encoder: TextEncoder | undefined;
 	#vsock: VsockHost | undefined;
 	#vsockOut: Uint8Array[] = [];
@@ -207,6 +211,11 @@ export class WorkerKernel implements KernelHandle {
 		this.#onInput = opts.onInput;
 		const post = (m: ToWorker, transfer?: ArrayBuffer[]) => { if (!this.#result) endpoint.post(m, transfer); };
 		if (opts.shared) this.#shared = new SharedOwner(opts.shared, post);
+		if (opts.console) {
+			// Every CPU's console output, read here as it is written (console-ring.ts).
+			this.#console = new ConsoleRingReader(new ConsoleRing(opts.console), (b) => this.#emit(b.bytes));
+			this.#console.start();
+		}
 		if (opts.display) {
 			this.#evdev = new RemoteEvdev(post, this.#shared);
 			this.#frames = new FrameClient(post, this.#shared);
@@ -269,8 +278,7 @@ export class WorkerKernel implements KernelHandle {
 			this.#onProgress({ stage: "worker", jspi: m.jspi });
 			break;
 		case "output":
-			this.#onOutput?.(m.bytes);
-			this.#out.emit(m.bytes);
+			this.#emit(m.bytes);
 			break;
 		case "log":
 			this.#log(m.msg);
@@ -382,8 +390,20 @@ export class WorkerKernel implements KernelHandle {
 		this.#statsAt = performance.now();
 	}
 
+	#emit(bytes: Uint8Array): void {
+		this.#onOutput?.(bytes);
+		this.#out.emit(bytes);
+	}
+
 	#finish(res: ExitResult): void {
 		if (this.#result) return;
+		// What the CPUs wrote before the exit, which the worker reported after it.
+		const con = this.#console;
+		if (con) {
+			con.take();
+			con.stop();
+			con.ring.close();
+		}
 		this.#result = res;
 		clearTimeout(this.#stopTimer);
 		this.#evdev?.close();
@@ -689,10 +709,13 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 	if (opts.shared === true && !canShare)
 		throw new BootError("support", "createKernel({ worker: true, shared: true }): SharedArrayBuffer cannot be used here (a browser page must be cross-origin isolated: COOP same-origin and COEP require-corp)");
 	const shared = canShare ? newSharedControl() : undefined;
+	// More than one CPU: their console output comes here through a shared ring (unused if the kernel gets one CPU).
+	const consoleRing = shared && (opts.cpus ?? 1) > 1 ? newConsoleRing() : undefined;
 	const endpoint = platform.spawnWorker!();
 	const vm = new WorkerKernel(endpoint, {
 		onOutput: opts.onOutput, onProgress: progress, log, onDiskError: opts.onDiskError,
 		display: opts.display, onDisplay: opts.onDisplay, onInput: opts.onInput, sound: opts.sound, vsock: opts.vsock ?? true, shm: opts.shm, shared,
+		console: consoleRing,
 	});
 	let spec: WorkerBootSpec, transfer: ArrayBuffer[];
 	try {
@@ -726,6 +749,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 			vsock: !!(opts.vsock ?? true),
 			shm: !!opts.shm,
 			shared,
+			console: consoleRing,
 			restore,
 		};
 		transfer = [...kernelTransfer, ...initrdTransfer, ...diskTransfer, ...restoreTransfer];

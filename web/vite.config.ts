@@ -21,7 +21,7 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { nitro } from "nitro/vite";
-import { fetchKernel, KERNEL_FILE } from "./scripts/kernel.ts";
+import { fetchKernel, KERNEL_FILE, PAGE_SMP_FILE, splitKernel } from "./scripts/kernel.ts";
 
 const git = (...args: string[]) => {
 	try { return execFileSync("git", args, { cwd: import.meta.dirname, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
@@ -35,6 +35,7 @@ const git = (...args: string[]) => {
  */
 async function buildInfo(dev: boolean) {
 	const kernel = await fetchKernel(dev);
+	await splitKernel();
 	const linux = /Linux version (\S+)/.exec(await readFile(KERNEL_FILE, "latin1"))?.[1] ?? "";
 	const [commit = "", date = ""] = git("log", "-1", "--format=%H %cI").split(" ");
 	return {
@@ -68,6 +69,32 @@ export default defineConfig({
 			// The dev server keeps the file that is there (a local build).
 			async config(_, { command }) {
 				return { define: { __KW_BUILD__: JSON.stringify(await buildInfo(command === "serve")) } };
+			},
+		},
+		{
+			// The SMP bundle (scripts/kernel.ts splitKernel()) as an asset of its
+			// own, hashed like the UP one, and its URL for src/sdk.ts; null when
+			// the kernel has no SMP patch. Emitted whether or not code uses it.
+			name: "unkernel:kernel-smp",
+			// The dev server serves web/kernel/page/: split again when a local
+			// build replaces the kernel (kernel/build.sh bundle), as it was
+			// served fresh before there was a split.
+			configureServer(server) {
+				server.watcher.add(KERNEL_FILE);
+				server.watcher.on("change", (file) => {
+					if (file === KERNEL_FILE) splitKernel(true).catch((e: unknown) => console.error(`[kernel] ${(e as Error).message}`));
+				});
+			},
+			resolveId(id) {
+				return id === "virtual:unkernel-smp-kernel" ? "\0virtual:unkernel-smp-kernel" : null;
+			},
+			async load(id) {
+				if (id !== "\0virtual:unkernel-smp-kernel") return null;
+				const { smp } = await splitKernel();
+				if (!smp) return "export const kernelSmpUrl = null;";
+				if (this.environment.mode === "dev") return `export const kernelSmpUrl = new URL(${JSON.stringify(`/@fs${PAGE_SMP_FILE}`)}, import.meta.url);`;
+				const ref = this.emitFile({ type: "asset", name: "unkernel-alpine-smp.wasm", source: await readFile(PAGE_SMP_FILE) });
+				return `export const kernelSmpUrl = new URL(import.meta.ROLLUP_FILE_URL_${ref}, import.meta.url);`;
 			},
 		},
 		{

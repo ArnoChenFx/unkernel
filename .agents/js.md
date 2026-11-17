@@ -40,10 +40,14 @@ parts that are easy to get wrong.
 - The build checks that `dist/web.mjs` reaches no Node built-in, and that
   each entry (not a shared chunk) computes
   `new URL("./unkernel-alpine.wasm", import.meta.url)`.
-- It inlines the kernel workers (Packaging, below) and checks that
-  `dist/node.mjs` and `dist/cli.mjs` carry the Node worker and
-  `dist/web.mjs` the web worker (and not the other), and that no dist file
-  mentions `worker-entry`.
+- It inlines the kernel workers (Packaging, below) and the Node CPU
+  worker (`js/node/cpu-entry.ts`, started by `js/node/cpu.ts`; CPU
+  threads, below) and checks that `dist/node.mjs` and `dist/cli.mjs`
+  carry the Node and CPU workers and `dist/web.mjs` the web worker (and
+  not the others), and that no dist file mentions `worker-entry` or
+  `cpu-entry`. The CPU worker is inlined into the Node kernel worker's
+  bundle too (`nested` in WORKERS), since in worker mode that worker
+  starts the CPUs.
 - Test the built package with `node dist/cli.mjs` and
   `UNKERNEL_DIST=1 node --test test/api.test.ts`, which imports the package
   by its own name.
@@ -333,7 +337,8 @@ parts that are easy to get wrong.
   type: "module" })`, which Vite bundles when the page builds from source
   (`worker.format: "es"`); for the dist the plugin replaces it with
   `inlineWorkerUrl(code)`, a Blob URL revoked at the first message. Each
-  `WORKERS` entry has its own mark (`/*unkernel-worker:node*/`, `:web*/`).
+  `WORKERS` entry has its own mark (`/*unkernel-worker:node*/`, `:web*/`,
+  `:cpu*/`).
   Vite's `?worker&inline` is not usable: plain Node cannot load it.
 - A worker's WebSocket sends the page's origin, so the Wisp allow list
   works as inline; Node workers send `NODE_WISP_HEADERS`.
@@ -419,19 +424,24 @@ parts that are easy to get wrong.
   and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
   `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's
   `memory.atomic.notify` (an IPI) ends; the wait's `done` runs once.
-- Both kernels in one bundle (prototype, status.md item 8): a bundle made
-  with `kernel/tools/bundle.mjs --smp <SMP vmlinux32.wasm>` carries
-  `unkernel.kernel.smp.kwpatch`, a patch from its UP kernel to the SMP
-  one (`kwdiff.mjs --remap`: function, global and type indices and data
-  addresses renumbered by `js/core/kremap.ts`, then a bsdiff-style byte
-  diff). With more than one CPU asked (`cpus`, CLI `--smp N`),
-  `loadKernelModule({ smp: true })` reads the bundle's bytes (no
-  streaming compile), applies it (`smpKernelFromBundle()`: SHA-256 of
-  base and result checked) and compiles the SMP kernel followed by the
-  bundle's other `unkernel.*` sections. Without the section, or with one
-  CPU, nothing changes.
-- Not done: a browser `spawnCpu`, and `pnpm build` bundling
-  `cpu-entry.ts` (from source only); status.md item 8.
+- Both kernels in one bundle: a bundle made with `kernel/tools/bundle.mjs
+  --smp <SMP vmlinux32.wasm>` (same tree) carries
+  `unkernel.kernel.smp.kwpatch` last, a patch from its UP kernel to the
+  SMP one (`kernel/tools/kwdiff.mjs --remap`: the base's function, global
+  and type indices and data addresses renumbered to the target's by
+  `js/core/kremap.ts`, then a bsdiff-style byte diff; 1.37 MB raw, 0.76
+  MB gzip, 0.67 MB brotli, 2026-11-17). With more than one CPU asked
+  (`cpus`, CLI `--smp N`), `loadKernelModule({ smp: true })` (and the
+  CLI) reads the bundle's bytes (no streaming compile), applies the patch
+  (`js/core/kpatch.ts` `smpKernelFromBundle()`: base length and SHA-256,
+  result SHA-256 checked; about 0.2 s and +50 MiB transient in Node) and
+  compiles the SMP kernel followed by the bundle's other `unkernel.*`
+  sections, so `bundledBoot()` reads it as the bundle. Without the
+  section, with one CPU, or with a compiled Module as `kernel`, nothing
+  changes. `withoutSmpPatch()` gives the bundle without the section (the
+  page's split, web.md). `test/kpatch.test.ts` (with `KPATCH_UP` and
+  `KPATCH_SMP` set, also on the real kernels).
+- Not done: a browser `spawnCpu`; status.md item 8.
 
 ## vsock (`js/core/vsock.ts`)
 

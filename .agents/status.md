@@ -313,15 +313,13 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message
      from the sender's host would do instead).
-   - `pnpm build` does not bundle `js/node/cpu-entry.ts` yet (source
-     checkouts only), and `kernel/build.sh` has no SMP target.
-   - Packaging both kernels (study and numbers in
-     `vendor/smp-deferred/packaging/README.md`, 2026-11-17): a prototype
-     on the `smp-pkg` branch ships the UP bundle plus a patch to the SMP
-     kernel (`kernel/tools/bundle.mjs --smp`, `kwdiff.mjs`; applied by
-     `js/core/kpatch.ts` when more than one CPU is asked: js.md, CPU
-     threads). The release workflow, `kernel/build.sh` and the page do
-     not use it yet.
+   - Packaging: one bundle carries the UP kernel and a patch to the SMP
+     one (`kernel/tools/bundle.mjs --smp`; js.md, CPU threads; web.md for
+     the page's split; study and sizes in
+     `vendor/smp-deferred/packaging/README.md`, 2026-11-17). Not done:
+     `kernel/build.sh` has no SMP target and `bundle` no `--smp`, so the
+     release workflow (and with it npm and the page) still ships UP only;
+     the README there has the proposal.
    - Deferred fork and wakeup changes, measured 2026-11-16 (kwfork,
      9 alternating rounds; patches and a README with their base in
      `vendor/smp-deferred/`, which is gitignored like all of vendor):

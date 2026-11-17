@@ -52,7 +52,8 @@ The parts that `ls` does not make obvious:
   `kernel/patches/` is their only durable record.
 - The page's kernel is the gitignored `web/kernel/unkernel-alpine.wasm`.
   `kernel/build.sh bundle` copies its output there, and `pnpm dev` runs
-  that file as it is. A page build (`pnpm build:web`, a deploy) replaces it
+  that file as it is (its copy in `web/kernel/page/`, without an SMP
+  patch section). A page build (`pnpm build:web`, a deploy) replaces it
   with the newest GitHub release's bundle (`web/scripts/kernel.ts`, web.md).
 
 ## Building

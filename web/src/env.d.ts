@@ -12,3 +12,8 @@ declare const __KW_BUILD__: {
 	commit: string;
 	date: string;
 };
+
+/** The page's SMP bundle (vite.config.ts, web/scripts/kernel.ts splitKernel()), or null without one. */
+declare module "virtual:unkernel-smp-kernel" {
+	export const kernelSmpUrl: URL | null;
+}

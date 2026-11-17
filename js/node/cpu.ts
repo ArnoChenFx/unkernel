@@ -5,12 +5,19 @@
 // kernel's own thread (the main thread inline, the kernel worker in worker
 // mode). The worker gets the compiled module and the shared memory in its
 // first message.
+//
+// From source, Node starts the worker from cpu-entry.ts itself. `pnpm
+// build` (build.config.ts, WORKERS) replaces the URL below (it must appear
+// exactly once in this file) with the bundled entry as a string literal,
+// in the dist entries and inside the inlined kernel worker, which starts
+// the CPUs in worker mode.
 
 import { Worker } from "node:worker_threads";
 import type { CpuEndpoint, CpuInit, CpuMessage } from "../core/cpu.ts";
 
 export function spawnNodeCpu(init: CpuInit): CpuEndpoint {
-	const w = new Worker(new URL("./cpu-entry.ts", import.meta.url));
+	const entry: URL | string = new URL("./cpu-entry.ts", import.meta.url);
+	const w = typeof entry === "string" ? new Worker(entry, { eval: true }) : new Worker(entry);
 	// The CPU never keeps the process alive: CPU 0's exit ends the session.
 	w.unref();
 	w.postMessage(init);

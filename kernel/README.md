@@ -82,6 +82,10 @@ separate and not part of `all`):
   with `alpine.cpio` (gzipped), its command line and, if it exists, the data
   disk template in custom sections (`tools/bundle.mjs`; `unkernel.initrd`,
   `unkernel.cmdline`, `unkernel.datadisk`). There is no wasm64 bundle.
+  `tools/bundle.mjs --smp <SMP vmlinux32.wasm>` also adds
+  `unkernel.kernel.smp.kwpatch`, a patch from this kernel to an SMP build
+  of the same tree (`tools/kwdiff.mjs`), which the runtime applies when it
+  is asked for more than one CPU; build.sh does not pass it yet.
   `kernel`, `lower`, `alpine` and `datadisk` refresh it when both inputs
   exist; without a template it warns and bundles none.
 * **datadisk**: `vendor/build/disk/kwdata.kwsparse.gz`, the template of the
@@ -759,7 +763,8 @@ from source). Everything is self-hosted except the Wisp fallback.
   (`web/src/demos/`, one file each); web servers open in the preview. The
   page ships nothing for them, so most need the network.
 * **What it downloads.** One file: `web/kernel/unkernel-alpine.wasm`, the
-  `bundle` output attached to the newest GitHub release (10.6 MiB;
+  `bundle` output attached to the newest GitHub release (10.6 MiB, without
+  an SMP patch section if the release has one;
   `web/scripts/kernel.ts` fetches it when the page is built; `pnpm dev`
   runs the local build's copy), a Vite asset (`/assets/unkernel-alpine-<hash>.wasm` in the
   build; the runtime takes the initramfs and command line from its custom

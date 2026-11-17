@@ -46,8 +46,17 @@ the dev server's own responses) and `__KW_BUILD__`.
 
 ## The page's kernel: a local build in dev, the newest release in a build
 
-- The page loads only `web/kernel/unkernel-alpine.wasm` (gitignored): the
-  lowered kernel with Alpine bundled, about 10 MB. Building or deploying the
+- The page loads only `web/kernel/page/unkernel-alpine.wasm` (gitignored):
+  the lowered kernel with Alpine bundled, about 10 MB. `splitKernel()`
+  (`web/scripts/kernel.ts`) makes it from `web/kernel/unkernel-alpine.wasm`
+  (the file the rest of this list is about) without its SMP patch section
+  (js.md, CPU threads), so it is byte for byte that file when there is
+  none, as in every release so far. When there is one, it also writes
+  `web/kernel/page/unkernel-alpine-smp.wasm`, the SMP bundle the patch
+  makes, which the `unkernel:kernel-smp` plugin emits as its own hashed
+  asset and `src/sdk.ts` exports as `kernelSmpUrl` (null without it,
+  from `virtual:unkernel-smp-kernel`). Nothing uses it yet: the page has
+  no CPU threads. The dev server splits again when the file changes. Building or deploying the
   page needs no kernel toolchain.
 - `pnpm dev` runs the file that is there, without a network check.
   `kernel/build.sh bundle` (and so `kernel`, `alpine`, `datadisk`, `all`)

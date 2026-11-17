@@ -149,6 +149,21 @@ export async function smpKernelFromBundle(bundle: Uint8Array, opts?: { verify?: 
 	return concat([smp, ...extra]);
 }
 
+/**
+ * The bundle without its SMP patch section (every other section as it is,
+ * in order), or the bundle itself if it has none: the UP bundle as
+ * bundle.mjs makes it without --smp.
+ */
+export function withoutSmpPatch(bundle: Uint8Array): Uint8Array {
+	const keep: Uint8Array[] = [bundle.subarray(0, 8)];
+	let found = false;
+	for (const [id, start, payload, end] of moduleSections(bundle)) {
+		if (id === 0 && customName(bundle, payload, end)[0] === SMP_PATCH_SECTION) { found = true; continue; }
+		keep.push(bundle.subarray(start, end));
+	}
+	return found ? concat(keep) : bundle;
+}
+
 function concat(parts: Uint8Array[]): Uint8Array {
 	let n = 0;
 	for (const p of parts) n += p.length;

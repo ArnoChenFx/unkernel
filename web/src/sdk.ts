@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The SDK from source (the page is built with it, not with the published
-// dist/), with the page's own kernel: web/kernel/unkernel-alpine.wasm, the
+// dist/), with the page's own kernel: web/kernel/page/unkernel-alpine.wasm, the
 // bundle of the newest GitHub release (web/scripts/kernel.ts fetches it when
 // the dev server starts or the page is built), a Vite asset. js/web.ts is not imported, so the SDK's own bundled kernel (the
 // symlink into vendor/) is not part of the page.
@@ -13,8 +13,19 @@ export * from "../../js/core/index.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
 export { DATA_DISK_NAME, importDataDisk, openDataDisk, resetDataDisk } from "../../js/web/disk.ts";
 
-/** The kernel with Alpine bundled (vmlinux32.wasm + the initramfs, kernel/tools/bundle.mjs). */
-export const kernelUrl: URL = new URL("../kernel/unkernel-alpine.wasm", import.meta.url);
+/**
+ * The kernel with Alpine bundled (vmlinux32.wasm + the initramfs,
+ * kernel/tools/bundle.mjs): web/kernel/page/'s copy, without an SMP patch
+ * (web/scripts/kernel.ts splitKernel()).
+ */
+export const kernelUrl: URL = new URL("../kernel/page/unkernel-alpine.wasm", import.meta.url);
+
+/**
+ * The SMP kernel with the same Alpine, its own hashed asset, or null when
+ * the release bundle has no SMP patch. Nothing uses it yet: the page has no
+ * CPU threads (.agents/status.md, SMP).
+ */
+export { kernelSmpUrl } from "virtual:unkernel-smp-kernel";
 
 const platform = webPlatform(kernelUrl);
 

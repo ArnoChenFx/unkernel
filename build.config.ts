@@ -12,6 +12,9 @@
 //   js/web/web-worker-entry.ts    Node and in browsers, each bundled into one minified ES
 //                                 module and inlined as a string where js/node/worker.ts
 //                                 and js/web/worker.ts start it (WORKERS)
+//   js/node/cpu-entry.ts          a secondary CPU of an SMP kernel on Node, inlined the
+//                                 same way where js/node/cpu.ts starts it: in the Node
+//                                 entries and inside the Node kernel worker (WORKERS)
 
 import { realpathSync } from "node:fs";
 import { copyFile, readFile, readdir, stat } from "node:fs/promises";
@@ -31,8 +34,19 @@ const WASM = "vendor/build/bundle/unkernel-alpine.wasm";
  * (js/web/worker.ts). `entries` are the dist entries that must carry it;
  * every other entry must not.
  */
-const WORKERS = [
-	{ name: "node", starter: "js/node/worker.ts", entry: "js/node/worker-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"] },
+interface WorkerSpec {
+	name: string;
+	starter: string;
+	entry: string;
+	platform: "node" | "browser";
+	wrap: (s: string) => string;
+	entries: string[];
+	/** Workers this worker starts itself: inlined into its own bundle first. */
+	nested?: string[];
+}
+const WORKERS: WorkerSpec[] = [
+	{ name: "cpu", starter: "js/node/cpu.ts", entry: "js/node/cpu-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"] },
+	{ name: "node", starter: "js/node/worker.ts", entry: "js/node/worker-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"], nested: ["cpu"] },
 	{ name: "web", starter: "js/web/worker.ts", entry: "js/web/web-worker-entry.ts", platform: "browser", wrap: (s: string) => `inlineWorkerUrl(${s})`, entries: ["web.mjs"] },
 ];
 /** Starts every inlined worker string (WORKER_MARK + name + "*" + "/"); the end hook looks for it. */
@@ -64,19 +78,52 @@ function withoutWorkerStrings(code: string): string {
 }
 
 /**
- * One worker entry as a standalone minified ES module that imports nothing
- * but Node built-ins (node), or nothing at all (browser).
+ * A rolldown plugin that replaces `new URL("./<entry>", import.meta.url)`
+ * in each worker's starter with the worker's code (`codes`: name -> the
+ * string from bundleWorker()). `strict`: every starter must be bundled.
  */
-async function bundleWorker(pkgDir: string, w: (typeof WORKERS)[number]): Promise<string> {
+function inlinePlugin(pkgDir: string, workers: WorkerSpec[], codes: Map<string, string>, strict: boolean) {
+	const inline = new Map<string, { pattern: string; code: string; done: boolean }>();
+	for (const w of workers) {
+		inline.set(path.join(pkgDir, w.starter), {
+			pattern: `new URL("./${path.basename(w.entry)}", import.meta.url)`,
+			code: w.wrap(JSON.stringify(codes.get(w.name)!)),
+			done: false,
+		});
+	}
+	return {
+		name: "unkernel:inline-worker",
+		transform(code: string, id: string) {
+			const w = inline.get(path.normalize(id.split("?")[0]!));
+			if (!w) return null;
+			if (code.split(w.pattern).length !== 2) throw new Error(`${id} must contain ${w.pattern} exactly once (build.config.ts WORKERS)`);
+			w.done = true;
+			return { code: code.replace(w.pattern, () => w.code), map: null };
+		},
+		buildEnd() {
+			if (!strict) return;
+			for (const [id, w] of inline) if (!w.done) throw new Error(`${id} was not bundled, so its worker was not inlined`);
+		},
+	};
+}
+
+/**
+ * One worker entry as a standalone minified ES module that imports nothing
+ * but Node built-ins (node), or nothing at all (browser), with the workers
+ * it starts (`nested`, already in `codes`) inlined.
+ */
+async function bundleWorker(pkgDir: string, w: WorkerSpec, codes: Map<string, string>): Promise<string> {
 	const { entry } = w;
 	const node = w.platform === "node";
 	const rolldown = await loadRolldown(pkgDir);
+	const nested = WORKERS.filter((n) => w.nested?.includes(n.name));
 	const bundle = await rolldown({
 		input: path.join(pkgDir, entry),
 		cwd: pkgDir,
 		platform: w.platform,
 		external: node ? [/^node:/, ...builtinModules] : [],
 		treeshake: true,
+		plugins: nested.length ? [inlinePlugin(pkgDir, nested, codes, true)] : [],
 	});
 	const { output } = await bundle.generate({ format: "esm", minify: true, codeSplitting: false });
 	await bundle.close();
@@ -108,29 +155,12 @@ export default defineBuildConfig({
 			// dist/node.mjs, not dist/js/node.mjs.
 			const input = config.input as Record<string, string>;
 			config.input = Object.fromEntries(Object.entries(input).map(([name, src]) => [name.replace(/^js[/\\]/, ""), src]));
-			// Inline each worker entry as a string where it is started (WORKERS).
-			const inline = new Map<string, { pattern: string; code: string; done: boolean }>();
-			for (const w of WORKERS) {
-				inline.set(path.join(ctx.pkgDir, w.starter), {
-					pattern: `new URL("./${path.basename(w.entry)}", import.meta.url)`,
-					code: w.wrap(JSON.stringify(await bundleWorker(ctx.pkgDir, w))),
-					done: false,
-				});
-			}
+			// Inline each worker entry as a string where it is started (WORKERS),
+			// nested ones first (WORKERS lists them before the workers that start them).
+			const codes = new Map<string, string>();
+			for (const w of WORKERS) codes.set(w.name, await bundleWorker(ctx.pkgDir, w, codes));
 			const plugins = Array.isArray(config.plugins) ? config.plugins : config.plugins ? [config.plugins] : [];
-			config.plugins = [{
-				name: "unkernel:inline-worker",
-				transform(code: string, id: string) {
-					const w = inline.get(path.normalize(id.split("?")[0]!));
-					if (!w) return null;
-					if (code.split(w.pattern).length !== 2) throw new Error(`${id} must contain ${w.pattern} exactly once (build.config.ts WORKERS)`);
-					w.done = true;
-					return { code: code.replace(w.pattern, () => w.code), map: null };
-				},
-				buildEnd() {
-					for (const [id, w] of inline) if (!w.done) throw new Error(`${id} was not bundled, so its worker was not inlined`);
-				},
-			}, ...plugins];
+			config.plugins = [inlinePlugin(ctx.pkgDir, WORKERS, codes, true), ...plugins];
 		},
 		rolldownOutput(output) {
 			// Name the shared chunks after what they hold: dist/_chunks/core.mjs
@@ -178,8 +208,9 @@ export default defineBuildConfig({
 				}
 			}
 			for (const f of [...(await readdir(dist)), ...(await readdir(path.join(dist, "_chunks")).catch(() => [])).map((c) => `_chunks/${c}`)]) {
-				if (f.endsWith(".mjs") && (await readFile(path.join(dist, f), "utf8")).includes("worker-entry"))
-					throw new Error(`dist/${f} refers to worker-entry: a worker was not inlined`);
+				const code = f.endsWith(".mjs") ? await readFile(path.join(dist, f), "utf8") : "";
+				for (const name of ["worker-entry", "cpu-entry"])
+					if (code.includes(name)) throw new Error(`dist/${f} refers to ${name}: a worker was not inlined`);
 			}
 			// The bundled-kernel URL must be resolved relative to the entry itself, not a shared chunk.
 			for (const entry of ["node.mjs", "web.mjs", "cli.mjs"]) {
@@ -196,7 +227,7 @@ export default defineBuildConfig({
 				const mod = await import(`${pathToFileURL(path.join(dist, entry)).href}?check=${Date.now()}`);
 				if (typeof mod.createKernel !== "function") throw new Error(`dist/${entry} has no createKernel export`);
 			}
-			console.log(`unkernel: dist/unkernel-alpine.wasm copied; web entry is free of Node imports; kernel workers inlined; entries link; ${chunks.length} shared chunk(s)`);
+			console.log(`unkernel: dist/unkernel-alpine.wasm copied; web entry is free of Node imports; kernel and CPU workers inlined; entries link; ${chunks.length} shared chunk(s)`);
 		},
 	},
 });

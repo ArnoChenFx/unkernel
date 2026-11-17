@@ -23,9 +23,21 @@
 //                             one; past that, the release feed is used)
 // If GitHub cannot be reached and the file is a release's (the tag asked
 // for, if one was), a build keeps it.
+//
+// splitKernel() then makes what the page serves, in web/kernel/page/: the
+// UP bundle unkernel-alpine.wasm, which is the file above without its SMP
+// patch section (kernel/tools/bundle.mjs --smp; byte for byte the file when
+// it has none), and, only when the file has that section,
+// unkernel-alpine-smp.wasm: the SMP kernel the patch makes with the same
+// root file system, command line and data disk template
+// (js/core/kpatch.ts). So UP visitors download what they would without the
+// patch, and an SMP page would download one SMP bundle without patching in
+// the browser. vite.config.ts serves the second file as its own hashed
+// asset (virtual:unkernel-smp-kernel).
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { smpKernelFromBundle, withoutSmpPatch } from "../../js/core/kpatch.ts";
 
 const REPO = "pithings/unkernel";
 const ASSET = "unkernel-alpine.wasm";
@@ -33,6 +45,11 @@ const DIR = fileURLToPath(new URL("../kernel/", import.meta.url));
 /** Where the kernel goes; src/sdk.ts imports it from here. */
 export const KERNEL_FILE = `${DIR}${ASSET}`;
 const META_FILE = `${DIR}release.json`;
+const PAGE_DIR = `${DIR}page/`;
+/** The UP bundle the page serves (src/sdk.ts kernelUrl). */
+export const PAGE_KERNEL_FILE = `${PAGE_DIR}${ASSET}`;
+/** The SMP bundle the page serves, present only when KERNEL_FILE carries an SMP patch. */
+export const PAGE_SMP_FILE = `${PAGE_DIR}unkernel-alpine-smp.wasm`;
 
 export interface KernelRelease {
 	/** The release's tag, or "local" for KW_KERNEL. */
@@ -142,4 +159,41 @@ let once: Promise<KernelRelease> | undefined;
  */
 export function fetchKernel(dev = false): Promise<KernelRelease> {
 	return (once ??= fetchOnce(dev));
+}
+
+/** Write `bytes` to `file` unless it holds them already (atomically). */
+async function writeIfChanged(file: string, bytes: Uint8Array): Promise<void> {
+	try {
+		if (Buffer.compare(await readFile(file), bytes) === 0) return;
+	} catch {}
+	await writeFile(`${file}.tmp`, bytes);
+	await rename(`${file}.tmp`, file);
+}
+
+let split: Promise<{ smp: boolean }> | undefined;
+
+/**
+ * Make web/kernel/page/ from KERNEL_FILE (once per process unless `again`,
+ * which the dev server passes when the file changes; after fetchKernel()):
+ * the UP bundle without the SMP patch section and, if there is a patch,
+ * the SMP bundle. A bundle without the section (every release so far)
+ * gives the same UP file and no SMP file.
+ */
+export function splitKernel(again = false): Promise<{ smp: boolean }> {
+	if (again) split = undefined;
+	return (split ??= (async () => {
+		const bytes = new Uint8Array(await readFile(KERNEL_FILE));
+		await mkdir(PAGE_DIR, { recursive: true });
+		const up = withoutSmpPatch(bytes);
+		await writeIfChanged(PAGE_KERNEL_FILE, up);
+		if (up === bytes) {
+			await rm(PAGE_SMP_FILE, { force: true });
+			return { smp: false };
+		}
+		const smp = await smpKernelFromBundle(bytes);
+		if (!smp) throw new Error(`${ASSET}: an SMP patch section that makes no kernel`);
+		await writeIfChanged(PAGE_SMP_FILE, smp);
+		log(`SMP patch: UP ${(up.length / 1048576).toFixed(1)} MiB and SMP ${(smp.length / 1048576).toFixed(1)} MiB bundles in web/kernel/page/`);
+		return { smp: true };
+	})());
 }

@@ -7,7 +7,8 @@ are run only when asked; the page is tested by hand with `pnpm dev`.
 | Change | Run |
 | --- | --- |
 | Emulator (`src/`, `guest/`, `include/`) | `zig build test`, then the kernel row |
-| Kernel or `kw_emu.h` | `kernel/build.sh kernel`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"`, the same with `--kernel vendor/build/kernel/vmlinux`, and both again with `--no-jit` (expect `kwtest: 0 failure(s)`, exit 0); `node test/wasi-node.ts` (`PASS`) |
+| Kernel or `kw_emu.h` | `kernel/build.sh kernel` and `kernel/build.sh smp`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"`, the same with `--kernel vendor/build/kernel/vmlinux`, and both again with `--no-jit` (expect `kwtest: 0 failure(s)`, exit 0); the SMP kernel as below the table; `node test/wasi-node.ts` (`PASS`) |
+| Bundle, kernel patch, `build.sh` | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch`; after a change to the stamps or the build, two clean builds into different `KW_BUILD` roots give the same `vmlinux32.wasm` files and bundle (`sha256sum`) |
 | JIT (`src/emu/jit.zig`, `js/core/jit.ts`) | the two rows above; `zig build test -Dkwemu-fp-fuzz=1000000` after FP changes; `zig build fuzz -- 20000` after control-flow changes; Alpine with real work under JIT and `--no-jit`, comparing outputs (`seq 30000 \| sort -rn \| md5sum`, `tar cf - /lib \| gzip \| md5sum`, `sha256sum`); `node --expose-gc --test test/api.test.ts` |
 | Anything a real userland sees | `node js/cli.ts --timeout 120 --input '{8}uname -a; apk --version\n{2}poweroff\n'` |
 | Block, ext4, disk script | `node js/cli.ts --disk vendor/build/disk/alpine.ext4 --snapshot --timeout 120 --input '{6}df -h /\n{2}poweroff\n'` (`/dev/root` mounted, `kw-shutdown: / is clean`) |
@@ -27,10 +28,12 @@ dumped frame pixel for pixel, the injected input events and the recorded
 test signal sample for sample (`--no-sound`: without a sound card; `--worker`:
 the same through the CLI's `--worker`, with input and frames in shared
 memory; run it also with `--worker=messages` after a worker-mode change).
-An SMP kernel (kernel.md, SMP) runs the same checks: kwtest with `--smp
-2` and `--smp 4` (add `--display --shm` for its kwfb and kwshm checks),
-`UNKERNEL_TEST_KERNEL=<a bundle of it> UNKERNEL_TEST_CPUS=2 node --test
-test/api.test.ts` (the snapshot tests skip), and `node
+The SMP kernel (kernel.md, SMP; `kernel/build.sh smp` puts it in the
+bundle) runs the same checks: kwtest with `--smp 2`, `--smp 4` and
+`--smp 2 --no-jit` (add `--display --shm` for its kwfb and kwshm checks)
+and once on one CPU (`--kernel vendor/build/kernel-smp/vmlinux32.wasm
+--initrd alpine-test`), `UNKERNEL_TEST_CPUS=2 pnpm test:api` (the
+snapshot tests skip), and `node
 test/glimmer-check.mjs --run --kernel <it> --initrd <an image> --smp 2`.
 Emulator guests print
 `name: N checks, 0 failures`.
@@ -48,11 +51,15 @@ date, UTC), which it tags `v<version>` once the build passes. Its
 other ref before building, and stamps the version into package.json
 before `pnpm build`. It builds everything from source with `KW_RELEASE=1`, so `alpine.sh`
 leaves kwtest and kwbench out of `alpine.cpio` and the bundle
-(`kernel/build.sh toolchain kernel alpine datadisk`, clang 22 from
-apt.llvm.org; kwemu with `zig build -Dcpu=baseline` handed over as
-`KWEMU=`, so the zig cache survives runners with other CPU models), runs
+(`kernel/build.sh toolchain kernel smp alpine datadisk`, the last two
+with `KW_SMP=1`, so the bundle must carry the SMP patch; clang 22 from
+apt.llvm.org; both kwemu libraries with `zig build -Dcpu=baseline`
+handed over as `KWEMU=` and `KWEMU_SMP=`, so the zig cache survives
+runners with other CPU models), runs
 kwtest with and without the JIT (the bundle's kernel with `--initrd
-alpine-test`), `pnpm typecheck`, the tty, http and 9p
+alpine-test`) and on 2 CPUs (the SMP kernel from the bundle; a hosted
+runner has 4 vCPUs, so not more), `pnpm typecheck`, `pnpm test:kpatch`
+on the two kernels, the tty, http and 9p
 tests, `pnpm build`, kwtest (the same way) and the api tests on the built package, then
 uploads `npm pack`'s tarball (`unkernel.tgz`) and the bundle. A release
 publishes the tarball to npm through trusted publishing (npmjs.com trusts
@@ -61,4 +68,11 @@ publishes the tarball to npm through trusted publishing (npmjs.com trusts
 publishes a GitHub release with both files attached (a normal release,
 marked latest). CI runs Node 26; package.json's engines stay at
 >= 24. The workflow's header lists the caches. The kernel tree is restored only by an exact
-patch-series key, and the kernel build only for that same tree.
+patch-series key, and the kernel builds (UP and SMP, one cache) only for
+that same tree.
+The SMP steps are unexercised (not run in CI as of 2026-11-17; the YAML
+parses, and the kernels, bundle and tests they make were checked
+locally). Still to do there: a first run, its time (a second kernel build on a cache miss, about
+as long as the first: 1.5 min each at `-j8` locally), whether kwtest's
+timing checks (`move:`) hold on a 4-vCPU runner, kwtest without the JIT
+on 2 CPUs, and the api tests with `UNKERNEL_TEST_CPUS=2`.

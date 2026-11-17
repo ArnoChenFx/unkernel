@@ -22,7 +22,7 @@
 set -euo pipefail
 
 . "$(dirname "$0")/../tools/env.sh"   # root, UBUNTU_*, fetch_verified
-out="$root/vendor/build/disk"
+out="$build/disk"
 dl="$root/vendor/downloads"
 size="${DISK_SIZE:-2G}"
 mkdir -p "$out" "$dl"

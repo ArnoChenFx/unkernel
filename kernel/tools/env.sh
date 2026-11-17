@@ -2,6 +2,9 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # Sourced by setup.sh and the kernel/ build scripts (bash). Sets:
 #   root, vendor        repository root and its vendor/ directory
+#   build               where the build outputs go: $KW_BUILD (an absolute
+#                       path), default vendor/build; sources, downloads and
+#                       the toolchain stay in vendor/
 #   zig                 the zig binary ($ZIG, else zig on PATH)
 # and provides real_bin, use_real_host_tools and fetch_verified.
 #
@@ -10,6 +13,7 @@
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 vendor="$root/vendor"
+build="$(realpath -m "${KW_BUILD:-$vendor/build}")"
 zig="${ZIG:-$(command -v zig || true)}"
 
 ALPINE_VERSION=3.24.4

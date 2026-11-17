@@ -43,9 +43,12 @@ The parts that `ls` does not make obvious:
 - `src/` is kwemu, with its contract in `include/kw_emu.h`. `guest/` holds
   its test guests.
 - `kernel/build.sh` runs every kernel-side step (`toolchain binaryen kernel
-  lower alpine disk datadisk bundle all`, plus `ubuntu` and the profiling
-  variant `stats`). Linux patches are in `kernel/patches/linux/`, wasm-ld
-  patches in `kernel/patches/llvm/`.
+  smp lower alpine disk datadisk bundle all`, plus `ubuntu` and the
+  profiling variant `stats`). One tree gives two kernels, UP (`kernel`)
+  and SMP (`smp`); the bundle carries the UP kernel and a patch to the SMP
+  one (kernel.md, Two kernels). `KSRC`, `KOUT`, `KOUT_SMP` and `KW_BUILD`
+  point it at another tree and output root. Linux patches are in
+  `kernel/patches/linux/`, wasm-ld patches in `kernel/patches/llvm/`.
 - `vendor/` (gitignored) holds the kernel tree
   `vendor/src/linux-wasm-kernel` (branch `kw-riscv-user`), `vendor/src/llvm22`,
   the toolchain and all build outputs. Those branches exist only there, so
@@ -61,7 +64,8 @@ The parts that `ls` does not make obvious:
 ```sh
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
 zig build test              # emulator tests, native and wasm64, with and without the JIT
-kernel/build.sh kernel      # rebuild kwemu with the JIT, make vmlinux, lower, refresh the bundle
+kernel/build.sh kernel      # the UP kernel: kwemu with the JIT, vmlinux, lower, refresh the bundle
+kernel/build.sh smp         # the SMP kernel (kwemu with atomics); the bundle then gets the SMP patch
 pnpm install                # SDK and page dev dependencies
 node js/cli.ts              # boot Alpine from the bundle; --help lists options
 ```
@@ -125,7 +129,8 @@ Run the quick check for what you changed. The full matrix in
 | Host file systems (9p, `kw9p`) | `pnpm test:9p`; `pnpm test:api` (after a kw9p change, `kernel/build.sh alpine` first) |
 | Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh alpine` first) |
 | Network | `pnpm test:net` |
-| SMP (`CONFIG_SMP`, `js/core/cpu.ts`; kernel.md, SMP) | build it by hand (kernel.md, SMP); kwtest with `--kernel <its vmlinux32.wasm> --smp 2` (and once without `--smp`); `zig build test -Dkwemu-atomics=true` after a kwemu change |
+| SMP (`CONFIG_SMP`, `js/core/cpu.ts`; kernel.md, SMP), or any kernel change that SMP code sees | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--smp 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd alpine-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
+| Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |
 | Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
 
 The optional checks boot the same bundle as `pnpm test:api`, which already

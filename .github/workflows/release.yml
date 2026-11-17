@@ -26,9 +26,9 @@
 #   toolchain   the patched wasm-ld (~1 h to build on a 2-core runner);
 #               key: LLVM commit, kernel/patches/llvm
 #   linux-src   the patched kernel tree; key: base commit, kernel/patches/linux
-#   kernel-out  the kernel build directory, reused only with the same tree
-#               (same patches, clang and fake-llvm wrapper), so Kbuild
-#               rebuilds incrementally and never from a different source
+#   kernel-out  the UP and SMP kernel build directories, reused only with
+#               the same tree (same patches, clang and fake-llvm wrapper), so
+#               Kbuild rebuilds incrementally and never from a different source
 #   downloads   Alpine minirootfs and Binaryen (checksums are verified anyway)
 #   alpine-opt  the rebuilt busybox, zlib, openssl and apk-tools (installed
 #               files only, ~9 MB; ~4 min to rebuild); key: alpine-opt.sh,
@@ -214,25 +214,34 @@ jobs:
         id: kernel-out
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: vendor/build/kernel
+          path: |
+            vendor/build/kernel
+            vendor/build/kernel-smp
           key: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-${{ hashFiles('src/**', 'include/**', 'build.zig', 'build.zig.zon', 'kernel/build.sh') }}
           restore-keys: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-
 
       - name: Drop a kernel build that does not match the tree
         if: steps.linux-src.outputs.cache-hit != 'true'
-        run: rm -rf vendor/build/kernel
+        run: rm -rf vendor/build/kernel vendor/build/kernel-smp
 
       # build.sh would run `zig build` itself, whose native artifacts (unused
       # here) target the runner's CPU, and hosted runners vary in CPU model,
       # which invalidates that part of the zig cache. Build for a baseline
       # CPU instead and hand build.sh the library.
       - name: Build kwemu
-        run: zig build -Dkwemu-jit=true -Dcpu=baseline
+        run: |
+          zig build -Dkwemu-jit=true -Dcpu=baseline
+          zig build -Dkwemu-jit=true -Dkwemu-atomics=true -Dcpu=baseline --prefix vendor/build/kwemu-smp
 
-      - name: Build the kernel
+      # Both kernels of the one tree: the bundle carries the UP kernel and a
+      # patch to the SMP one (kernel/build.sh, bundle.mjs --smp).
+      - name: Build the kernels
         env:
           KWEMU: ${{ github.workspace }}/zig-out/lib/libkwemu.a
-        run: kernel/build.sh kernel
+          KWEMU_SMP: ${{ github.workspace }}/vendor/build/kwemu-smp/lib/libkwemu.a
+        run: |
+          kernel/build.sh kernel
+          kernel/build.sh smp
 
       - name: Save the kernel tree
         if: steps.linux-src.outputs.cache-hit != 'true'
@@ -244,7 +253,9 @@ jobs:
         if: steps.kernel-out.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: vendor/build/kernel
+          path: |
+            vendor/build/kernel
+            vendor/build/kernel-smp
           key: ${{ steps.kernel-out.outputs.cache-primary-key }}
 
       # busybox, zlib, openssl and apk-tools rebuilt for kwemu
@@ -264,6 +275,8 @@ jobs:
             vendor/downloads/alpine-opt/*/APKBUILD
           key: alpine-opt-${{ runner.os }}-${{ hashFiles('kernel/guest/alpine-opt.sh', 'kernel/tools/env.sh') }}
       - name: Build the Alpine initramfs, data disk template and bundle
+        env:
+          KW_SMP: "1" # the bundle must carry the SMP patch
         run: |
           kernel/build.sh alpine
           kernel/build.sh datadisk   # refreshes the bundle with the template
@@ -305,8 +318,19 @@ jobs:
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
 
+      - name: kwtest (SMP, 2 CPUs)
+        run: |
+          node js/cli.ts --timeout 900 --smp 2 --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+            --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
+          grep -q 'kwtest: 0 failure(s)' kwtest.log
+
       - name: Typecheck
         run: pnpm typecheck
+      - name: Kernel patch tests
+        env:
+          KPATCH_UP: vendor/build/kernel/vmlinux32.wasm
+          KPATCH_SMP: vendor/build/kernel-smp/vmlinux32.wasm
+        run: pnpm test:kpatch
       - name: SDK unit tests
         run: |
           pnpm test:tty

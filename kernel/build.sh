@@ -1,58 +1,100 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Build the unkernel kernel (wasm64 vmlinux with emulated riscv64 user mode),
-# its 32-bit-memory variant (the one the page and the bundle use), the
-# Alpine initramfs and disk images, and the single-file bundle; `ubuntu`
-# builds the Ubuntu Base disk image (not part of `all`).
+# Build the unkernel kernels (wasm64 vmlinux with emulated riscv64 user mode)
+# and their 32-bit-memory variants (the ones the page and the bundle use):
+# the UP kernel and the SMP kernel (CONFIG_SMP, one wasm instance per CPU on
+# a shared memory) from the same tree; the Alpine initramfs and disk
+# images, and the single-file bundle (the UP kernel, Alpine and a patch
+# from the UP to the SMP kernel); `ubuntu` builds the Ubuntu Base disk
+# image (not part of `all`).
 # ./setup.sh at the repository root checks the prerequisites and runs `all`.
 #
-#   kernel/build.sh [toolchain|binaryen|kernel|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]  (default: all)
+#   kernel/build.sh [toolchain|binaryen|kernel|smp|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]  (default: all)
 #
 # `all` is idempotent: finished steps are skipped or rebuilt incrementally, and
 # an existing vendor/build/disk/alpine.ext4 is kept (it may hold your changes;
-# `kernel/build.sh disk` rebuilds it).
+# `kernel/build.sh disk` rebuilds it). It builds both kernels (KW_SMP=0: the
+# UP kernel only).
+#
+# `kernel` builds the UP kernel only (the quick loop for kernel work), `smp`
+# the SMP kernel only (vendor/build/kernel-smp, with kwemu built with atomics
+# in vendor/build/kwemu-smp); each refreshes the bundle. The bundle carries
+# the patch to the SMP kernel when that kernel was built from the same tree
+# as the UP one (the kernels' banners, kernel/tools/bundle.mjs --smp), and
+# otherwise leaves it out with a warning (run `smp` after `kernel`).
 #
 # `stats` builds a profiling variant next to the normal outputs, which it
 # leaves alone: kwemu with -Dkwemu-stats (exit counters, the kw_debug_stats
-# export) in vendor/build/kwemu-stats, the kernel in vendor/build/kernel-stats
-# (the first run is a full kernel build) and the bundle
-# vendor/build/bundle/unkernel-alpine-stats.wasm. Boot it with
-# `node js/cli.ts --kernel vendor/build/bundle/unkernel-alpine-stats.wasm --stats`.
+# export) in vendor/build/kwemu-stats, the UP kernel in
+# vendor/build/kernel-stats (the first run is a full kernel build) and the
+# bundle vendor/build/bundle/unkernel-alpine-stats.wasm (no SMP patch). Boot
+# it with `node js/cli.ts --kernel vendor/build/bundle/unkernel-alpine-stats.wasm --stats`.
+#
+# Kernels are reproducible: two builds of the same tree with the same
+# toolchain are byte for byte the same (so is the bundle's SMP patch). The
+# banner (linux_banner, `uname -v`) has fixed stamps instead of the user,
+# host, build count and time: (unkernel@unkernel), the build id as the build
+# "number" (#<12 hex digits>: a hash of the kernel tree with its uncommitted
+# changes, the kwemu sources, the wasm-ld patches and the zig version, so
+# every other build of the kernel module has another banner, which is what a
+# snapshot is matched against), and the date of the newest commit (author
+# date) on the kernel tree. KBUILD_BUILD_USER, _HOST, _VERSION and
+# _TIMESTAMP in the environment take precedence.
 #
 # Everything large lives under vendor/ (gitignored):
 #   vendor/src/llvm22               llvm-project llvmorg-22.1.8 (sparse: llvm, lld)
 #   vendor/build/lld22              wasm-ld with kernel/patches/llvm applied
 #   vendor/src/linux-wasm-kernel    Linux at $LINUX_BASE (kernel.org) + kernel/patches/linux
 #                                   (branch kw-riscv-user)
-#   vendor/build/kernel             kernel build output (vmlinux = the wasm64 module,
+#   vendor/build/kernel             UP kernel build output (vmlinux = the wasm64 module,
 #                                   vmlinux32.wasm = the same lowered to a 32-bit memory/table,
 #                                   the default for the browser page)
+#   vendor/build/kernel-smp         SMP kernel build output (kw_defconfig + kw_smp.config),
+#                                   and up.kwpatch, the UP->SMP patch the last bundle used
+#   vendor/build/kwemu-smp          kwemu built with atomics, for the SMP kernel
 #   vendor/toolchain/binaryen       Binaryen release (wasm-opt), fetched by `binaryen`
 #   vendor/build/disk/alpine.ext4   Alpine root file system image for kwblk (`disk`)
 #   vendor/build/disk/kwdata.kwsparse.gz  empty ext4 "kwdata" data disk template (`datadisk`)
 #   vendor/build/disk/ubuntu.ext4  Ubuntu Base 24.04 root file system image (`ubuntu`)
 #   vendor/build/initramfs/         alpine.cpio (also holds /usr/bin/kwtest and kwbench)
 #   vendor/build/bundle/            unkernel-alpine.wasm (vmlinux32.wasm + alpine.cpio + cmdline
-#                                   + the data disk template in custom sections); the default of
-#                                   the CLI (js/cli.ts) and the SDK, and copied to web/kernel/
-#                                   for the page's dev server; unkernel-alpine-stats.wasm from `stats`
+#                                   + the data disk template + the SMP patch in custom sections);
+#                                   the default of the CLI (js/cli.ts) and the SDK, and copied to
+#                                   web/kernel/ for the page's dev server;
+#                                   unkernel-alpine-stats.wasm from `stats`
 #
 # Environment:
-#   KWEMU=path     wasm64 kwemu static library (default: zig-out/lib/libkwemu.a,
-#                  rebuilt with `zig build` on every run; set KWEMU=none for the stub)
-#   KWEMU_JIT=0    build that library without the JIT tier (default 1: -Dkwemu-jit=true,
+#   KW_BUILD=dir   build output root instead of vendor/build (every output above but
+#                  the toolchain's vendor/build/lld22; alpine-opt.sh's package rebuild
+#                  also stays in vendor/build/alpine-opt, a cache that its stamp keys),
+#                  e.g. with KSRC to build a branch without touching the main outputs.
+#                  The CLI, the SDK build and the tests read vendor/build: give them
+#                  paths (--kernel, --initrd, UNKERNEL_TEST_KERNEL, KW_KERNEL)
+#   KW_SMP=1|0     1: the bundle must carry the SMP patch (fail otherwise); 0: no SMP
+#                  kernel in `all` and no patch in the bundle. Default: `all` builds
+#                  both and requires it, every other step adds it when it matches
+#   KWEMU=path     wasm64 kwemu static library for the UP kernel (default:
+#                  zig-out/lib/libkwemu.a, rebuilt with `zig build` on every run;
+#                  set KWEMU=none for the stub)
+#   KWEMU_SMP=path the same for the SMP kernel, built with -Dkwemu-atomics=true
+#                  (default: vendor/build/kwemu-smp/lib/libkwemu.a, rebuilt on every run).
+#                  Libraries given here count as built from this checkout with the
+#                  default options (the build id hashes the sources, not the library)
+#   KWEMU_JIT=0    build those libraries without the JIT tier (default 1: -Dkwemu-jit=true,
 #                  the kernel then imports unkernel.kw_host_jit_*; ignored with KWEMU=)
-#   KWEMU_STATS=1  build that library with -Dkwemu-stats into vendor/build/kwemu-stats
+#   KWEMU_STATS=1  build the UP library with -Dkwemu-stats into vendor/build/kwemu-stats
 #                  (what `stats` sets; ignored with KWEMU=)
 #   JOBS=n         parallelism (default: nproc)
 #   KSRC=dir       kernel source tree, e.g. a git worktree (default: vendor/src/linux-wasm-kernel)
-#   KOUT=dir       kernel build output (default: vendor/build/kernel)
+#   KOUT=dir       UP kernel build output (default: vendor/build/kernel)
+#   KOUT_SMP=dir   SMP kernel build output (default: vendor/build/kernel-smp)
+#   LINUX_REPO=url where a fresh kernel tree fetches $LINUX_BASE from (default: kernel.org)
 #   WASM_OPT=path  wasm-opt for the 32-bit lowering (default: vendor/toolchain/binaryen,
-#                  then PATH); `lower` redoes only that step on an existing vmlinux
+#                  then PATH); `lower` redoes only that step on existing vmlinux files
 set -euo pipefail
 
-. "$(dirname "$0")/tools/env.sh"   # root, vendor, zig, pins, real_bin, ...
+. "$(dirname "$0")/tools/env.sh"   # root, vendor, build, zig, pins, real_bin, ...
 jobs="${JOBS:-$(nproc)}"
 what="${1:-all}"
 use_real_host_tools
@@ -60,7 +102,7 @@ use_real_host_tools
 # Kernel base: Linux v7.3.4 from kernel.org, fetched by exact commit (shallow).
 # arch/wasm is based on Joel Severin's linux-wasm (joelseverin/linux, branch
 # wasm-7.0); see .agents/kernel.md.
-LINUX_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+LINUX_REPO="${LINUX_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
 LINUX_BASE=7595a62d45ee1a2297eafa5f2ef5d0a45142d84d
 LLVM_REPO=https://github.com/llvm/llvm-project.git
 LLVM_TAG=llvmorg-22.1.8
@@ -70,7 +112,8 @@ BINARYEN_SHA256_x86_64=2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af479778
 BINARYEN_SHA256_aarch64=89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d427f299bf8
 
 ksrc="${KSRC:-$vendor/src/linux-wasm-kernel}"
-kout="${KOUT:-$vendor/build/kernel}"
+kout="${KOUT:-$build/kernel}"
+kout_smp="${KOUT_SMP:-$build/kernel-smp}"
 toolchain="$vendor/toolchain/bin"
 
 need_clang() {
@@ -141,13 +184,14 @@ prepare_kernel_tree() {
 		git_am "$ksrc" "$root"/kernel/patches/linux/*.patch
 		git -C "$ksrc" checkout -q -b kw-riscv-user
 	fi
-	# An existing branch is never re-applied: say so when it no longer
+	# An existing branch is never re-applied: say so when what is checked
+	# out (kw-riscv-user, or the branch of a KSRC worktree) no longer
 	# matches the series (an older series, or commits not yet exported).
 	local npatch ncommit
 	npatch=$(ls "$root"/kernel/patches/linux/*.patch | wc -l)
-	ncommit=$(git -C "$ksrc" rev-list --count "$LINUX_BASE..kw-riscv-user" 2>/dev/null || echo "?")
+	ncommit=$(git -C "$ksrc" rev-list --count "$LINUX_BASE..HEAD" 2>/dev/null || echo "?")
 	if [ "$npatch" != "$ncommit" ]; then
-		echo "warning: kw-riscv-user has $ncommit commits, kernel/patches/linux has $npatch patches;" >&2
+		echo "warning: $ksrc has $ncommit commits on $LINUX_BASE, kernel/patches/linux has $npatch patches;" >&2
 		echo "  export your commits, or rename the branch (git -C $ksrc branch -m kw-riscv-user old) to re-apply the series" >&2
 	fi
 	# The emulator contract (include/kw_emu.h) is the source of truth; the
@@ -166,23 +210,29 @@ kwemu_jit_flag() {
 	if [ "${KWEMU_JIT:-1}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi
 }
 
+# kwemu_obj up|smp: the kwemu library to link into that kernel (empty for
+# the stub). The SMP kernel's is built with atomics (kernel.md, SMP), into
+# its own prefix, as a stats library is, so zig-out keeps the normal one.
 kwemu_obj() {
-	# A stats library goes to its own prefix, so zig-out keeps the normal one.
-	local prefix="$root/zig-out" stats=()
-	if [ "${KWEMU_STATS:-0}" = 1 ]; then
-		prefix="$vendor/build/kwemu-stats"
-		stats=(-Dkwemu-stats=true)
+	local prefix="$root/zig-out" flags=() k="${KWEMU:-}"
+	if [ "$1" = smp ]; then
+		prefix="$build/kwemu-smp"
+		flags=(-Dkwemu-atomics=true)
+		k="${KWEMU_SMP:-}"
+	elif [ "${KWEMU_STATS:-0}" = 1 ]; then
+		prefix="$build/kwemu-stats"
+		flags=(-Dkwemu-stats=true)
 	fi
-	local k="${KWEMU:-$prefix/lib/libkwemu.a}"
 	if [ "$k" = none ]; then
 		echo ""
 		return
 	fi
-	if [ -z "${KWEMU:-}" ]; then
+	if [ -z "$k" ]; then
 		# Always run it: zig build is incremental and keeps libkwemu.a current
 		# (also after a `zig build` or `zig build test` without the JIT option).
 		need_zig
-		(cd "$root" && "$zig" build "$(kwemu_jit_flag)" "${stats[@]}" --prefix "$prefix" >&2) || return 1
+		(cd "$root" && "$zig" build "$(kwemu_jit_flag)" "${flags[@]}" --prefix "$prefix" >&2) || return 1
+		k="$prefix/lib/libkwemu.a"
 	fi
 	if [ ! -f "$k" ]; then
 		echo "no kwemu library at $k (KWEMU=none links a stub that cannot run user code)" >&2
@@ -191,23 +241,108 @@ kwemu_obj() {
 	echo "$k"
 }
 
+# digest_files DIR PATH...: sha256 lines of the files under PATH (tracked or
+# untracked but not ignored, when DIR is a git checkout).
+digest_files() {
+	local dir="$1"
+	shift
+	(
+		cd "$dir"
+		if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+			git --no-optional-locks ls-files -z -co --exclude-standard -- "$@"
+		else
+			find "$@" -type f ! -path '*/__pycache__/*' -print0 2>/dev/null | sort -z
+		fi | xargs -0r sha256sum 2>/dev/null || true
+	)
+}
+
+# kernel_stamps: export the fixed build stamps (KBUILD_BUILD_*; see the top
+# of this file), unless the environment has them. Both kernels of a tree get
+# the same ones, so their banners differ only in "SMP".
+kernel_stamps() {
+	[ -z "${stamps_done:-}" ] || return 0
+	stamps_done=1
+	local id when
+	id="$(
+		{
+			echo "tree $(git -C "$ksrc" rev-parse 'HEAD^{tree}')"
+			git -C "$ksrc" --no-optional-locks diff --binary HEAD
+			(cd "$ksrc" && git --no-optional-locks ls-files -z -o --exclude-standard | xargs -0r sha256sum)
+			digest_files "$root" src include build.zig build.zig.zon kernel/patches/llvm kernel/tools/fake-llvm
+			echo "zig $("${zig:-zig}" version 2>/dev/null) jit ${KWEMU_JIT:-1} stats ${KWEMU_STATS:-0}"
+		} | sha256sum | cut -c1-12
+	)"
+	when="$({
+		git -C "$ksrc" log -1 --format=%at "$LINUX_BASE"
+		git -C "$ksrc" log --format=%at "$LINUX_BASE..HEAD"
+	} | sort -n | tail -1)"
+	export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-unkernel}"
+	export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-unkernel}"
+	export KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION:-$id}"
+	export KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP:-$(LC_ALL=C date -u -d "@$when")}"
+	echo "kernel stamps: #$KBUILD_BUILD_VERSION $KBUILD_BUILD_TIMESTAMP ($KBUILD_BUILD_USER@$KBUILD_BUILD_HOST)"
+}
+
+# check_config OUT FRAGMENT...: every option the fragments set (a later one
+# wins) must be in OUT/.config as written. Kconfig drops an option whose
+# dependencies are not met without a word.
+check_config() {
+	local out="$1" bad
+	shift
+	bad="$(cd "$ksrc/arch/wasm/configs" && awk -v cfg="$out/.config" '
+		function key(l) {
+			if (l ~ /^CONFIG_[A-Za-z0-9_]+=/) { sub(/=.*/, "", l); return l }
+			if (l ~ /^# CONFIG_[A-Za-z0-9_]+ is not set$/) { l = substr(l, 3); sub(/ is not set$/, "", l); return l }
+			return ""
+		}
+		{ k = key($0) }
+		k == "" { next }
+		FILENAME != cfg { want[k] = $0; next }
+		{ have[k] = $0 }
+		END {
+			for (k in want) {
+				w = want[k]; h = (k in have) ? have[k] : "# " k " is not set"
+				if (w ~ /^#/ ? h !~ /^#/ : w != h) print "  " w " (.config: " h ")"
+			}
+		}' "$@" "$out/.config")"
+	if [ -n "$bad" ]; then
+		echo "$out/.config lacks what $* set (dependencies not met?):" >&2
+		echo "$bad" >&2
+		return 1
+	fi
+}
+
+# build_kernel [up|smp]: the UP kernel (kw_defconfig) into KOUT, or the SMP
+# kernel (kw_defconfig + kw_smp.config, kwemu with atomics) into KOUT_SMP,
+# from the same tree, then lowered (vmlinux32.wasm).
 build_kernel() {
+	local variant="${1:-up}" out="$kout" frags=(kw_defconfig) f stale= kwemu
+	if [ "$variant" = smp ]; then
+		out="$kout_smp"
+		frags+=(kw_smp.config)
+	fi
 	[ -x "$toolchain/wasm-ld" ] || build_toolchain
 	prepare_kernel_tree
-	local kwemu
-	kwemu="$(kwemu_obj)" || exit 1
-	local make_cmd=(make -C "$ksrc" O="$kout" ARCH=wasm
+	kernel_stamps
+	kwemu="$(kwemu_obj "$variant")" || exit 1
+	local make_cmd=(make -C "$ksrc" O="$out" ARCH=wasm
 		LLVM="$root/kernel/tools/fake-llvm/" REAL_LLVM="$toolchain/"
 		CROSS_COMPILE=wasm64-unknown-unknown- HOSTCC=gcc KWEMU="$kwemu")
 	# The wrapper (python3) and Kbuild find clang/wasm-ld through REAL_LLVM.
-	mkdir -p "$kout"
-	# (Re)configure when there is no .config or kw_defconfig changed since.
-	if [ ! -f "$kout/.config" ] || [ "$ksrc/arch/wasm/configs/kw_defconfig" -nt "$kout/.config" ]; then
-		"${make_cmd[@]}" kw_defconfig
+	mkdir -p "$out"
+	# (Re)configure when there is no .config or a fragment changed since, and
+	# then check the result.
+	[ -f "$out/.config" ] || stale=1
+	for f in "${frags[@]}"; do
+		[ "$ksrc/arch/wasm/configs/$f" -nt "$out/.config" ] && stale=1
+	done
+	if [ -n "$stale" ]; then
+		"${make_cmd[@]}" "${frags[@]}"
+		check_config "$out" "${frags[@]}" || exit 1
 	fi
 	"${make_cmd[@]}" -j"$jobs" vmlinux
-	echo "kernel: $kout/vmlinux"
-	lower_kernel
+	echo "kernel ($variant): $out/vmlinux"
+	lower_kernel "$out"
 }
 
 # Binaryen release binaries (wasm-opt) into vendor/toolchain/binaryen.
@@ -247,16 +382,17 @@ find_wasm_opt() {
 # every load/store, memory and table op wraps its address to i32, which is
 # exact because guest RAM is < 4 GiB. The import/export signatures (and with
 # them JSPI) are unchanged. Fetches the pinned Binaryen if there is no wasm-opt.
+# $1: the kernel build output (default KOUT).
 lower_kernel() {
-	local wasm_opt
+	local k="${1:-$kout}" wasm_opt
 	wasm_opt="$(find_wasm_opt)"
 	[ -n "$wasm_opt" ] || { fetch_binaryen && wasm_opt="$(find_wasm_opt)"; } || true
 	if [ -z "$wasm_opt" ]; then
 		echo "lower: no wasm-opt with --table64-lowering (run '$0 binaryen' or set WASM_OPT);" >&2
 		echo "  the browser page and the bundle need vmlinux32.wasm" >&2
-		if [ -f "$kout/vmlinux32.wasm" ] && [ "$kout/vmlinux" -nt "$kout/vmlinux32.wasm" ]; then
-			rm -f "$kout/vmlinux32.wasm"
-			echo "  removed the stale $kout/vmlinux32.wasm (older than vmlinux)" >&2
+		if [ -f "$k/vmlinux32.wasm" ] && [ "$k/vmlinux" -nt "$k/vmlinux32.wasm" ]; then
+			rm -f "$k/vmlinux32.wasm"
+			echo "  removed the stale $k/vmlinux32.wasm (older than vmlinux)" >&2
 		fi
 		return 1
 	fi
@@ -264,29 +400,52 @@ lower_kernel() {
 	# In current Binaryen --table64-lowering is an alias of --memory64-lowering
 	# (which lowers both); giving both is harmless (identical output) and also
 	# covers releases where they were separate passes.
-	"$wasm_opt" "$kout/vmlinux" -g --memory64-lowering --table64-lowering -o "$kout/vmlinux32.wasm.tmp"
-	mv "$kout/vmlinux32.wasm.tmp" "$kout/vmlinux32.wasm"
-	echo "kernel (32-bit memory): $kout/vmlinux32.wasm ($("$wasm_opt" --version))"
+	"$wasm_opt" "$k/vmlinux" -g --memory64-lowering --table64-lowering -o "$k/vmlinux32.wasm.tmp"
+	mv "$k/vmlinux32.wasm.tmp" "$k/vmlinux32.wasm"
+	echo "kernel (32-bit memory): $k/vmlinux32.wasm ($("$wasm_opt" --version))"
 }
 
-# A single-file kernel (the 32-bit-memory build) with Alpine (gzipped) and its
-# command line bundled in custom sections; the runtime boots it when given no
-# initrd of its own.
-# $1: the bundle's file name (default unkernel-alpine.wasm).
+# The bundle's SMP options (bundle.mjs): the SMP kernel and the file that
+# caches the patch to it (reused while both kernels are the same). Unless
+# KW_SMP=1 a kernel that does not match the UP one (another build of the
+# tree) is left out with a warning (--smp-optional).
+smp_bundle_args() {
+	[ "${KW_SMP:-}" != 0 ] || return 0
+	if [ -f "$kout_smp/vmlinux32.wasm" ]; then
+		printf '%s\n' --smp "$kout_smp/vmlinux32.wasm" --smp-patch "$kout_smp/up.kwpatch"
+		[ "${KW_SMP:-}" = 1 ] || echo --smp-optional
+	elif [ "${KW_SMP:-}" = 1 ]; then
+		echo "bundle: no SMP kernel $kout_smp/vmlinux32.wasm (run '$0 smp'; KW_SMP=1)" >&2
+		return 1
+	else
+		echo "bundle: no SMP kernel ($kout_smp; '$0 smp' builds it), so no SMP patch" >&2
+	fi
+}
+
+# A single-file kernel (the 32-bit-memory build) with Alpine (gzipped), its
+# command line, the data disk template and the patch to the SMP kernel
+# bundled in custom sections; the runtime boots it when given no initrd of
+# its own.
+# $1: the bundle's file name (default unkernel-alpine.wasm; another name,
+# the stats bundle, gets no SMP patch).
 bundle_alpine() {
-	local out="$vendor/build/bundle" cpio="$vendor/build/initramfs/alpine.cpio" name="${1:-unkernel-alpine.wasm}"
+	local out="$build/bundle" cpio="$build/initramfs/alpine.cpio" name="${1:-unkernel-alpine.wasm}"
 	[ -f "$cpio" ] || { echo "bundle: no $cpio (run '$0 alpine')" >&2; return 1; }
 	[ -f "$kout/vmlinux32.wasm" ] || { echo "bundle: no $kout/vmlinux32.wasm (run '$0 lower')" >&2; return 1; }
 	mkdir -p "$out"
 	rm -f "$out/unkernel-alpine32.wasm"   # earlier name of this bundle
-	local dd=() tpl="$vendor/build/disk/kwdata.kwsparse.gz"
+	local dd=() smp=() args tpl="$build/disk/kwdata.kwsparse.gz"
 	if [ -f "$tpl" ]; then
 		dd=(--datadisk "$tpl")
 	else
 		echo "warning: no $tpl ('$0 datadisk' needs mke2fs); the bundle has no data disk template" >&2
 	fi
+	if [ "$name" = unkernel-alpine.wasm ]; then
+		args="$(smp_bundle_args)" || return 1
+		[ -z "$args" ] || mapfile -t smp <<< "$args"
+	fi
 	node "$root/kernel/tools/bundle.mjs" "$kout/vmlinux32.wasm" "$cpio" -o "$out/$name" \
-		--cmdline "console=hvc0 rdinit=/init" "${dd[@]}"
+		--cmdline "console=hvc0 rdinit=/init" "${dd[@]}" "${smp[@]}"
 	# The page's dev server runs web/kernel/'s copy (web/scripts/kernel.ts);
 	# a page build replaces it with the newest release's.
 	if [ "$name" = unkernel-alpine.wasm ]; then
@@ -310,7 +469,7 @@ DATADISK_UUID=6b776461-7461-4000-8000-000000000001
 DATADISK_HASH_SEED=6b776461-7461-4000-8000-000000000002
 DATADISK_EPOCH=1767225600   # 2026-01-01T00:00:00Z
 build_datadisk() {
-	local out="$vendor/build/disk" mke2fs e2fsck
+	local out="$build/disk" mke2fs e2fsck
 	mke2fs="$(PATH="$PATH:/usr/sbin:/sbin" command -v mke2fs || true)"
 	e2fsck="$(PATH="$PATH:/usr/sbin:/sbin" command -v e2fsck || true)"
 	if [ -z "$mke2fs" ]; then
@@ -344,13 +503,13 @@ build_datadisk() {
 # After a kernel or Alpine rebuild: keep the bundle (the default of the CLI,
 # the SDK and the page) in step, when both inputs exist.
 refresh_bundle() {
-	[ -f "$vendor/build/initramfs/alpine.cpio" ] && [ -f "$kout/vmlinux32.wasm" ] || return 0
+	[ -f "$build/initramfs/alpine.cpio" ] && [ -f "$kout/vmlinux32.wasm" ] || return 0
 	bundle_alpine
 }
 
 # The disk image is kept if it is newer than everything it is built from.
 disk_is_current() {
-	local img="$vendor/build/disk/alpine.ext4" f
+	local img="$build/disk/alpine.ext4" f
 	[ -f "$img" ] || return 1
 	for f in "$root/kernel/guest/alpine-disk.sh" "$root/kernel/guest/alpine.sh" \
 		"$root/kernel/guest/curl-shim.sh" "$root/kernel/guest/kw-data.sh" "$root/kernel/tools/ext4-owners.py" \
@@ -362,8 +521,13 @@ disk_is_current() {
 case "$what" in
 toolchain) build_toolchain ;;
 binaryen) fetch_binaryen ;;
-kernel) build_kernel; refresh_bundle ;;
-lower) lower_kernel; refresh_bundle ;;
+kernel) build_kernel up; refresh_bundle ;;
+smp) build_kernel smp; refresh_bundle ;;
+lower)
+	lower_kernel "$kout"
+	if [ -f "$kout_smp/vmlinux" ]; then lower_kernel "$kout_smp"; fi
+	refresh_bundle
+	;;
 alpine) "$root/kernel/guest/alpine.sh"; refresh_bundle ;;
 disk) "$root/kernel/guest/alpine-disk.sh" ;;
 datadisk) build_datadisk; refresh_bundle ;;
@@ -371,22 +535,26 @@ bundle) bundle_alpine ;;
 ubuntu) "$root/kernel/guest/ubuntu-disk.sh" ;;
 stats)
 	KWEMU_STATS=1
-	kout="${KOUT:-$vendor/build/kernel-stats}"
-	build_kernel
+	kout="${KOUT:-$build/kernel-stats}"
+	build_kernel up
 	bundle_alpine unkernel-alpine-stats.wasm
 	;;
 all)
-	build_kernel
+	build_kernel up
+	if [ "${KW_SMP:-}" != 0 ]; then
+		build_kernel smp
+		KW_SMP=1   # so the bundle must carry the patch
+	fi
 	"$root/kernel/guest/alpine.sh"
 	build_datadisk || true   # without mke2fs: a bundle without the data disk
 	bundle_alpine
 	if disk_is_current; then
-		echo "disk: keeping $vendor/build/disk/alpine.ext4 (kernel/build.sh disk rebuilds it)"
+		echo "disk: keeping $build/disk/alpine.ext4 (kernel/build.sh disk rebuilds it)"
 	elif PATH="$PATH:/usr/sbin:/sbin" command -v mke2fs >/dev/null; then
 		"$root/kernel/guest/alpine-disk.sh"
 	else
 		echo "warning: no mke2fs (e2fsprogs); skipping the disk image" >&2
 	fi
 	;;
-*) echo "usage: $0 [toolchain|binaryen|kernel|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]" >&2; exit 2 ;;
+*) echo "usage: $0 [toolchain|binaryen|kernel|smp|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]" >&2; exit 2 ;;
 esac

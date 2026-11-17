@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # Set up unkernel from a fresh clone: check prerequisites, then build
-# everything (kwemu, patched wasm-ld, kernel + 32-bit-memory variant,
-# Alpine initramfs and bundle, Alpine disk image). The browser page (web/)
+# everything (kwemu, patched wasm-ld, the UP and SMP kernels + their
+# 32-bit-memory variants, Alpine initramfs and the bundle with the patch
+# to the SMP kernel, Alpine disk image). The browser page (web/)
 # needs its npm dependencies, which this script does not install: run
 # pnpm install, then pnpm dev.
 #
@@ -11,7 +12,7 @@
 #   ./setup.sh --check   only check prerequisites
 #
 # Environment: JOBS=n (parallelism), ZIG=/path/to/zig, KWEMU_JIT=0 (kwemu
-# without its JIT tier; see kernel/build.sh). Downloads go to
+# without its JIT tier), KW_SMP=0 (no SMP kernel; see kernel/build.sh). Downloads go to
 # vendor/ (gitignored); nothing is installed outside the repository and
 # nothing runs as root. Missing system packages are reported, not installed.
 set -euo pipefail

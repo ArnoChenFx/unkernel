@@ -27,11 +27,11 @@ set -euo pipefail
 
 . "$(dirname "$0")/../tools/env.sh"   # root, zig, ALPINE_*, fetch_verified, need_zig
 need_zig
-out="$root/vendor/build/initramfs"
+out="$build/initramfs"
 dl="$root/vendor/downloads"
 mkdir -p "$out" "$dl"
 # Images of the test and busybox root fs variants, which no longer exist.
-rm -rf "$out"/{test,busybox}{.cpio,-root} "$root/vendor/build/busybox-riscv64"
+rm -rf "$out"/{test,busybox}{.cpio,-root} "$build/busybox-riscv64"
 
 # ALPINE_TARBALL=file overrides the pinned release (tools/env.sh).
 if [ -z "${ALPINE_TARBALL:-}" ]; then

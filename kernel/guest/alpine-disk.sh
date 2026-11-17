@@ -12,7 +12,7 @@
 set -euo pipefail
 
 . "$(dirname "$0")/../tools/env.sh"   # root, ALPINE_*, fetch_verified
-out="$root/vendor/build/disk"
+out="$build/disk"
 dl="$root/vendor/downloads"
 size="${DISK_SIZE:-512M}"
 mkdir -p "$out" "$dl"

@@ -569,9 +569,8 @@ third-party implementation.
 A second build of the same tree: `make kw_defconfig kw_smp.config` (SMP,
 `NR_CPUS` 8), which also links with `--shared-memory` (arch Makefile),
 with kwemu built by `zig build -Dkwemu-jit=true -Dkwemu-atomics=true`.
-The build script has no target for it yet: run make by hand into a
-`KOUT` of its own with the script's make variables and `KWEMU=` that
-kwemu, then lower it as `lower` does. The UP build does not change
+`kernel/build.sh smp` does that into `vendor/build/kernel-smp` (Two
+kernels, below). The UP build does not change
 (every SMP piece is `#ifdef CONFIG_SMP` or compiles away). Status,
 numbers and open issues: status.md item 8.
 
@@ -921,6 +920,66 @@ default and `createKernel()` all use it. `vmlinux` stays the build input
 and the reference (`--kernel vendor/build/kernel/vmlinux`). `lower` is
 required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
 `--table64-lowering`.
+
+## Two kernels: UP and SMP
+
+One tree, two configs, two output directories: `kernel/build.sh kernel`
+builds the UP kernel into `vendor/build/kernel` (`KOUT`), `smp` the SMP
+kernel into `vendor/build/kernel-smp` (`KOUT_SMP`) with kwemu built with
+atomics in `vendor/build/kwemu-smp` (`KWEMU_SMP=` takes a prebuilt one);
+each is lowered, and `all` builds both (`KW_SMP=0`: UP only). `kernel`
+stays the quick loop and never builds SMP. A step reconfigures when a
+fragment (`kw_defconfig`, `kw_smp.config`) is newer than `.config` and
+then checks that every option the fragments set is in `.config` as
+written, failing with the list otherwise (Kconfig drops options whose
+dependencies are not met silently; both configs pass as of 2026-11-17).
+
+- **The bundle** (`bundle_alpine`, `kernel/tools/bundle.mjs --smp`)
+  carries the UP kernel and a patch to the SMP kernel (js.md, CPU
+  threads). bundle.mjs refuses two kernels that are not the UP and SMP
+  builds of one tree: their banners must differ only in `SMP` (with the
+  stamps below that means the same tree, kwemu sources and toolchain),
+  kwemu's `kw_abi_version()` must return the same constant, only the SMP
+  one may import `wasm_cpu_start`, and both must have the same memory
+  index type. Every step that refreshes the bundle (`kernel`, `smp`,
+  `lower`, `alpine`, `datadisk`, `bundle`) adds the patch when the SMP
+  kernel exists and matches, and otherwise warns and leaves it out
+  (`--smp-optional`), so after a tree change `kernel` gives a bundle
+  without the patch until `smp` runs. `KW_SMP=1` (and `all`) makes a
+  missing or mismatched SMP kernel an error; `KW_SMP=0` leaves the patch
+  out. Making the patch takes about 15 s, so it is cached in
+  `vendor/build/kernel-smp/up.kwpatch` (`--smp-patch`: reused when its
+  header's SHA-256s are those of the two kernels, else made again).
+- **Build stamps.** Kernels are reproducible: the same tree, kwemu
+  sources and toolchain give the same bytes, and so the same patch
+  (2026-11-17: two clean builds of each kernel into different output
+  roots, and the bundles made from them, were byte-identical; with the
+  stamps of a hand build the UP and SMP kernels were byte-identical to
+  it). `kernel_stamps` exports `KBUILD_BUILD_USER` and `_HOST`
+  (`unkernel`), `_VERSION` (the build id: 12 hex digits of a hash of the
+  kernel tree's HEAD tree, its uncommitted and untracked changes, the
+  repository's `src`, `include`, `build.zig*`, `kernel/patches/llvm`
+  and `kernel/tools/fake-llvm`, the zig version and the JIT and stats
+  options) and `_TIMESTAMP` (the newest author date on the tree, which a
+  fresh `git am` of the series reproduces), unless the environment sets
+  them. The banner then reads `Linux version 7.3.4+ (unkernel@unkernel)
+  (clang ..., LLD ...) #<id> [SMP] <date>`. The build id matters beyond
+  pairing: a snapshot is matched to its kernel by `linux_banner`
+  (Parking), so every build whose module may differ needs another
+  banner, and a fixed `#1` would let a snapshot restore into another
+  build of the same date. A different clang or wasm-ld changes the
+  banner through its compiler line. Libraries given as `KWEMU=` or
+  `KWEMU_SMP=` count as built from the checkout's sources.
+- **Overrides**: `KSRC` (the tree), `KOUT`, `KOUT_SMP`, and `KW_BUILD`
+  (the output root, default `vendor/build`: kernels, kwemu-smp and
+  kwemu-stats, initramfs, disks, bundle; the toolchain's
+  `vendor/build/lld22` and alpine-opt.sh's package cache stay). The CLI,
+  `pnpm build` and the tests read `vendor/build`, so pass them paths.
+  `LINUX_REPO` names where a fresh tree fetches the base commit from.
+- On a fresh clone `prepare_kernel_tree` applies the whole series (UP and
+  SMP patches alike) as `kw-riscv-user`; it warns when the checked-out
+  HEAD of `KSRC` has another number of commits than the series has
+  patches.
 
 ## Kernel tests
 

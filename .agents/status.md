@@ -384,15 +384,11 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      by hand on a deployed build in desktop Chrome, Firefox and on iOS.
      Not tried: desktop Safari, Android, a hidden tab (worker
      throttling), long sessions. The page offers it
-     only once a release bundle carries the SMP patch (Packaging, below).
-   - Packaging: one bundle carries the UP kernel and a patch to the SMP
-     one (`kernel/tools/bundle.mjs --smp`; js.md, CPU threads; web.md for
-     the page's split; study and sizes in
-     `vendor/smp-deferred/packaging/README.md`, 2026-11-17). Not done:
-     `kernel/build.sh` has no SMP target and `bundle` no `--smp`, so the
-     release workflow (and with it npm and the page, whose CPUs option
-     stays disabled) still ships UP only;
-     the README there has the proposal.
+     only once a release bundle carries the SMP patch (the next release:
+     `kernel/build.sh` builds both kernels and the bundle with the patch,
+     kernel.md, Two kernels, and the release workflow runs it). That
+     workflow's SMP steps are unexercised (testing.md, Release workflow,
+     says what they still need).
    - Deferred fork and wakeup changes, measured 2026-11-16 (kwfork,
      9 alternating rounds; patches and a README with their base in
      `vendor/smp-deferred/`, which is gitignored like all of vendor):

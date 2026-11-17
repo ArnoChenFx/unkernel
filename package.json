@@ -53,6 +53,7 @@
     "test:tty": "node --test test/tty.test.ts",
     "test:9p": "node --test test/9p.test.ts",
     "test:http": "node --test test/http.test.ts",
+    "test:kpatch": "node --test test/kpatch.test.ts",
     "test:wasi": "node test/wasi-node.ts",
     "test:api": "node --test test/api.test.ts",
     "unkernel": "node js/cli.ts",

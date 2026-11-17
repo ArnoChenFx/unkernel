@@ -20,7 +20,10 @@ repository root. Commands are run from the repository root.
 and `kernel/build.sh all`. By hand:
 
 ```sh
-kernel/build.sh all          # wasm-ld 22, Binaryen, kernel + vmlinux32.wasm, Alpine initramfs + bundle, disk
+kernel/build.sh all          # wasm-ld 22, Binaryen, UP and SMP kernels + vmlinux32.wasm, Alpine initramfs + bundle, disk
+kernel/build.sh kernel       # the UP kernel only (the quick loop), then the bundle
+kernel/build.sh smp          # the SMP kernel (vendor/build/kernel-smp), then the bundle with the SMP patch
+node js/cli.ts --smp 2 --append "console=hvc0 rdinit=/usr/bin/kwtest"   # kwtest on the SMP kernel from the bundle, 2 CPUs
 node js/cli.ts                                                  # Alpine (the bundle), interactive; Ctrl-] quits
 node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"   # kwtest smoke test as /init (the bundle)
 node js/cli.ts --kernel vendor/build/kernel/vmlinux --append "console=hvc0 rdinit=/usr/bin/kwtest"   # same tests on the wasm64 build
@@ -47,8 +50,8 @@ node test/overlay-node.mjs   # the overlay root under Node: persistence, kw.root
 ```
 
 `build.sh` steps, each also available on its own (`toolchain`, `binaryen`,
-`kernel`, `lower`, `alpine`, `disk`, `datadisk`, `bundle`; `ubuntu` is
-separate and not part of `all`):
+`kernel`, `smp`, `lower`, `alpine`, `disk`, `datadisk`, `bundle`; `ubuntu`
+and `stats` are separate and not part of `all`):
 
 * **toolchain**: sparse-clones `llvmorg-22.1.8` (commit checked), applies
   `patches/llvm/`, and builds `wasm-ld` only. The patches are Joel's GNU-ld linker-script support
@@ -67,7 +70,17 @@ separate and not part of `all`):
   takes a prebuilt library as is); with `KWEMU=none` a stub is linked
   instead. `include/kw_emu.h` is copied over the kernel's
   `arch/wasm/include/asm/kw_emu.h` (with a warning) if the two differ. It
-  then runs `lower`.
+  then runs `lower`. After a reconfigure it checks that `.config` has
+  every option `kw_defconfig` sets. The banner has fixed stamps, so two
+  builds of the same tree are identical: `(unkernel@unkernel)`, a build
+  id (`#` and 12 hex digits, a hash of the tree, the kwemu sources and
+  the toolchain inputs) and the date of the newest commit on the tree
+  (`.agents/kernel.md`, Two kernels).
+* **smp**: the SMP kernel from the same tree (`kw_defconfig` plus
+  `arch/wasm/configs/kw_smp.config`, kwemu built with
+  `-Dkwemu-atomics=true` in `vendor/build/kwemu-smp`) into
+  `vendor/build/kernel-smp`, lowered like the UP one. `all` builds it
+  (`KW_SMP=0`: not); `kernel` never does.
 * **binaryen**: downloads the Binaryen release `version_133` (pinned
   checksum) into `vendor/toolchain/binaryen`. `lower` does this if no
   suitable `wasm-opt` is found.
@@ -82,12 +95,17 @@ separate and not part of `all`):
   with `alpine.cpio` (gzipped), its command line and, if it exists, the data
   disk template in custom sections (`tools/bundle.mjs`; `unkernel.initrd`,
   `unkernel.cmdline`, `unkernel.datadisk`). There is no wasm64 bundle.
-  `tools/bundle.mjs --smp <SMP vmlinux32.wasm>` also adds
-  `unkernel.kernel.smp.kwpatch`, a patch from this kernel to an SMP build
-  of the same tree (`tools/kwdiff.mjs`), which the runtime applies when it
-  is asked for more than one CPU; build.sh does not pass it yet.
-  `kernel`, `lower`, `alpine` and `datadisk` refresh it when both inputs
-  exist; without a template it warns and bundles none.
+  With an SMP kernel built from the same tree it also has
+  `unkernel.kernel.smp.kwpatch` (`tools/bundle.mjs --smp`), a patch from
+  the UP kernel to the SMP one (`tools/kwdiff.mjs`, 1.3 MiB), which the
+  runtime applies when it is asked for more than one CPU. bundle.mjs
+  refuses an SMP kernel of another build (banners that differ in more
+  than `SMP`, another `KW_ABI_VERSION`); build.sh then warns and bundles
+  without the patch, or fails with `KW_SMP=1` (as in `all`). The patch
+  is cached in `vendor/build/kernel-smp/up.kwpatch` while both kernels
+  stay the same. `kernel`, `smp`, `lower`, `alpine` and `datadisk`
+  refresh the bundle when both inputs exist; without a template it warns
+  and bundles none.
 * **datadisk**: `vendor/build/disk/kwdata.kwsparse.gz`, the template of the
   data disk (see Block devices): an empty ext4 file system labelled
   `kwdata`, 4 GiB, 4 KiB blocks, made with `mke2fs -t ext4 -b 4096 -L
@@ -147,8 +165,11 @@ removes the device, `--net-mtu N` sets the MTU handed out by DHCP, and
 `--net-wisp URL` sends the guest's TCP through a Wisp server instead of host
 sockets.
 
-`build.sh` also takes `KSRC=dir` (a kernel git worktree) and `KOUT=dir` (its
-build output), so a branch can be built without touching the main tree.
+`build.sh` also takes `KSRC=dir` (a kernel git worktree), `KOUT=dir` and
+`KOUT_SMP=dir` (the two kernels' build outputs) and `KW_BUILD=dir` (the
+root of every build output, default `vendor/build`), so a branch can be
+built without touching the main tree or its outputs; the header of
+`build.sh` lists the rest (`KW_SMP`, `KWEMU`, `KWEMU_SMP`, ...).
 
 Downloads are pinned: the kernel base commit and the LLVM tag/commit in
 `build.sh`; Binaryen, Alpine and Ubuntu Base by SHA-256 (`build.sh`,
@@ -1037,7 +1058,7 @@ switching, no block or net device, no JIT).
   loses at most the unflushed tail. An export or import of the data disk is
   held in memory as a whole.
 * SMP is experimental: a second build (`arch/wasm/configs/kw_smp.config`,
-  built by hand, `.agents/kernel.md`, SMP) runs one kernel instance per
+  `kernel/build.sh smp`, `.agents/kernel.md`, SMP) runs one kernel instance per
   CPU in worker threads on a shared memory (CLI `--smp N`; the page's
   `?smp=N`, in Web Workers, once its bundle carries the SMP kernel),
   each CPU with its own JIT. It has every device, all served by CPU 0

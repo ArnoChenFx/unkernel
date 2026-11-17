@@ -440,7 +440,9 @@ parts that are easy to get wrong.
   `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's
   `memory.atomic.notify` (an IPI) ends; the wait's `done` runs once.
 - Both kernels in one bundle: a bundle made with `kernel/tools/bundle.mjs
-  --smp <SMP vmlinux32.wasm>` (same tree) carries
+  --smp <SMP vmlinux32.wasm>` (same tree; `kernel/build.sh` passes it once
+  the SMP kernel is built, and bundle.mjs refuses kernels of two different
+  builds: kernel.md, Two kernels) carries
   `unkernel.kernel.smp.kwpatch` last, a patch from its UP kernel to the
   SMP one (`kernel/tools/kwdiff.mjs --remap`: the base's function, global
   and type indices and data addresses renumbered to the target's by
@@ -453,9 +455,15 @@ parts that are easy to get wrong.
   compiles the SMP kernel followed by the bundle's other `unkernel.*`
   sections, so `bundledBoot()` reads it as the bundle. Without the
   section, with one CPU, or with a compiled Module as `kernel`, nothing
-  changes. `withoutSmpPatch()` gives the bundle without the section (the
-  page's split, web.md). `test/kpatch.test.ts` (with `KPATCH_UP` and
-  `KPATCH_SMP` set, also on the real kernels).
+  changes. A patch that does not fit the bundle's kernel (another length,
+  another SHA-256, or a result whose SHA-256 is wrong) is an error, never a
+  wrong kernel: `loadKernelModule()` rejects with a `BootError` at the
+  `compile` stage ("Deriving the SMP kernel from the bundle failed: ..."),
+  and the CLI says it cannot load the kernel and exits 1.
+  `withoutSmpPatch()` gives the bundle without the section (the page's
+  split, web.md). `pnpm test:kpatch` (`test/kpatch.test.ts`; with
+  `KPATCH_UP` and `KPATCH_SMP` set, also on the real kernels and
+  bundle.mjs's checks).
 - Browsers (`js/web/cpu.ts`, `web-cpu-entry.ts`; `webPlatform` and the
   web kernel worker pass `spawnWebCpu` and `webCpuBlocker`): each CPU is
   a module Web Worker (`unkernel-cpu<n>`) running the same `runCpu()`,

@@ -51,7 +51,8 @@ the dev server's own responses) and `__KW_BUILD__`.
   (`web/scripts/kernel.ts`) makes it from `web/kernel/unkernel-alpine.wasm`
   (the file the rest of this list is about) without its SMP patch section
   (js.md, CPU threads), so it is byte for byte that file when there is
-  none, as in every release so far. When there is one, it also writes
+  none, as in every release so far (the release workflow builds bundles
+  with it from the next release on; testing.md). When there is one, it also writes
   `web/kernel/page/unkernel-alpine-smp.wasm`, the SMP bundle the patch
   makes, which the `unkernel:kernel-smp` plugin emits as its own hashed
   asset and `src/sdk.ts` exports as `kernelSmpUrl` (null without it,
@@ -59,8 +60,12 @@ the dev server's own responses) and `__KW_BUILD__`.
   fetches it (Several CPUs, below). The dev server splits again when the file changes. Building or deploying the
   page needs no kernel toolchain.
 - `pnpm dev` runs the file that is there, without a network check.
-  `kernel/build.sh bundle` (and so `kernel`, `alpine`, `datadisk`, `all`)
-  copies its output there, so the dev server runs your latest local build.
+  `kernel/build.sh bundle` (and so `kernel`, `smp`, `alpine`, `datadisk`,
+  `all`) copies its output there, so the dev server runs your latest local
+  build, with the SMP bundle once `smp` has built the SMP kernel.
+  Checked 2026-11-17 with `KW_KERNEL=` a bundle from the build path: the
+  built page had both assets (UP 11.48 MB, SMP 11.88 MB); with the newest
+  release (no patch) it had only the UP asset, with the deployed name.
   Only when there is no file does it download one.
 - A page build (`pnpm build:web`, a deploy, the browser tests' build) always
   takes the `unkernel-alpine.wasm` attached to the newest non-draft release

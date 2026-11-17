@@ -1,4 +1,4 @@
-From e5d2a89bb5bd1d2558b38f2694398026046051a0 Mon Sep 17 00:00:00 2001
+From a65a2003481b0a5c973d85edf9b758fd9eb9720f Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:04 +0000
 Subject: [PATCH] wasm: kwsnd on SMP

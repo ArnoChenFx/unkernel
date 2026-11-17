@@ -664,10 +664,31 @@ numbers and open issues: status.md item 8.
   the wakeup if it sleeps in a system call. A task let go meanwhile moves
   the upstream way (stopper or `move_queued_task()`). A held kthread gets
   EBUSY, unless it is moving itself (`arch_kthread_move()`).
+
+  Placement: where the scheduler would have moved a held task itself,
+  it names the CPU to the arch instead (`arch_stay_move_to()`, which
+  sets TIF_KW_MOVE and `thread.move_to`): `sched_exec()`, whose stopper
+  cannot move a held task (it now asks with the task's own mask:
+  `cpus_ptr` has been its CPU's since it last switched out), and the
+  wakeup of a held user task whose CPU is busy (`stay_wake_target()` in
+  `select_task_rq()`): the waker's CPU for a WF_SYNC wakeup from
+  another CPU, else the first idle CPU; a WF_SYNC wakeup on the task's
+  own CPU keeps the pair together. The task finishes its system call
+  where it slept, and `kw_exit_to_user_move()` takes the hint on its
+  way to user mode only if that CPU is idle then and its own CPU has
+  other work (`sched_stay_release(dest)` queues the move as for an
+  affinity change); otherwise it goes on without a reschedule. A
+  sleeper woken behind a busy task thus leaves once and then wakes on
+  its new CPU, and nothing is cut short: interrupting interruptible
+  sleepers the way parking does was not done, since calls that do not
+  restart would return EINTR at the scheduler's whim. Tasks preempted
+  in the kernel (`cond_resched()`) stay where they are (status.md, SMP,
+  Placement, has what that costs).
   `/proc/kwmove` (SMP only) counts user tasks switched out where they may
   move (`released`), resumed on their CPU (`resumed`) or started on
-  another (`moved`), kthreads started again elsewhere (`restarted`), and
-  stacks dropped (`dropped`, `lost`). An Alpine boot to a shell
+  another (`moved`), kthreads started again elsewhere (`restarted`),
+  stacks dropped (`dropped`, `lost`), and exits that found a CPU named
+  by exec or a wakeup (`hinted`) and moved there (`followed`). An Alpine boot to a shell
   (2026-11-16) released 10-18 times, all resumed in place, and
   restarted 6 kthreads on 2 CPUs, 21 on 4. Held tasks never call
   `migrate_enable()` before they exit, so `rq->nr_pinned` (used only by
@@ -1059,7 +1080,12 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     return at once and move it at the wakeup; 2000 queued RT signals to
     a thread that keeps moving arrive exactly once each; 5000 pipe and
     5000 futex round trips between two threads that keep moving keep
-    their order; `/proc/kwmove` must show moves and no lost drops.
+    their order; a thread asleep in `read()` on CPU 0, which a thread
+    pinned there keeps busy, woken 60 times from CPU 1 must leave CPU 0
+    for good within its first 40 wakeups, every `read()` returning its
+    value; of 5 children that exec beside that busy thread, at least 4
+    must start their new image on another CPU; `/proc/kwmove` must show
+    moves and no lost drops.
   - `jit:` (more than one CPU online; skipped otherwise; compiled code on
     several CPUs, kwemu.md, JIT on several harts): `hot()` and `fphot()`
     three times each on every CPU at once (one pinned thread per CPU),

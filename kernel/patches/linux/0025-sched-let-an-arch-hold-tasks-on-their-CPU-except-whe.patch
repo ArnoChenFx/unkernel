@@ -1,4 +1,4 @@
-From 2e5bd0031147727749d0cd48bc2c5c5876dee041 Mon Sep 17 00:00:00 2001
+From 6fdeafc6424bc30824faa49ec14e246f680ffc3b Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:06:57 +0000
 Subject: [PATCH] sched: let an arch hold tasks on their CPU except where they
@@ -30,13 +30,23 @@ after the task's next sleep. If the arch can move the task later
 the mask and return; arch_stay_move() makes the task release itself
 soon. Otherwise fail with EBUSY. A stopper that finds a held task a
 waiter wants elsewhere also asks it to move.
+
+Where the scheduler would have moved a held task itself, it names the
+CPU to the arch instead (arch_stay_move_to()), which may pass it to
+sched_stay_release() on the task's way to user mode: sched_exec(), whose
+stopper cannot move a held task (and which now asks with the task's own
+mask, since cpus_ptr has been its CPU's since it last switched out), and
+the wakeup of a held task on a busy CPU (the waker's CPU for a WF_SYNC
+wakeup from another CPU, as wake_affine_idle() would, else an idle CPU).
+Nothing interrupts a sleeper: the task finishes its system call where
+it slept, and only then may move.
 ---
- include/linux/irq-entry-common.h |  22 +++++
- include/linux/sched.h            |  16 ++++
- init/Kconfig                     |  18 ++++
+ include/linux/irq-entry-common.h |  22 +++
+ include/linux/sched.h            |  23 +++
+ init/Kconfig                     |  22 +++
  kernel/entry/common.c            |   2 +-
- kernel/sched/core.c              | 155 ++++++++++++++++++++++++++++++-
- 5 files changed, 208 insertions(+), 5 deletions(-)
+ kernel/sched/core.c              | 231 ++++++++++++++++++++++++++++++-
+ 5 files changed, 295 insertions(+), 5 deletions(-)
 
 diff --git a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
 index c74b5c87e10..291968435a6 100644
@@ -72,24 +82,31 @@ index c74b5c87e10..291968435a6 100644
   * arch_exit_to_user_mode_prepare - Architecture specific preparation for
   *				    exit to user mode.
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 78bfc0e32e5..87d612da100 100644
+index 78bfc0e32e5..5de057dedc5 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -1942,6 +1942,22 @@ extern int dl_task_check_affinity(struct task_struct *p, const struct cpumask *m
+@@ -1942,6 +1942,29 @@ extern int dl_task_check_affinity(struct task_struct *p, const struct cpumask *m
  extern void force_compatible_cpus_allowed_ptr(struct task_struct *p);
  extern void relax_compatible_cpus_allowed_ptr(struct task_struct *p);
  
 +#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
 +/* Tasks held on their CPU by their stack (init/Kconfig, ARCH_TASKS_STAY_ON_CPU). */
-+extern bool sched_stay_release(void);
++extern bool sched_stay_release(int dest);
 +extern void sched_stay_switch_tail(struct task_struct *prev);
 +/*
-+ * Arch, called with p->pi_lock and its runqueue's lock held. May @p, held,
-+ * be given an affinity that excludes its CPU (and move later)? If so,
-+ * arch_stay_move() then asks it to reach sched_stay_release() soon.
++ * Arch, called with p->pi_lock held (and its runqueue's lock, but for a
++ * wakeup). May @p, held, be given an affinity that excludes its CPU (and
++ * move later)? If so, arch_stay_move() then asks it to reach
++ * sched_stay_release() soon.
 + */
 +extern bool arch_stay_may_move(struct task_struct *p);
 +extern void arch_stay_move(struct task_struct *p);
++/*
++ * Arch, called with p->pi_lock held: @p, held, would do better on @cpu
++ * (sched_exec(), or a wakeup on its busy CPU). The arch may pass @cpu to
++ * sched_stay_release() on @p's way back to user mode.
++ */
++extern void arch_stay_move_to(struct task_struct *p, int cpu);
 +#else
 +static inline bool arch_stay_may_move(struct task_struct *p) { return false; }
 +static inline void arch_stay_move(struct task_struct *p) { }
@@ -99,10 +116,10 @@ index 78bfc0e32e5..87d612da100 100644
  extern void set_user_nice(struct task_struct *p, long nice);
  extern int task_prio(const struct task_struct *p);
 diff --git a/init/Kconfig b/init/Kconfig
-index ad592fdf29a..1040f0fc2be 100644
+index ad592fdf29a..dd317cfcab9 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -967,6 +967,23 @@ config ARCH_HAS_PTE_PROTNONE
+@@ -967,6 +967,27 @@ config ARCH_HAS_PTE_PROTNONE
  config ARCH_SUPPORTS_NUMA_BALANCING
  	bool
  
@@ -119,6 +136,10 @@ index ad592fdf29a..1040f0fc2be 100644
 +# user task is recorded without waiting, and the task moves on its next
 +# way to user mode (arch_stay_move()); for a held kthread it fails with
 +# EBUSY instead of waiting for a migrate_enable() that may never come.
++# Where the scheduler would have moved a held task to another CPU itself
++# (sched_exec(), a wakeup on a busy CPU while another is idle), it names
++# that CPU to the arch instead (arch_stay_move_to()), which may move the
++# task there on its way to user mode.
 +#
 +config ARCH_TASKS_STAY_ON_CPU
 +	bool
@@ -126,7 +147,7 @@ index ad592fdf29a..1040f0fc2be 100644
  #
  # For architectures that prefer to flush all TLBs after a number of pages
  # are unmapped instead of sending one IPI per page to flush. The architecture
-@@ -974,6 +991,7 @@ config ARCH_SUPPORTS_NUMA_BALANCING
+@@ -974,6 +995,7 @@ config ARCH_SUPPORTS_NUMA_BALANCING
  # written after the unmap. Details are in mm/rmap.c near the check for
  # should_defer_flush. The architecture should also consider if the full flush
  # and the refill costs are offset by the savings of sending fewer IPIs.
@@ -148,7 +169,7 @@ index e3d381fd3d2..ea0c89b36f8 100644
  
  		if (ti_work & _TIF_UPROBE)
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 1754d9f95f2..dd8f5225b63 100644
+index 1754d9f95f2..66abbdb6a15 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -2660,8 +2660,12 @@ static int migration_cpu_stop(void *data)
@@ -165,7 +186,7 @@ index 1754d9f95f2..dd8f5225b63 100644
  
  		if (pending) {
  			p->migration_pending = NULL;
-@@ -2775,6 +2779,102 @@ int push_cpu_stop(void *arg)
+@@ -2775,6 +2779,111 @@ int push_cpu_stop(void *arg)
  	return 0;
  }
  
@@ -184,11 +205,13 @@ index 1754d9f95f2..dd8f5225b63 100644
 + * where the arch can resume it on any CPU on a fresh stack. Let it move
 + * until it runs again, as migrate_enable() would; if an affinity change
 + * excluded this CPU while it was held (__set_cpus_allowed_ptr_locked()),
-+ * have the stopper move it as soon as it is off the CPU. Returns false if
-+ * current is not held once (nothing changed). When current runs again, the
-+ * arch holds it with migrate_disable().
++ * have the stopper move it as soon as it is off the CPU, and otherwise to
++ * @dest if that is >= 0 (a better CPU the arch was told of while the task
++ * was held: arch_stay_move_to()). Returns false if current is not held
++ * once (nothing changed). When current runs again, the arch holds it with
++ * migrate_disable().
 + */
-+bool sched_stay_release(void)
++bool sched_stay_release(int dest)
 +{
 +	struct task_struct *p = current;
 +	struct affinity_context ac = {
@@ -213,7 +236,8 @@ index 1754d9f95f2..dd8f5225b63 100644
 +	 * the task held, so it records the mask and has the arch bring the
 +	 * task back here (arch_stay_move()) before it returns to user mode.
 +	 */
-+	if (likely(p->cpus_ptr == &p->cpus_mask && cpumask_test_cpu(cpu, &p->cpus_mask)))
++	if (likely(dest < 0 && p->cpus_ptr == &p->cpus_mask &&
++		   cpumask_test_cpu(cpu, &p->cpus_mask)))
 +		goto release;
 +
 +	/* As migrate_enable() and affine_move_task() would, under one lock. */
@@ -229,6 +253,12 @@ index 1754d9f95f2..dd8f5225b63 100644
 +		if (pending && !pending->stop_pending) {
 +			p->migration_pending = NULL;
 +			complete = pending;
++		} else if (!pending && !push_task && dest >= 0 && dest != cpu &&
++			   cpumask_test_cpu(dest, &p->cpus_mask) && cpu_active(dest)) {
++			/* A better CPU (sched_exec(), a wakeup): move there. */
++			arg = this_cpu_ptr(&stay_move_arg);
++			*arg = (struct migration_arg) { .task = p, .dest_cpu = dest };
++			work = this_cpu_ptr(&stay_move_work);
 +		}
 +	} else if (pending) {
 +		/* A waiter's request: its stop work moves the task. */
@@ -268,7 +298,7 @@ index 1754d9f95f2..dd8f5225b63 100644
  static inline void mm_update_cpus_allowed(struct mm_struct *mm, const cpumask_t *affmask);
  
  /*
-@@ -3128,6 +3228,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+@@ -3128,6 +3237,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
  	const struct cpumask *cpu_allowed_mask = task_cpu_possible_mask(p);
  	const struct cpumask *cpu_valid_mask = cpu_active_mask;
  	bool kthread = p->flags & PF_KTHREAD;
@@ -276,7 +306,7 @@ index 1754d9f95f2..dd8f5225b63 100644
  	unsigned int dest_cpu;
  	int ret = 0;
  
-@@ -3166,9 +3267,22 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+@@ -3166,9 +3276,22 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
  			goto out;
  		}
  
@@ -302,7 +332,7 @@ index 1754d9f95f2..dd8f5225b63 100644
  			ret = -EBUSY;
  			goto out;
  		}
-@@ -3187,6 +3301,21 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
+@@ -3187,6 +3310,21 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
  
  	do_set_cpus_allowed(p, ctx);
  
@@ -324,7 +354,61 @@ index 1754d9f95f2..dd8f5225b63 100644
  	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
  
  out:
-@@ -5467,6 +5596,24 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
+@@ -3624,6 +3762,42 @@ static int select_fallback_rq(int cpu, struct task_struct *p)
+ 	return dest_cpu;
+ }
+ 
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++/*
++ * @p, held on @cpu by its stack (sched_stay_release()), wakes there. If
++ * @cpu is busy, name another CPU to the arch, which moves @p there on its
++ * way back to user mode if that CPU is idle then and @cpu still has other
++ * work (arch_stay_move_to()): the waker's CPU for a WF_SYNC wakeup from
++ * another CPU that runs only the waker (about to sleep, as
++ * wake_affine_idle() assumes), else an idle CPU. A WF_SYNC wakeup on @cpu
++ * keeps the two together.
++ */
++static void stay_wake_target(struct task_struct *p, int cpu, int wake_flags)
++{
++	int this_cpu = smp_processor_id(), dest;
++
++	if (!(wake_flags & WF_TTWU) || p->sched_class != &fair_sched_class ||
++	    p->nr_cpus_allowed == 1 || available_idle_cpu(cpu) ||
++	    !arch_stay_may_move(p))
++		return;
++	if (wake_flags & WF_SYNC) {
++		if (this_cpu == cpu)
++			return;
++		if (cpu_rq(this_cpu)->nr_running == 1 &&
++		    cpumask_test_cpu(this_cpu, &p->cpus_mask)) {
++			arch_stay_move_to(p, this_cpu);
++			return;
++		}
++	}
++	for_each_cpu_wrap(dest, &p->cpus_mask, cpu) {
++		if (dest != cpu && available_idle_cpu(dest) && cpu_active(dest)) {
++			arch_stay_move_to(p, dest);
++			return;
++		}
++	}
++}
++#endif
++
+ /*
+  * The caller (fork, wakeup) owns p->pi_lock, ->cpus_ptr is stable.
+  */
+@@ -3637,6 +3811,10 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
+ 		*wake_flags |= WF_RQ_SELECTED;
+ 	} else {
+ 		cpu = cpumask_any(p->cpus_ptr);
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++		if (is_migration_disabled(p))
++			stay_wake_target(p, cpu, *wake_flags);
++#endif
+ 	}
+ 
+ 	/*
+@@ -5467,6 +5645,24 @@ asmlinkage __visible void schedule_tail(struct task_struct *prev)
  	calculate_sigpending();
  }
  
@@ -349,6 +433,47 @@ index 1754d9f95f2..dd8f5225b63 100644
  /*
   * context_switch - switch to the new MM and the new thread's register state.
   */
+@@ -5649,6 +5845,26 @@ void sched_exec(void)
+ 	struct migration_arg arg;
+ 	int dest_cpu;
+ 
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++	/*
++	 * Held by its stack: cpus_ptr has been this CPU since the task last
++	 * switched out. Give it its own mask, as it had at its first run, so
++	 * that the choice below sees every allowed CPU.
++	 */
++	if (is_migration_disabled(p) && p->cpus_ptr != &p->cpus_mask) {
++		struct affinity_context ac = {
++			.new_mask  = &p->cpus_mask,
++			.flags     = SCA_MIGRATE_ENABLE,
++		};
++		struct rq_flags rf;
++		struct rq *rq;
++
++		rq = task_rq_lock(p, &rf);
++		if (p->cpus_ptr != &p->cpus_mask)
++			do_set_cpus_allowed(p, &ac);
++		task_rq_unlock(rq, p, &rf);
++	}
++#endif
+ 	scoped_guard (raw_spinlock_irqsave, &p->pi_lock) {
+ 		dest_cpu = p->sched_class->select_task_rq(p, task_cpu(p), WF_EXEC);
+ 		if (dest_cpu == smp_processor_id())
+@@ -5659,6 +5875,13 @@ void sched_exec(void)
+ 
+ 		arg = (struct migration_arg){ p, dest_cpu };
+ 	}
++#ifdef CONFIG_ARCH_TASKS_STAY_ON_CPU
++	/* The stopper cannot move it; the arch can, on its way to user mode. */
++	if (is_migration_disabled(p)) {
++		arch_stay_move_to(p, dest_cpu);
++		return;
++	}
++#endif
+ 	stop_one_cpu(task_cpu(p), migration_cpu_stop, &arg);
+ }
+ 
 -- 
 2.56.0
 

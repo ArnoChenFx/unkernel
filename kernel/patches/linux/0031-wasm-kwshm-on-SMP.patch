@@ -1,4 +1,4 @@
-From cf35f2dee35c4a6f35a00a3adc9b3e02edd0a782 Mon Sep 17 00:00:00 2001
+From 31332912b0acc890e4790fa9f9f146f1a3d9d5aa Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:03 +0000
 Subject: [PATCH] wasm: kwshm on SMP

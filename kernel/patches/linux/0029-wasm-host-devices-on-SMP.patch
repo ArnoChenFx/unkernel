@@ -1,4 +1,4 @@
-From 074c925c898956a1246b6102c897b0a10b7a4056 Mon Sep 17 00:00:00 2001
+From 9cf31aed97ee5f5cec3afb3bffd4edf7bcc2fc71 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: host devices on SMP

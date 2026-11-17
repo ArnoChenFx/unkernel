@@ -1,4 +1,4 @@
-From 57a083d7b408b4cfadf7ce933ededc871b47ee91 Mon Sep 17 00:00:00 2001
+From c233878dfe07fcd5ae917094eb6743d21a7edf8f Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:02 +0000
 Subject: [PATCH] wasm: kwblk on SMP

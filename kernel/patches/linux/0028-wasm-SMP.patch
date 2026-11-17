@@ -1,4 +1,4 @@
-From d67b258b96f1417bfa9660586d9c3178f8214548 Mon Sep 17 00:00:00 2001
+From 1faccf03deb80dcd477cf763787380086ce195bb Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -26,8 +26,11 @@ tells its host to drop it (wasm_stack_drop()) at its next switch or
 idle; switched in on its own CPU it resumes its stack. An affinity
 change that excludes a held user task's CPU sets TIF_KW_MOVE, so the
 task moves on its way to user mode (at once from user mode: the
-change kicks it). /proc/kwmove counts the moves. copy_thread() drops
-the hold a fork copied.
+change kicks it). So does a better CPU the scheduler names for a held
+user task (arch_stay_move_to(): exec, a wakeup on its busy CPU), which
+the task takes on its way to user mode only if that CPU is idle then
+and its own CPU has other work. /proc/kwmove counts the moves.
+copy_thread() drops the hold a fork copied.
 
 IPIs are bits in the target's word (CPU 0's is wasm_host_irqs, where
 the host's device bits arrive), set atomically and followed by
@@ -59,21 +62,21 @@ Parking (KW_PARK) is off.
 
 kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
 ---
- arch/wasm/Kconfig                    |  25 ++-
+ arch/wasm/Kconfig                    |  25 +-
  arch/wasm/Makefile                   |   5 +
  arch/wasm/configs/kw_smp.config      |   4 +
- arch/wasm/include/asm/entry-common.h |  23 +++
- arch/wasm/include/asm/futex.h        |  26 ++-
+ arch/wasm/include/asm/entry-common.h |  27 +++
+ arch/wasm/include/asm/futex.h        |  26 +-
  arch/wasm/include/asm/hwcap.h        |   2 +
  arch/wasm/include/asm/irq.h          |  22 ++
- arch/wasm/include/asm/irqflags.h     |  71 ++++++-
+ arch/wasm/include/asm/irqflags.h     |  71 +++++-
  arch/wasm/include/asm/kw_emu.h       |  11 +-
- arch/wasm/include/asm/kwcpu.h        |  23 +++
+ arch/wasm/include/asm/kwcpu.h        |  23 ++
  arch/wasm/include/asm/mmu_context.h  |   5 +
  arch/wasm/include/asm/park.h         |  17 ++
- arch/wasm/include/asm/pgtable.h      |  70 +++++++
- arch/wasm/include/asm/processor.h    |  24 +++
- arch/wasm/include/asm/smp.h          |  34 ++++
+ arch/wasm/include/asm/pgtable.h      |  70 ++++++
+ arch/wasm/include/asm/processor.h    |  29 +++
+ arch/wasm/include/asm/smp.h          |  34 +++
  arch/wasm/include/asm/thread_info.h  |   3 +
  arch/wasm/include/asm/time.h         |  10 +
  arch/wasm/include/asm/tlbflush.h     |   7 +-
@@ -82,20 +85,20 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/kernel/cpu.c               |   7 +
  arch/wasm/kernel/entry.S             |  42 ++++
  arch/wasm/kernel/head.S              |   9 +
- arch/wasm/kernel/irq.c               | 119 ++++++++++-
+ arch/wasm/kernel/irq.c               | 119 +++++++++-
  arch/wasm/kernel/irqflags.c          |   4 +-
  arch/wasm/kernel/park.c              |   3 +-
- arch/wasm/kernel/process.c           | 288 ++++++++++++++++++++++++++-
+ arch/wasm/kernel/process.c           | 340 ++++++++++++++++++++++++++-
  arch/wasm/kernel/setup.c             |  14 ++
  arch/wasm/kernel/signal.c            |   3 +-
- arch/wasm/kernel/smp.c               | 169 ++++++++++++++++
+ arch/wasm/kernel/smp.c               | 169 +++++++++++++
  arch/wasm/kernel/sys_riscv.c         |   6 +-
  arch/wasm/kernel/time.c              |  54 ++++-
- arch/wasm/kernel/traps.c             |  26 ++-
+ arch/wasm/kernel/traps.c             |  26 +-
  arch/wasm/kernel/wasi.c              |  41 +++-
- arch/wasm/mm/fault.c                 |  60 ++++--
- arch/wasm/mm/tlb.c                   | 236 +++++++++++++++++++++-
- 36 files changed, 1424 insertions(+), 72 deletions(-)
+ arch/wasm/mm/fault.c                 |  60 +++--
+ arch/wasm/mm/tlb.c                   | 236 ++++++++++++++++++-
+ 36 files changed, 1485 insertions(+), 72 deletions(-)
  create mode 100644 arch/wasm/configs/kw_smp.config
  create mode 100644 arch/wasm/include/asm/kwcpu.h
  create mode 100644 arch/wasm/include/asm/smp.h
@@ -183,10 +186,10 @@ index 00000000000..69e9db0c132
 +CONFIG_SMP=y
 +CONFIG_NR_CPUS=8
 diff --git a/arch/wasm/include/asm/entry-common.h b/arch/wasm/include/asm/entry-common.h
-index 185b2ff8246..7493ca079d3 100644
+index 185b2ff8246..ea8e4a240f7 100644
 --- a/arch/wasm/include/asm/entry-common.h
 +++ b/arch/wasm/include/asm/entry-common.h
-@@ -5,4 +5,27 @@
+@@ -5,4 +5,31 @@
  
  #include <asm/stacktrace.h>
  
@@ -197,9 +200,13 @@ index 185b2ff8246..7493ca079d3 100644
 + * there on a fresh stack (process.c).
 + */
 +void kw_exit_to_user_schedule(void);
++void kw_exit_to_user_move(void);
 +#define arch_exit_to_user_mode_schedule kw_exit_to_user_schedule
 +
-+/* An affinity change that excludes the CPU sets TIF_KW_MOVE (arch_stay_move()). */
++/*
++ * An affinity change that excludes the CPU (arch_stay_move()) or a better
++ * CPU named by the scheduler (arch_stay_move_to()) sets TIF_KW_MOVE.
++ */
 +#define ARCH_EXIT_TO_USER_MODE_WORK	_TIF_KW_MOVE
 +
 +static inline void arch_exit_to_user_mode_work(struct pt_regs *regs,
@@ -207,7 +214,7 @@ index 185b2ff8246..7493ca079d3 100644
 +{
 +	if (unlikely(ti_work & _TIF_KW_MOVE)) {
 +		clear_thread_flag(TIF_KW_MOVE);
-+		kw_exit_to_user_schedule();
++		kw_exit_to_user_move();
 +	}
 +}
 +#define arch_exit_to_user_mode_work arch_exit_to_user_mode_work
@@ -622,7 +629,7 @@ index 78f4b6ab5f4..841c27fd516 100644
  /* --- swap entries (riscv layout) --------------------------------------- */
  /*
 diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
-index da9befa9706..5bf0fefcb46 100644
+index da9befa9706..67d9ec0deed 100644
 --- a/arch/wasm/include/asm/processor.h
 +++ b/arch/wasm/include/asm/processor.h
 @@ -25,7 +25,17 @@
@@ -643,7 +650,7 @@ index da9befa9706..5bf0fefcb46 100644
  
  struct thread_struct {
  	int (*fn)(void *);	/* kernel thread entry (until first run) */
-@@ -34,6 +44,20 @@ struct thread_struct {
+@@ -34,6 +44,25 @@ struct thread_struct {
  	int (*park_fn)(void *);	/* kernel thread: re-enters its loop */
  	void *park_arg;
  	int park_state;		/* KW_PARK_* (asm/park.h) */
@@ -658,6 +665,11 @@ index da9befa9706..5bf0fefcb46 100644
 +	 * kthread_exit(restart_fn(restart_arg)).
 +	 */
 +	int movable;
++	/*
++	 * 1 + a CPU the scheduler named as better while the task was held
++	 * (arch_stay_move_to(): exec, a wakeup on a busy CPU), 0 for none.
++	 */
++	int move_to;
 +	int (*restart_fn)(void *);
 +	void *restart_arg;
 +#endif
@@ -1159,10 +1171,10 @@ index c5986eabefd..be30d4df89c 100644
  
  static BLOCKING_NOTIFIER_HEAD(kw_park_restore_chain);
 diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
-index 3cad124e5cb..302cb615c37 100644
+index 3cad124e5cb..05622e66df2 100644
 --- a/arch/wasm/kernel/process.c
 +++ b/arch/wasm/kernel/process.c
-@@ -10,29 +10,175 @@
+@@ -10,29 +10,180 @@
   */
  
  #include <linux/entry-common.h>
@@ -1170,6 +1182,7 @@ index 3cad124e5cb..302cb615c37 100644
  #include <linux/ptrace.h>
  #include <linux/sched.h>
  #include <linux/sched/debug.h>
++#include <linux/sched/stat.h>
  #include <linux/sched/task.h>
  #include <linux/sched/task_stack.h>
  #include <linux/printk.h>
@@ -1232,6 +1245,8 @@ index 3cad124e5cb..302cb615c37 100644
 +	unsigned long restarted;	/* kthreads started again on another CPU */
 +	unsigned long dropped;		/* stacks this CPU's host was told to drop */
 +	unsigned long lost;		/* drops that found the list full */
++	unsigned long hinted;		/* exits that found a better CPU named (exec, wakeup) */
++	unsigned long followed;		/* ... and moved there (it was idle, this CPU busy) */
 +};
 +
 +static DEFINE_PER_CPU(struct kw_move_stats, kw_move_stats);
@@ -1287,9 +1302,11 @@ index 3cad124e5cb..302cb615c37 100644
 +		s.restarted += READ_ONCE(c->restarted);
 +		s.dropped += READ_ONCE(c->dropped);
 +		s.lost += READ_ONCE(c->lost);
++		s.hinted += READ_ONCE(c->hinted);
++		s.followed += READ_ONCE(c->followed);
 +	}
-+	seq_printf(m, "released %lu resumed %lu moved %lu restarted %lu dropped %lu lost %lu\n",
-+		   s.released, s.resumed, s.moved, s.restarted, s.dropped, s.lost);
++	seq_printf(m, "released %lu resumed %lu moved %lu restarted %lu dropped %lu lost %lu hinted %lu followed %lu\n",
++		   s.released, s.resumed, s.moved, s.restarted, s.dropped, s.lost, s.hinted, s.followed);
 +	return 0;
 +}
 +
@@ -1339,7 +1356,7 @@ index 3cad124e5cb..302cb615c37 100644
  
  	/* Threads sharing an mm must not inherit an LR/SC reservation. */
  	kw_clear_reservation(wasm_kw_cpu);
-@@ -41,14 +187,140 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
+@@ -41,14 +192,186 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
  				READ_ONCE(prev->__state) == TASK_DEAD);
  }
  
@@ -1367,15 +1384,15 @@ index 3cad124e5cb..302cb615c37 100644
 +}
 +
 +/*
-+ * exit_to_user_mode_loop()'s reschedule (asm/entry-common.h), also taken
-+ * for TIF_KW_MOVE: the task may move to another CPU while it is switched
-+ * out here, and then never returns from this schedule() (kw_user_resume()).
++ * Let current go (sched_stay_release(), to @dest if >= 0) and reschedule:
++ * the task may move to another CPU while it is switched out here, and then
++ * never returns from this schedule() (kw_user_resume()).
 + */
-+void kw_exit_to_user_schedule(void)
++static void kw_stay_schedule(int dest)
 +{
 +	struct task_struct *p = current;
 +
-+	if (!sched_stay_release()) {
++	if (!sched_stay_release(dest)) {
 +		schedule();
 +		return;
 +	}
@@ -1384,6 +1401,52 @@ index 3cad124e5cb..302cb615c37 100644
 +	/* Not switched out, or switched in again on this CPU: held again. */
 +	p->thread.movable = 0;
 +	migrate_disable();
++}
++
++/* exit_to_user_mode_loop()'s reschedule (asm/entry-common.h). */
++void kw_exit_to_user_schedule(void)
++{
++	kw_stay_schedule(-1);
++}
++
++/*
++ * TIF_KW_MOVE: an affinity change that excludes this CPU (arch_stay_move()),
++ * or a better CPU named while the task was held (arch_stay_move_to()). That
++ * one is taken only if it is idle now and this CPU has other work: a move
++ * costs a fresh stack, and the code the JIT compiled for the task here.
++ */
++void kw_exit_to_user_move(void)
++{
++	struct task_struct *p = current;
++	int dest = p->thread.move_to - 1;
++
++	p->thread.move_to = 0;
++	if (dest >= 0) {
++		this_cpu_inc(kw_move_stats.hinted);
++		if (single_task_running() || !idle_cpu(dest)) {
++			/* Unless an affinity change also wants it elsewhere. */
++			if (cpumask_test_cpu(smp_processor_id(), &p->cpus_mask))
++				return;
++			dest = -1;
++		} else {
++			this_cpu_inc(kw_move_stats.followed);
++		}
++	}
++	kw_stay_schedule(dest);
++}
++
++/*
++ * The scheduler would have moved @p, held, to @cpu (sched_exec(), a wakeup
++ * on a busy CPU while @cpu was idle): let a user task try on its way to
++ * user mode (kw_exit_to_user_move()). Called with p->pi_lock held, for
++ * current or a task being woken, so no kick.
++ */
++void arch_stay_move_to(struct task_struct *p, int cpu)
++{
++	if (p->flags & (PF_KTHREAD | PF_USER_WORKER))
++		return;
++	p->thread.move_to = cpu + 1;
++	set_tsk_thread_flag(p, TIF_KW_MOVE);
 +}
 +
 +/*
@@ -1439,7 +1502,7 @@ index 3cad124e5cb..302cb615c37 100644
 +	 * and sched_stay_release() has the stopper move this thread once it
 +	 * is off the CPU; switched in there, it starts on a fresh stack.
 +	 */
-+	if (!set_cpus_allowed_ptr(p, cpumask_of(cpu)) && sched_stay_release()) {
++	if (!set_cpus_allowed_ptr(p, cpumask_of(cpu)) && sched_stay_release(-1)) {
 +		schedule();
 +		/* Picked again here: it did not move (cpu not active?). */
 +		migrate_disable();
@@ -1481,13 +1544,14 @@ index 3cad124e5cb..302cb615c37 100644
  	if (unlikely(READ_ONCE(current->thread.park_state) == KW_PARK_RESUMING))
  		kw_park_resume(prev);
  
-@@ -94,6 +366,18 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -94,6 +417,19 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  	p->thread.park_fn = NULL;
  	p->thread.park_arg = NULL;
  	p->thread.park_state = KW_PARK_NONE;
 +#ifdef CONFIG_SMP
 +	p->thread.restart_fn = NULL;
 +	p->thread.movable = 0;
++	p->thread.move_to = 0;
 +	clear_ti_thread_flag(task_thread_info(p), TIF_KW_MOVE);
 +	/*
 +	 * Not the parent's hold (fork copies migration_disabled and, for a

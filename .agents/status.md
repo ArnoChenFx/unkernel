@@ -363,16 +363,62 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    api tests on 2 CPUs pass. The UP build changes in `kw_user_addr()`,
    `kw_handle_fault()` and the futex callers. The kernel changes are
    folded into the arch patch and `wasm: SMP`.
+   Placement (2026-11-17; kernel.md, SMP, Placement): what holding a
+   task on its CPU while it is in the kernel cost, measured with a
+   scratch suite (`kwmig`: CPU-bound children by fork, fork+exec,
+   vfork+exec, shell `&` and `xargs -P`; pipelines; a thread pool fed
+   in bursts; kernel-heavy processes; a sleeper woken behind a busy
+   task; fork+exec loops; lowered kernels, JIT, 2 and 4 CPUs, 3
+   interleaved rounds, host load 3.7-13.5 from other work) and a
+   SCHEDSTATS build. Most of it did not matter: children of every
+   launcher finished within 0-8% of the ideal (their CPU time spread
+   evenly), fork-only and fork+exec alike, since fork already places
+   them; pipelines 5-15% over theirs, the pool at its ideal wall time,
+   also when every task started asleep on CPU 0; kernel-heavy processes
+   (16 and 64 MiB `MAP_POPULATE` and `munmap` rounds, preempted in
+   `cond_resched()`) started on CPU 0 spread to one per CPU anyway,
+   because they pass through user mode often enough. What did matter: a
+   sleeper held on a CPU it shares with a busy task, while another CPU
+   idles, stayed there for good, and the busy task lost the sleeper's
+   share (500 µs every 2 ms: the busy task got 80% of its CPU on 2
+   CPUs; the idle CPU stayed idle). Wakeup preemption kept the wake-to-
+   run latency low (median 10-35 µs), and the balancer could not help
+   (30-50% of its attempts failed on held or cache-hot tasks; it never
+   tried an active balance). And `sched_exec()` never moved anything:
+   its choice used `cpus_ptr`, which a held task that has slept has
+   narrowed to its CPU, and its stopper cannot move a held task anyway.
+   Now the scheduler names a better CPU for a held task at exec and at
+   a wakeup on its busy CPU, and the task moves there on its way to
+   user mode if that CPU is idle then and its own is not; nothing is
+   interrupted, so no call returns EINTR or restarts (a check of
+   threads asleep in `read`, `nanosleep`, `poll`, `epoll_wait`,
+   `futex`, `accept`, `recv` with `SO_RCVTIMEO` and `select` while
+   being moved and beside busy movers: no EINTR, early or short
+   return). Before and after (medians): the busy task's share beside
+   that sleeper 80.5% to 99.7% on 2 CPUs and 93.1% to 99.7% on 4 (3
+   busy tasks); the sleeper's wake-to-run p99 0.12 to 0.04 ms on 2
+   CPUs (0.10 to 0.09 on 4); kwtest's
+   new checks (a sleeper woken 60 times behind a busy thread pinned to
+   CPU 0; 5 execs beside it) failed on the old kernel (0 of 60 wakeups
+   and 0 of 5 images away from CPU 0) and pass (away from the 1st-7th
+   wakeup on; 5 of 5). Unchanged within noise: the suite's other
+   numbers, fork+exec+wait loops (1000-loop runs 189-238 µs before,
+   180-259 after, 4 CPUs), move ping-pong (201-220 and 192-203 ms on 2
+   CPUs, 267-339 and 277-313 on 4, 3 and 8 runs), fork+exit+wait of an
+   8 MiB process (203-240 and 200-212 µs on 2 CPUs, 259-296 and 213-245
+   on 4) and kwpar process scaling (1.89-2.13x and 1.93-2.02x on 2,
+   3.65-3.75x and 3.86-4.03x on 4; host load about 4). The UP build
+   differs only in `__LINE__` constants of WARNs after the inserted
+   lines (`kernel/sched/core.c`, `include/linux/sched.h`).
    Open, roughly in order:
-   - A task asleep in a system call stays on its CPU until it returns,
-     and so does one preempted in the kernel (`cond_resched()`): their
-     stacks are live. An interruptible sleeper could be moved the way
-     parking does it (TIF_NOTIFY_SIGNAL ends the sleep, the call
-     restarts on the way out, where the task may move), at the price of
-     a spurious restart (EINTR for the calls that do not restart);
-     not done. `sched_exec()` asks the stopper to move an exec'ing task,
-     which is held there, so exec does not balance (fork does); it could
-     record the CPU and move at the exit of `execve()`.
+   - A task preempted in the kernel (`cond_resched()`) or asleep in a
+     system call still stays on its CPU until it reaches user mode;
+     only its later placement improved (above). A long system call
+     beside another task on its CPU therefore shares that CPU while
+     another idles, until it returns; nothing measured needed more.
+     Ending interruptible sleeps to move the sleeper (as parking does)
+     is not done: calls that do not restart would return EINTR at the
+     scheduler's whim.
    - Device I/O is serialised on CPU 0 and pays two cross-thread wakeups
      per request from another CPU (step 5); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.

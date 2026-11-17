@@ -1731,7 +1731,7 @@ static int mv_task_cpu(pid_t tid)
 }
 
 struct mv_stats {
-	unsigned long released, resumed, moved, restarted, dropped, lost;
+	unsigned long released, resumed, moved, restarted, dropped, lost, hinted, followed;
 };
 
 static int mv_stats_read(struct mv_stats *s)
@@ -1741,10 +1741,12 @@ static int mv_stats_read(struct mv_stats *s)
 
 	if (!f)
 		return -1;
-	n = fscanf(f, "released %lu resumed %lu moved %lu restarted %lu dropped %lu lost %lu",
-		   &s->released, &s->resumed, &s->moved, &s->restarted, &s->dropped, &s->lost);
+	s->hinted = s->followed = 0;
+	n = fscanf(f, "released %lu resumed %lu moved %lu restarted %lu dropped %lu lost %lu hinted %lu followed %lu",
+		   &s->released, &s->resumed, &s->moved, &s->restarted, &s->dropped, &s->lost,
+		   &s->hinted, &s->followed);
 	fclose(f);
-	return n == 6 ? 0 : -1;
+	return n >= 6 ? 0 : -1;
 }
 
 static struct {
@@ -2117,6 +2119,143 @@ static void mv_pingpong_check(void)
 	      MV_PP, MV_PP, mv_pp.bad[0], mv_pp.bad[1], mv_now_ms() - t0);
 }
 
+/*
+ * Placement of held tasks (kernel.md, SMP). A thread asleep in read() on
+ * CPU 0, which a busy thread pinned there keeps busy, is woken from CPU 1
+ * again and again: it must leave CPU 0 on one of its ways back to user
+ * mode (to the waker's CPU, which is about to sleep, or an idle one) and
+ * stay away, and every read() must return its byte as usual (no EINTR, no
+ * short read). Before, it woke on CPU 0 every time while CPU 1 idled.
+ */
+#define MV_WAKES 60
+static struct {
+	int p1[2], p2[2];
+	volatile int stop;
+	volatile pid_t tid;
+	int cpu[MV_WAKES], bad;
+} mv_w;
+
+static void *mv_wake_hog(void *arg)
+{
+	(void)arg;
+	if (mv_setaff(0, 1))
+		mv_w.bad++;
+	while (!mv_w.stop) {
+		volatile unsigned long x = 0;
+
+		for (int i = 0; i < 20000; i++)
+			x += i;
+	}
+	return NULL;
+}
+
+static void *mv_wake_sleeper(void *arg)
+{
+	int i, v;
+
+	(void)arg;
+	mv_w.tid = syscall(SYS_gettid);
+	for (i = 0; i < MV_WAKES; i++) {
+		if (read(mv_w.p1[0], &v, sizeof(v)) != sizeof(v) || v != i)
+			mv_w.bad++;
+		mv_w.cpu[i] = mv_cpu();
+		if (write(mv_w.p2[1], &v, sizeof(v)) != sizeof(v))
+			mv_w.bad++;
+	}
+	return NULL;
+}
+
+static void mv_wake_check(void)
+{
+	struct mv_stats a, b;
+	pthread_t hog, sl;
+	int i, err = 0, left = -1, away = 0;
+
+	memset(&mv_w, 0, sizeof(mv_w));
+	if (pipe(mv_w.p1) || pipe(mv_w.p2)) {
+		CHECK(0, "move: wakeup on a busy CPU: no pipes");
+		return;
+	}
+	mv_stats_read(&a);
+	err += mv_setaff(0, 1) != 0;	/* the sleeper starts on CPU 0 */
+	err += pthread_create(&hog, NULL, mv_wake_hog, NULL) != 0;
+	err += pthread_create(&sl, NULL, mv_wake_sleeper, NULL) != 0;
+	while (!err && !mv_w.tid)
+		usleep(1000);
+	usleep(50000);
+	if (!err)
+		err += mv_setaff(mv_w.tid, mv.all) != 0;	/* asleep: held on CPU 0 */
+	err += mv_setaff(0, 2) != 0;	/* the waker on CPU 1 */
+	for (i = 0; i < MV_WAKES && !err; i++) {
+		int v;
+
+		if (write(mv_w.p1[1], &i, sizeof(i)) != sizeof(i) || read(mv_w.p2[0], &v, sizeof(v)) != sizeof(v)) {
+			err++;
+			break;
+		}
+		usleep(2000);
+	}
+	mv_w.stop = 1;
+	pthread_join(hog, NULL);
+	if (!err)
+		pthread_join(sl, NULL);
+	mv_setaff(0, mv.all);
+	mv_stats_read(&b);
+	for (i = MV_WAKES - 1; i >= 0 && mv_w.cpu[i] != 0; i--)
+		;
+	left = i + 1;	/* the first wakeup from which it stayed away */
+	for (i = 0; i < MV_WAKES; i++)
+		away += mv_w.cpu[i] != 0;
+	close(mv_w.p1[0]);
+	close(mv_w.p1[1]);
+	close(mv_w.p2[0]);
+	close(mv_w.p2[1]);
+	CHECK(!err && !mv_w.bad && left <= MV_WAKES - 20,
+	      "move: a thread woken in read() on a CPU a busy thread keeps: away from it from wakeup %d of %d on (%d away, %d bad), %lu better CPUs named, %lu taken",
+	      left + 1, MV_WAKES, away, mv_w.bad, b.hinted - a.hinted, b.followed - a.followed);
+}
+
+/*
+ * A child execs beside a busy thread pinned to CPU 0 while other CPUs idle:
+ * the new image must start elsewhere (the move happens on execve()'s way
+ * to user mode; the exec'd kwtest exits with its CPU).
+ */
+static void mv_exec_check(void)
+{
+	pthread_t hog;
+	int i, err = 0, away = 0, n = 5;
+	char cpus[16] = "";
+
+	mv_w.stop = 0;
+	mv_w.bad = 0;
+	err += mv_setaff(0, 1) != 0;
+	err += pthread_create(&hog, NULL, mv_wake_hog, NULL) != 0;
+	usleep(20000);
+	for (i = 0; i < n && !err; i++) {
+		int status = 0;
+		pid_t pid = fork();
+
+		if (pid == 0) {
+			mv_setaff(0, mv.all);
+			execl("/proc/self/exe", "kwtest", "cpu", (char *)NULL);
+			_exit(99);
+		}
+		if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+			err++;
+			break;
+		}
+		cpus[i] = '0' + (WEXITSTATUS(status) < 10 ? WEXITSTATUS(status) : 0);
+		away += WEXITSTATUS(status) > 0 && WEXITSTATUS(status) < 64;
+	}
+	mv_w.stop = 1;
+	if (!err || i)
+		pthread_join(hog, NULL);
+	mv_setaff(0, mv.all);
+	CHECK(!err && !mv_w.bad && away >= n - 1,
+	      "move: exec beside a busy thread on CPU 0: %d of %d new images started on another CPU (%s)",
+	      away, n, cpus);
+}
+
 static void move_checks(void)
 {
 	struct mv_stats a, b;
@@ -2138,6 +2277,8 @@ static void move_checks(void)
 	mv_other_check();
 	mv_signal_check();
 	mv_pingpong_check();
+	mv_wake_check();
+	mv_exec_check();
 	mv_setaff(0, mv.all);
 	if (mv_stats_read(&b)) {
 		CHECK(0, "move: no /proc/kwmove");
@@ -2529,6 +2670,12 @@ int main(int argc, char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "child"))
 		return 7;	/* exec'd by the execve test */
+	if (argc > 1 && !strcmp(argv[1], "cpu")) {
+		unsigned cpu = 99;
+
+		syscall(SYS_getcpu, &cpu, NULL, NULL);
+		return cpu;	/* exec'd by the move: exec check */
+	}
 	if (argc > 1 && !strcmp(argv[1], "hot")) {
 		printf("%#lx\n", hot(HOT_SEED));	/* HOT_EXPECT, see hot() */
 		return 0;

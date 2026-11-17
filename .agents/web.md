@@ -448,7 +448,8 @@ has no Options control.
 
 ## fx
 
-The status line's `fx` button (`#bar-fx`, left of the About triangle) and Ctrl-A f
+The status line's `fx` button (`#bar-fx`, after the display and preview
+icons; in the ⋯ menu on phones) and Ctrl-A f
 start fx, the coding agent from fx.sh, in a panel (`#fx`, `Fx.tsx`, the
 store's `fx`); pressed again they hide and show it, and its `[×]`
 (`#fx-close`) stops fx. `?fx` (or `?fx=1`) starts it at load, once the

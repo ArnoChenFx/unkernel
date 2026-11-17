@@ -5,16 +5,17 @@
 // windows (the console, the terminal windows 1 to 9, and last + for a new
 // window; the current one is inverted; terminal windows have a × while
 // current or under the pointer), and the prefix and what it takes while it
-// is armed. Right: the special views as icons, inverted while shown (a
-// monitor for the guest's display while a program has it open, a globe for
-// the preview while it is open; Preview.tsx has its close), ^A, faint, which opens the Keys tab (hidden
-// while the prefix is armed), the data disk's used space (opens System),
-// kernel memory (opens Environment), Suspend (a pause icon while the system
-// runs; a play icon, Resume, once suspended), Reboot, the dialog's tabs as icons (Kernel log, Errors
-// with their count, only while there are any), fx (fx.ts: starts the agent in its side
-// panel, then hides and shows it; inverted while shown), the About triangle (About.tsx),
-// and last System, which also shows the state in its colour. Below sm, all but
-// the views, Errors and fx move into a ⋯ menu (More). The windows and icons
+// is armed. Right, in groups: the views, inverted while shown (a monitor for
+// the guest's display while a program has it open; a globe for the preview
+// while it is open, Preview.tsx has its close; fx, fx.ts, which starts the
+// agent in its side panel, then hides and shows it); the data disk's used
+// space (opens System) and kernel memory (opens Environment); the dialog's
+// tabs (^A, faint, which opens the Keys tab and hides while the prefix is
+// armed; the Kernel log; Errors with their count, only while there are any);
+// Suspend (a pause icon while the system runs; a play icon, Resume, once
+// suspended) and Reboot; the About triangle (About.tsx), and last System,
+// which also shows the state in its colour. Below sm, all but the display,
+// the preview and Errors move into a ⋯ menu (More). The windows and icons
 // are buttons, so phones get around by tapping; on touch the line is taller
 // and its buttons wider (--bar-h, style.css).
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
@@ -95,11 +96,13 @@ const N = ({ n }: { n: string }) => <span className="max-sm:hidden">{n}:</span>;
 const fmtSize = (n: number) =>
 	n >= 1073741824 ? `${+(n / 1073741824).toFixed(1)}G` : n >= 1048576 ? `${Math.round(n / 1048576)}M` : `${Math.round(n / 1024)}K`;
 
+type Item = [string, ReactNode, () => void];
+
 /**
- * Narrow screens (below sm): the right side keeps only the views (display,
- * preview) and Errors, and the rest
- * (Suspend or Resume, Reboot, System, Kernel log, the data disk, memory,
- * Keys, About) moves into this menu. Esc, a pick or a tap outside closes it.
+ * Narrow screens (below sm): the right side keeps only the display, the
+ * preview and Errors, and the rest moves into this menu, in groups: System,
+ * the data disk, memory; Kernel log, Keys, fx; Suspend or Resume, Reboot;
+ * About. Esc, a pick or a tap outside closes it.
  */
 function More() {
 	const ui = KW.ui!;
@@ -108,6 +111,7 @@ function More() {
 	const state = useStore((s) => s.state);
 	const suspended = useStore((s) => s.suspended);
 	const disk = useStore((s) => s.disk);
+	const fx = useStore((s) => s.fx);
 	const mem = KW.memActualMiB || KW.config.memMiB;
 	useEffect(() => {
 		if (!open) return;
@@ -119,16 +123,24 @@ function More() {
 		return () => { document.removeEventListener("pointerdown", down, true); document.removeEventListener("keydown", key, true); };
 	}, [open]);
 	const pick = (run: () => void) => () => { setOpen(false); run(); };
-	const items: [string, ReactNode, () => void][] = [
-		...(suspended ? [["Resume", <PlayIcon />, ui.resume] as [string, ReactNode, () => void]]
-			: state === "running" && KW.suspend ? [["Suspend", <PauseIcon />, () => void ui.confirmSuspend()] as [string, ReactNode, () => void]] : []),
-		["Reboot", <RebootIcon />, () => void ui.confirmReboot()],
-		["System", <SysIcon />, () => ui.openPanel("status")],
-		["Kernel log", <LogIcon />, () => ui.openPanel("log")],
-		...(disk ? [[`Data disk ${fmtSize(disk.used)}/${fmtSize(disk.size)}`, <DiskIcon />, () => ui.openPanel("status")] as [string, ReactNode, () => void]] : []),
-		[`Memory ${mem >= 1024 ? `${mem / 1024}G` : `${mem}M`}`, <MemIcon />, () => ui.openPanel("env")],
-		["Keyboard shortcuts", <span className="w-[13px] text-center text-[10px]">{PREFIX_SHORT}</span>, () => ui.openPanel("keys")],
-		["About", <svg width="11" height="11" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 23 21.5H1Z" fill="currentColor" /></svg>, openAbout],
+	// A separator between groups.
+	const groups: Item[][] = [
+		[
+			["System", <SysIcon />, () => ui.openPanel("status")],
+			...(disk ? [[`Data disk ${fmtSize(disk.used)}/${fmtSize(disk.size)}`, <DiskIcon />, () => ui.openPanel("status")] as Item] : []),
+			[`Memory ${mem >= 1024 ? `${mem / 1024}G` : `${mem}M`}`, <MemIcon />, () => ui.openPanel("env")],
+		],
+		[
+			["Kernel log", <LogIcon />, () => ui.openPanel("log")],
+			["Keyboard shortcuts", <span className="w-[13px] text-center text-[10px]">{PREFIX_SHORT}</span>, () => ui.openPanel("keys")],
+			[fx ? (fx.shown ? "Hide fx" : "Show fx") : "fx coding agent", <span className="text-[10px] font-semibold">fx</span>, toggleFx],
+		],
+		[
+			...(suspended ? [["Resume", <PlayIcon />, ui.resume] as Item]
+				: state === "running" && KW.suspend ? [["Suspend", <PauseIcon />, () => void ui.confirmSuspend()] as Item] : []),
+			["Reboot", <RebootIcon />, () => void ui.confirmReboot()],
+		],
+		[["About", <svg width="11" height="11" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 23 21.5H1Z" fill="currentColor" /></svg>, openAbout]],
 	];
 	return (
 		<div ref={box} className="flex flex-none items-stretch sm:hidden">
@@ -138,12 +150,15 @@ function More() {
 			{open && (
 				<div id="bar-menu" role="menu" aria-label="More"
 					className="absolute right-[max(4px,var(--sr))] bottom-full z-30 mb-1 flex min-w-48 flex-col border border-line-strong bg-bg py-1 shadow-[0_16px_48px_rgba(0,0,0,.8)]">
-					{items.map(([name, icon, run]) => (
-						<button key={name} type="button" role="menuitem" onClick={pick(run)}
-							className="flex items-center gap-2.5 px-3 py-2.5 text-left text-muted hover:bg-hover hover:text-fg focus-visible:bg-hover focus-visible:text-fg focus-visible:outline-none">
-							<span className="inline-flex w-[13px] justify-center">{icon}</span>{name}
-						</button>
-					))}
+					{groups.map((group, i) => [
+						i > 0 && <div key={`sep-${i}`} role="separator" className="my-1 border-t border-line" />,
+						...group.map(([name, icon, run]) => (
+							<button key={name} type="button" role="menuitem" onClick={pick(run)}
+								className="flex items-center gap-2.5 px-3 py-2.5 text-left text-muted hover:bg-hover hover:text-fg focus-visible:bg-hover focus-visible:text-fg focus-visible:outline-none">
+								<span className="inline-flex w-[13px] justify-center">{icon}</span>{name}
+							</button>
+						)),
+					])}
 				</div>
 			)}
 		</div>
@@ -204,7 +219,8 @@ export function Bar() {
 						<PreviewIcon />
 					</Seg>
 				)}
-				{!prefix && <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
+				<Seg id="bar-fx" on={!!fx?.shown} title={fx ? `fx, the coding agent: ${fx.shown ? "hide" : "show"} it` : "fx, the coding agent: start it in a side panel, working on this VM"}
+					label="fx coding agent" hint="f" onClick={toggleFx} className="font-semibold max-sm:hidden">fx</Seg>
 				{disk && (
 					<Seg hint="k" onClick={tab("status")} className="gap-1.5 tabular-nums max-md:hidden"
 						title={`Data disk (/data): ${fmtSize(disk.used)} of ${fmtSize(disk.size)} in use${disk.saved ? ", saved in this browser" : ", in memory only"}. Counts blocks ever written; df in the guest is exact. Opens System.`}>
@@ -214,18 +230,17 @@ export function Bar() {
 				<Seg hint="i" onClick={tab("env")} className="gap-1.5 tabular-nums max-md:hidden" title={`Kernel memory: ${mem} MiB. Opens Environment.`}>
 					<MemIcon />{mem >= 1024 ? `${mem / 1024}G` : `${mem}M`}
 				</Seg>
-				{suspended
-					? <Seg id="bar-resume" title="Resume the suspended system" label="Resume" onClick={ui.resume} className="text-ok max-sm:hidden"><PlayIcon /></Seg>
-					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="s" label="Suspend" onClick={() => void ui.confirmSuspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
-				<Seg id="bar-reboot" title="Reboot (asks first while the system runs)" hint="r" label="Reboot" onClick={() => void ui.confirmReboot()} className="max-sm:hidden"><RebootIcon /></Seg>
+				{!prefix && <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
 				<Seg id="bar-log" on={panel === "log"} title="Kernel log" hint="l" label="Show the kernel log" onClick={tab("log")} className="max-sm:hidden"><LogIcon /></Seg>
 				{(errors > 0 || panel === "errors") && (
 					<Seg id="bar-errors" on={panel === "errors"} title="Errors" hint="e" label={`Errors: ${errors}`} onClick={tab("errors")}>
 						<span className={`inline-flex items-center gap-1 ${panel === "errors" ? "" : "text-err"}`}><ErrIcon />{errors > 0 && errors}</span>
 					</Seg>
 				)}
-				<Seg id="bar-fx" on={!!fx?.shown} title={fx ? `fx, the coding agent: ${fx.shown ? "hide" : "show"} it` : "fx, the coding agent: start it in a side panel, working on this VM"}
-					label="fx coding agent" hint="f" onClick={toggleFx} className="font-semibold">fx</Seg>
+				{suspended
+					? <Seg id="bar-resume" title="Resume the suspended system" label="Resume" onClick={ui.resume} className="text-ok max-sm:hidden"><PlayIcon /></Seg>
+					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="s" label="Suspend" onClick={() => void ui.confirmSuspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
+				<Seg id="bar-reboot" title="Reboot (asks first while the system runs)" hint="r" label="Reboot" onClick={() => void ui.confirmReboot()} className="max-sm:hidden"><RebootIcon /></Seg>
 				<About hint={<Hint k="a" />} className="max-sm:hidden" />
 				<More />
 				{/* System: the icon is red on an error and dim once halted (style.css);

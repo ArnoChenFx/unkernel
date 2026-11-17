@@ -1,4 +1,4 @@
-From 9ae4f81cf46776e4d22bc824cf028a9347ea466c Mon Sep 17 00:00:00 2001
+From 080ead54d22f57e9d0061f2cac116ad828681496 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:09 +0000
 Subject: [PATCH] wasm: kwfb, a lazy framebuffer read by the JavaScript host

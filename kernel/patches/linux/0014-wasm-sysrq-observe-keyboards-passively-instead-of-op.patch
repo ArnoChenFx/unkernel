@@ -1,4 +1,4 @@
-From 25d237c6a3631a61efc59f1c98163825a7de49f2 Mon Sep 17 00:00:00 2001
+From 81327b93517f3ba701e10c507f6e923590366766 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:10 +0000
 Subject: [PATCH] wasm: sysrq: observe keyboards passively instead of opening

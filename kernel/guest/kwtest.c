@@ -147,6 +147,7 @@ static int failures;
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <linux/vm_sockets.h>
+#include <linux/userfaultfd.h>
 
 #ifndef __NR_riscv_hwprobe
 #define __NR_riscv_hwprobe 258
@@ -964,6 +965,141 @@ static void config_checks(void)
 	      file_has("/proc/misc", " tun"),
 	      "config: user ns %s, userfaultfd %s, pids cgroup, PSI, /proc/self/io, sysrq, loop-control, tun",
 	      WIFEXITED(status) && !WEXITSTATUS(status) ? "ok" : "BAD", uffd >= 0 ? "ok" : "BAD");
+}
+
+/*
+ * Software uaccess (arch/wasm/mm/fault.c). A kernel access to user memory
+ * whose fault returns VM_FAULT_RETRY with a signal pending must be retried
+ * (only a fatal signal ends it): read() from a pipe into a userfaultfd page
+ * while the handler signals the reader before it supplies the page. And
+ * the futex ops on user words (FUTEX_WAKE_OP here) must be atomic against
+ * user AMOs on other CPUs: one thread adds through FUTEX_OP_ADD while
+ * another (on another CPU when there is one) runs amoadd on the same word,
+ * and no increment may be lost.
+ */
+static volatile int ua_sigs;
+static void ua_on_sig(int sig)
+{
+	ua_sigs++;
+}
+
+static struct {
+	char *page;
+	int fd[2];
+	long n;
+	int err;
+	pid_t tid;
+} ua_rd;
+
+static void *ua_reader(void *arg)
+{
+	__atomic_store_n(&ua_rd.tid, syscall(SYS_gettid), __ATOMIC_RELEASE);
+	ua_rd.n = read(ua_rd.fd[0], ua_rd.page, 100);
+	ua_rd.err = ua_rd.n < 0 ? errno : 0;
+	return NULL;
+}
+
+#define UA_ITERS 100000
+static unsigned ua_word, ua_dummy;
+static void *ua_adder(void *arg)
+{
+	unsigned long mask = 1UL << (long)arg;
+	int i;
+
+	syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
+	for (i = 0; i < UA_ITERS; i++)
+		__atomic_fetch_add(&ua_word, 1, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+static void *ua_wakeop(void *arg)
+{
+	unsigned long mask = 1UL << (long)arg;
+	int i;
+
+	syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
+	for (i = 0; i < UA_ITERS; i++)
+		syscall(SYS_futex, &ua_dummy, FUTEX_WAKE_OP_PRIVATE, 0, 0, &ua_word,
+			FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 0));
+	return NULL;
+}
+
+static void uaccess_checks(void)
+{
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	struct uffdio_api api = { .api = UFFD_API };
+	struct sigaction sa = { .sa_handler = ua_on_sig }, old;
+	char src[4096], *area;
+	int uffd, rounds = 0, good = 0, i;
+	unsigned sum = 0;
+
+	/* 1. The fault retried with a signal pending. */
+	uffd = syscall(SYS_userfaultfd, O_CLOEXEC);
+	area = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (uffd >= 0 && area != MAP_FAILED && !ioctl(uffd, UFFDIO_API, &api) && !pipe(ua_rd.fd)) {
+		struct uffdio_register reg = {
+			.range = { (unsigned long)area, 4 * 4096 }, .mode = UFFDIO_REGISTER_MODE_MISSING,
+		};
+
+		sigaction(SIGUSR2, &sa, &old);
+		memset(src, 'u', sizeof(src));
+		if (!ioctl(uffd, UFFDIO_REGISTER, &reg)) {
+			for (i = 0; i < 4; i++) {
+				struct pollfd pfd = { .fd = uffd, .events = POLLIN };
+				struct uffd_msg msg;
+				struct uffdio_copy cp = {
+					.dst = (unsigned long)area + i * 4096, .src = (unsigned long)src, .len = 4096,
+				};
+				pthread_t th;
+
+				rounds++;
+				ua_rd.page = area + i * 4096;
+				ua_rd.tid = 0;
+				if (write(ua_rd.fd[1], "0123456789abcdef0123456789abcdef0123456789abcdef"
+						       "0123456789abcdef0123456789abcdef0123", 100) != 100 ||
+				    pthread_create(&th, NULL, ua_reader, NULL))
+					break;
+				/* The reader is now asleep in the fault. */
+				if (poll(&pfd, 1, 5000) == 1 && read(uffd, &msg, sizeof(msg)) == sizeof(msg) &&
+				    msg.event == UFFD_EVENT_PAGEFAULT) {
+					while (!__atomic_load_n(&ua_rd.tid, __ATOMIC_ACQUIRE))
+						;
+					syscall(SYS_tgkill, getpid(), ua_rd.tid, SIGUSR2);
+					usleep(20000);
+				}
+				ioctl(uffd, UFFDIO_COPY, &cp);
+				pthread_join(th, NULL);
+				good += ua_rd.n == 100 && !memcmp(ua_rd.page, "0123456789", 10);
+				if (ua_rd.n != 100)
+					printf("     uaccess: read() into a userfaultfd page with a signal pending: %ld (%s)\n",
+					       ua_rd.n, strerror(ua_rd.err));
+			}
+		}
+		sigaction(SIGUSR2, &old, NULL);
+		close(ua_rd.fd[0]);
+		close(ua_rd.fd[1]);
+	}
+	if (uffd >= 0)
+		close(uffd);
+	if (area != MAP_FAILED)
+		munmap(area, 4 * 4096);
+	CHECK(rounds == 4 && good == 4 && ua_sigs == 4,
+	      "uaccess: fault retried with a signal pending (userfaultfd): %d/%d reads whole, %d signals", good, rounds,
+	      ua_sigs);
+
+	/* 2. FUTEX_WAKE_OP's add against amoadd on another CPU. */
+	for (i = 0; i < 2; i++) {
+		pthread_t a, b;
+
+		ua_word = 0;
+		pthread_create(&a, NULL, ua_adder, (void *)0L);
+		pthread_create(&b, NULL, ua_wakeop, (void *)(long)(online > 1));
+		pthread_join(a, NULL);
+		pthread_join(b, NULL);
+		sum += ua_word;
+	}
+	CHECK(sum == 2 * 2 * UA_ITERS, "uaccess: FUTEX_WAKE_OP add beside amoadd on %s CPU: %u, want %u",
+	      online > 1 ? "another" : "the same", sum, 2 * 2 * UA_ITERS);
 }
 
 /*
@@ -2405,6 +2541,7 @@ int main(int argc, char **argv)
 	/* Only the SMP checks (`rdinit=/usr/bin/kwtest -- smp` repeats them faster). */
 	if (argc > 1 && !strcmp(argv[1], "smp")) {
 		mount("proc", "/proc", "proc", 0, NULL);
+		uaccess_checks();
 		smp_checks();
 		move_checks();
 		jit_smp_checks();
@@ -2518,6 +2655,7 @@ int main(int argc, char **argv)
 
 #ifdef __riscv
 	config_checks();
+	uaccess_checks();
 	input_handler_checks();
 	vsock_checks();
 	ninep_checks();

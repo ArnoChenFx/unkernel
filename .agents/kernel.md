@@ -147,7 +147,19 @@ patch re-export.
   stack guard, and per-cpu memory uses `percpu-km`.
 - uaccess (`copy_{to,from}_user`, `clear_user`, futex ops) walks the user
   page tables in software and faults pages in. `get_user`/`put_user` and
-  `strn*_user` are the generic ones on top of that.
+  `strn*_user` are the generic ones on top of that. As a hardware MMU
+  retries the access, `kw_user_addr()` walks again for as long as the
+  fault succeeds (another thread may take the page away in between: a
+  zap, a fork's COW write-protect); a real fault error, a fatal signal
+  or `pagefault_disable()` ends it, and after 10000 rounds it gives up
+  with a one-time warning (a fault handler that never maps the page;
+  on UP nothing else would end the loop; beside host load other threads
+  took the page away up to 17 times in a row, 2026-11-17). A kernel access is ended by a
+  fatal signal only, so its faults wait killable, not interruptible
+  (without `FAULT_FLAG_INTERRUPTIBLE`, as GUP): an interruptible wait
+  that a pending signal ends at once would spin, and the kernel does not
+  poll the tick in such a loop. The futex ops on user words are wasm
+  atomics (plain accesses without the atomics feature).
 - Kernel memory is not shared (no SharedArrayBuffer) by default. The
   arch Makefile's experimental `KW_ATOMICS=1` (wasm atomics, so the
   `__atomic_*` builtins become atomic instructions) and
@@ -714,7 +726,12 @@ numbers and open issues: status.md item 8.
   after the mmu_gather flush, which waits for every CPU that uses the mm,
   so a CPU never copies into a freed page (gup-fast's argument; the
   default mmu_gather, without `MMU_GATHER_RCU_TABLE_FREE`, frees page
-  tables in the same batch).
+  tables in the same batch). The walk takes no lock (munmap frees page
+  tables under the mmap read lock), so it reads each level once and
+  finds the next table from that value, as gup-fast does. User code on
+  other CPUs updates futex words with AMOs and LR/SC, so the kernel's
+  futex ops on them (`FUTEX_WAKE_OP`, PI, robust futex death) are
+  atomic RMWs (asm/futex.h).
 - **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
   on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
   Spinlocks are asm-generic's ticket locks with the wait out of line
@@ -944,6 +961,12 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
     child still holds the file after the parent closed it, and while a
     mapping outlives `close()`; it opens again after the child's exit and
     after `munmap`.
+  - `uaccess:` (every build): `read()` from a pipe into a userfaultfd
+    page whose handler signals the reader before it supplies the page
+    must return the data (a non-fatal signal neither ends the fault's
+    wait nor fails the retried access); `FUTEX_WAKE_OP`'s add beside an
+    amoadd loop on the same word, on another CPU when there is one, must
+    lose no increment. `kwtest smp` runs it too.
   - `config:` checks the options below, and `input handlers` that no
     input handler besides evdev and sysrq is registered.
   - `smp:` (more than one CPU online; skipped otherwise): three threads,
@@ -977,8 +1000,8 @@ required: build.sh fetches Binaryen 133 if it finds no `wasm-opt` with
     published a version, CPU 1 must never run an older one, never run
     the code while it is not executable (it must fault), and never
     crash.
-    `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only `smp:`,
-    `move:` and `jit:`.
+    `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only
+    `uaccess:`, `smp:`, `move:` and `jit:`.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).

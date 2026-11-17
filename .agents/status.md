@@ -293,6 +293,42 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    ms inline (UP 0.17-0.18 and 0.16-0.18); `seq 1 20000` on CPU 0
    0.36-0.39 and 0.36-0.46 s in worker mode, on CPU 1 6.2-6.3 s either
    way.
+   Uaccess races (2026-11-17, after step 7; kernel.md, Memory model and
+   SMP, MM): a system call could fail with EFAULT on a valid address
+   (kwmmstress's `getcpu()` once). `kw_user_addr()` gave up after three
+   faults, and other threads of the mm can take the page away again
+   between a fault that succeeded and the next walk: `MADV_DONTNEED` zaps
+   under the mmap read lock, beside the fault, and under host load a
+   fork's COW write-protect lands there while the faulting CPU's host
+   thread is descheduled (a temporary counter showed the PTE empty, or
+   the same page write-protected again, after every such fault). The walk
+   now goes on for as long as the fault succeeds (up to 17 rounds in a
+   row seen beside host load; 10000 rounds end it with a warning). Two
+   more bugs turned up: a kernel access whose fault returned
+   `VM_FAULT_RETRY` failed whenever any signal was pending
+   (`fault_signal_pending()` with no regs read `user_mode()` at address
+   0), and the futex ops on user words were a plain read and write, so
+   `FUTEX_WAKE_OP`'s add beside an amoadd on another CPU lost up to 6% of
+   the increments (robust futex death and the PI paths could drop
+   `FUTEX_WAITERS`). A scratch reproducer (`kwuarace`: one writer thread
+   per CPU in `clock_gettime`, `getcpu`, `read` and `uname` into four
+   pages and `getcpu` on its stack, while siblings zap the pages, fork,
+   mprotect them RW and RWX, and the main thread re-pins the writers; 120
+   s per run, lowered kernels, JIT): before, 60 EFAULTs in 5 of 6 runs
+   (idle 5, 1 and 0 at 2, 4 and 8 CPUs in 0.3, 0.5 and 0.9 billion calls;
+   beside 24 host spinners 32, 21 and 1), and lost adds in most of its
+   3-second `FUTEX_WAKE_OP` rounds; after, none in 2.1 billion calls and
+   no lost add. kwtest's new `uaccess:` checks fail on the old UP and SMP
+   kernels and pass now. Cost (39 alternating boots per kernel,
+   interpreter only): `getppid`, `clock_gettime`, 64-byte and 4 KiB pipe
+   round trips, `uname`, anonymous and COW faults within ±3% on UP, on
+   SMP with one CPU and with two, inside their run-to-run spread; the
+   walk's code is the same apart from the slow path. kwtest (UP with and
+   without the JIT; SMP on 1, 2 and 4 CPUs with the JIT, 2 without), 2
+   minutes of kwstorm with kwmmstress and with kwtlb on 4 CPUs, and the
+   api tests on 2 CPUs pass. The UP build changes in `kw_user_addr()`,
+   `kw_handle_fault()` and the futex callers. The kernel changes are
+   folded into the arch patch and `wasm: SMP`.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -330,6 +366,14 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      say, 1 ms could take a ticket; nothing measured needs it), and
      nothing switches `kw_spin_unfair=` by itself. Bare `cpu_relax()`
      loops (seqcount retries) do not take the timer.
+   - Aligned `get_user()` and `put_user()` copy through `memcpy` (wasm
+     `memory.copy`), which the wasm spec does not make single-copy
+     atomic on a shared memory, unlike riscv's loads and stores: a
+     futex word read beside user stores on another CPU could tear.
+     None seen (2026-11-17: 7.8 million `FUTEX_WAIT` reads of a word
+     another CPU flips between 0 and ~0, 2 CPUs), and the futex paths
+     retry on an unexpected value. Scalar `__get_user_fn` and
+     `__put_user_fn` for aligned 1, 2, 4 and 8 bytes would make it so.
    - Browsers: not tried. They need cross-origin isolation, a worker for
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message

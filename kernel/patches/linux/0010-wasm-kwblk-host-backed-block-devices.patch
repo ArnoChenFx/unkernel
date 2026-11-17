@@ -1,4 +1,4 @@
-From a3ceb534880bd7bce704d3114b27cce3a6e3be27 Mon Sep 17 00:00:00 2001
+From 48a2ea9e571521370786f54ef1ef48231406d5cc Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:09 +0000
 Subject: [PATCH] wasm: kwblk, host-backed block devices

@@ -1,4 +1,4 @@
-From 8bcfd74429b37dfe04f65aee55e38168da9247f2 Mon Sep 17 00:00:00 2001
+From bd27350ab0b0ed8ef1bdeab9a893b065542866ae Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:09 +0000
 Subject: [PATCH] wasm: add the Wasm (WebAssembly) architecture
@@ -132,7 +132,7 @@ Signed-off-by: Pooya Parsa <pooya@pi0.io>
  arch/wasm/lib/delay.c                    |  20 ++
  arch/wasm/lib/multi3.c                   |  25 ++
  arch/wasm/mm/Makefile                    |   6 +
- arch/wasm/mm/fault.c                     | 267 +++++++++++++++
+ arch/wasm/mm/fault.c                     | 313 +++++++++++++++++
  arch/wasm/mm/init.c                      |  47 +++
  arch/wasm/mm/sigpage.c                   |  62 ++++
  arch/wasm/mm/tlb.c                       |  88 +++++
@@ -140,7 +140,7 @@ Signed-off-by: Pooya Parsa <pooya@pi0.io>
  drivers/tty/hvc/Makefile                 |   1 +
  drivers/tty/hvc/hvc_wasm.c               | 106 ++++++
  scripts/Makefile.clang                   |   1 +
- 86 files changed, 4880 insertions(+)
+ 86 files changed, 4926 insertions(+)
  create mode 100644 arch/wasm/Kbuild
  create mode 100644 arch/wasm/Kconfig
  create mode 100644 arch/wasm/Kconfig.debug
@@ -4985,10 +4985,10 @@ index 00000000000..7e8addacdc2
 +obj-y += tlb.o
 diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
 new file mode 100644
-index 00000000000..4dada661636
+index 00000000000..553d1c3e541
 --- /dev/null
 +++ b/arch/wasm/mm/fault.c
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,313 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Page faults and user memory access.
@@ -5080,8 +5080,18 @@ index 00000000000..4dada661636
 +	vm_fault_t fault;
 +
 +	*code = SEGV_MAPERR;
++	/*
++	 * Only a fatal signal ends a kernel access (the uaccess walk, below),
++	 * so it also waits killable only, as GUP without FOLL_INTERRUPTIBLE:
++	 * with FAULT_FLAG_INTERRUPTIBLE any pending signal would end each
++	 * wait at once (handle_userfault()) and the retries would spin, and
++	 * the kernel does not poll the tick in such a loop, so on UP the task
++	 * that would resolve the fault might never run.
++	 */
 +	if (user)
 +		flags |= FAULT_FLAG_USER;
++	else
++		flags &= ~FAULT_FLAG_INTERRUPTIBLE;
 +	if (access == KW_ACCESS_WRITE)
 +		flags |= FAULT_FLAG_WRITE;
 +	else if (access == KW_ACCESS_EXEC)
@@ -5102,7 +5112,15 @@ index 00000000000..4dada661636
 +
 +	fault = handle_mm_fault(vma, addr, flags, regs);
 +
-+	if (fault_signal_pending(fault, regs))
++	/*
++	 * fault_signal_pending(), with @user for user_mode(regs): the uaccess
++	 * walk passes no regs. Only a fatal signal ends a kernel access (it
++	 * fails with EFAULT); any signal ends a user fault, which comes again
++	 * if the instruction runs again after the handler.
++	 */
++	if (unlikely((fault & VM_FAULT_RETRY) &&
++		     (fatal_signal_pending(current) ||
++		      (user && signal_pending(current)))))
 +		return user ? 0 : VM_FAULT_SIGSEGV;
 +
 +	if (fault & VM_FAULT_COMPLETED)
@@ -5159,8 +5177,23 @@ index 00000000000..4dada661636
 +{
 +	unsigned long addr = (unsigned long)uaddr;
 +	struct mm_struct *mm = current->mm;
-+	int tries = 0, code;
++	int rounds = 0, code;
 +
++	/*
++	 * As a hardware MMU retries the access after every fault it took,
++	 * walk again for as long as the fault handler succeeds: another
++	 * thread of the mm may take the access away again before the walk
++	 * (on SMP: MADV_DONTNEED zaps under the mmap read lock, fork
++	 * write-protects for COW, mprotect(), migration), or change the PTE
++	 * while the fault sleeps, which then succeeds without mapping it.
++	 * Only a real error (SIGSEGV, SIGBUS, OOM), a fatal signal (checked
++	 * each time round, as GUP does, so that the loop stays killable) or
++	 * pagefault_disable() ends it. The 10000 rounds are a backstop for a
++	 * fault handler that reports success without ever mapping the page:
++	 * on UP nothing else would end the loop (no other task runs, and the
++	 * kernel does not poll the tick). Under host load other threads were
++	 * seen to take the page away up to 17 times in a row.
++	 */
 +	if (!mm || addr >= TASK_SIZE || TASK_SIZE - addr < len)
 +		return NULL;
 +
@@ -5183,8 +5216,21 @@ index 00000000000..4dada661636
 +					(addr & ~PAGE_MASK));
 +		}
 +
-+		if (faulthandler_disabled() || tries++ >= 3)
++		if (faulthandler_disabled())
 +			return NULL;
++		if (rounds) {
++			/* Lost the page again since the last fault. */
++			if (fatal_signal_pending(current))
++				return NULL;
++			if (rounds >= 10000) {
++				pr_warn_once("%s[%d]: %d faults at %lx did not map it (pte %lx)\n",
++					     current->comm, task_pid_nr(current),
++					     rounds, addr, v);
++				return NULL;
++			}
++			cond_resched();
++		}
++		rounds++;
 +		if (kw_handle_fault(NULL, addr,
 +				    write ? KW_ACCESS_WRITE : KW_ACCESS_READ,
 +				    false, &code))

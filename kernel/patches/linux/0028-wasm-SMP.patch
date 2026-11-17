@@ -1,4 +1,4 @@
-From a8415c43f5790d2f7324df6ae5fb7a0a16a14a64 Mon Sep 17 00:00:00 2001
+From d67b258b96f1417bfa9660586d9c3178f8214548 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -63,6 +63,7 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/Makefile                   |   5 +
  arch/wasm/configs/kw_smp.config      |   4 +
  arch/wasm/include/asm/entry-common.h |  23 +++
+ arch/wasm/include/asm/futex.h        |  26 ++-
  arch/wasm/include/asm/hwcap.h        |   2 +
  arch/wasm/include/asm/irq.h          |  22 ++
  arch/wasm/include/asm/irqflags.h     |  71 ++++++-
@@ -92,9 +93,9 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/kernel/time.c              |  54 ++++-
  arch/wasm/kernel/traps.c             |  26 ++-
  arch/wasm/kernel/wasi.c              |  41 +++-
- arch/wasm/mm/fault.c                 |  39 +++-
+ arch/wasm/mm/fault.c                 |  60 ++++--
  arch/wasm/mm/tlb.c                   | 236 +++++++++++++++++++++-
- 35 files changed, 1395 insertions(+), 54 deletions(-)
+ 36 files changed, 1424 insertions(+), 72 deletions(-)
  create mode 100644 arch/wasm/configs/kw_smp.config
  create mode 100644 arch/wasm/include/asm/kwcpu.h
  create mode 100644 arch/wasm/include/asm/smp.h
@@ -213,6 +214,67 @@ index 185b2ff8246..7493ca079d3 100644
 +#endif
 +
  #endif /* _ASM_WASM_ENTRY_COMMON_H */
+diff --git a/arch/wasm/include/asm/futex.h b/arch/wasm/include/asm/futex.h
+index 298606ab13a..295105b9d6b 100644
+--- a/arch/wasm/include/asm/futex.h
++++ b/arch/wasm/include/asm/futex.h
+@@ -8,8 +8,13 @@
+ #include <asm/errno.h>
+ 
+ /*
+- * Single CPU, no preemption, and user mode only runs when the kernel calls
+- * kw_run(): plain read-modify-write on the translated address is atomic.
++ * Read-modify-write of a user word through its kernel address
++ * (kw_user_addr(), valid until the next poll point). On SMP user code on
++ * other CPUs updates the same word with AMOs and LR/SC (kwemu's atomics
++ * are wasm atomics on the same memory), so these are wasm atomics too,
++ * fully ordered as riscv's amo*.aqrl and lr/sc.aqrl. Without wasm atomics
++ * (UP) the compiler makes them plain loads and stores, which suffices:
++ * one CPU, no preemption, and user code only runs inside kw_run().
+  */
+ static inline int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 						u32 oldval, u32 newval)
+@@ -22,9 +27,9 @@ static inline int futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 	if (!p)
+ 		return -EFAULT;
+ 
+-	*uval = *p;
+-	if (*uval == oldval)
+-		*p = newval;
++	*uval = oldval;
++	__atomic_compare_exchange_n(p, uval, newval, false, __ATOMIC_SEQ_CST,
++				    __ATOMIC_SEQ_CST);
+ 	return 0;
+ }
+ 
+@@ -39,22 +44,21 @@ static inline int arch_futex_atomic_op_inuser(int op, u32 oparg, int *oval,
+ 	if (!p)
+ 		return -EFAULT;
+ 
+-	old = *p;
+ 	switch (op) {
+ 	case FUTEX_OP_SET:
+-		*p = oparg;
++		old = __atomic_exchange_n(p, oparg, __ATOMIC_SEQ_CST);
+ 		break;
+ 	case FUTEX_OP_ADD:
+-		*p = old + oparg;
++		old = __atomic_fetch_add(p, oparg, __ATOMIC_SEQ_CST);
+ 		break;
+ 	case FUTEX_OP_OR:
+-		*p = old | oparg;
++		old = __atomic_fetch_or(p, oparg, __ATOMIC_SEQ_CST);
+ 		break;
+ 	case FUTEX_OP_ANDN:
+-		*p = old & ~oparg;
++		old = __atomic_fetch_and(p, ~oparg, __ATOMIC_SEQ_CST);
+ 		break;
+ 	case FUTEX_OP_XOR:
+-		*p = old ^ oparg;
++		old = __atomic_fetch_xor(p, oparg, __ATOMIC_SEQ_CST);
+ 		break;
+ 	default:
+ 		return -ENOSYS;
 diff --git a/arch/wasm/include/asm/hwcap.h b/arch/wasm/include/asm/hwcap.h
 index f71640d38f5..e116408e5c1 100644
 --- a/arch/wasm/include/asm/hwcap.h
@@ -1920,10 +1982,10 @@ index f96cf96b2cf..62c43ddb405 100644
  	if (wasi_stdin_ready())
  		wasi_raise_console_irq();
 diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
-index 4dada661636..6b5275b2f03 100644
+index 553d1c3e541..959f2396685 100644
 --- a/arch/wasm/mm/fault.c
 +++ b/arch/wasm/mm/fault.c
-@@ -16,11 +16,10 @@
+@@ -16,25 +16,31 @@
  #include <linux/hugetlb.h>
  #include <asm/entry.h>
  #include <asm/kw_emu.h>
@@ -1933,10 +1995,38 @@ index 4dada661636..6b5275b2f03 100644
  
 -extern struct kw_cpu *const wasm_kw_cpu;
 -
- /* Find the PTE for @addr in @mm, or NULL if no page table covers it. */
+-/* Find the PTE for @addr in @mm, or NULL if no page table covers it. */
++/*
++ * Find the PTE for @addr in @mm, or NULL if no page table covers it. Runs
++ * without the mmap lock or the PTE lock, as a hardware walker: another CPU
++ * may clear an entry meanwhile (free_pgtables() after munmap() downgraded
++ * to a read lock), so each level is read once and the next table found
++ * from that value (as gup-fast does); the table itself stays allocated
++ * until that CPU's flush, which waits for this one (kw_user_addr()).
++ */
  static pte_t *kw_walk(struct mm_struct *mm, unsigned long addr)
  {
-@@ -49,6 +48,23 @@ static bool access_error(unsigned int access, struct vm_area_struct *vma)
+ 	pgd_t *pgd = pgd_offset(mm, addr);
+ 	p4d_t *p4d = p4d_offset(pgd, addr);
+-	pud_t *pud = pud_offset(p4d, addr);
+-	pmd_t *pmd;
++	pud_t pud = __pud(READ_ONCE(pud_val(*pud_offset(p4d, addr))));
++	pmd_t pmd;
+ 
+-	if (pud_none(*pud) || !pud_present(*pud))
++	if (pud_none(pud) || !pud_present(pud))
+ 		return NULL;
+-	pmd = pmd_offset(pud, addr);
+-	if (pmd_none(*pmd) || !(pmd_val(*pmd) & _PAGE_PRESENT))
++	pmd = __pmd(READ_ONCE(pmd_val(*(pud_pgtable(pud) + pmd_index(addr)))));
++	if (pmd_none(pmd) || !(pmd_val(pmd) & _PAGE_PRESENT))
+ 		return NULL;
+-	return pte_offset_kernel(pmd, addr);
++	return (pte_t *)pmd_page_vaddr(pmd) + pte_index(addr);
+ }
+ 
+ static bool access_error(unsigned int access, struct vm_area_struct *vma)
+@@ -49,6 +55,23 @@ static bool access_error(unsigned int access, struct vm_area_struct *vma)
  	}
  }
  
@@ -1960,7 +2050,7 @@ index 4dada661636..6b5275b2f03 100644
  /*
   * What a hardware walker with Svadu would do: the mapping allows the access
   * but A (or D for a store) is clear. Returns true if fixed.
-@@ -61,7 +77,7 @@ static bool kw_fixup_ad(struct mm_struct *mm, unsigned long addr,
+@@ -61,7 +84,7 @@ static bool kw_fixup_ad(struct mm_struct *mm, unsigned long addr,
  
  	if (!ptep)
  		return false;
@@ -1969,7 +2059,7 @@ index 4dada661636..6b5275b2f03 100644
  	if (!(v & _PAGE_PRESENT) || !(v & _PAGE_USER))
  		return false;
  	need = access == KW_ACCESS_WRITE ? _PAGE_WRITE :
-@@ -69,8 +85,8 @@ static bool kw_fixup_ad(struct mm_struct *mm, unsigned long addr,
+@@ -69,8 +92,8 @@ static bool kw_fixup_ad(struct mm_struct *mm, unsigned long addr,
  	if (!(v & need))
  		return false;
  	need = _PAGE_ACCESSED | (access == KW_ACCESS_WRITE ? _PAGE_DIRTY : 0);
@@ -1980,7 +2070,7 @@ index 4dada661636..6b5275b2f03 100644
  	kw_flush_tlb_range(wasm_kw_cpu, addr & PAGE_MASK,
  			   (addr & PAGE_MASK) + PAGE_SIZE);
  	return true;
-@@ -164,6 +180,14 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
+@@ -182,6 +205,14 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
  
  /* ---------------------------------------------------------------------- */
  
@@ -1995,7 +2085,7 @@ index 4dada661636..6b5275b2f03 100644
  void *kw_user_addr(const void __user *uaddr, size_t len, bool write)
  {
  	unsigned long addr = (unsigned long)uaddr;
-@@ -175,7 +199,7 @@ void *kw_user_addr(const void __user *uaddr, size_t len, bool write)
+@@ -208,7 +239,7 @@ void *kw_user_addr(const void __user *uaddr, size_t len, bool write)
  
  	for (;;) {
  		pte_t *ptep = kw_walk(mm, addr);
@@ -2004,7 +2094,7 @@ index 4dada661636..6b5275b2f03 100644
  		unsigned long need = _PAGE_PRESENT | _PAGE_USER |
  				     (write ? _PAGE_WRITE : _PAGE_READ);
  
-@@ -184,7 +208,8 @@ void *kw_user_addr(const void __user *uaddr, size_t len, bool write)
+@@ -217,7 +248,8 @@ void *kw_user_addr(const void __user *uaddr, size_t len, bool write)
  					   (write ? _PAGE_DIRTY : 0);
  
  			if ((v & ad) != ad) {

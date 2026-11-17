@@ -265,8 +265,10 @@ other options.
   reloaded on one CPU; a UP session resumed from a `?smp=2` load ("Resume
   on 1 CPU") and was deleted by "Boot on 2 CPUs"; a page from the newest
   release (no patch) showed the option disabled and booted UP. Also the
-  Vite dev server (nested worker from source). Firefox, Safari and
-  phones: not tried.
+  Vite dev server (nested worker from source).
+- Checked by hand on a deployed build (2026-11-17): several CPUs work in
+  desktop Chrome, in Firefox and on iOS. Desktop Safari and Android: not
+  tried.
 
 ## Suspend and resume
 

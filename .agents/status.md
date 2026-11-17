@@ -379,11 +379,11 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      mode's kernel worker (CPU 0 must be able to block, so not on a
      page's main thread), and the page has a CPUs option (`?smp=N`, off
      by default) that loads the SMP bundle only then and falls back to
-     one CPU. Run only in headless Chromium (2 and 4 CPUs: boot, a
-     terminal window, glimmer, the JIT on every CPU, parallel loops
-     scaling). Not tried: Firefox (whether it has `Atomics.waitAsync`;
-     the option is disabled where it is missing), Safari, phones, a
-     hidden tab (worker throttling), long sessions. The page offers it
+     one CPU. Run in headless Chromium (2 and 4 CPUs: boot, a terminal
+     window, glimmer, the JIT on every CPU, parallel loops scaling) and
+     by hand on a deployed build in desktop Chrome, Firefox and on iOS.
+     Not tried: desktop Safari, Android, a hidden tab (worker
+     throttling), long sessions. The page offers it
      only once a release bundle carries the SMP patch (Packaging, below).
    - Packaging: one bundle carries the UP kernel and a patch to the SMP
      one (`kernel/tools/bundle.mjs --smp`; js.md, CPU threads; web.md for

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Build-time byte diff of two kernel modules (a prototype: SMP packaging,
-// .agents/status.md item 8). The patch converts one module into the other;
+// Build-time byte diff of two kernel modules (bundle.mjs --smp: the UP
+// bundle's patch to the SMP kernel). The patch converts one module into the other;
 // js/core/kpatch.ts applies it in the loader.
 //
 //   node kernel/tools/kwdiff.mjs <base.wasm> <target.wasm> -o <out.kwpatch> [--remap]

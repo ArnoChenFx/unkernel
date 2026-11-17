@@ -10,7 +10,7 @@
 // The initramfs goes into a custom section "unkernel.initrd", the command
 // line into "unkernel.cmdline", and the data disk template (a gzipped
 // kwsparse image, kernel/build.sh datadisk) into "unkernel.datadisk".
-// --smp (a prototype, .agents/status.md item 8) adds the patch that turns
+// --smp (.agents/js.md, CPU threads) adds the patch that turns
 // this kernel into the given SMP build of the same tree
 // ("unkernel.kernel.smp.kwpatch", kwdiff.mjs --remap, last), which the
 // loader applies when asked for more than one CPU (js/core/kpatch.ts).

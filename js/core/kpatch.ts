@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Apply a kernel patch made by kernel/tools/kwdiff.mjs (a prototype for
-// shipping the UP and SMP kernels in one bundle, .agents/status.md item 8).
+// Apply a kernel patch made by kernel/tools/kwdiff.mjs: how one bundle
+// ships the UP and the SMP kernel (.agents/js.md, CPU threads).
 // Universal: no Node or DOM APIs; the hash check uses crypto.subtle where
 // there is one.
 

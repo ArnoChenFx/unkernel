@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Kernel patches (prototype, .agents/status.md item 8): kernel/tools/kwdiff.mjs
+// Kernel patches (.agents/js.md, CPU threads): kernel/tools/kwdiff.mjs
 // makes them, js/core/kpatch.ts applies them. Synthetic data always; the
 // real UP and SMP kernels when given (byte-identical result, remapped and
 // not, and the bundle path of bundle.mjs --smp):

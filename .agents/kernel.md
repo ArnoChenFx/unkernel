@@ -710,7 +710,11 @@ numbers and open issues: status.md item 8.
   the pending interrupts are taken, and TLB flushes do not wait for a
   yielding CPU (MM, below). Only CPU 0 also checks stdin there.
   `smp_send_stop()` parks the others (CPU 0 in `wasm_idle(-1)`, so its
-  host can still take a secondary's exit). A CPU takes the stop IPI in
+  host can still take a secondary's exit; it clears its pending word
+  before each such wait, since the host's idle ends at once while that
+  word is not 0, and a stop bit left there kept CPU 0 resuming in a loop
+  of microtasks that starved the host's event loop, so the exit was never
+  taken). A CPU takes the stop IPI in
   `cpu_relax()` even with interrupts off, and a secondary's host raises
   it on CPU 0 when the session ends there (exit, trap, fatal; js.md):
   CPU 0's host takes that CPU's message only once CPU 0 suspends, and

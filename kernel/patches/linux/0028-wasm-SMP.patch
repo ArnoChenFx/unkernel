@@ -1,4 +1,4 @@
-From 1faccf03deb80dcd477cf763787380086ce195bb Mon Sep 17 00:00:00 2001
+From ddeeb1c801992a21e9fa8d484f03ce9b871e6123 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -91,14 +91,14 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  arch/wasm/kernel/process.c           | 340 ++++++++++++++++++++++++++-
  arch/wasm/kernel/setup.c             |  14 ++
  arch/wasm/kernel/signal.c            |   3 +-
- arch/wasm/kernel/smp.c               | 169 +++++++++++++
+ arch/wasm/kernel/smp.c               | 174 ++++++++++++++
  arch/wasm/kernel/sys_riscv.c         |   6 +-
  arch/wasm/kernel/time.c              |  54 ++++-
  arch/wasm/kernel/traps.c             |  26 +-
  arch/wasm/kernel/wasi.c              |  41 +++-
  arch/wasm/mm/fault.c                 |  60 +++--
  arch/wasm/mm/tlb.c                   | 236 ++++++++++++++++++-
- 36 files changed, 1485 insertions(+), 72 deletions(-)
+ 36 files changed, 1490 insertions(+), 72 deletions(-)
  create mode 100644 arch/wasm/configs/kw_smp.config
  create mode 100644 arch/wasm/include/asm/kwcpu.h
  create mode 100644 arch/wasm/include/asm/smp.h
@@ -1617,10 +1617,10 @@ index 3eceaadeb6e..5df45d42d6e 100644
  	struct siginfo info;
 diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
 new file mode 100644
-index 00000000000..3d6bb0b0301
+index 00000000000..e48cf0a45bb
 --- /dev/null
 +++ b/arch/wasm/kernel/smp.c
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,174 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * SMP: one instance of the kernel module per CPU, each in its own host
@@ -1754,11 +1754,16 @@ index 00000000000..3d6bb0b0301
 +		/*
 +		 * CPU 0 suspends instead of blocking its thread: the host
 +		 * there still has to take the exit (a panic) from the CPU that
-+		 * stopped it.
++		 * stopped it. Its idle wait ends as soon as its word of pending
++		 * interrupts is not 0, so clear the word first: a stop bit left
++		 * there (taken in cpu_relax(), or raised again by a CPU whose
++		 * session ended) would end every wait at once, and the host,
++		 * resuming CPU 0 without end, would never get to that exit.
 +		 */
-+		if (smp_processor_id() == 0)
++		if (smp_processor_id() == 0) {
++			xchg(kw_irq_word_of(0), 0);
 +			wasm_idle(-1);
-+		else
++		} else
 +			__builtin_wasm_memory_atomic_wait32(&never, 0, -1);
 +	}
 +}

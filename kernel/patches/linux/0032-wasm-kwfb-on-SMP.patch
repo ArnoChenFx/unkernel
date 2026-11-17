@@ -1,4 +1,4 @@
-From fa17a15e1ef450b844d0883c31e2434c0b13bda0 Mon Sep 17 00:00:00 2001
+From e5e74efe028262d3f68a57f4e7ede53a8ba34122 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:03 +0000
 Subject: [PATCH] wasm: kwfb on SMP

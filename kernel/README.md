@@ -757,6 +757,14 @@ kernel (70 KB gzipped, 54 KB with brotli) and 25 KiB of RAM. Alpine's
 `/init` and the Alpine disk's fstab mount cgroup2 at `/sys/fs/cgroup`
 (24 KiB, about 10 ms).
 
+For VPNs and containers the kernel also has policy routing (`ip rule` and
+more than one routing table), veth pairs and dummy links (64 KB, 24 KB
+gzipped, 20 KiB of RAM; 2026-11-17). Tailscale's `tailscaled` runs on
+`/dev/net/tun` with its usual rules and table 52; start it with
+`tailscale up --netfilter-mode=off`, since there is no netfilter, and
+expect relayed (DERP) connections, since the host network stack carries no
+UDP. A `dummy0` link exists from boot.
+
 ## Browser page
 
 The page (`web/`, repository root) is a full-screen terminal (wterm) with

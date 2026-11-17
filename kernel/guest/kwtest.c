@@ -148,6 +148,9 @@ static int failures;
 #include <sys/sysmacros.h>
 #include <linux/vm_sockets.h>
 #include <linux/userfaultfd.h>
+#include <linux/rtnetlink.h>
+#include <linux/fib_rules.h>
+#include <linux/veth.h>
 
 #ifndef __NR_riscv_hwprobe
 #define __NR_riscv_hwprobe 258
@@ -965,6 +968,114 @@ static void config_checks(void)
 	      file_has("/proc/misc", " tun"),
 	      "config: user ns %s, userfaultfd %s, pids cgroup, PSI, /proc/self/io, sysrq, loop-control, tun",
 	      WIFEXITED(status) && !WEXITSTATUS(status) ? "ok" : "BAD", uffd >= 0 ? "ok" : "BAD");
+}
+
+/*
+ * rtnetlink requests for net_config_checks: attributes appended to a
+ * buffer (without data: a nest, or room that the caller fills).
+ */
+struct nl_req {
+	struct nlmsghdr h;
+	char body[256];
+};
+
+static struct rtattr *nl_attr(struct nl_req *r, int type, const void *data, int len)
+{
+	struct rtattr *a = (struct rtattr *)((char *)r + NLMSG_ALIGN(r->h.nlmsg_len));
+
+	a->rta_type = type;
+	a->rta_len = RTA_LENGTH(len);
+	if (data)
+		memcpy(RTA_DATA(a), data, len);
+	r->h.nlmsg_len = NLMSG_ALIGN(r->h.nlmsg_len) + RTA_ALIGN(a->rta_len);
+	return a;
+}
+
+static void nl_nest_end(struct nl_req *r, struct rtattr *a)
+{
+	a->rta_len = (char *)r + NLMSG_ALIGN(r->h.nlmsg_len) - (char *)a;
+}
+
+/* Sends the request and returns the kernel's ack: 0 or a negative errno. */
+static int nl_ack(int fd, struct nl_req *r)
+{
+	struct {
+		struct nlmsghdr h;
+		struct nlmsgerr e;
+		char pad[128];
+	} ans;
+
+	r->h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+	if (send(fd, r, r->h.nlmsg_len, 0) < 0 || recv(fd, &ans, sizeof(ans), 0) < (ssize_t)NLMSG_LENGTH(sizeof(ans.e)) ||
+	    ans.h.nlmsg_type != NLMSG_ERROR)
+		return -EIO;
+	return ans.e.error;
+}
+
+static void nl_newlink(struct nl_req *r, const char *name)
+{
+	memset(r, 0, sizeof(*r));
+	r->h.nlmsg_type = RTM_NEWLINK;
+	r->h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	nl_attr(r, IFLA_IFNAME, name, strlen(name) + 1);
+}
+
+/*
+ * Network options in kw_defconfig, tried in a network namespace of the
+ * child's own, so nothing is left behind: a dummy link, a veth pair and a
+ * policy routing rule (IP_MULTIPLE_TABLES; tailscale's "from all lookup 52").
+ */
+static void net_config_checks(void)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		struct nl_req r;
+		struct rtattr *info, *data, *peer;
+		struct fib_rule_hdr *rule;
+		uint32_t prio = 5270;
+		int fd, bad = 0;
+
+		if (syscall(SYS_unshare, 0x40000000 /* CLONE_NEWNET */))
+			_exit(8);
+		fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+		if (fd < 0)
+			_exit(8);
+
+		nl_newlink(&r, "kwd0");
+		info = nl_attr(&r, IFLA_LINKINFO, NULL, 0);
+		nl_attr(&r, IFLA_INFO_KIND, "dummy", 5);
+		nl_nest_end(&r, info);
+		bad |= nl_ack(fd, &r) ? 1 : 0;
+
+		nl_newlink(&r, "kwv0");
+		info = nl_attr(&r, IFLA_LINKINFO, NULL, 0);
+		nl_attr(&r, IFLA_INFO_KIND, "veth", 4);
+		data = nl_attr(&r, IFLA_INFO_DATA, NULL, 0);
+		peer = nl_attr(&r, VETH_INFO_PEER, NULL, sizeof(struct ifinfomsg));
+		memset(RTA_DATA(peer), 0, sizeof(struct ifinfomsg));
+		nl_attr(&r, IFLA_IFNAME, "kwv1", 5);
+		nl_nest_end(&r, peer);
+		nl_nest_end(&r, data);
+		nl_nest_end(&r, info);
+		bad |= nl_ack(fd, &r) ? 2 : 0;
+
+		memset(&r, 0, sizeof(r));
+		r.h.nlmsg_type = RTM_NEWRULE;
+		r.h.nlmsg_len = NLMSG_LENGTH(sizeof(*rule));
+		rule = NLMSG_DATA(&r.h);
+		rule->family = AF_INET;
+		rule->table = 52;
+		rule->action = FR_ACT_TO_TBL;
+		nl_attr(&r, FRA_PRIORITY, &prio, sizeof(prio));
+		bad |= nl_ack(fd, &r) ? 4 : 0;
+		_exit(bad);
+	}
+	waitpid(pid, &status, 0);
+	status = WIFEXITED(status) ? WEXITSTATUS(status) : 8;
+	CHECK(!status, "net config: netns %s, dummy %s, veth %s, ip rule %s", status & 8 ? "BAD" : "ok",
+	      status & 9 ? "BAD" : "ok", status & 10 ? "BAD" : "ok", status & 12 ? "BAD" : "ok");
 }
 
 /*
@@ -2802,6 +2913,7 @@ int main(int argc, char **argv)
 
 #ifdef __riscv
 	config_checks();
+	net_config_checks();
 	uaccess_checks();
 	input_handler_checks();
 	vsock_checks();

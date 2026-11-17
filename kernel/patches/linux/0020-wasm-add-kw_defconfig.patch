@@ -1,4 +1,4 @@
-From fe57d4215d2178775d2b8be6f7e454ccd0e2c7a7 Mon Sep 17 00:00:00 2001
+From 7f31046471678a4da946e20e5d30e7797c76fa5d Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:10 +0000
 Subject: [PATCH] wasm: add kw_defconfig
@@ -48,16 +48,16 @@ calls. Built with FRAME_WARN=1024, no other function warns.
 
 Signed-off-by: Pooya Parsa <pooya@pi0.io>
 ---
- arch/wasm/configs/kw_defconfig | 145 +++++++++++++++++++++++++++++++++
- 1 file changed, 145 insertions(+)
+ arch/wasm/configs/kw_defconfig | 153 +++++++++++++++++++++++++++++++++
+ 1 file changed, 153 insertions(+)
  create mode 100644 arch/wasm/configs/kw_defconfig
 
 diff --git a/arch/wasm/configs/kw_defconfig b/arch/wasm/configs/kw_defconfig
 new file mode 100644
-index 00000000000..6557791443a
+index 00000000000..0e1809fd2b4
 --- /dev/null
 +++ b/arch/wasm/configs/kw_defconfig
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,153 @@
 +# unkernel: wasm64 kernel, emulated riscv64 user mode (kwemu)
 +# CONFIG_LOCALVERSION_AUTO is not set
 +CONFIG_DEFAULT_HOSTNAME="unkernel"
@@ -110,6 +110,10 @@ index 00000000000..6557791443a
 +CONFIG_UNIX=y
 +CONFIG_INET=y
 +CONFIG_IP_MULTICAST=y
++# policy routing (ip rule, more than one table): tailscale's table 52,
++# source-based routes
++CONFIG_IP_ADVANCED_ROUTER=y
++CONFIG_IP_MULTIPLE_TABLES=y
 +# ss(8) for unix, packet and netlink sockets (INET_DIAG is on by default)
 +CONFIG_UNIX_DIAG=y
 +CONFIG_PACKET_DIAG=y
@@ -132,8 +136,12 @@ index 00000000000..6557791443a
 +CONFIG_BLK_DEV_LOOP_MIN_COUNT=0
 +CONFIG_BLK_DEV_KWBLK=y
 +CONFIG_NETDEVICES=y
++# a throwaway interface (ip link add type dummy)
++CONFIG_DUMMY=y
 +# /dev/net/tun: openvpn, wireguard-go, tailscale
 +CONFIG_TUN=y
++# a link into a network namespace (containers, ip netns)
++CONFIG_VETH=y
 +# CONFIG_ETHERNET is not set
 +# CONFIG_WLAN is not set
 +CONFIG_KWNET=y

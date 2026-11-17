@@ -1127,7 +1127,12 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   accounting, USERFAULTFD, IP_MULTICAST, the socket DIAGs, BLK_DEV_LOOP
   with MIN_COUNT=0, TUN, MAGIC_SYSRQ with its passive handler, see
   kwinput), and FUSE_FS for sshfs, rclone and AppImage (measured
-  2026-11-14: +129 KB raw, +48 KB gzip, 20 KiB RAM). BPF_SYSCALL, KEYS, IPV6 and SECCOMP stay off. COREDUMP must
+  2026-11-14: +129 KB raw, +48 KB gzip, 20 KiB RAM), and policy routing
+  (IP_ADVANCED_ROUTER with IP_MULTIPLE_TABLES: `ip rule`, which tailscaled
+  uses for its table 52 and falls back to the main table without), VETH
+  and DUMMY (measured together 2026-11-17: +64 KB raw, +24 KB gzip,
+  20 KiB RAM, no new imports; DUMMY built in makes a `dummy0` link at
+  boot). There is no netfilter. BPF_SYSCALL, KEYS, IPV6 and SECCOMP stay off. COREDUMP must
   stay off until the arch has `elf_core_copy_task_fpregs` and riscv64 core
   notes: without them a fault with a core limit is a wasm trap.
 - To measure an option, copy a built `$KOUT`, append the option to its

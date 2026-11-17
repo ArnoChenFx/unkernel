@@ -1,4 +1,4 @@
-From ad003fd441a1684f71d6d71fdbdb2baca8d4fc2a Mon Sep 17 00:00:00 2001
+From be7d5eb9e98eb01c6faa6e59b82e148c356e8ab1 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 23:07:54 +0000
 Subject: [PATCH] smp: let an arch wait for a csd and wake its waiter

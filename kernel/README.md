@@ -751,7 +751,9 @@ from source). Everything is self-hosted except the Wisp fallback.
   `?root=initramfs` (safe mode: `kw.root=initramfs`), `?verbose=1`, `?worker=1`
   (experimental: the kernel, the data disk, the network, the display, input and sound
   in a Web Worker; input and frames through shared memory when the page is
-  cross-origin isolated, `?shared=0` for messages), `?fx` (start the fx
+  cross-origin isolated, `?shared=0` for messages), `?smp=N` (experimental: the SMP
+  kernel on N CPUs, each in a Web Worker; offered only when the page's bundle carries
+  the SMP kernel and the page is cross-origin isolated, else one CPU; no Suspend), `?fx` (start the fx
   coding agent in its panel at load), and, for tests,
   `?simulate=nojspi|oom|lowmem` (documented in `web/src/config.ts`).
 * **Launcher:** ❯ at the left of the status line (or ⌘K on Apple devices,
@@ -1036,7 +1038,8 @@ switching, no block or net device, no JIT).
   held in memory as a whole.
 * SMP is experimental: a second build (`arch/wasm/configs/kw_smp.config`,
   built by hand, `.agents/kernel.md`, SMP) runs one kernel instance per
-  CPU in worker threads on a shared memory (CLI `--smp N`; Node only),
+  CPU in worker threads on a shared memory (CLI `--smp N`; the page's
+  `?smp=N`, in Web Workers, once its bundle carries the SMP kernel),
   each CPU with its own JIT. It has every device, all served by CPU 0
   (disk I/O from other CPUs is handed to it), but no snapshots yet. A task moves to another CPU only on its way back to
   user mode (the load balancer, `taskset`); one asleep in a system call

@@ -128,6 +128,7 @@ The page takes a few URL parameters:
 | `?jit=0` | Interpreter only |
 | `?data=0` | No persistent disk, a fresh system every time |
 | `?worker=1` | Run the kernel in a Web Worker (experimental) |
+| `?smp=2` | Boot on several CPUs, each in a Web Worker (experimental; only where the page has the SMP kernel and is cross-origin isolated) |
 
 Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you
@@ -228,7 +229,8 @@ faster than without it, which is still well behind native.
 
 ### 🚧 Known limits
 
-- One CPU, no SMP.
+- One CPU in the released kernel. Several CPUs (SMP) are experimental,
+  not in a release yet, and cannot be suspended.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
@@ -457,6 +459,13 @@ and the network are given as specs, which the worker builds: `{ kind:
 template: "bundled" }` in browsers. Input and frames go through shared
 memory when it is available (`vm.transport` says). This mode is
 experimental.
+
+An SMP kernel (a bundle with the SMP patch) boots on several CPUs with
+`cpus: 4`, each CPU in a thread of its own on one shared memory. In
+browsers that needs a cross-origin isolated page and `worker: true`,
+because a CPU blocks while it waits for another, which a page's main
+thread may not; `webCpuBlocker()` says why it cannot, and
+`vm.stats().cpus` how many CPUs the kernel got.
 
 ### Boot options and helpers
 

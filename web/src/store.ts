@@ -112,6 +112,8 @@ export interface Options {
 	data: "on" | "off";
 	root: "overlay" | "safe";
 	worker: "on" | "off";
+	/** CPUs, "1" to "8" (?smp=). */
+	cpus: string;
 	fx: "on" | "off";
 }
 

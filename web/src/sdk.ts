@@ -12,6 +12,7 @@ import { webPlatform } from "../../js/web/platform.ts";
 export * from "../../js/core/index.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
 export { DATA_DISK_NAME, importDataDisk, openDataDisk, resetDataDisk } from "../../js/web/disk.ts";
+export { webCpuBlocker } from "../../js/web/cpu.ts";
 
 /**
  * The kernel with Alpine bundled (vmlinux32.wasm + the initramfs,
@@ -22,8 +23,8 @@ export const kernelUrl: URL = new URL("../kernel/page/unkernel-alpine.wasm", imp
 
 /**
  * The SMP kernel with the same Alpine, its own hashed asset, or null when
- * the release bundle has no SMP patch. Nothing uses it yet: the page has no
- * CPU threads (.agents/status.md, SMP).
+ * the release bundle has no SMP patch. Fetched only when the page boots on
+ * more than one CPU (?smp=N, config.ts; boot.ts).
  */
 export { kernelSmpUrl } from "virtual:unkernel-smp-kernel";
 
@@ -32,7 +33,8 @@ const platform = webPlatform(kernelUrl);
 /**
  * js/web.ts's createKernel(), with the page's kernel as the default; with
  * `worker: true` (?worker=1) on a Web Worker (js/web/worker.ts, which Vite
- * bundles as a worker).
+ * bundles as a worker), which starts an SMP kernel's other CPUs as nested
+ * workers (js/web/cpu.ts) when `cpus` asks for them.
  */
 export function createKernel(opts: CreateKernelOptions & { worker: true }): Promise<WorkerKernel>;
 export function createKernel(opts?: CreateKernelOptions & { worker?: false }): Promise<KernelInstance>;

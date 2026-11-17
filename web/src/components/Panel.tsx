@@ -86,8 +86,9 @@ export function Panel() {
 						<K>esc</K> close <K>k i l e ?</K> tabs <K>c</K> copy <K>s</K> suspend <K>r</K> reboot
 					</p>
 					<button id="copy" type="button" className="btn btn-sm max-md:flex-1" onClick={() => ui.copyDiagnostics()}>Copy diagnostics</button>
-					<button id="suspend" type="button" className="btn btn-sm max-md:flex-1" title="Save the running system in this browser and stop it; the next load offers to resume it"
-						onClick={() => void ui.confirmSuspend()}>Suspend</button>
+					{/* The SMP kernel cannot be saved (no parking): no Suspend with several CPUs. */}
+					{KW.config.cpus < 2 && <button id="suspend" type="button" className="btn btn-sm max-md:flex-1" title="Save the running system in this browser and stop it; the next load offers to resume it"
+						onClick={() => void ui.confirmSuspend()}>Suspend</button>}
 					<button id="reboot" type="button" className="btn btn-sm btn-primary max-md:flex-1" onClick={() => ui.reboot()}>{changed ? "Reboot to apply" : "Reboot"}</button>
 				</div>
 			</aside>

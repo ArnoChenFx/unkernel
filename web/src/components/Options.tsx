@@ -3,8 +3,10 @@
 // Options in the System tab: one control per URL parameter (config.ts)
 // except ?simulate. Reboot loads the page with them (ui.rebootUrl()); Font
 // size applies at once and is kept in localStorage. Terminal style: on/off
-// options are [x] check boxes, Network is (•) radio choices, Memory and
-// Font size are sliders over their sizes.
+// options are [x] check boxes, Network and CPUs are (•) radio choices,
+// Memory and Font size are sliders over their sizes. CPUs are disabled,
+// with the reason, where the page cannot boot more than one (config.ts
+// smpBlocker()).
 //
 // The fields are controlled by the store. Besides onChange, native listeners
 // on the form (capture phase, so non-bubbling events count too) read every
@@ -57,11 +59,11 @@ function Check({ id, name, on, off, value, label, note }: { id: string; name: ke
 }
 
 /** (•) one of several. */
-function Radio({ id, name, value, current, label }: { id: string; name: keyof Opts; value: string; current: string; label: string }) {
+function Radio({ id, name, value, current, label, disabled }: { id: string; name: keyof Opts; value: string; current: string; label: string; disabled?: boolean }) {
 	const checked = value === current;
 	return (
-		<label className="flex cursor-pointer items-center gap-1.5 text-muted select-none hover:text-fg">
-			<input id={id} name={name} type="radio" value={value} checked={checked} onChange={onField} className="peer sr-only" />
+		<label className={`flex items-center gap-1.5 text-muted select-none ${disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:text-fg"}`}>
+			<input id={id} name={name} type="radio" value={value} checked={checked} disabled={disabled} onChange={onField} className="peer sr-only" />
 			<span aria-hidden="true" className="whitespace-pre peer-focus-visible:outline-2 peer-focus-visible:outline-accent">
 				<span className="text-faint">(</span><span className={checked ? "text-ok" : ""}>{checked ? "•" : " "}</span><span className="text-faint">)</span>
 			</span>
@@ -103,6 +105,7 @@ function Slider({ id, name, label, value, stops }: { id: string; name: string; l
 }
 
 const SIZES = [64, 128, 256, 512, 1024];
+const CPU_COUNTS = [1, 2, 4, 8];
 const FONTS = [11, 12, 13, 14, 15, 16, 18];
 
 export function Options() {
@@ -141,6 +144,12 @@ export function Options() {
 	}));
 	const fontValue = fontPref === String(autoPx) ? "auto" : fontPref;
 
+	// CPUs: 1, 2, 4, 8 up to the host's threads, the suggested count and a ?smp= that is none of them.
+	const cpus = [...new Set([...CPU_COUNTS.filter((n) => n <= cfg.cpuMax), ...(cfg.cpuSuggested ? [cfg.cpuSuggested] : []), cfg.smpParam])].sort((a, b) => a - b);
+	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`
+		: cfg.smpWhy ? `This boot runs on one CPU: ${cfg.smpWhy}.`
+		: "Experimental. More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); no Suspend.";
+
 	// Enter in a text field reboots, like the button.
 	const enter = (e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); ui.reboot(); } };
 
@@ -153,7 +162,7 @@ export function Options() {
 				<Check id="opt-sound" name="sound" on="on" off="off" value={o.sound} label="Sound" note="ALSA and /dev/dsp" />
 				<Check id="opt-verbose" name="verbose" on="keep" off="clear" value={o.verbose} label="Verbose boot" note="show all kernel messages" />
 				<Check id="opt-root" name="root" on="safe" off="overlay" value={o.root} label="Safe mode" note="boot without your changes" />
-				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" note="experimental" />
+				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" note={o.cpus !== "1" && !cfg.smpBlocked ? "experimental; on with several CPUs" : "experimental"} />
 				<Check id="opt-fx" name="fx" on="on" off="off" value={o.fx} label="fx" note="start the coding agent at load" />
 			</div>
 
@@ -170,6 +179,16 @@ export function Options() {
 					value={o.wisp} onChange={onField} onKeyDown={enter} className="field h-8 px-2.5 text-[12.5px]" />
 			</Field>
 
+			<fieldset className="col-span-full flex flex-col gap-1.5">
+				<legend className="mb-1.5 text-[11.5px] text-faint">CPUs</legend>
+				<div className="flex flex-wrap gap-x-5 gap-y-1" role="radiogroup" id="opt-cpus">
+					{cpus.map((n) => (
+						<Radio key={n} id={`opt-cpus-${n}`} name="cpus" value={String(n)} current={o.cpus} disabled={!!cfg.smpBlocked && n > 1}
+							label={n === cfg.cpuSuggested && n > 1 ? `${n} (suggested)` : String(n)} />
+					))}
+				</div>
+				<small id="opt-cpus-note" className="text-[11.5px] text-faint">{cpuNote}</small>
+			</fieldset>
 			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-x-12 gap-y-5">
 				<Slider id="opt-mem" name="mem" label="Memory" value={memValue} stops={mem} />
 				<Slider id="opt-font" name="font" label="Font size" value={fontValue} stops={fonts} />

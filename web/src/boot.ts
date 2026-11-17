@@ -9,12 +9,15 @@
 // a wterm terminal with a systemd-style boot transcript, the status
 // indicator and stages (ui.ts), and the kernel's console as window 0, with
 // more terminal windows over vsock (windows.ts), and the guest preview
-// (preview.ts: guest web servers in an iframe).
+// (preview.ts: guest web servers in an iframe). With several CPUs (?smp=N,
+// config.ts) it loads the SMP kernel instead and boots it in worker mode,
+// whose worker starts the other CPUs; whatever stops that before the
+// kernel runs reloads once on one CPU (bootUpOnce()).
 import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
 import { createAudioOut } from "./audio.ts";
-import { REPO } from "./config.ts";
+import { REPO, UP_ONCE_KEY } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, fmtSize, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
@@ -108,6 +111,10 @@ export function start(): void {
 	/** The kernel has exited (inline: the moment it does; a worker: once its exit message arrived). */
 	const ended = () => { const l = local(); return l ? !!l.kernel.result : vmExited; };
 	const send = (s: string | Uint8Array) => vm?.write(s);
+	/** This load boots the SMP kernel on several CPUs (config.ts; never resumed, never suspended). */
+	const smp = cfg.cpus > 1;
+	/** The kernel this load runs: the UP bundle, or the SMP one (sdk.ts kernelSmpUrl). */
+	const kernelUrl = smp ? cfg.kernelSmpUrl! : cfg.kernelUrl;
 
 	// --- display and input (kwfb, kwinput; ?display=0 turns them off): display.ts --------------
 	const display = createDisplayUi({
@@ -408,7 +415,8 @@ export function start(): void {
 	let replay = ""; // user-space output during the boot phase, redrawn below the summary
 	// Each step already shows its own time: the summary is the total from page load.
 	const summary = () => `${SGR.dim}Booted in${SGR.off} ${SGR.bold}${fmtS(Date.now() - KW.t0)}${SGR.off}` +
-		(cfg.worker ? ` ${SGR.dim}in a Web Worker (experimental, ?worker=1)${SGR.off}` : "") + "\r\n";
+		(smp ? ` ${SGR.dim}on ${cfg.cpus} CPUs, in Web Workers (experimental, ?smp=${cfg.smpParam})${SGR.off}`
+			: cfg.worker ? ` ${SGR.dim}in a Web Worker (experimental, ?worker=1)${SGR.off}` : "") + "\r\n";
 	// Two lines under the summary of a fresh boot: the source (an OSC 8 link,
 	// which wterm opens on Ctrl/⌘-click) and how to open the demo launcher.
 	const link = (url: string, text: string) => `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
@@ -519,7 +527,7 @@ export function start(): void {
 			const ms = performance.now() - t0Download;
 			const rate = `${(d.loaded / 1048576 / Math.max(ms / 1000, 0.001)).toFixed(1)} MiB/s`;
 			ui.stage("kernel", "done", `${d.url} · ${fmtMiB(d.loaded)} · ${rate}`);
-			ok(`Downloaded unkernel-alpine.wasm, ${fmtMiB(d.loaded)}`, ms);
+			ok(`Downloaded ${smp ? "unkernel-alpine-smp.wasm" : "unkernel-alpine.wasm"}, ${fmtMiB(d.loaded)}`, ms);
 			// The kernel compiles while it downloads (compileStreaming); what is left shows as the compile step.
 			ui.stage("compile", "active");
 			ui.setState("booting", "Compiling");
@@ -594,8 +602,13 @@ export function start(): void {
 	}
 	/** The Suspend in progress: settles with null once saved, or why it failed (the exit waits for it). */
 	let suspending: Promise<string | null> | null = null;
-	/** Suspend: save the running machine in this browser and stop it (session.ts); the next load offers to resume it. */
-	KW.suspend = async () => {
+	/**
+	 * Suspend: save the running machine in this browser and stop it
+	 * (session.ts); the next load offers to resume it. Not with several CPUs:
+	 * the SMP kernel cannot park, so it has no snapshots (ui.confirmSuspend()
+	 * says so, and KW.suspend stays unset).
+	 */
+	if (!smp) KW.suspend = async () => {
 		if (!vm || ended() || !running) throw new Error("the system is not running");
 		if (suspending) throw new Error("a suspend is in progress");
 		if (typeof indexedDB === "undefined") throw new Error("this browser has no IndexedDB to keep the session in");
@@ -623,6 +636,59 @@ export function start(): void {
 		}
 	};
 
+	// --- several CPUs: what falls back to one ---------------------------------------
+	/**
+	 * Reload this tab once on one CPU (config.ts reads UP_ONCE_KEY; ?smp= stays
+	 * in the URL, so the next Reboot tries again), optionally resuming the
+	 * suspended session. False if sessionStorage refuses the note, which would
+	 * make the reload try the same again: then the caller reports the failure.
+	 */
+	function bootUpOnce(reason: string, resume = false): boolean {
+		try {
+			sessionStorage.setItem(UP_ONCE_KEY, reason);
+		} catch {
+			return false;
+		}
+		ui.hostLog(`[host] booting on one CPU instead: ${reason}`);
+		KW.term?.notice(`[host] booting on one CPU instead: ${reason}`);
+		if (resume) ui.resume(); // sets kw-resume and reloads
+		else location.reload();
+		return true;
+	}
+	/**
+	 * Several CPUs and a suspended session (always saved on one CPU, the UP
+	 * kernel): offer to resume it on one CPU this time. True: the page
+	 * reloads to do that. Asked before the kernel downloads, since the answer
+	 * picks which one.
+	 */
+	async function offerResumeUp(info: Promise<SessionMeta | null>): Promise<boolean> {
+		let meta: SessionMeta | null;
+		try {
+			meta = await info;
+		} catch (e) {
+			ui.hostLog(`[host] suspended session: cannot read it: ${(e as Error)?.message ?? e}`);
+			return false;
+		}
+		if (!meta) return false;
+		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}`;
+		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices()) ??
+			(cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null);
+		if (why) {
+			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
+			ui.hostLog(`[host] suspended session (${label}) not offered: ${why}`);
+			return false;
+		}
+		const n = cfg.cpus;
+		const dataNote = meta.devices.data ? ` Booting on ${n} CPUs discards it: that boot changes the data disk.` : ` Booting on ${n} CPUs keeps it for later.`;
+		if (!resumeRequested && !await ui.ask({ title: "resume", msg: `Resume the session suspended ${ago(meta.saved)} (${fmtMiB(meta.bytes)}, ${meta.memoryMiB} MiB of memory)? It resumes on one CPU, as it was saved.${dataNote}`, ok: "Resume on 1 CPU", cancel: `Boot on ${n} CPUs` })) {
+			ui.hostLog(`[host] suspended session (${label}): booting on ${n} CPUs instead`);
+			ui.check("session", "Suspended session", "info", `${label}; not resumed`, `booted on ${n} CPUs instead${meta.devices.data ? " (discarded: the data disk changes)" : ""}`);
+			if (meta.devices.data) await clearSession().catch(() => {});
+			return false;
+		}
+		return bootUpOnce(`resuming the session suspended ${ago(meta.saved)}, which runs on one CPU`, true);
+	}
+
 	// --- boot --------------------------------------------------------------------
 	async function boot() {
 		ui.setState("loading", "Downloading");
@@ -631,22 +697,37 @@ export function start(): void {
 		// The kernel downloads and compiles on this thread in both modes (the engine compiles
 		// off-thread while it streams), so it overlaps the terminal's start and, in worker
 		// mode, the data disk lock; the worker then gets the compiled Module.
-		const loading = loadKernelModule(cfg.kernelUrl, { what: "kernel", onProgress: onDownload }).catch((e: unknown) => {
-			const compile = e instanceof BootError && e.stage === "compile";
-			throw tag(e, compile ? "compile" : "fetch", compile ? "compile" : "kernel");
-		});
-		loading.catch(() => {}); // awaited below; a failure there is the one reported
+		const load = (url: string) => {
+			const p = loadKernelModule(url, { what: "kernel", onProgress: onDownload }).catch((e: unknown) => {
+				const compile = e instanceof BootError && e.stage === "compile";
+				throw tag(e, compile ? "compile" : "fetch", compile ? "compile" : "kernel");
+			});
+			p.catch(() => {}); // awaited below; a failure there is the one reported
+			return p;
+		};
+		// Several CPUs: the SMP kernel, once a suspended session was offered (below).
+		let loading = smp ? null : load(kernelUrl);
 		const session = sessionInfo();
 		session.catch(() => {});
 		let dataDisks: BlockDevice[] | DiskSpec[] = [];
 		if (cfg.worker) {
 			// The worker builds the data disk and the network from specs.
-			ui.check("worker", "Worker mode", "warn", "experimental (?worker=1)",
-				"the kernel, the data disk, the network, the display, input and sound devices run in a Web Worker");
-			ui.hostLog("[host] worker mode: the kernel runs in a Web Worker, with the data disk, the network, the display, input and sound");
+			ui.check("worker", "Worker mode", "warn", cfg.workerParam ? "experimental (?worker=1)" : `for ${cfg.cpus} CPUs (?smp=${cfg.smpParam})`,
+				"the kernel, the data disk, the network, the display, input and sound devices run in a Web Worker" + (smp ? ", which starts the other CPUs as workers of its own" : ""));
+			ui.hostLog(`[host] worker mode: the kernel runs in a Web Worker, with the data disk, the network, the display, input and sound${smp ? `; ${cfg.cpus} CPUs` : ""}`);
 			dataDisks = await dataSpec();
 		}
-		const module = await loading;
+		if (smp) {
+			if (await offerResumeUp(session)) return; // reloading to resume on one CPU
+			loading = load(kernelUrl);
+		}
+		let module: WebAssembly.Module;
+		try {
+			module = await loading!;
+		} catch (e) {
+			if (smp && bootUpOnce(`the SMP kernel did not load (${(e as Error)?.message ?? e})`)) return;
+			throw e;
+		}
 		dropLegacyScope(); // an older build's offline copy (sw.ts)
 		if (ui.stageState("compile") !== "active") ui.stage("compile", "active"); // no progress events (e.g. a cached module)
 		ui.stage("compile", "done", `${WebAssembly.Module.imports(module).length} imports, ${WebAssembly.Module.exports(module).length} exports`);
@@ -654,8 +735,8 @@ export function start(): void {
 		ok("Compiled the kernel", ui.stageTime("compile"));
 		ui.hostLog(`[host] kernel downloaded and compiled in ${fmtS(performance.now() - t0)}`);
 		const b = bundledBoot(module).initrd;
-		if (!b) throw tag(new Error(`${cfg.kernelUrl} has no bundled root file system`), "compile", "kernel");
-		ui.hostLog(`[host] root file system: bundled in ${cfg.kernelUrl} (${fmtMiB(b.length)} gzipped)`);
+		if (!b) throw tag(new Error(`${kernelUrl} has no bundled root file system`), "compile", "kernel");
+		ui.hostLog(`[host] root file system: bundled in ${kernelUrl} (${fmtMiB(b.length)} gzipped)`);
 		ok(`Found the bundled root fs (${fmtMiB(b.length)})`);
 		if (!cfg.worker) dataDisks = await openData(module);
 
@@ -712,7 +793,8 @@ export function start(): void {
 			sound: cfg.sound ? createAudioOut({ log }) : false, // Web Audio, ?sound=0 (audio.ts)
 			vsock: true, // the terminal windows (windows.ts: kwtty sessions)
 		};
-		const resume = await offerResume(session, dataDisks);
+		// Several CPUs: offered above (offerResumeUp), on one CPU only.
+		const resume = smp ? null : await offerResume(session, dataDisks);
 		kernelStarting = true;
 		try {
 			const create = (restore?: KernelSnapshot) => {
@@ -722,6 +804,7 @@ export function start(): void {
 				// worker downloads (from the HTTP cache) and compiles it.
 				const inWorker = (kernel: WebAssembly.Module | string) => createKernel({
 					...common, worker: true, kernel, compileInWorker: typeof kernel === "string",
+					cpus: smp ? cfg.cpus : undefined, // the worker starts the other CPUs (js/web/cpu.ts)
 					shared: cfg.shared ? undefined : false, // shared memory where the page is cross-origin isolated (?shared=0: never)
 					disks: dataDisks as DiskSpec[], onDiskError: (_i, e) => saveError(e),
 					net: browserNetSpec({ enabled: cfg.net, servers: cfg.wisp }), // Wisp, in the worker (net.ts)
@@ -731,7 +814,7 @@ export function start(): void {
 					? inWorker(module).catch((e: unknown) => {
 						if (!(e instanceof BootError && e.stage === "support" && /cannot send the kernel/.test(e.message))) throw e;
 						ui.hostLog(`[host] ${e.message}; the worker loads the kernel itself`);
-						return inWorker(new URL(cfg.kernelUrl, location.href).href);
+						return inWorker(new URL(kernelUrl, location.href).href);
 					})
 					: createKernel({
 						...common, kernel: module, disks: dataDisks as BlockDevice[], restore,
@@ -758,6 +841,8 @@ export function start(): void {
 		} catch (e) {
 			kernelStarting = false;
 			clearTimeout(workerWatchdog);
+			// Several CPUs that did not start (the worker, its JSPI, the shared memory): one CPU.
+			if (smp && bootUpOnce(`booting on ${cfg.cpus} CPUs failed (${(e as Error)?.message ?? e})`)) return;
 			const be = e instanceof BootError ? e : undefined;
 			if (cfg.worker && be?.stage === "support") throw tag(e, "worker", "boot");
 			if (cfg.worker && be?.stage === "download") throw tag(e, "fetch", "kernel");
@@ -786,6 +871,15 @@ export function start(): void {
 				shared ? `${why}: the worker reads input and frame requests while the kernel runs (about 1 ms)`
 					: `${why}: they wait for the kernel's next yield, up to 20 ms while the guest is busy`);
 			ui.hostLog(`[host] kernel worker: console and evdev input and frames by ${shared ? "shared memory" : "messages"} (${why})`);
+		}
+		if (smp) {
+			// The worker gives the SMP kernel one CPU where it cannot start their threads (it logs why).
+			const got = vm.stats().cpus;
+			ui.check("smp", "Guest CPUs", got > 1 ? "pass" : "warn", got > 1 ? `${got} (?smp=${cfg.smpParam})` : `1 (asked for ${cfg.cpus})`,
+				got > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory (experimental)"
+					: "the kernel worker could not start CPU threads (the Kernel log says why): the SMP kernel runs on one CPU");
+			ui.hostLog(`[host] SMP kernel on ${got} CPU${got > 1 ? "s" : ""} (${cfg.cpus} asked)`);
+			if (got < cfg.cpus) ui.toast(`Running on ${got} CPU${got > 1 ? "s" : ""}: the worker could not start more`);
 		}
 		const booted = vm;
 		KW.jitStats = () => booted.stats().jit;

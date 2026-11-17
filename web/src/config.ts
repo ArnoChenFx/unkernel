@@ -49,6 +49,16 @@
 //                                      on the page's thread.
 //   ?shared=0                          with ?worker=1: messages even where shared memory works
 //                                      (to compare the two)
+//   ?smp=N                             experimental: boot the SMP kernel on N CPUs (2 to 8, at most
+//                                      navigator.hardwareConcurrency), each CPU in a Web Worker
+//                                      of its own on one shared memory; implies ?worker=1 (CPU 0
+//                                      blocks while it waits for another CPU, which a page's main
+//                                      thread may not). Needs the page's SMP kernel (sdk.ts
+//                                      kernelSmpUrl: a release bundle with an SMP patch) and
+//                                      cross-origin isolation (https or localhost); otherwise, or
+//                                      when the SMP kernel fails to load or start, the page boots
+//                                      on one CPU as usual (smpBlocker(), boot.ts). No Suspend.
+//                                      Default (and ?smp=1): one CPU, the UP kernel.
 //   ?fx (or ?fx=1)                     start fx, the coding agent, in its side panel once the
 //                                      page passes its preflight (fx.ts; the status line's fx
 //                                      button does the same later). ?fx=0 is off, as is no ?fx.
@@ -60,7 +70,7 @@
 //                                      pre-installs them, step ids pick a subset (showcase.ts);
 //                                      read in launcher.ts
 //   ?simulate=nojspi,oom,lowmem        fake a failure (for tests)
-import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelUrl } from "./sdk.ts";
+import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 
 /** The project's source, linked from About and the boot notes. */
 export const REPO = "https://github.com/pithings/unkernel";
@@ -96,8 +106,24 @@ export interface Config {
 	data: boolean;
 	/** ?root=initramfs: safe mode (kw.root=initramfs) for this boot, else null. */
 	root: "initramfs" | null;
-	/** ?worker=1: the kernel runs in a Web Worker (with the data disk, network, display, input and sound). */
+	/** The kernel runs in a Web Worker (with the data disk, network, display, input and sound): ?worker=1, or more than one CPU. */
 	worker: boolean;
+	/** ?worker=1 as given (the Worker thread option). */
+	workerParam: boolean;
+	/** The SMP kernel's URL (sdk.ts kernelSmpUrl), or null when the page has none. */
+	kernelSmpUrl: string | null;
+	/** ?smp= as given (1 to 8; 1 when absent): the CPUs option. */
+	smpParam: number;
+	/** CPUs this load boots with: smpParam where possible (capped at cpuMax), else 1. */
+	cpus: number;
+	/** Why this page cannot boot more than one CPU (smpBlocker()), or null. */
+	smpBlocked: string | null;
+	/** Why this load boots on one CPU although ?smp= asks for more, or null. */
+	smpWhy: string | null;
+	/** The most CPUs offered: navigator.hardwareConcurrency, at most 8 (the kernel's limit). */
+	cpuMax: number;
+	/** The count the CPUs option suggests, or 0 when this device has too few threads to suggest one. */
+	cpuSuggested: number;
 	/** Worker mode: shared memory for input and frames where it works (?shared=0: messages). */
 	shared: boolean;
 	/** ?fx: start fx (fx.ts) in its panel at load. */
@@ -109,6 +135,36 @@ export interface Config {
 	coarse: boolean;
 	mobileUA: boolean;
 	fontSize: number;
+}
+
+/** The kernel's limit (NR_CPUS in kw_smp.config). */
+export const MAX_CPUS = 8;
+
+/**
+ * Why this page cannot boot the SMP kernel, or null: no SMP kernel in the
+ * page's bundle, no cross-origin isolation (shared memory), no Web
+ * Workers or no Atomics.waitAsync (webCpuBlocker()), or one CPU thread.
+ * JSPI and nested workers in the kernel worker are checked there: a worker
+ * that cannot start CPUs boots the SMP kernel on one CPU (boot.ts says so).
+ */
+export function smpBlocker(): string | null {
+	if (!kernelSmpUrl) return "this page's kernel has no SMP build (its release bundle carries no SMP patch)";
+	const why = webCpuBlocker({ worker: true });
+	if (why) return why;
+	if ((navigator.hardwareConcurrency || 1) < 2) return "this device reports a single CPU thread";
+	return null;
+}
+
+/** sessionStorage: boot this tab's next load on one CPU (boot.ts bootUpOnce()), with why. */
+export const UP_ONCE_KEY = "kw-up-once";
+function takeUpOnce(): string | null {
+	try {
+		const v = sessionStorage.getItem(UP_ONCE_KEY);
+		sessionStorage.removeItem(UP_ONCE_KEY);
+		return v;
+	} catch {
+		return null;
+	}
 }
 
 export function readConfig(search: string = location.search): Config {
@@ -123,6 +179,19 @@ export function readConfig(search: string = location.search): Config {
 	const root = params.get("root") === "initramfs" ? "initramfs" : null;
 	const wispParam = params.get("wisp");
 	const wisp = wispParam && wispParam !== "0" ? wispParam.split(",").map((s) => s.trim()).filter(Boolean) : null;
+	// CPUs: as many as asked where the page can, never more than the host's
+	// threads. The suggestion leaves half of them to the host (the page, the
+	// browser, other tabs): a guest CPU whose thread the host deschedules
+	// stalls the others when they wait for it (.agents/status.md, SMP).
+	const hc = navigator.hardwareConcurrency || 1;
+	const cpuMax = Math.max(1, Math.min(MAX_CPUS, hc));
+	const half = Math.min(4, Math.floor(hc / 2));
+	const smpParam = Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("smp"))) || 1));
+	const smpBlocked = smpBlocker();
+	const upOnce = smpParam > 1 ? takeUpOnce() : null;
+	const smpWhy = smpParam < 2 ? null : smpBlocked ?? upOnce;
+	const cpus = smpWhy ? 1 : Math.min(smpParam, cpuMax);
+	const workerParam = params.get("worker") === "1";
 	return {
 		kernelUrl: kernelUrl.pathname,
 		memMiB: fixed ? Number(memParam) : auto.mib,
@@ -140,7 +209,15 @@ export function readConfig(search: string = location.search): Config {
 		sound: params.get("sound") !== "0",
 		data: params.get("data") !== "0",
 		root,
-		worker: params.get("worker") === "1",
+		worker: workerParam || cpus > 1,
+		workerParam,
+		kernelSmpUrl: kernelSmpUrl?.pathname ?? null,
+		smpParam,
+		cpus,
+		smpBlocked,
+		smpWhy,
+		cpuMax,
+		cpuSuggested: half >= 2 ? Math.min(half, cpuMax) : 0,
 		shared: params.get("shared") !== "0",
 		fx: params.has("fx") && params.get("fx") !== "0",
 		verbose: params.get("verbose") === "1",

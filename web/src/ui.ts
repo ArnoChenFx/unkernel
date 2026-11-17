@@ -77,8 +77,10 @@ function hintFor(msg: string): string {
 		return "The kernel could not be downloaded. Check the network and reload; a page from an older deploy may refer to a kernel that is gone.";
 	if (/module|script/i.test(msg))
 		return "A page script failed to load or parse: check the network and the server log. A browser too old for the syntax fails the same way; Chrome/Edge 137+ or Safari 27+ is required anyway.";
-	if (/panic|trap|unreachable|RuntimeError/i.test(msg))
-		return "The kernel stopped. The kernel log tab has the last console lines; Copy diagnostics and reboot.";
+	const smp = (KW.config?.cpus ?? 1) > 1;
+	if (/panic|trap|unreachable|RuntimeError/i.test(msg) || (smp && /\bCPU \d/.test(msg)))
+		return "The kernel stopped. The kernel log tab has the last console lines; Copy diagnostics and reboot." +
+			(smp ? " Several CPUs are experimental: set CPUs to 1 under Options to boot as usual." : "");
 	return "";
 }
 
@@ -106,7 +108,8 @@ export function createUi(cfg: Config) {
 		append: cfg.baseCmdline,
 		data: cfg.data ? "on" : "off",
 		root: cfg.root === "initramfs" ? "safe" : "overlay",
-		worker: cfg.worker ? "on" : "off",
+		worker: cfg.workerParam ? "on" : "off",
+		cpus: String(cfg.smpParam),
 		fx: cfg.fx ? "on" : "off",
 	};
 	const $ = initStore({
@@ -248,6 +251,7 @@ export function createUi(cfg: Config) {
 		},
 		/** Suspend from a shortcut or the dialog: asks first (boot.ts does it: KW.suspend). */
 		async confirmSuspend() {
+			if (cfg.cpus > 1) { ui.toast("Suspend needs one CPU: the SMP kernel cannot be saved (Options, CPUs)"); return; }
 			if (!KW.suspend || $.get().state !== "running") { ui.toast("Suspend works once the system runs"); return; }
 			if (!await ui.ask({ title: "suspend", msg: "Save the running system in this browser and stop it? The next load offers to resume it. Terminal windows 1-9 and network connections do not survive.", ok: "Suspend" })) return;
 			ui.closePanel();
@@ -378,7 +382,7 @@ export function createUi(cfg: Config) {
 		L.push(`unkernel diagnostics, ${new Date().toISOString()}`);
 		L.push(`url: ${location.href}`);
 		L.push(`state: ${s.state} (${s.label}) after ${fmtT(now())}`);
-		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.kernelUrl} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}`);
+		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.cpus > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}${cfg.smpParam > 1 ? ` cpus=${cfg.cpus}${cfg.smpWhy ? ` (asked ${cfg.smpParam}: ${cfg.smpWhy})` : ""}` : ""}`);
 		L.push("", "== stages");
 		for (const [id] of STAGES) {
 			const st = stages[id]!;
@@ -433,6 +437,7 @@ export function createUi(cfg: Config) {
 		set("data", o.data === "off" ? "0" : null);
 		set("root", o.root === "safe" ? "initramfs" : null);
 		set("worker", o.worker === "on" ? "1" : null);
+		set("smp", o.cpus === "1" ? null : o.cpus);
 		if (o.fx === "off") set("fx", null);
 		else if (!cfg.fx) set("fx", "1"); // an existing ?fx (any value but 0) stays as written
 		// URLSearchParams writes a bare ?fx as fx=: keep it bare, so the URL stays as given.

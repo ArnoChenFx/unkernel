@@ -374,16 +374,24 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      another CPU flips between 0 and ~0, 2 CPUs), and the futex paths
      retry on an unexpected value. Scalar `__get_user_fn` and
      `__put_user_fn` for aligned 1, 2, 4 and 8 bytes would make it so.
-   - Browsers: not tried. They need cross-origin isolation, a worker for
-     CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
-     `Atomics.waitAsync` for CPU 0's idle (check each engine; a message
-     from the sender's host would do instead).
+   - Browsers (2026-11-17; js.md, CPU threads; web.md, Several CPUs):
+     `js/web/cpu.ts` starts each CPU as a Web Worker, nested in worker
+     mode's kernel worker (CPU 0 must be able to block, so not on a
+     page's main thread), and the page has a CPUs option (`?smp=N`, off
+     by default) that loads the SMP bundle only then and falls back to
+     one CPU. Run only in headless Chromium (2 and 4 CPUs: boot, a
+     terminal window, glimmer, the JIT on every CPU, parallel loops
+     scaling). Not tried: Firefox (whether it has `Atomics.waitAsync`;
+     the option is disabled where it is missing), Safari, phones, a
+     hidden tab (worker throttling), long sessions. The page offers it
+     only once a release bundle carries the SMP patch (Packaging, below).
    - Packaging: one bundle carries the UP kernel and a patch to the SMP
      one (`kernel/tools/bundle.mjs --smp`; js.md, CPU threads; web.md for
      the page's split; study and sizes in
      `vendor/smp-deferred/packaging/README.md`, 2026-11-17). Not done:
      `kernel/build.sh` has no SMP target and `bundle` no `--smp`, so the
-     release workflow (and with it npm and the page) still ships UP only;
+     release workflow (and with it npm and the page, whose CPUs option
+     stays disabled) still ships UP only;
      the README there has the proposal.
    - Deferred fork and wakeup changes, measured 2026-11-16 (kwfork,
      9 alternating rounds; patches and a README with their base in

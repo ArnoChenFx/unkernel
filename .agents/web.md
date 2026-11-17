@@ -55,8 +55,8 @@ the dev server's own responses) and `__KW_BUILD__`.
   `web/kernel/page/unkernel-alpine-smp.wasm`, the SMP bundle the patch
   makes, which the `unkernel:kernel-smp` plugin emits as its own hashed
   asset and `src/sdk.ts` exports as `kernelSmpUrl` (null without it,
-  from `virtual:unkernel-smp-kernel`). Nothing uses it yet: the page has
-  no CPU threads. The dev server splits again when the file changes. Building or deploying the
+  from `virtual:unkernel-smp-kernel`). Only a load with several CPUs
+  fetches it (Several CPUs, below). The dev server splits again when the file changes. Building or deploying the
   page needs no kernel toolchain.
 - `pnpm dev` runs the file that is there, without a network check.
   `kernel/build.sh bundle` (and so `kernel`, `alpine`, `datadisk`, `all`)
@@ -143,7 +143,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   after `write()` returned and yields a task (a MessageChannel, which
   background tabs do not throttle) every 16 ms or 256 KiB. `KW.windows`
   is their API. Checked by hand only (no browser test yet).
-- `?worker=1` (experimental) boots through the SDK's worker mode (js.md):
+- `?worker=1` (experimental, and implied by `?smp=N`) boots through the SDK's worker mode (js.md):
   the page compiles the kernel and passes the `WebAssembly.Module`; disks
   and the network are specs built in the worker. The data disk in worker
   mode follows data-disk.md (Persistence in the browser). `KW.kernel` and
@@ -203,9 +203,74 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   `user-scalable=no`), and wterm's hidden textarea is 16 px, because iOS
   zooms on focusing a smaller field.
 
+## Several CPUs
+
+The CPUs option (System tab, Options, `#opt-cpus-<n>` radios; `?smp=N`,
+config.ts) boots the SMP kernel on N CPUs (kernel.md, SMP; js.md, CPU
+threads). Default 1: the UP kernel, exactly as without the option (the
+same files and code paths; `#opt-cpus-1`). It applies on Reboot, like the
+other options.
+
+- Choices: 1, 2, 4 and 8 up to `navigator.hardwareConcurrency` (the
+  kernel's limit is 8), plus the suggested count, min(4,
+  hardwareConcurrency / 2), marked "(suggested)" (none below 4 threads).
+  Half the host's threads stay free for the page, the browser and other
+  tabs: a guest CPU whose thread the host deschedules stalls the CPUs
+  that wait for it (status.md, SMP, under host load). A larger `?smp=` is
+  capped at the thread count.
+- `smpBlocker()` (config.ts) disables the choices above 1, with the
+  reason under them (`#opt-cpus-note`) and in the Environment tab's
+  "Guest CPUs" row: no SMP kernel in the page's bundle (`kernelSmpUrl`
+  null, every release so far), no cross-origin isolation (a plain-http
+  LAN page), no Web Workers or no `Atomics.waitAsync`
+  (`webCpuBlocker({ worker: true })`), or one host thread. Such a load
+  with `?smp=N` boots on one CPU as usual and says why.
+- With several CPUs, boot.ts loads `kernelSmpUrl` instead of `kernelUrl`
+  (streaming compile; the UP bundle is not fetched) and boots in worker
+  mode (`cfg.worker` is set, the Worker thread option is not), with
+  `cpus`; the kernel worker starts the other CPUs as nested Web Workers.
+  The download starts only after the suspended session was offered
+  (below), since the answer picks the kernel. The SMP bundle is a hashed
+  `/assets/` file like the UP one: the service worker (scope `/vm/`) never
+  sees it, and the HTTP cache keeps each file on its own.
+- Falling back: a failed SMP download or compile, or a `createKernel()`
+  that rejects (the worker, its JSPI, the shared memory), calls
+  `bootUpOnce()`: it stores the reason in sessionStorage `kw-up-once` and
+  reloads; that load boots on one CPU the usual way (inline unless
+  `?worker=1`) and shows the reason (`cfg.smpWhy`: the Guest CPUs row,
+  the CPUs note, diagnostics). `?smp=` stays in the URL, so the next
+  Reboot tries again. If sessionStorage refuses, the failure is reported
+  instead (no reload loop). A kernel worker that cannot start CPU threads
+  (`webCpuBlocker()` there) runs the SMP kernel on one CPU: the Guest
+  CPUs row warns, from `stats().cpus`. A failure after the kernel started
+  (a CPU's trap or fatal error) ends the session like any other, with a
+  hint to set CPUs to 1.
+- No Suspend: the SMP kernel cannot park. `KW.suspend` stays unset (so
+  the status line has no pause icon), the dialog footer has no
+  `#suspend`, and Ctrl-A s says why. A suspended session (always a UP
+  one) is offered before the download: "Resume on 1 CPU" reloads once on
+  one CPU (`bootUpOnce()` with `kw-resume`) and resumes it; "Boot on N
+  CPUs" boots SMP and, when the session has a data disk, deletes it (that
+  boot changes the disk), else keeps it.
+- The boot summary says "on N CPUs, in Web Workers"; diagnostics' config
+  line has `cpus=`.
+- Checked in headless Chromium (Playwright's build, the built page from
+  the l2 patch bundle, 2026-11-17, a scratch script, not in `web/test/`):
+  the default load fetched only the UP bundle and ran on one CPU; `?smp=2`
+  and `?smp=4` fetched only the SMP bundle, `nproc` gave 2 and 4, a
+  terminal window, glimmer's test pattern, key and sound through worker
+  mode worked, the JIT compiled on every CPU, and n parallel awk loops
+  took 1.14x (2 CPUs) and 1.20x (4) the time of one; a plain-http LAN
+  load disabled the option and booted on one CPU; a blocked SMP download
+  reloaded on one CPU; a UP session resumed from a `?smp=2` load ("Resume
+  on 1 CPU") and was deleted by "Boot on 2 CPUs"; a page from the newest
+  release (no patch) showed the option disabled and booted UP. Also the
+  Vite dev server (nested worker from source). Firefox, Safari and
+  phones: not tried.
+
 ## Suspend and resume
 
-Suspend (Ctrl-A s, `s` in the dialog, the dialog footer's `#suspend`, the
+Not with several CPUs (above). Suspend (Ctrl-A s, `s` in the dialog, the dialog footer's `#suspend`, the
 status line's pause icon `#bar-suspend` while the system runs, or
 `KW.suspend()` without asking) saves the running machine with the SDK's
 `snapshot({ stop: true })` (js.md, Snapshots), inline or in worker mode, and
@@ -509,6 +574,11 @@ script.
 
 ## Engines
 
+- Several CPUs need, besides JSPI in every worker: cross-origin
+  isolation, nested dedicated workers (Chrome, Firefox, Safari 15.5+),
+  `Atomics.waitAsync` (Chrome 87+, Safari 16.4+; check Firefox) and
+  posting a `WebAssembly.Module` and a shared `WebAssembly.Memory` to a
+  worker. Only Chromium has run it (Several CPUs).
 - JSPI (`WebAssembly.Suspending`/`promising`) is required: Chrome/Edge
   137+, Firefox 153+, Safari 27+ (every iOS browser uses the system
   WebKit). memory64 is not needed, because the page runs the lowered

@@ -46,11 +46,16 @@ async function preflight(): Promise<boolean> {
 	ui.check("secure", "Secure context", isSecureContext ? "pass" : "info", isSecureContext ? "yes" : `no (${location.protocol}//${location.hostname})`,
 		isSecureContext ? "" : "not required: plain http on a LAN address is fine; only the clipboard and device-memory APIs are hidden");
 	ui.check("coi", "Cross-origin isolated", "info", crossOriginIsolated ? "yes" : "no",
-		"not required; with ?worker=1 it lets input and frames cross through shared memory instead of messages");
+		"not required; with ?worker=1 it lets input and frames cross through shared memory instead of messages, and several CPUs (?smp=) need it");
 	const devMem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
 	ui.check("devmem", "Device memory", "info", devMem ? `${devMem} GB` : "unknown", devMem ? "" : isSecureContext ? "API not supported" : "hidden on insecure origins");
 	ui.check("mem", "Kernel memory", "info", `${cfg.memMiB} MiB requested`, cfg.memWhy);
 	ui.check("cpu", "CPU threads", "info", String(navigator.hardwareConcurrency || "unknown"));
+	// Several guest CPUs (?smp=N, config.ts): what this load boots with, and why not more.
+	ui.check("smp", "Guest CPUs", cfg.smpParam < 2 ? "info" : cfg.cpus > 1 ? "pass" : "warn",
+		cfg.cpus > 1 ? `${cfg.cpus} (?smp=${cfg.smpParam})` : cfg.smpParam > 1 ? `1 (asked for ${cfg.smpParam})` : "1",
+		cfg.smpWhy ?? (cfg.cpus > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory (experimental)"
+			: cfg.smpBlocked ? `several CPUs are unavailable: ${cfg.smpBlocked}` : "Options, CPUs, boots the SMP kernel on several"));
 	ui.check("input", "Input", "info", (cfg.coarse ? "touch" : "mouse/keyboard") + (navigator.maxTouchPoints ? `, ${navigator.maxTouchPoints} touch points` : ""));
 	ui.check("viewport", "Viewport", "info", `${innerWidth}×${innerHeight} @${devicePixelRatio || 1}x`);
 	ui.check("clipboard", "Clipboard API", navigator.clipboard ? "pass" : "info", navigator.clipboard ? "yes" : "no", navigator.clipboard ? "" : "copy/paste use a manual fallback");

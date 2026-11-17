@@ -376,8 +376,15 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    - Device I/O is serialised on CPU 0 and pays two cross-thread wakeups
      per request from another CPU (step 5); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.
-   - Parking and snapshots: off (`KW_PARK` depends on `!SMP`; kernel.md,
-     Parking lists what they would need).
+   - Parking and snapshots: deferred (decided 2026-11-17). They stay
+     UP only (`KW_PARK` depends on `!SMP`; kernel.md, Parking lists what
+     they would need), and the page hides Suspend with several CPUs.
+   - Console ring (js.md, CPU threads), paths that never ran: the
+     reader's 4 ms polling where the main thread has no
+     `Atomics.waitAsync`, the drop path in a real guest (stress test
+     only), CPU 0 stuck inside the kernel. A single write over 64 KiB
+     is split into records that another CPU's write can land between.
+   - No browser test in `web/test/` covers the CPUs option.
    - JIT on SMP, what is left: a synchronous compile delays that CPU's
      answer to IPIs (not mitigated; kwemu.md, JIT on several harts,
      describes the cheapest fix); modules are not shared between CPUs,
@@ -519,6 +526,9 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   (`kernel/guest/bwrap-shim.sh`) drops the seccomp arguments. The fix is
   seccomp in the arch (a syscall entry hook and the `asm/syscall.h`
   helpers); remove the shim then.
+- **kwfb: mmap racing a mode change.** An `mmap` of `/dev/fb0` racing a
+  mode change from another thread of the same program can map the old
+  buffer (found 2026-11-16, on UP too). Not fixed.
 - **One long syscall delays the host.** Every syscall and page fault
   costs 1000 instructions of the 200k slice, so kernel-bound
   loops end slices, but a single syscall that stays in the kernel for long

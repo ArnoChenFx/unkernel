@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // A secondary CPU of an SMP kernel (CONFIG_SMP; kernel.md, SMP): another
 // instance of the same module on the same shared memory, in its own thread
-// (a worker the platform starts: Platform.spawnCpu, js/node/cpu.ts). CPU 0
+// (a worker the platform starts: Platform.spawnCpu, js/node/cpu.ts and
+// js/web/cpu.ts). CPU 0
 // (Kernel, kernel.ts) keeps every device; this side serves only what any
 // CPU needs: task switching (its own JSPI stacks: a task's stack lives in
 // the thread that started it; a task the kernel moves starts on a fresh
@@ -164,6 +165,11 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		port.post({ t: "fatal", msg: `CPU ${cpu}: ${msg}` });
 		stopCpu0();
 	};
+	// JSPI is per thread in principle (a browser's worker may lack what its page has).
+	if (typeof WebAssembly.Suspending !== "function" || typeof WebAssembly.promising !== "function") {
+		fatal("this thread has no JSPI (WebAssembly.Suspending / WebAssembly.promising)");
+		return;
+	}
 	// The start function initialises the data only while this reads 0
 	// (CPU 0's instance did, and the kernel keeps the word reserved).
 	if (!init.initFlag || Atomics.load(i32, init.initFlag >> 2) !== 2) {

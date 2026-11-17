@@ -184,6 +184,8 @@ export interface KernelConfig {
 	cpus?: number;
 	/** Start a secondary CPU's thread (Platform.spawnCpu); without it an SMP kernel gets one CPU. */
 	spawnCpu?: (init: CpuInit) => CpuEndpoint;
+	/** Why spawnCpu cannot work on this thread (Platform.whyNoCpus), checked once; a reason gives an SMP kernel one CPU. */
+	whyNoCpus?: () => string | undefined;
 }
 
 /**
@@ -342,7 +344,11 @@ export class Kernel {
 		const cpus = Math.max(1, Math.floor(opts.cpus ?? 1));
 		if (cpus > 1 && !smp) this.log(`[host] this kernel is not SMP: ${cpus} CPUs asked, it runs on one`);
 		else if (cpus > 1 && !opts.spawnCpu) this.log("[host] this platform cannot start CPU threads: the SMP kernel runs on one CPU");
-		else if (smp) this.cpus = cpus;
+		else if (smp) {
+			const why = cpus > 1 ? opts.whyNoCpus?.() : undefined;
+			if (why) this.log(`[host] cannot start CPU threads here (${why}): the SMP kernel runs on one CPU`);
+			else this.cpus = cpus;
+		}
 		// Memory and its type are read at call time: boot() may retry with
 		// the other memory type. Another CPU's host has a JitHost of its own
 		// (cpu.ts), which mirrors its counters (jitMirrors).

@@ -20,6 +20,7 @@ export * from "./core/index.ts";
 export { DATA_DISK_NAME, DATA_DISK_VERSION, IdbStore, dataDiskStore, importDataDisk, openDataDisk, openHttpDisk, resetDataDisk, resetHttpDisk } from "./web/disk.ts";
 export type { DataDiskNameOptions, HttpDiskOptions, IdbStoreOptions, OpenDataDiskOptions } from "./web/disk.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, isMobile } from "./web/memory.ts";
+export { webCpuBlocker } from "./web/cpu.ts";
 
 /**
  * The bundled kernel: vmlinux32.wasm with the Alpine root file system and

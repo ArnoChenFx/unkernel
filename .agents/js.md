@@ -40,14 +40,15 @@ parts that are easy to get wrong.
 - The build checks that `dist/web.mjs` reaches no Node built-in, and that
   each entry (not a shared chunk) computes
   `new URL("./unkernel-alpine.wasm", import.meta.url)`.
-- It inlines the kernel workers (Packaging, below) and the Node CPU
-  worker (`js/node/cpu-entry.ts`, started by `js/node/cpu.ts`; CPU
-  threads, below) and checks that `dist/node.mjs` and `dist/cli.mjs`
-  carry the Node and CPU workers and `dist/web.mjs` the web worker (and
-  not the others), and that no dist file mentions `worker-entry` or
-  `cpu-entry`. The CPU worker is inlined into the Node kernel worker's
-  bundle too (`nested` in WORKERS), since in worker mode that worker
-  starts the CPUs.
+- It inlines the kernel workers (Packaging, below) and the CPU workers
+  (`js/node/cpu-entry.ts`, started by `js/node/cpu.ts`, and
+  `js/web/web-cpu-entry.ts`, started by `js/web/cpu.ts`; CPU threads,
+  below) and checks that `dist/node.mjs` and `dist/cli.mjs` carry the
+  Node kernel and CPU workers and `dist/web.mjs` the web ones (and not
+  the others), and that no dist file mentions `worker-entry` or
+  `cpu-entry`. Each CPU worker is inlined into its platform's kernel
+  worker bundle too (`nested` in WORKERS), since in worker mode that
+  worker starts the CPUs.
 - Test the built package with `node dist/cli.mjs` and
   `UNKERNEL_DIST=1 node --test test/api.test.ts`, which imports the package
   by its own name.
@@ -338,7 +339,7 @@ parts that are easy to get wrong.
   (`worker.format: "es"`); for the dist the plugin replaces it with
   `inlineWorkerUrl(code)`, a Blob URL revoked at the first message. Each
   `WORKERS` entry has its own mark (`/*unkernel-worker:node*/`, `:web*/`,
-  `:cpu*/`).
+  `:cpu*/`, `:webcpu*/`).
   Vite's `?worker&inline` is not usable: plain Node cannot load it.
 - A worker's WebSocket sends the page's origin, so the Wisp allow list
   works as inline; Node workers send `NODE_WISP_HEADERS`.
@@ -349,7 +350,9 @@ parts that are easy to get wrong.
   `wasm_cpu_count` and `wasm_cpu_start`. `CreateKernelOptions.cpus` (CLI
   `--smp N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
   CPUs `Kernel` offers. A UP kernel ignores it with a log line, so does a
-  platform without `Platform.spawnCpu`. The memory is shared (the
+  platform without `Platform.spawnCpu` or one whose `Platform.whyNoCpus()`
+  gives a reason for the kernel's thread (browsers: below);
+  `stats().cpus` says how many it got. The memory is shared (the
   module's import says so).
 - `Kernel` is CPU 0, in whatever thread runs it, with every device.
   `wasm_cpu_start(cpu, idle)` calls `KernelConfig.spawnCpu` (from
@@ -453,7 +456,34 @@ parts that are easy to get wrong.
   changes. `withoutSmpPatch()` gives the bundle without the section (the
   page's split, web.md). `test/kpatch.test.ts` (with `KPATCH_UP` and
   `KPATCH_SMP` set, also on the real kernels).
-- Not done: a browser `spawnCpu`; status.md item 8.
+- Browsers (`js/web/cpu.ts`, `web-cpu-entry.ts`; `webPlatform` and the
+  web kernel worker pass `spawnWebCpu` and `webCpuBlocker`): each CPU is
+  a module Web Worker (`unkernel-cpu<n>`) running the same `runCpu()`,
+  started by the kernel's own thread, so in worker mode the CPU workers
+  are nested workers of the kernel worker (Chrome, Firefox and Safari
+  15.5+ have nested dedicated workers). The init message carries the
+  compiled Module and the shared `WebAssembly.Memory` (both
+  structured-cloneable; the memory only where the page is cross-origin
+  isolated). `webCpuBlocker()` is why a thread cannot run CPUs: no
+  SharedArrayBuffer / cross-origin isolation, no `Worker` in that
+  thread, no `Atomics.waitAsync` (CPU 0's idle wait on its IRQ word), or
+  a thread that may not block: CPU 0 waits for another CPU in
+  `memory.atomic.wait32` (step 6), which traps on a browser's main
+  thread, so inline mode on a page gives the SMP kernel one CPU and SMP
+  needs `worker: true` (or a worker of the caller's own).
+  `webCpuBlocker({ worker: true })` is the page's view before it starts
+  a kernel worker (no main-thread test). `runCpu()` checks JSPI in its
+  thread and reports a missing one as fatal; `web-cpu-entry.ts` turns any
+  rejection into a `fatal` message, because a browser worker reports no
+  unhandled rejection to its owner. Clocks agree across a worker and its
+  nested worker (`performance.timeOrigin + performance.now()`): in
+  headless Chromium (2026-11-17) a nested worker that read its parent's
+  latest clock value and then its own found its own later by 5 µs at the
+  median and at the minimum (the timers' resolution in an isolated page),
+  never earlier. From source, Vite bundles the nested worker
+  (dev server and build); the dist inlines it as a Blob URL
+  (`inlineCpuUrl()`, revoked at the first message). The page (web.md,
+  Several CPUs) is the only browser user so far.
 
 ## vsock (`js/core/vsock.ts`)
 

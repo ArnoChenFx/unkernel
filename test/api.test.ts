@@ -123,9 +123,13 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			await waitFor(PROMPT);
 			assert.match(s.text, /Linux version/, "the stream starts at the first byte");
 			const at = s.text.length;
-			vm.write("uname -m; ls /sys/class/net | cat\n");
+			vm.write("uname -m; nproc; ls /sys/class/net | cat\n");
 			await waitFor(/riscv64[\s\S]*⇒/, at);
 			const out = s.text.slice(at);
+			// stats().cpus: the CPUs the kernel got, which the guest sees (UNKERNEL_TEST_CPUS on an SMP kernel).
+			const cpus = vm.stats().cpus;
+			assert.equal(cpus, testCpus ?? 1);
+			assert.match(out, new RegExp(`riscv64\\r?\\n${cpus}\\r?\\n`), "the guest's nproc is stats().cpus");
 			assert.match(out, /\blo\b/);
 			assert.doesNotMatch(out, /\beth0\b/, "no network device unless one is passed");
 			assert.ok(vm.vsock, "a vsock device by default");

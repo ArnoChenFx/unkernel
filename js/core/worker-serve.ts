@@ -44,6 +44,8 @@ export interface ServeKernelOptions {
 	devices?: DeviceRegistry;
 	/** Starts the threads of an SMP kernel's other CPUs (Platform.spawnCpu), from this worker. */
 	spawnCpu?: Platform["spawnCpu"];
+	/** Why spawnCpu cannot work in this worker (Platform.whyNoCpus). */
+	whyNoCpus?: Platform["whyNoCpus"];
 }
 
 /** How long the exit waits for saves in flight before it is reported anyway. */
@@ -220,6 +222,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				readFile: options.readFile,
 				devices: options.devices,
 				spawnCpu: options.spawnCpu,
+				whyNoCpus: options.whyNoCpus,
 			}, {
 				disks: spec.disks,
 				net: spec.net,

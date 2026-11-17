@@ -113,9 +113,11 @@ export interface CreateKernelOptions {
 	/**
 	 * CPUs to give an SMP kernel (a kernel built with CONFIG_SMP; kernel.md,
 	 * SMP): each runs in its own thread on a shared memory, so it needs a
-	 * platform that starts CPU threads (Platform.spawnCpu: Node) and, in
-	 * browsers, cross-origin isolation. Default 1. A UP kernel ignores it
-	 * (with a log line). With more than one CPU the JIT is off.
+	 * platform that starts CPU threads (Platform.spawnCpu: Node, and browsers
+	 * where the kernel runs in a worker of a cross-origin isolated page, as
+	 * `worker: true` does). Default 1. A UP kernel ignores it, and so does a
+	 * thread that cannot start CPUs (both with a log line); stats().cpus
+	 * says how many it got.
 	 */
 	cpus?: number;
 	/**
@@ -239,6 +241,8 @@ export interface WorkerOption {
 export interface InstanceStats extends KernelStats {
 	/** Milliseconds since kernel entry. */
 	uptimeMs: number;
+	/** CPUs the kernel was offered (CreateKernelOptions.cpus, or 1 for a UP kernel or where CPU threads cannot start). */
+	cpus: number;
 	/** Milliseconds to download and compile the kernel (0 if a Module was given). */
 	compileMs: number;
 	block: BlockStats;
@@ -269,6 +273,8 @@ export interface Platform {
 	spawnWorker?: () => WorkerEndpoint;
 	/** Start a thread running a secondary CPU of an SMP kernel (cpu.ts, runCpu()); without it the kernel gets one CPU. */
 	spawnCpu?: (init: CpuInit) => CpuEndpoint;
+	/** Why spawnCpu cannot work on the kernel's thread (browsers: no cross-origin isolation, a main thread), or undefined. */
+	whyNoCpus?: () => string | undefined;
 	/** A relative kernel or initrd location as an absolute URL, for the worker (Node: a path -> file: URL). */
 	absoluteUrl?: (src: string) => string | undefined;
 	/** The device kinds this platform builds from specs (devices.ts). */
@@ -607,6 +613,7 @@ export class KernelInstance implements KernelHandle {
 		return {
 			...k.stats,
 			uptimeMs: k.bootTime ? performance.now() - k.bootTime : 0,
+			cpus: k.cpus,
 			compileMs: this.#compileMs,
 			block: { ...k.block.stats },
 			jit: k.jitStatsAll(),
@@ -752,6 +759,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		jit: opts.jit,
 		cpus: opts.cpus,
 		spawnCpu: platform.spawnCpu,
+		whyNoCpus: platform.whyNoCpus,
 		restore: opts.restore,
 		display: opts.display,
 		onDisplay: opts.onDisplay,

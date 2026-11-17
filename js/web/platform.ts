@@ -5,11 +5,16 @@
 // on a Web Worker (worker.ts), and relative locations made absolute against
 // the page, because the worker (a Blob URL in the package) has no useful
 // base URL. Disk and network specs are built by webDevices (devices.ts).
+// CPU threads for an SMP kernel (cpu.ts) start wherever the kernel runs in
+// a worker of a cross-origin isolated page: worker mode's kernel worker,
+// or a worker of the caller's own; never on the page's main thread
+// (webCpuBlocker()).
 // The entry (web.ts, or the page's web/src/sdk.ts) passes the
 // default kernel's URL, so `new URL(..., import.meta.url)` stays in it.
 
 import type { Platform } from "../core/instance.ts";
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "./memory.ts";
+import { spawnWebCpu, webCpuBlocker } from "./cpu.ts";
 import { webDevices } from "./devices.ts";
 import { spawnWebWorker } from "./worker.ts";
 
@@ -19,6 +24,8 @@ export function webPlatform(defaultKernel: URL): Platform {
 		defaultMemoryMiB: () => autoMemoryMiB().mib,
 		defaultMemoryFallbackMiB: [...DEFAULT_MEMORY_FALLBACK_MIB],
 		spawnWorker: spawnWebWorker,
+		spawnCpu: spawnWebCpu,
+		whyNoCpus: webCpuBlocker,
 		absoluteUrl: (src) => new URL(src, location.href).href,
 		devices: webDevices,
 	};

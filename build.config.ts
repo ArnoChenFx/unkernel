@@ -15,6 +15,9 @@
 //   js/node/cpu-entry.ts          a secondary CPU of an SMP kernel on Node, inlined the
 //                                 same way where js/node/cpu.ts starts it: in the Node
 //                                 entries and inside the Node kernel worker (WORKERS)
+//   js/web/web-cpu-entry.ts       the same in browsers, inlined as a Blob URL where
+//                                 js/web/cpu.ts starts it: in the web entry and inside
+//                                 the web kernel worker (WORKERS)
 
 import { realpathSync } from "node:fs";
 import { copyFile, readFile, readdir, stat } from "node:fs/promises";
@@ -47,7 +50,8 @@ interface WorkerSpec {
 const WORKERS: WorkerSpec[] = [
 	{ name: "cpu", starter: "js/node/cpu.ts", entry: "js/node/cpu-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"] },
 	{ name: "node", starter: "js/node/worker.ts", entry: "js/node/worker-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"], nested: ["cpu"] },
-	{ name: "web", starter: "js/web/worker.ts", entry: "js/web/web-worker-entry.ts", platform: "browser", wrap: (s: string) => `inlineWorkerUrl(${s})`, entries: ["web.mjs"] },
+	{ name: "webcpu", starter: "js/web/cpu.ts", entry: "js/web/web-cpu-entry.ts", platform: "browser", wrap: (s: string) => `inlineCpuUrl(${s})`, entries: ["web.mjs"] },
+	{ name: "web", starter: "js/web/worker.ts", entry: "js/web/web-worker-entry.ts", platform: "browser", wrap: (s: string) => `inlineWorkerUrl(${s})`, entries: ["web.mjs"], nested: ["webcpu"] },
 ];
 /** Starts every inlined worker string (WORKER_MARK + name + "*" + "/"); the end hook looks for it. */
 const WORKER_MARK = "/*unkernel-worker:";

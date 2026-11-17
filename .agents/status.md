@@ -244,6 +244,34 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    kwstorm with kwmmstress and with kwtlb on 2 and 4 CPUs, the block
    scenario of step 5, glimmer-check and the api tests on 2 CPUs pass;
    the UP build is the same binary.
+   Step 7, spinlocks taken out of turn (2026-11-17; kernel.md, SMP,
+   Waiting for another CPU; evaluation in
+   `vendor/smp-deferred/load/README.md`, Patch 2 on realistic
+   workloads): with `kw_spin_unfair=1`, the default, a CPU takes a
+   spinlock only while no ticket is outstanding instead of queueing
+   behind waiters whose host threads may be descheduled. On realistic
+   guest workloads (gcc, configure, file systems, node, Python, apk; 2-8
+   CPUs, idle to 2x oversubscribed host) fair and unfair locks measured
+   the same (geomean of the ratios 0.97-1.02). Beside 24 spinning host
+   processes at 8 CPUs (lowered kernels, JIT; 4 interleaved boots each,
+   medians; host 7-16% busy before the spinners started) against step 6:
+   kwload's `kspin` (8 threads on one kernel spinlock) 14.7 s
+   (7.6-20.9) to 0.097 s, the whole kwload run 40 to 23 s, pipe
+   ping-pong p99 3.2 to 1.0 ms; `pp`, `ppx`, `fork`, `mutex`, `par` and
+   `shoot` the same within noise. On an idle host (7 rounds, random
+   order, against step 6): move ping-pong 198 to 203 ms on 2 CPUs and
+   273 either way on 4, fork+exit+wait of an 8 MiB process 209 to 203
+   µs (2 CPUs) and 209 to 208 (4), compiled loops scale 2.00x/2.00x on
+   2 CPUs and 3.90x/3.92x on 4. Its idle-host cost is under heavy
+   contention only: `kspin` at 8 CPUs 0.073 to 0.102 s (1.4x; 5 boots,
+   0.077 s with `kw_spin_unfair=0`), and in the evaluation kernel
+   `dup()` from 8 threads 0.69x the throughput, p99 no worse.
+   kwtest (1, 2 and 4 CPUs with the JIT, 2 without, 4 with
+   `kw_spin_unfair=0`), 2 minutes of kwstorm with kwmmstress and with
+   kwtlb on 4 and 8 CPUs idle and beside 24 spinners, the same at 8
+   CPUs with the parameter flipped every 50 ms, the block scenario of
+   step 5, glimmer-check and the api tests on 2 CPUs pass; the UP build
+   is the same binary.
    Open, roughly in order:
    - A task asleep in a system call stays on its CPU until it returns,
      and so does one preempted in the kernel (`cond_resched()`): their
@@ -271,16 +299,16 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      so a task that moves compiles its hot code again; FENCE and PAUSE
      are handed back to the interpreter on SMP (an atomic RMW in
      compiled code would do).
-   - Under host load (after step 6): a synchronous TLB shootdown to a
+   - Under host load (after steps 6 and 7): a synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
      again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);
      nothing in the guest can shorten it, so fewer guest CPUs than free
      host cores is the remedy (a CLI warning for `--smp` above
-     `os.availableParallelism()` is not built). With 8 CPUs, ticket
-     locks still convoy behind a descheduled waiter; an unfair lock
-     (deferred `load-2-unfair-lock.patch`, off by default, costs 1.7-2x
-     under extreme contention on an idle host) removes that. Bare
-     `cpu_relax()` loops (seqcount retries) do not take the timer.
+     `os.availableParallelism()` is not built). Spinlocks taken out of
+     turn (step 7) have no starvation bound (a waiter that has waited,
+     say, 1 ms could take a ticket; nothing measured needs it), and
+     nothing switches `kw_spin_unfair=` by itself. Bare `cpu_relax()`
+     loops (seqcount retries) do not take the timer.
    - Browsers: not tried. They need cross-origin isolation, a worker for
      CPU 0 (the CLI implies `--worker`), a web `Platform.spawnCpu`, and
      `Atomics.waitAsync` for CPU 0's idle (check each engine; a message

@@ -44,8 +44,9 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   new patches follow `kw_defconfig`: the shared-memory build, the atomic
   tweaks, then percpu-km, `ARCH_TASKS_STAY_ON_CPU` (sched with the
   exit-to-user hook, kthread and workqueue), the csd wait hooks
-  (kernel/smp.c), the arch and driver SMP patches, and the waits that
-  block (below, SMP, Waiting for another CPU). There
+  (kernel/smp.c), the arch and driver SMP patches, the waits that
+  block and the spinlocks taken out of turn (below, SMP, Waiting for
+  another CPU). There
   `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
@@ -717,6 +718,7 @@ numbers and open issues: status.md item 8.
 - **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
   on SMP with `VMALLOC_FLAT`) with the generic `setup_per_cpu_areas()`.
   Spinlocks are asm-generic's ticket locks with the wait out of line
+  and, by default, taken out of turn while no ticket is outstanding
   (asm/spinlock.h, below), rwlocks queued (`ARCH_USE_QUEUED_RWLOCKS`),
   RCU is TREE_RCU.
 - **Waiting for another CPU** (wait.c). A CPU's host thread may be
@@ -758,6 +760,28 @@ numbers and open issues: status.md item 8.
   word and its tick starves (an RCU stall was seen that way). Bare
   `cpu_relax()` loops (seqcount retries) still spin
   without the timer check.
+  Ticket locks are FIFO, so a waiter whose thread the host has
+  descheduled holds up every waiter behind it even once the lock is
+  free; blocking does not help there. So with `kw_spin_unfair=1` (the
+  default; a boot parameter, writable in
+  `/sys/module/kernel/parameters/`) a CPU takes no ticket: it takes the
+  lock as `arch_spin_trylock()` does (cmpxchg of the ticket word while
+  owner == next) and otherwise waits for that in `kw_steal_wait()`,
+  which spins, blocks and is kicked as a ticket waiter (the same key
+  and sleeper count; only an unlock frees the lock, and it kicks every
+  CPU blocked on it). Waiters are then served in no particular order,
+  as on x86 guests without PV spinlocks (`virt_spin_lock()`); there is
+  no starvation bound. Both kinds share the word, the unlock and the
+  kick, so the parameter may change at any time: a ticket holder is
+  served in turn, a CPU without one never overtakes a ticket, and one
+  still waiting when the parameter turns 0 takes a ticket.
+  `kw_spin_unfair=0` gives plain ticket locks (cost when 0: one read of
+  a flag per lock). `arch_spin_is_contended()` counts only tickets
+  (its users, `spin_needbreak()` and `rwlock_needbreak()`, return 0
+  without preemption anyway). qrwlock's `wait_lock` is an
+  `arch_spinlock_t`, so it is unfair too; a waiting writer holds it,
+  so readers still cannot starve a writer. Measurements: status.md,
+  SMP, step 7.
 - **Devices** stay on CPU 0 (their imports answer only there; another
   CPU's host ends the session when one is called there, js.md). hvc_wasm:
   CPU 0's console interrupt pulls the input into a FIFO and records the

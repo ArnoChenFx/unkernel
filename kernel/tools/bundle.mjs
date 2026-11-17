@@ -5,10 +5,15 @@
 //
 //   node kernel/tools/bundle.mjs <vmlinux|vmlinux32.wasm> <initrd.cpio[.gz]> -o <out.wasm>
 //        [--cmdline "console=hvc0 rdinit=/init"] [--datadisk kwdata.kwsparse.gz] [--no-gzip]
+//        [--smp <SMP vmlinux32.wasm>]
 //
 // The initramfs goes into a custom section "unkernel.initrd", the command
 // line into "unkernel.cmdline", and the data disk template (a gzipped
 // kwsparse image, kernel/build.sh datadisk) into "unkernel.datadisk".
+// --smp (a prototype, .agents/status.md item 8) adds the patch that turns
+// this kernel into the given SMP build of the same tree
+// ("unkernel.kernel.smp.kwpatch", kwdiff.mjs --remap, last), which the
+// loader applies when asked for more than one CPU (js/core/kpatch.ts).
 // Custom sections are ignored by the engine, so
 // the module is otherwise unchanged (same code, imports and memory type), and
 // the kernel needs no rebuild. The host runtime (js/core/kernel.ts, see
@@ -20,10 +25,12 @@
 // given. Existing unkernel.* sections are replaced, so re-bundling works.
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { gzipSync } from "node:zlib";
+import { makePatch } from "./kwdiff.mjs";
 
 export const INITRD_SECTION = "unkernel.initrd";
 export const CMDLINE_SECTION = "unkernel.cmdline";
 export const DATADISK_SECTION = "unkernel.datadisk";
+export const SMP_PATCH_SECTION = "unkernel.kernel.smp.kwpatch";
 
 function uleb(n) {
 	const out = [];
@@ -68,7 +75,7 @@ function sections(wasm) {
 	return out;
 }
 
-export function bundle(wasm, initrd, { cmdline, datadisk, gzip = true } = {}) {
+export function bundle(wasm, initrd, { cmdline, datadisk, gzip = true, smp } = {}) {
 	const isGz = initrd[0] === 0x1f && initrd[1] === 0x8b;
 	if (gzip && !isGz) initrd = gzipSync(initrd, { level: 9 });
 	const parts = [wasm.subarray(0, 8)];
@@ -81,7 +88,14 @@ export function bundle(wasm, initrd, { cmdline, datadisk, gzip = true } = {}) {
 		if (!(datadisk[0] === 0x1f && datadisk[1] === 0x8b)) throw new Error("the data disk template must be a gzipped kwsparse image");
 		parts.push(...customSection(DATADISK_SECTION, datadisk));
 	}
-	return { bytes: Buffer.concat(parts), kernelBytes, initrdBytes: initrd.length, datadiskBytes: datadisk?.length ?? 0 };
+	let smpPatchBytes = 0;
+	if (smp) {
+		// The base is what the loader takes from the bundle: every section but the unkernel.* ones.
+		const { patch } = makePatch(Buffer.concat(parts).subarray(0, kernelBytes), smp, { remap: true });
+		parts.push(...customSection(SMP_PATCH_SECTION, patch));
+		smpPatchBytes = patch.length;
+	}
+	return { bytes: Buffer.concat(parts), kernelBytes, initrdBytes: initrd.length, datadiskBytes: datadisk?.length ?? 0, smpPatchBytes };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -96,18 +110,21 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 	const out = take("-o");
 	const cmdline = take("--cmdline");
 	const datadiskPath = take("--datadisk");
+	const smpPath = take("--smp");
 	const noGzip = args.includes("--no-gzip");
 	const [kernelPath, initrdPath] = args.filter((a) => a !== "--no-gzip");
 	if (!kernelPath || !initrdPath || !out) {
-		console.error("usage: bundle.mjs <vmlinux|vmlinux32.wasm> <initrd.cpio[.gz]> -o <out.wasm> [--cmdline STR] [--datadisk FILE] [--no-gzip]");
+		console.error("usage: bundle.mjs <vmlinux|vmlinux32.wasm> <initrd.cpio[.gz]> -o <out.wasm> [--cmdline STR] [--datadisk FILE] [--no-gzip] [--smp SMP.wasm]");
 		process.exit(2);
 	}
 	const wasm = readFileSync(kernelPath);
 	const datadisk = datadiskPath ? readFileSync(datadiskPath) : undefined;
-	const { bytes, kernelBytes, initrdBytes, datadiskBytes } = bundle(wasm, readFileSync(initrdPath), { cmdline, datadisk, gzip: !noGzip });
+	const smp = smpPath ? readFileSync(smpPath) : undefined;
+	const { bytes, kernelBytes, initrdBytes, datadiskBytes, smpPatchBytes } = bundle(wasm, readFileSync(initrdPath), { cmdline, datadisk, gzip: !noGzip, smp });
 	writeFileSync(out + ".tmp", bytes);
 	renameSync(out + ".tmp", out);
 	const mib = (n) => (n / 1048576).toFixed(1) + " MiB";
 	console.log(`bundle: ${out} (${mib(bytes.length)}: kernel ${mib(kernelBytes)} + initrd ${mib(initrdBytes)}` +
-		`${datadiskBytes ? ` + data disk template ${(datadiskBytes / 1024).toFixed(0)} KiB` : ""}${cmdline ? `, cmdline "${cmdline}"` : ""})`);
+		`${datadiskBytes ? ` + data disk template ${(datadiskBytes / 1024).toFixed(0)} KiB` : ""}` +
+		`${smpPatchBytes ? ` + SMP patch ${(smpPatchBytes / 1024).toFixed(0)} KiB` : ""}${cmdline ? `, cmdline "${cmdline}"` : ""})`);
 }

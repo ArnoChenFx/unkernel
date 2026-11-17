@@ -700,7 +700,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 		if (compileHere) {
 			const t0 = performance.now();
 			progress({ stage: "compile" });
-			kernel = await loadKernelModule(src, { what: "kernel", readFile: platform.readFile, onProgress: progress, signal });
+			kernel = await loadKernelModule(src, { what: "kernel", readFile: platform.readFile, onProgress: progress, signal, smp: (opts.cpus ?? 1) > 1 });
 			compileMs = performance.now() - t0;
 			progress({ stage: "compiled", ms: compileMs, memory64: moduleIsMemory64(kernel) });
 		} else [kernel, kernelTransfer] = await toWorkerSource(src, platform, "kernel", progress, signal);

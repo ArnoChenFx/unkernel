@@ -4,6 +4,8 @@
 // compile (streaming when the engine can). Universal; the Node entry adds
 // file paths and file: URLs (readFile hook).
 
+import { smpKernelFromBundle } from "./kpatch.ts";
+
 /** A kernel: a compiled module, its bytes, a Response, or a URL to fetch (a file path or file: URL on Node). */
 export type KernelSource = WebAssembly.Module | BytesSource;
 
@@ -31,6 +33,13 @@ export interface LoadOptions {
 	 * Node entry reads file: URLs and plain paths from disk).
 	 */
 	readFile?: (src: URL | string) => Promise<Uint8Array> | undefined;
+	/**
+	 * Want the SMP kernel: if the kernel is a bundle with an SMP patch
+	 * (kernel/tools/bundle.mjs --smp), load its bytes (no streaming
+	 * compile), patch them (kpatch.ts) and compile the result. A bundle
+	 * without one, or a compiled Module, is used as it is.
+	 */
+	smp?: boolean;
 }
 
 /** Why loading or booting failed: the step that failed. */
@@ -159,6 +168,13 @@ export async function loadBytes(src: BytesSource, opts: LoadOptions = {}): Promi
 export async function loadKernelModule(src: KernelSource, opts: LoadOptions = {}): Promise<WebAssembly.Module> {
 	if (src instanceof WebAssembly.Module) return src;
 	const compile = async (bytes: Uint8Array) => {
+		if (opts.smp) {
+			try {
+				bytes = (await smpKernelFromBundle(bytes)) ?? bytes;
+			} catch (e) {
+				throw new BootError("compile", `Deriving the SMP kernel from the bundle failed: ${(e as Error).message}`, { cause: e });
+			}
+		}
 		try {
 			return await WebAssembly.compile(bytes as Uint8Array<ArrayBuffer>);
 		} catch (e) {
@@ -175,7 +191,7 @@ export async function loadKernelModule(src: KernelSource, opts: LoadOptions = {}
 		r = src;
 	}
 	const url = r.url || (isLocation(src) ? String(src) : "");
-	if (typeof WebAssembly.compileStreaming !== "function" || !r.body) return compile(await readResponse(r, url, opts));
+	if (opts.smp || typeof WebAssembly.compileStreaming !== "function" || !r.body) return compile(await readResponse(r, url, { ...opts, what: "kernel" }));
 	const [counted, readError] = withProgress(r, url, { ...opts, what: "kernel" }, WASM_HEADERS);
 	try {
 		return await WebAssembly.compileStreaming(counted);

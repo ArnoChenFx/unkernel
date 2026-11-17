@@ -714,7 +714,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	const kernelSource = opts.kernel ?? platform.defaultKernel();
 	if (!(kernelSource instanceof WebAssembly.Module)) progress({ stage: "compile" });
 	const [module, initrdBytes] = await Promise.all([
-		loadKernelModule(kernelSource, { ...loadOpts, what: "kernel" }),
+		loadKernelModule(kernelSource, { ...loadOpts, what: "kernel", smp: (opts.cpus ?? 1) > 1 }),
 		opts.initrd == null ? opts.initrd : loadBytes(opts.initrd, { ...loadOpts, what: "initrd" }),
 	]);
 	const compileMs = kernelSource instanceof WebAssembly.Module ? 0 : performance.now() - t0;

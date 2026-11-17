@@ -419,6 +419,17 @@ parts that are easy to get wrong.
   and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
   `wasm_host_irqs` (`Kernel.watchIrqWord`), which another CPU's
   `memory.atomic.notify` (an IPI) ends; the wait's `done` runs once.
+- Both kernels in one bundle (prototype, status.md item 8): a bundle made
+  with `kernel/tools/bundle.mjs --smp <SMP vmlinux32.wasm>` carries
+  `unkernel.kernel.smp.kwpatch`, a patch from its UP kernel to the SMP
+  one (`kwdiff.mjs --remap`: function, global and type indices and data
+  addresses renumbered by `js/core/kremap.ts`, then a bsdiff-style byte
+  diff). With more than one CPU asked (`cpus`, CLI `--smp N`),
+  `loadKernelModule({ smp: true })` reads the bundle's bytes (no
+  streaming compile), applies it (`smpKernelFromBundle()`: SHA-256 of
+  base and result checked) and compiles the SMP kernel followed by the
+  bundle's other `unkernel.*` sections. Without the section, or with one
+  CPU, nothing changes.
 - Not done: a browser `spawnCpu`, and `pnpm build` bundling
   `cpu-entry.ts` (from source only); status.md item 8.
 

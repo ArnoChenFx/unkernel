@@ -16,6 +16,7 @@ import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domCodeToLinux, type InputState } from
 import { KernelInstance, createKernelOn, type KernelHandle } from "./core/instance.ts";
 import { decodeSnapshot, encodeSnapshot, type KernelSnapshot } from "./core/snapshot.ts";
 import { bundledBoot, moduleIsMemory64, type ExitResult } from "./core/kernel.ts";
+import { smpKernelFromBundle } from "./core/kpatch.ts";
 import type { MountsOption } from "./core/mounts.ts";
 import { NetStack } from "./core/net.ts";
 import type { JitStats, KwemuStats } from "./core/jit.ts";
@@ -206,7 +207,17 @@ if (workerTransport && workerTransport !== "shared" && workerTransport !== "mess
 const t0 = performance.now();
 let module: WebAssembly.Module;
 try {
-	module = await WebAssembly.compile(readFileSync(kernelPath));
+	let bytes: Uint8Array = readFileSync(kernelPath);
+	// --smp N with a bundle that carries an SMP patch (kernel/tools/bundle.mjs --smp): boot the SMP kernel it makes.
+	if (smpCpus > 1) {
+		const tp = performance.now();
+		const smp = await smpKernelFromBundle(bytes);
+		if (smp) {
+			bytes = smp;
+			process.stderr.write(`[host] SMP kernel from the bundle's patch (${(performance.now() - tp).toFixed(0)} ms)\n`);
+		}
+	}
+	module = await WebAssembly.compile(bytes as Uint8Array<ArrayBuffer>);
 } catch (e) {
 	const err = e as NodeJS.ErrnoException;
 	const hint = err.code === "ENOENT" && !kernelOpt

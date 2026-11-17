@@ -14,14 +14,18 @@
 // was lowered with wasm-opt --memory64-lowering); strict: a compile into a
 // slot that is already installed is an error (it is legal after a second
 // kw_cpu_init, which forgets its slots). Errors are collected in stats.errors.
+// Every compile also calls the new f with cpu = 0, which must return 0 at
+// once (what js/core/jit.ts does to have V8 compile it inside the call), and
+// then the export kwemu_test_compile_hook, if the instance has one (the unit
+// tests' stand-in for another CPU acting during a compile).
 export function createJitHost({ available = true, eager = false, mem32 = false, strict = false } = {}) {
-  let mem, table, big = true;
+  let mem, table, hook, big = true;
   const saved = new Map();
   const stats = { compiles: 0, frees: 0, failures: 0, bytes: 0, compileNs: 0n, errors: [] };
   const idx = (slot) => (big ? BigInt(slot) : slot);
   const imports = {
     kw_host_jit_caps: () => (available ? 1 : 0) | (mem32 ? 2 : 0) | (eager ? 4 : 0),
-    kw_host_jit_compile(ptr, len, slot) {
+    kw_host_jit_compile(ptr, len, slot, flags) {
       const t0 = process.hrtime.bigint();
       try {
         if (!table) throw new Error("the module does not export __indirect_function_table");
@@ -31,8 +35,15 @@ export function createJitHost({ available = true, eager = false, mem32 = false, 
           if (strict) stats.errors.push(`compile into installed slot ${slot}`);
         } else saved.set(slot, table.get(idx(slot)));
         table.set(idx(slot), inst.exports.f);
+        // flags bit 0: f(cpu = 0) returns 0 at once (kw_emu.h), which a
+        // kernel host calls to make a lazy engine compile f here. Every
+        // module must have it.
+        if (!(flags & 1)) stats.errors.push(`compile without flags bit 0 (slot ${slot})`);
+        else if (inst.exports.f(0n, 0n, 0n, 0n) !== 0n) stats.errors.push(`f(0, 0, 0, 0) did not return 0 (slot ${slot})`);
         stats.compiles++;
         stats.bytes += Number(len);
+        // The unit tests' stand-in for another CPU acting during the compile.
+        hook?.();
         return 0;
       } catch (e) {
         stats.failures++;
@@ -60,6 +71,7 @@ export function createJitHost({ available = true, eager = false, mem32 = false, 
       mem = exports.memory;
       table = exports.__indirect_function_table; // needed once kwemu compiles
       big = typeof table?.length === "bigint";
+      hook = exports.kwemu_test_compile_hook;
     },
   };
 }

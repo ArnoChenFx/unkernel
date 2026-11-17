@@ -18,10 +18,12 @@
 //!       bit 3: the memory is shared (the generated code declares its
 //!       import shared, with the largest maximum of its type).
 //!       Called once, by kw_cpu_init.
-//!   kw_host_jit_compile(ptr, len, slot: u32) -> i32
+//!   kw_host_jit_compile(ptr, len, slot: u32, flags: u32) -> i32
 //!       Compile the `len` bytes at `ptr` (a module importing env.memory and
 //!       exporting function "f") and install "f" into table slot `slot`.
-//!       0 = installed, < 0 = failed (the slot is left as it was).
+//!       0 = installed, < 0 = failed (the slot is left as it was). flags
+//!       bit 0 (`compile_warm`): f(x, 0, irqp, jl) returns 0 at once, so the
+//!       host may call it to make a lazy engine compile f inside the call.
 //!   kw_host_jit_free(slot: u32)
 //!       Put the slot's original function back and drop the module.
 //!
@@ -100,7 +102,10 @@ const member_shift = 16;
 const slot_mask: u32 = (1 << member_shift) - 1;
 
 extern "unkernel" fn kw_host_jit_caps() u32;
-extern "unkernel" fn kw_host_jit_compile(ptr: [*]const u8, len: usize, slot: u32) i32;
+extern "unkernel" fn kw_host_jit_compile(ptr: [*]const u8, len: usize, slot: u32, flags: u32) i32;
+/// kw_host_jit_compile flags: every module returns 0 at once when called
+/// with cpu = 0 (see `emitModule`).
+const compile_warm: u32 = 1;
 extern "unkernel" fn kw_host_jit_free(slot: u32) void;
 
 /// Per-block fields. Empty without the JIT, so the default build keeps the
@@ -354,17 +359,50 @@ fn allocSlot(cpu: *Cpu) usize {
     }
 }
 
-noinline fn compile(cpu: *Cpu, b: *Block) void {
+/// Compile b (it got hot); true: `run` must look b up again before it runs
+/// anything (`windowClose`).
+noinline fn compile(cpu: *Cpu, b: *Block) bool {
     @branchHint(.cold);
     const st = &cpu.priv.jit;
     if (!supported(cpu.priv.ops[b.op])) {
         b.jx.st = never;
         st.skips += 1;
-        return;
+        return false;
+    }
+    windowOpen(cpu);
+    // An interrupt that is already pending (an IPI sent just before the
+    // window opened, whose sender may now be waiting) is taken first: the
+    // block runs interpreted this pass, and its next pass compiles it.
+    if (cpu.irq_pending) |p| {
+        if (p.* != 0) return windowClose(cpu);
     }
     var rg: Region = .{ .cpu = cpu };
     gatherRegion(cpu, b, &rg);
     install(cpu, &rg, b.pc >> 12, null);
+    return windowClose(cpu);
+}
+
+/// A compile (gathering a region, emitting its module, the host's compile
+/// and the slot bookkeeping) is a window in which other CPUs need not wait
+/// for this one's TLB flushes (kw_emu.h, "Flushes during a JIT compile"):
+/// nothing in it runs guest code or reads guest memory or a page table
+/// (only struct kw_cpu: decoded ops, exec-TLB generations, the emit
+/// buffer). Without atomics (one hart) nobody sets flush_all, and these
+/// are plain stores and loads.
+inline fn windowOpen(cpu: *Cpu) void {
+    @atomicStore(u32, &cpu.jit_busy, 1, .seq_cst);
+}
+
+/// End the window and do the flush another CPU asked for meanwhile, if
+/// any. True if it did: every block revalidates, and the one `run` was
+/// about to run may be gone, so `run` must look it up again before it runs
+/// anything. (An interrupt raised meanwhile is taken where the interpreter
+/// takes it, after that block.)
+fn windowClose(cpu: *Cpu) bool {
+    @atomicStore(u32, &cpu.jit_busy, 0, .seq_cst);
+    if (@atomicRmw(u32, &cpu.flush_all, .Xchg, 0, .seq_cst) == 0) return false;
+    cpu.flushAll();
+    return true;
 }
 
 /// Compile region `rg` (member 0 first) into a free pool entry for virtual
@@ -375,7 +413,8 @@ noinline fn compile(cpu: *Cpu, b: *Block) void {
 /// does not fit the buffer, that region stays as it is (closed) instead of
 /// being cut: a cut would drop members, which then run interpreted until
 /// they get hot again. Otherwise member 0 is the block that got hot, which
-/// is never compiled again if this fails.
+/// is never compiled again if this fails. Called inside the window
+/// (`windowOpen`).
 fn install(cpu: *Cpu, rg: *Region, page: u64, grow: ?u32) void {
     const st = &cpu.priv.jit;
     const b: *Block = &cpu.priv.blocks[rg.idx[0]];
@@ -428,7 +467,7 @@ fn install(cpu: *Cpu, rg: *Region, page: u64, grow: ?u32) void {
     if (!home) return;
     st.max_bytes = @max(st.max_bytes, @as(u32, @intCast(len)));
     st.size[i] = @intCast(len);
-    if (kw_host_jit_compile(&st.buf, len, tableSlot(i)) < 0) {
+    if (kw_host_jit_compile(&st.buf, len, tableSlot(i), compile_warm) < 0) {
         if (hot) b.jx.st = never;
         st.fails += 1;
         return;
@@ -453,10 +492,11 @@ fn install(cpu: *Cpu, rg: *Region, page: u64, grow: ?u32) void {
 
 /// `run` is about to enter compiled block `b` right after compiled code of
 /// the region in pool entry `s` left (terminator or side exit) towards it.
-/// Cheap unless b is compiled in another region.
-pub inline fn noteExit(cpu: *Cpu, s: u32, b: *Block) void {
-    if (b.jx.st < compiled or b.jx.st & slot_mask == s) return;
-    noteHot(cpu, s, b);
+/// Cheap unless b is compiled in another region. True: a grow compiled, and
+/// `run` must look b up again (`windowClose`).
+pub inline fn noteExit(cpu: *Cpu, s: u32, b: *Block) bool {
+    if (b.jx.st < compiled or b.jx.st & slot_mask == s) return false;
+    return noteHot(cpu, s, b);
 }
 
 /// Region growth along hot exits: a block compiled in another region, on
@@ -469,21 +509,21 @@ pub inline fn noteExit(cpu: *Cpu, s: u32, b: *Block) void {
 /// closed or full regions and self-loops (which keep their own module) are
 /// left alone: in measurements, growing towards those cost more in compiles
 /// than the exits it saved.
-noinline fn noteHot(cpu: *Cpu, s: u32, b: *Block) void {
+noinline fn noteHot(cpu: *Cpu, s: u32, b: *Block) bool {
     const st = &cpu.priv.jit;
     // Called on every such exit: only the cheap tests before counting.
-    if (st.page[s] & page_closed != 0 or b.pc >> 12 == st.page[s]) return;
+    if (st.page[s] & page_closed != 0 or b.pc >> 12 == st.page[s]) return false;
     b.jx.hits += 1;
     // A grow recompiles the whole region: the bigger it is, the more exits
     // it takes (grow_threshold per KiB of module).
-    if (b.jx.hits < st.grow_threshold *| @max(1, st.size[s] >> 10)) return;
+    if (b.jx.hits < st.grow_threshold *| @max(1, st.size[s] >> 10)) return false;
     b.jx.hits = 0;
-    if (selfLoop(cpu, b)) return;
+    if (selfLoop(cpu, b)) return false;
     // Already a member with this decode: the region stopped before it
     // (budget, interrupt, a page revalidated since).
     const me = blockIndex(cpu, b) + 1;
     for (st.members[s], st.member_op[s]) |m, o| {
-        if (m == me and o == @as(u16, @truncate(b.op))) return;
+        if (m == me and o == @as(u16, @truncate(b.op))) return false;
     }
     const limit = @min(st.region_max, max_members);
     var rg: Region = .{ .cpu = cpu };
@@ -492,10 +532,12 @@ noinline fn noteHot(cpu: *Cpu, s: u32, b: *Block) void {
     }
     if (rg.n == 0 or rg.n >= limit) {
         st.page[s] |= page_closed; // full: stop counting its exits
-        return;
+        return false;
     }
     addMember(&rg, blockIndex(cpu, b));
+    windowOpen(cpu);
     install(cpu, &rg, st.page[s], s);
+    return windowClose(cpu);
 }
 
 /// A decoded block that may be a region member.
@@ -503,19 +545,24 @@ fn usable(cpu: *Cpu, b: *const Block) bool {
     return b.pc != std.math.maxInt(u64) and supported(cpu.priv.ops[b.op]) and !selfLoop(cpu, b);
 }
 
+/// What `ready` decided for a pass through a block: interpret it, run its
+/// compiled code, or neither: a compile asked `run` to look the block up
+/// again first (`windowClose`).
+pub const Go = enum { interp, compiled, again };
+
 /// A pass through `b` is about to run: whether it runs compiled. Counts the
 /// pass towards the threshold and compiles the block once it is hot. One
 /// load and no store for a block that is never compiled.
-pub inline fn ready(cpu: *Cpu, b: *Block) bool {
+pub inline fn ready(cpu: *Cpu, b: *Block) Go {
     const s = b.jx.st;
-    if (s >= compiled) return true;
-    if (s == never) return false;
+    if (s >= compiled) return .compiled;
+    if (s == never) return .interp;
     if (s > b.ninsn) {
         b.jx.st = s - b.ninsn;
-        return false;
+        return .interp;
     }
-    compile(cpu, b);
-    return b.jx.st >= compiled;
+    if (compile(cpu, b)) return .again;
+    return if (b.jx.st >= compiled) .compiled else .interp;
 }
 
 /// The interpreter's self-loop over b continues while `left >= limit`
@@ -1333,6 +1380,17 @@ fn emitModule(cpu: *Cpu, b: *const Block, rg: ?*Region, limit: *usize) Error!usi
         e.uleb(n_region_locals);
         e.op(W.i64_t);
     }
+
+    // cpu == 0 (never from `run`): return at once. The host calls f so
+    // inside kw_host_jit_compile, so that an engine that compiles a
+    // function only at its first call (V8) does it there, inside the
+    // jit_busy window, instead of in `run`'s first call (kw_emu.h).
+    e.get(l_cpu);
+    e.op(W.i64_eqz);
+    e.open(W.@"if", W.void_t);
+    e.k64(0);
+    e.op(W.@"return");
+    e.close();
 
     // prologue
     for (1..32) |r| {

@@ -385,12 +385,15 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      only), CPU 0 stuck inside the kernel. A single write over 64 KiB
      is split into records that another CPU's write can land between.
    - No browser test in `web/test/` covers the CPUs option.
-   - JIT on SMP, what is left: a synchronous compile delays that CPU's
-     answer to IPIs (not mitigated; kwemu.md, JIT on several harts,
-     describes the cheapest fix); modules are not shared between CPUs,
-     so a task that moves compiles its hot code again; FENCE and PAUSE
-     are handed back to the interpreter on SMP (an atomic RMW in
-     compiled code would do).
+   - JIT on SMP, what is left: TLB flushes no longer wait for a CPU
+     that compiles or yields to its host (kwemu.md, JIT on several
+     harts, and Numbers, Compile stalls), but other IPIs do (`membarrier()`,
+     other cross-CPU calls; a wakeup onto a compiling CPU starts after
+     the compile), and so does a flush whose IPI was already on its way
+     when the compile began; modules are not shared between CPUs, so a
+     task that moves compiles its hot code again; FENCE and PAUSE are
+     handed back to the interpreter on SMP (an atomic RMW in compiled
+     code would do).
    - Under host load (after steps 6 and 7): a synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
      again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);

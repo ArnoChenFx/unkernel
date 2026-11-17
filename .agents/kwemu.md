@@ -622,36 +622,54 @@ its own thread, on one shared memory. The JIT is per CPU:
   hoisted, and another CPU's IPI (a TLB shootdown waits for the answer)
   would then never be seen. Nothing in compiled code waits for another
   CPU.
-- **Compiles stall the CPU.** `new WebAssembly.Module` (and V8's lazy
-  first-call compile) run on the CPU's thread inside `kw_run`, so a CPU
-  that compiles answers an IPI only afterwards, and a CPU waiting for it
-  spins for 20 µs and then blocks (kernel.md, SMP, Waiting for another
-  CPU). Measured (Numbers, SMP with the JIT): a compile takes about
-  0.1 ms plus V8's first-call compile, a CPU compiling without pause
-  delays 0.1% of the answers by more than 98 µs, and a realistic
-  workload compiles a few hundred modules per CPU and run. Not
-  mitigated. The cheapest mitigation would be the lazy-TLB argument of
-  tlb.c: kwemu sets a word in `struct kw_cpu` around the host call, a
-  flusher that sees it (Dekker pairing with `smp_mb()` on both sides)
-  marks the CPU stale instead of waiting, and kwemu, seeing the mark
-  after the compile, flushes everything and goes back to `run`'s lookup
-  before it executes anything (a compile reads only `kw_cpu`, never
-  guest memory or page tables, and the block being compiled must be
-  looked up again). It needs an ABI change and covers only IPIs that
-  are TLB flushes; V8's first-call compile happens in the call into the
-  module, outside that window, unless the host compiles eagerly.
+- **Compiles do not hold up TLB flushes.** A compile (gathering the
+  region, emitting the module, the host's `new WebAssembly.Module`,
+  `new Instance`, V8's first-call compile and `table.set`) takes 0.1 to
+  0.4 ms of host time, up to a few ms, and the CPU polls no interrupt in
+  it. kwemu marks it (ABI 8, kw_emu.h "Flushes during a JIT compile"):
+  `jit_busy` in `struct kw_cpu` is 1 from before the region is gathered
+  (`windowOpen`) until after the host returns (`windowClose`), and
+  nothing in between runs guest code, reads guest memory or walks a page
+  table (only `kw_cpu`: decoded ops, exec-TLB generations, the emit
+  buffer, the slot tables). A flush (tlb.c `kw_flush_later()`) that
+  finds a target busy sets its `flush_all`, `smp_mb()`, and skips it if
+  it still reads `jit_busy` (acquire; kwemu's `jit_busy = 1` is a
+  seq_cst store, so the user stores made before are visible to the
+  flusher, as `csd_unlock()` would make them). kwemu stores 0, then takes
+  `flush_all` with an atomic exchange: either the flusher sees the window
+  closed and waits as before, or kwemu sees the mark, flushes everything
+  (a range flush becomes a full one there) and `run` looks the block up
+  again before it runs anything (`Go.again`, also after a grow): the
+  flusher may have returned and unmapped or remapped it. V8 compiles a
+  wasm function at its first call, which would otherwise come from `run`
+  after the window: every module starts with `if (cpu == 0) return 0`,
+  and the host calls `f(0, 0, 0, 0)` inside the import (`flags` bit 0),
+  so that compile is in the window too. Before it gathers, kwemu looks at
+  its irq word: an interrupt already pending (an IPI sent just before the
+  window, whose sender now waits) is taken first, and the block compiles
+  at its next pass. The 20 ms yield to the host (below) is skipped by
+  flushes the same way (kernel.md, SMP, MM). Still waited for: an IPI
+  raised in the ~1-2 µs between a flusher's read of `jit_busy` (0) and
+  its IPI, if the window opens in between (most of the 50-500 µs waits
+  left under constant compiling); IPIs that are not TLB flushes
+  (`membarrier()`, other `smp_call_function()` users); a reschedule IPI
+  (a wakeup onto the compiling CPU starts after the compile); frees
+  (`table.set`, a few µs, outside the window). Measured: Numbers, Compile
+  stalls.
 - **Flushes** retire generations on each CPU, as on one hart: the kernel
   sends `flush_tlb_*()` to every CPU that has the mm loaded and waits,
-  marks a CPU in lazy TLB mode stale (it flushes everything when it
-  takes the mm again, before any user code), and `riscv_flush_icache`
-  (with any flags) flushes every CPU and waits. A flushed CPU revalidates
+  marks a CPU in lazy TLB mode (or yielding to its host) stale (it
+  flushes everything when it takes the mm again, before any user code),
+  does the same for a CPU that is compiling (below), and
+  `riscv_flush_icache` (with any flags) flushes every CPU and waits for
+  all but those. A flushed CPU revalidates
   each block before it runs it again (same pc, host address and raw
   bits), and a block that was rewritten or moved to another page is
   decoded again and its code freed (`drop`).
 - **Code changed by another hart** (its stores or `cbo.zero`) is seen by
   a hart after that hart's FENCE.I, after
   `riscv_flush_icache()` (any flags: it flushes every CPU and returns
-  only when all have), and after any unmap, remap or permission change
+  only when each has flushed or will before it runs user code), and after any unmap, remap or permission change
   of the page (the shootdown completes before the call returns), as on
   RISC-V hardware with Linux; until then the hart may keep running the
   old instructions, decoded or compiled. That is what Linux on hardware
@@ -696,7 +714,7 @@ These imports exist only with `-Dkwemu-jit`. The kernel host is
 | Import | |
 | --- | --- |
 | `kw_host_jit_caps() -> u32` | bit 0 = JIT available (0: never compile), bit 1 = 32-bit memory (lowered kernel: the code imports a 32-bit `env.memory` and wraps addresses), bit 2 = eager, bit 3 = shared memory (the code declares its `env.memory` import shared, with a maximum of 65536 pages for memory32 and 262144 for memory64, and reads `*irqp` with `i32.atomic.load`; the host sets it when the kernel's memory is a SharedArrayBuffer). Called once, from `kw_cpu_init`, by each CPU on its own host. |
-| `kw_host_jit_compile(ptr, len, slot) -> i32` | Compile the module at `ptr` (it imports `env.memory` and exports `f`) synchronously with `new WebAssembly.Module` and `table.set` its `f` into `slot` (a BigInt index for table64). 0 = installed, < 0 = failed (slot untouched, and that block is never compiled). |
+| `kw_host_jit_compile(ptr, len, slot, flags) -> i32` | Compile the module at `ptr` (it imports `env.memory` and exports `f`) synchronously with `new WebAssembly.Module` and `table.set` its `f` into `slot` (a BigInt index for table64). 0 = installed, < 0 = failed (slot untouched, and that block is never compiled). `flags` bit 0 (ABI 8; older kwemu passes no `flags`): `f` called with `cpu` = 0 returns 0 at once (every module starts with that test), and `jit.ts` calls `f(0, 0, 0, 0)` once so that V8 compiles it there, inside kwemu's compile window (JIT on several harts). |
 | `kw_host_jit_free(slot)` | Put back the stub that was there before the first compile, and drop the module. |
 
 kwemu's 1024 stubs are the last 1024 entries of the kernel's exported
@@ -716,7 +734,9 @@ as the external memory it already holds (which includes the kernel's
 memory); Node collects for 64 MiB at any memory size. So `jit.ts` tracks
 modules with a FinalizationRegistry. While 256 or more freed modules are
 uncollected (`RETAINED_NUDGE`), it allocates and detaches an ArrayBuffer
-on every compile and free. The nudge starts at 64 MiB, doubles up to
+on every compile (not on a free: a free is outside kwemu's compile window,
+and an allocation there can start a collection that delays the CPU's
+answer to an IPI). The nudge starts at 64 MiB, doubles up to
 4 GiB whenever nudges have seen no collection for 250 ms, and halves when
 an allocation fails. At 2048 uncollected (`RETAINED_LIMIT`) it refuses
 compiles, and kwemu interprets those blocks. Measured 2026-11-13: a
@@ -742,7 +762,11 @@ fixed + 6 µs/KiB), and the first call compiles with Liftoff on the
 calling thread (16 µs + 30 µs/KiB). `WebAssembly.compile` or a worker that
 posts the Module leaves that first-call compile where it was; only a
 worker that also instantiates on a dummy memory and calls `f` once moves
-it. JavaScriptCore compiles in the constructor. TurboFan tier-up already
+it. `jit.ts` makes that first call itself, inside `kw_host_jit_compile`
+(`f(0, 0, 0, 0)` returns at once), so it is in kwemu's compile window
+(JIT on several harts) and counted in `compileMs`; the table's first-call
+column is from before that. JavaScriptCore compiles in the constructor
+(there the extra call costs only the call). TurboFan tier-up already
 runs on background threads. Even if compiling were free and instant, the
 shell rows of Numbers would gain 2.4% in sum and `npx --version` 4.5%, and
 lower thresholds still would not win; an asynchronous install could also
@@ -816,6 +840,14 @@ that long instead of the ~0.25 ms compiling takes (Rejected designs).
   (musl is built with it too). Each prints a digest that
   `test/kwemu-test.mjs` checks against the value `qemu-riscv64-static -cpu
   rv64,<ext>=true,...` prints.
+- `kwemu jit: a flush asked for during a compile`: the test host
+  (`kwemu-jit-host.mjs`) calls the unit tests' `kwemu_test_compile_hook`
+  export inside every compile; there "another CPU" checks `jit_busy`,
+  maps another page at the block's address and sets `flush_all`, and the
+  new code must run, not the old; an interrupt raised there is taken
+  where the interpreter takes it. The fuzz asks for such a flush in every
+  other compile (results must not change). The host also checks that
+  every module's `f(0, 0, 0, 0)` returns 0 and that `flags` bit 0 is set.
 - `kwemu jit: compile threshold counts self-loop passes that an interrupt
   ends`: a self-loop that rings its own doorbell every 64 passes must be
   compiled after the threshold's worth of passes (dropping `loopDone` on
@@ -1046,16 +1078,60 @@ on CPU 1 (a `-Dkwemu-stats` kernel): 1.05 G instructions, 84% compiled
   2.0 / 3.8 / 210; CPU 1 making getppid calls 1.9 / 3.8 / 64; CPU 1 idle
   and not waited for, lazy TLB, 1.3 / 2.4 / 60). Single calls of about
   1 ms in every mode are the host's scheduling.
-- **Compile stalls.** In the same tool with CPU 1 compiling all the time
-  (8192 generated functions called in turn, each just past the threshold:
-  80,304 compiles in 60 s, 4.2 s of them in `new Module` + `new
-  Instance`), the shootdown takes p99.9 98 µs, p99.99 290 µs, at most
-  23 ms (569 calls over 1 ms, 8 over 10 ms, from collections in the
-  nudge path). Realistic workloads compile far less: `kwjob 2` 322 and
-  351 modules on CPU 0 and 1 (0.10-0.11 ms each, longest 0.37 ms);
-  4 minutes of kwstorm + kwmmstress on 2 CPUs about 5000 per CPU
-  (0.08 ms each). V8's lazy first-call compile adds about 16 µs +
-  30 µs/KiB (5.3 KiB on average here) inside the first call.
+- **Compile stalls** (2026-11-17, Node 24.22.1, 16-core host shared with
+  other builds, load average 4-7 unless said; lowered kernels; "before"
+  is the tree without the compile window, kernel and host; JIT on several
+  harts describes the design). Where the time goes, from a host trace of
+  CPU 1 compiling all the time (kwipi `churn`: 8192 generated functions
+  called in turn, each just past the threshold): `new Module` 0.10 ms,
+  `new Instance` 0.02, V8's first-call compile 0.27 (p99 0.7), `table.set`
+  3 µs, a free 1.4 µs (up to 0.4 ms when it nudged the collector), and
+  kwemu's own gathering and emitting about as much again before the host
+  call. The 20 ms yield took a median 32 µs but up to 19 ms (V8's
+  finalizers and collections of freed modules); every shootdown that
+  waited over 1 ms overlapped such a yield. kwipi `churn` on 2 CPUs,
+  20 s, 4 interleaved boots each, medians (time of one `mprotect()` that
+  shoots down CPU 1's TLB):
+
+  | | before | after | after, no first call in the host | window, but flushes still wait |
+  | --- | ---: | ---: | ---: | ---: |
+  | mprotects in 20 s | 5.53 M | 7.07 M | 6.29 M | 5.04 M |
+  | p50 / p99, µs | 2.0 / 5.1 | 2.0 / 4.1 | 2.2 / 5.4 | 2.3 / 6.4 |
+  | p99.9 / p99.99, µs | 130 / 350 | 13 / 230 | 47 / 220 | 120 / 330 |
+  | max, ms | 20.0 | 3.9 | 16.5 | 20.5 |
+  | calls over 1 ms | 194 | 3 | 5 | 193 |
+
+  (the last two columns come from a kernel with a switch for the skip and
+  counters; in the third, 9.5% of the CPUs to answer were skipped as
+  compiling and 4.5% as yielding). Beside 16 host spinners (load 15-17, 2 boots
+  each): p99.9 310 to 130 µs, max 52 to 22 ms, calls over 1 ms 1561 to
+  970, 2.47 M to 3.51 M mprotects. Kwipi's `spin` mode (no compiles)
+  is unchanged (p99.9 11 µs, max 0.5-0.7 ms). Real workloads compile far
+  less: the node set below (3 × `node -e`, `npx --version`, a CPU loop and
+  4 worker threads; Alpine's node 24.22.3) compiles about 3600 modules
+  and makes about 12,800 shootdowns on 2 CPUs (10,500 CPUs to answer, of
+  which 1-2% were compiling); the time flushes spent waiting fell from
+  145 to 18 ms on 2 CPUs and from 206 to 46 ms on 4, and the longest wait
+  from 14.7 to 0.8 ms (2 CPUs).
+- **Cost of the window** (same dates and host, interleaved medians).
+  Compile counts are unchanged; `compileMs` rises about 2.6x because it
+  now holds V8's first-call compile, which was spent in the first call
+  before. kwbench (5 boots): within its noise on UP and 2 CPUs (int loop
+  3897 vs 3588 MIPS UP, 3845 vs 3798 on 2 CPUs; mem and fp within 2%).
+  JIT harness (`kwemu-bench.mjs --jit`, 2 alternating runs of median-of-5):
+  sieve+fib 2127-2149 vs 2076-2123 MIPS, fib 1451-1474 vs 1407-1431,
+  interp 1649-1677 vs 1671-1697, the rest within 1%: the `cpu == 0` test
+  at every entry costs nothing measurable. Shell set (5 boots, seconds,
+  before → after): UP ash 1.96 → 1.94, sort 3.01 → 2.88, md5 0.102 →
+  0.106, awk 2.10 → 2.10, `yes` 4.50 → 4.61; 2 CPUs ash 1.95 → 2.17
+  (noisy, as on one hart), sort 2.98 → 2.84, awk 2.48 → 2.30. Node set
+  (4 boots): the sum of the six medians 22.28 → 22.39 s on UP, 17.04 →
+  17.17 s on 2 CPUs, 14.23 → 14.10 s on 4 (`npx --version` 4.19 → 4.14 s
+  on 2 CPUs). kwpar on 2 and 4 CPUs (400M iterations per thread): 1.15
+  → 1.16 s for one thread, 1.18 → 1.17 s (2) and 1.19 → 1.20 s (4) for one
+  per CPU. kwstorm + kwmmstress (120 s) and kwtlb (60 s) on 4 CPUs with
+  the JIT: no errors, and each secondary still collects what it frees
+  (about 1500-1750 compiles per CPU, at most 2 uncollected at the end).
 - **Host memory** (peak RSS of the CLI process after `kwjob N` on N CPUs,
   JIT vs `--no-jit`): 1 CPU 244 vs 193 MiB, 2 CPUs 365 vs 300, 4 CPUs 457
   vs 394. A CPU's thread costs about 100 MiB with or without the JIT;
@@ -1102,6 +1178,10 @@ Measured under V8 (Node 24). Do not retry these without a new reason.
 | 32-member regions and a 32 KiB emit buffer, with checked entries (2026-11-15) | apk entries 42.3M to 40.2M, jalr exits -13%, but apk 3.05 vs 2.88 s: bigger modules cost more per entry (prologue and epilogue over the union of registers) and per recompile |
 | Grow threshold 1024 per KiB, with checked entries (2026-11-15) | apk entries -7%, PLT exits 4.9M to 3.5M, a quarter to a third more compiles per run; time 2.85 vs 2.88 s (noise). With 32 members too: entries -14%, jalr exits 9.4M, slower |
 | Four AES T-tables instead of one table plus `i32.rotl` (AesTab +6 KiB) | aes-256-cbc 8 KiB +3.6% (78.8 vs 76.1 MB/s), aes-256-gcm and curl unchanged (2026-11-14); below the 4% bar for an AesTab change |
+| SMP compile stalls: taking a pending interrupt right after the compile, before the block runs (2026-11-17) | the JIT then takes an interrupt that a guest store raised earlier than the interpreter does (fuzz seed 100675: 7 instructions earlier), so the two diverge; kwemu looks at the irq word before the compile instead |
+| SMP compile stalls: the host's first call of a new module made to trap (out-of-bounds `x`, `cpu` and `irqp`) instead of a `cpu == 0` test in every module (2026-11-17) | a wasm trap costs 33-43 µs in a CPU's thread (5-6 µs in a small test process, also on a JSPI stack; cause not found), against one compare per entry |
+| SMP compile stalls: compiling asynchronously (`WebAssembly.compile`, or a helper worker posting the Module, which could also be shared between CPUs) | a finished Module reaches a CPU's thread only through its event loop, which it runs at the 20 ms yields: a hot block would stay interpreted that long instead of ~0.3 ms; V8's first-call compile stays on the CPU unless the helper also calls `f` on a memory of the same type |
+| SMP compile stalls: returning to the kernel between `new Module`, `new Instance` and the first call, to take interrupts there | 0.1, 0.02 and 0.25 ms on average: the first-call compile alone is most of it and cannot be split; for TLB flushes the window covers all of it anyway |
 
 ## Next steps
 

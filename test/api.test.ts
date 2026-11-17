@@ -492,8 +492,8 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const st = host.stats;
 		assert.deepEqual({ compiled: st.compiled, freed: st.freed, live: st.live, failed: st.failed, refused: st.refused, collected: st.collected, retained: st.retained, maxRetained: st.maxRetained },
 			{ compiled: 4, freed: 4, live: 0, failed: 0, refused: 2, collected: 0, retained: 4, maxRetained: 4 });
-		// Nudged on every free and compile with 2 or more uncollected: frees 2-4, compiles 3-6.
-		assert.equal(st.gcNudges, 7);
+		// Nudged on every compile (not on a free) with 2 or more uncollected: compiles 3-6.
+		assert.equal(st.gcNudges, 4);
 		assert.equal(table.get(1), stub);
 		assert.equal(logs.length, 1, logs.join("\n"));
 		// With a GC the modules are collected and compiling resumes.

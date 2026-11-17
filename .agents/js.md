@@ -445,8 +445,11 @@ parts that are easy to get wrong.
   counters per CPU (copied through CPU 0's emit buffer from the emit
   buffer address in the mirror); the CLI's `--stats` prints a line per
   CPU. `JitStats.maxCompileMs` is the longest `new Module` +
-  `new Instance` + `table.set` (V8's lazy first-call compile is not in
-  it).
+  `new Instance` + first call + `table.set`: with kwemu's `flags` bit 0
+  the host calls the new `f` once with `cpu` = 0 (it returns at once), so
+  that V8's lazy compile of it happens inside the import, in kwemu's
+  compile window, where other CPUs do not wait for this one (kwemu.md,
+  JIT on several harts).
 - `sched_yield` is a Suspending import here too (the kernel yields on
   every CPU, kernel.md, SMP): it returns through `yieldToEventLoop()`.
   This thread otherwise never reaches its event loop (it idles in the

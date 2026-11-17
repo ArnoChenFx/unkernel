@@ -9,17 +9,23 @@
 //   kw_host_jit_caps() -> u32        bit 0 available, bit 1 32-bit memory
 //                                    (the lowered vmlinux32.wasm), bit 2 eager
 //                                    (tests only; never set here)
-//   kw_host_jit_compile(ptr, len, slot) -> i32
+//   kw_host_jit_compile(ptr, len, slot, flags) -> i32
 //                                    compile the module at ptr (it imports
 //                                    env.memory, exports "f") and install "f"
-//                                    in table slot `slot`; 0 ok, -1 failed
+//                                    in table slot `slot`; 0 ok, -1 failed;
+//                                    flags bit 0: f(cpu = 0) returns at once
 //   kw_host_jit_free(slot)           put the slot's original function back
 //
 // kwemu owns the slots: a pool of stub functions that are already in the
 // kernel's exported __indirect_function_table, so the table never grows.
 // Compiling is synchronous (new WebAssembly.Module / Instance); the modules
-// are a few KiB. A failure returns -1 (kwemu then interprets that block for
-// good) and never throws into the kernel. The only reference to a compiled
+// are a few KiB. V8 compiles a wasm function only at its first call, which
+// would otherwise come from kwemu after the import returned; with flags bit
+// 0 the host calls f(0, 0, 0, 0) once (it returns at once), so that this
+// compile happens inside the import as well, where other CPUs need not wait
+// for this one's TLB flushes (kw_emu.h, "Flushes during a JIT compile").
+// A failure returns -1 (kwemu then interprets that block for good) and
+// never throws into the kernel. The only reference to a compiled
 // module is its table slot, so a free (or the kernel being dropped)
 // releases it. A kernel built without the tier never calls these imports.
 //
@@ -31,12 +37,13 @@
 // compiling never reaches, so freed modules were never collected. The host
 // therefore counts what the engine has collected (a FinalizationRegistry on
 // every module) and, while RETAINED_NUDGE or more freed modules are still
-// uncollected, allocates a 64 MiB ArrayBuffer on every compile and free and
-// detaches it at once (transfer(0); it is never touched, so it costs about
-// 10-30 us). JavaScriptCore counts the allocation towards its next
-// collection, which then reclaims the modules. V8 (Chromium) starts a
-// collection only for an allocation about as large as the external memory
-// it already has, which includes the kernel's wasm memory: with 512 MiB of
+// uncollected, allocates a 64 MiB ArrayBuffer on every compile (not on a
+// free, which is outside that window) and detaches it at once (transfer(0);
+// it is never touched, so it costs about 10-30 us). JavaScriptCore counts
+// the allocation towards its next collection, which then reclaims the
+// modules. V8 (Chromium) starts a collection only for an allocation about
+// as large as the external memory it already has, which includes the
+// kernel's wasm memory: with 512 MiB of
 // RAM a quiet page reached the refusal limit with 64 and 256 MiB nudges and
 // collected at once with 512 MiB. So while nudges see no collection for
 // NUDGE_PATIENCE_MS, each one is twice as large (up to NUDGE_MAX; an
@@ -60,9 +67,9 @@ export interface JitStats {
 	freed: number;
 	/** Compiles that failed (kwemu interprets those blocks), plus rejected calls. */
 	failed: number;
-	/** Total time spent compiling and instantiating, in ms. */
+	/** Total time spent compiling and instantiating (with V8, also the first call's compile), in ms. */
 	compileMs: number;
-	/** Longest single compile and instantiation, in ms (the longest the CPU could not answer an interrupt for one). */
+	/** Longest single compile, instantiation and first call, in ms (the longest the CPU could not answer an interrupt for one). */
 	maxCompileMs: number;
 	/** Total size of the compiled modules, in bytes. */
 	bytes: number;
@@ -145,6 +152,8 @@ export interface JitHostOptions {
 const CAP_AVAILABLE = 1;
 const CAP_MEM32 = 2;
 const CAP_SHARED = 8;
+/** kw_host_jit_compile flags bit 0: f(x, 0, irqp, jl) returns 0 at once. */
+const WARM = 1;
 /** kwemu's emit buffer is 16 KiB; anything much larger is not from kwemu. */
 const MAX_MODULE = 1 << 20;
 /** Failure messages logged before going quiet. */
@@ -255,7 +264,8 @@ export class JitHost {
 	imports(): Record<string, unknown> {
 		return {
 			kw_host_jit_caps: (): number => this.caps(),
-			kw_host_jit_compile: (ptr: bigint | number, len: bigint | number, slot: number): number => this.compile(ptr, len, slot),
+			kw_host_jit_compile: (ptr: bigint | number, len: bigint | number, slot: number, flags?: number): number =>
+				this.compile(ptr, len, slot, flags ?? 0),
 			kw_host_jit_free: (slot: number): void => this.free(slot),
 		};
 	}
@@ -272,7 +282,7 @@ export class JitHost {
 		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0);
 	}
 
-	compile(ptr: bigint | number, len: bigint | number, slot: number): number {
+	compile(ptr: bigint | number, len: bigint | number, slot: number, flags = 0): number {
 		const st = this.stats;
 		if (st.retained >= this.#nudgeAt) this.#nudge();
 		if (st.retained >= this.#limit) {
@@ -297,6 +307,8 @@ export class JitHost {
 			const module = new WebAssembly.Module(mem.buffer instanceof ArrayBuffer ? view : view.slice());
 			const f = new WebAssembly.Instance(module, { env: { memory: mem } }).exports.f;
 			if (typeof f !== "function") throw new Error("the module exports no function f");
+			// cpu = 0: f returns at once, after V8 has compiled it (flags bit 0).
+			if (flags & WARM) (f as (x: bigint, cpu: bigint, irqp: bigint, jl: bigint) => bigint)(0n, 0n, 0n, 0n);
 			const idx = this.#big ? BigInt(slot) : slot;
 			const prev = table.get(idx);
 			table.set(idx, f);
@@ -329,7 +341,6 @@ export class JitHost {
 			this.#table.set(this.#big ? BigInt(slot) : slot, orig);
 			this.#saved.delete(slot);
 			this.#freed();
-			if (this.stats.retained >= this.#nudgeAt) this.#nudge();
 		} catch (e) {
 			this.stats.failed++;
 			this.#warn((e as Error)?.message ?? String(e));

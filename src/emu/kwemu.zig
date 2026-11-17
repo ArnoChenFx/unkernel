@@ -23,7 +23,7 @@ const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
 pub const Regs = core.Regs;
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 pub const cpu_size: usize = 8 << 20;
 
 pub const Event = extern struct {
@@ -249,6 +249,10 @@ pub const Cpu = extern struct {
     budget: u64,
     icount: u64,
     ev: Event,
+    /// 1 while kwemu compiles (jit.windowOpen): another CPU may then set
+    /// `flush_all` instead of waiting for this one's flush.
+    jit_busy: u32,
+    flush_all: u32,
     priv: Priv,
 
     // ---- TLB ------------------------------------------------------------------
@@ -696,7 +700,7 @@ comptime {
     std.debug.assert(abi_version == c.KW_ABI_VERSION);
     std.debug.assert(@alignOf(Cpu) == 8);
     std.debug.assert(@sizeOf(Op) == 16);
-    for (.{ "phys_base", "pgd", "irq_pending", "budget", "icount", "ev" }) |f|
+    for (.{ "phys_base", "pgd", "irq_pending", "budget", "icount", "ev", "jit_busy", "flush_all" }) |f|
         std.debug.assert(@offsetOf(Cpu, f) == @offsetOf(c.struct_kw_cpu, f));
     std.debug.assert(@offsetOf(Cpu, "priv") >= @sizeOf(c.struct_kw_cpu));
     std.debug.assert(@sizeOf(Event) == @sizeOf(c.struct_kw_event));
@@ -770,8 +774,10 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
             return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
         if (jit.enabled and left_region) {
             if (stats_on) jit.countNext(cpu, xk, xb, b, xs);
-            jit.noteExit(cpu, xs, b);
             left_region = false;
+            // A grow compiled, and a flush came during the compile: look b
+            // up again (see jit.windowClose).
+            if (jit.noteExit(cpu, xs, b)) continue;
         }
         if (b.ninsn > left) {
             // Single-step: the budget ends inside this block.
@@ -807,7 +813,15 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         var lim: u64 = blk.ninsn;
         const entry_left = left;
         if (jit.enabled) {
-            const compiled = jit.ready(cpu, blk);
+            const go = jit.ready(cpu, blk);
+            if (go == .again) {
+                // It compiled, and a flush came during the compile: blk may
+                // be gone. Nothing of it ran; take it back and look it up
+                // again (jit.windowClose).
+                left += blk.ninsn;
+                continue;
+            }
+            const compiled = go == .compiled;
             if (compiled) {
                 // Runs this pass (and further self-loop passes), or hands
                 // op `code` back to the interpreter for the rest of it.

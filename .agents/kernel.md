@@ -92,7 +92,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 7. `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 8. `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it, in both copies, on any change to
   the layout or the semantics. A new `KW_ISA_*` bit is an ABI change;
   implementing an extension that already has a bit is not. Host imports
@@ -131,7 +131,9 @@ patch re-export.
   Signal handlers return through the `[sigpage]` mapping
   (`li a7,139; ecall`).
 - The JIT imports (`unkernel.kw_host_jit_caps`/`compile`/`free`) are not
-  part of the ABI version, and the kernel never calls them. kwemu imports
+  part of the ABI version (a host takes a missing `flags` argument of
+  `compile`, from a kwemu before ABI 8, as 0), and the kernel never calls
+  them. kwemu imports
   them itself and owns 1024 stub functions in the kernel's exported
   `__indirect_function_table`. Details are in kwemu.md.
 
@@ -683,7 +685,9 @@ numbers and open issues: status.md item 8.
   devices, and a secondary's event loop runs the engine's housekeeping,
   without which V8 never finishes collecting the JIT modules freed
   there (finalizers and the collector's last pass are tasks; js.md, CPU
-  threads). Only CPU 0 also checks stdin there.
+  threads). That can take milliseconds, so on SMP the yield comes after
+  the pending interrupts are taken, and TLB flushes do not wait for a
+  yielding CPU (MM, below). Only CPU 0 also checks stdin there.
   `smp_send_stop()` parks the others (CPU 0 in `wasm_idle(-1)`, so its
   host can still take a secondary's exit). A CPU takes the stop IPI in
   `cpu_relax()` even with interrupts off, and a secondary's host raises
@@ -702,7 +706,19 @@ numbers and open issues: status.md item 8.
   asleep): it sets that CPU's `kw_tlb_stale` instead, and `switch_mm()`
   back to that mm flushes everything first (Dekker pairing of
   `kw_tlb_lazy` and `kw_tlb_stale` with `smp_mb()` on both sides; a
-  switch to another mm drops everything anyway). Unlike on x86 this
+  switch to another mm drops everything anyway). The same holds, and the
+  same flag is used, while a CPU yields to its host from user mode
+  (`kw_yield_to_host()`: no user code and no uaccess until it is back, and
+  then it flushes everything if marked). A CPU whose kwemu is compiling
+  (kw_emu.h, `jit_busy`: no user code, no guest memory and no page table
+  in it, a few hundred µs of host time without interrupts) is not waited
+  for either: the flusher sets its `flush_all`, `smp_mb()`, and skips it
+  if it still reads `jit_busy` (acquire, pairing with kwemu's release
+  store, so the user stores made before the compile are visible); kwemu
+  clears `jit_busy`, then takes `flush_all` and flushes everything before
+  it runs user code (`kw_flush_later()`, tlb.c; kwemu.md, JIT on several
+  harts). `flush_tlb_all()` (so `riscv_flush_icache`) skips both kinds
+  too. Unlike on x86 this
   holds when page tables are freed too: a lazy CPU runs no user code and
   no uaccess walk for the mm, and kwemu walks the table only while it
   runs user code and caches no table entries. `update_mmu_cache_range()`

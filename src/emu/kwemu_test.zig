@@ -751,6 +751,21 @@ fn jitMode(m: *Machine, mode: JitMode, threshold: u32) void {
     };
 }
 
+/// Run by the test host inside every kw_host_jit_compile, after the module
+/// is installed (test/kwemu-jit-host.mjs calls the export
+/// kwemu_test_compile_hook): what another CPU does while this one compiles.
+var compile_hook: ?*const fn () void = null;
+/// The machine a hook acts on, and its count of calls.
+var hook_m: ?*Machine = null;
+var hook_calls: u64 = 0;
+
+comptime {
+    if (jit_on) @export(&compileHookExport, .{ .name = "kwemu_test_compile_hook" });
+}
+fn compileHookExport() callconv(.c) void {
+    if (compile_hook) |h| h();
+}
+
 fn jitStat(m: *Machine, comptime field: []const u8) u64 {
     if (!jit_on) return 0;
     return @field(m.cpu.priv.jit, field);
@@ -1614,6 +1629,74 @@ test "kwemu jit: compile threshold counts self-loop passes that an interrupt end
         if (i == 12) try t.expectEqual(@as(u64, 0), jitStat(&m, "compiles"));
     }
     if (jit_on) try t.expectEqual(@as(u64, 1), jitStat(&m, "compiles"));
+    try checkJitSlots(&m);
+}
+
+var hook_busy: u32 = 0;
+var hook_pa: u64 = 0;
+
+test "kwemu jit: a flush asked for during a compile: nothing runs before the block is looked up again" {
+    if (!jit_on) return error.SkipZigTest;
+    var m = try Machine.init();
+    defer m.deinit();
+    jitMode(&m, .eager, 0);
+    const irq = m.frame();
+    m.map(0x70000, irq, R | W | U | A | D);
+    const word: *u32 = @ptrCast(@alignCast(m.bytes(irq).ptr));
+    m.cpu.irq_pending = word;
+    hook_m = &m;
+    defer {
+        compile_hook = null;
+        hook_m = null;
+    }
+    // Another CPU maps another page at the block's address while this one
+    // compiles the block. It finds jit_busy set and asks for a flush instead
+    // of waiting (kernel: tlb.c), so its munmap/mmap may return before this
+    // CPU has flushed: the old code must not run after the compile.
+    _ = m.code(0x10000, &.{ addi(5, 5, 1), ecall });
+    hook_pa = m.frame();
+    putCode(&m, hook_pa, 0, &.{ addi(5, 5, 100), ecall });
+    hook_calls = 0;
+    compile_hook = struct {
+        fn f() void {
+            const hm = hook_m.?;
+            hook_calls += 1;
+            if (hook_calls != 1) return;
+            hook_busy = @atomicLoad(u32, &hm.cpu.jit_busy, .seq_cst);
+            hm.map(0x10000, hook_pa, R | X | U | A);
+            @atomicStore(u32, &hm.cpu.flush_all, 1, .seq_cst);
+        }
+    }.f;
+    try t.expectEqual(@as(u32, EV_SYSCALL), m.run(100));
+    try t.expectEqual(@as(u32, 1), hook_busy);
+    try t.expectEqual(@as(u64, 100), m.regs.x[5]);
+    try t.expectEqual(@as(u64, 2), m.cpu.icount);
+    try t.expectEqual(@as(u64, 98), m.cpu.budget);
+    try t.expectEqual(@as(u32, 0), m.cpu.flush_all);
+    try t.expectEqual(@as(u32, 0), m.cpu.jit_busy);
+    try t.expectEqual(@as(u64, 2), jitStat(&m, "compiles")); // the old block, then the new one
+    try t.expectEqual(@as(u64, 2), hook_calls);
+    // An interrupt raised during the compile is taken where the
+    // interpreter takes it: after the block (here at its ecall's trap, the
+    // next run returns it at once).
+    _ = m.code(0x20000, &.{ addi(6, 6, 1), ecall });
+    hook_calls = 0;
+    compile_hook = struct {
+        fn f() void {
+            hook_calls += 1;
+            const w: *volatile u32 = @constCast(hook_m.?.cpu.irq_pending.?);
+            w.* = 1;
+        }
+    }.f;
+    const ic = m.cpu.icount;
+    try t.expectEqual(@as(u32, EV_SYSCALL), m.run(100));
+    try t.expectEqual(@as(u64, 1), m.regs.x[6]);
+    try t.expectEqual(ic + 2, m.cpu.icount);
+    try t.expectEqual(@as(u64, 1), hook_calls);
+    try t.expectEqual(@as(u32, EV_INTERRUPT), m.run(100));
+    try t.expectEqual(ic + 2, m.cpu.icount);
+    word.* = 0;
+    try t.expectEqual(@as(u64, 3), jitStat(&m, "compiles"));
     try checkJitSlots(&m);
 }
 
@@ -2975,6 +3058,20 @@ fn fuzzOne(seed: u64, tot: *FuzzTotals) !void {
     if (jit_on) {
         b.m.cpu.priv.jit.region_max = ([_]u32{ 1, 2, 4, 16, 16, 16 })[rnd.uintLessThan(usize, 6)];
         b.m.cpu.priv.jit.grow_threshold = ([_]u32{ 1, 2, 8, 64, std.math.maxInt(u32) })[rnd.uintLessThan(usize, 5)];
+    }
+    // Every other compile, "another CPU" asks for a flush during it (no
+    // change of mappings: the results must not change).
+    hook_m = &b.m;
+    hook_calls = 0;
+    compile_hook = struct {
+        fn f() void {
+            hook_calls += 1;
+            if (hook_calls & 1 == 0) @atomicStore(u32, &hook_m.?.cpu.flush_all, 1, .seq_cst);
+        }
+    }.f;
+    defer {
+        compile_hook = null;
+        hook_m = null;
     }
     var total: u64 = 0;
     var slices: usize = 0;

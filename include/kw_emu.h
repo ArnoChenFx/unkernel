@@ -44,6 +44,21 @@
  * Guest stores are tracked only by the struct kw_cpu that runs them: code
  * another CPU rewrites is seen after a flush on this one (riscv's
  * flush_icache syscall, FENCE.I alone is local), as on hardware.
+ *
+ * Flushes during a JIT compile (ABI 8): a compile takes a few hundred
+ * microseconds, and the CPU answers no interrupt meanwhile. Around each
+ * (choosing the blocks, emitting the module, kw_host_jit_compile()) kwemu
+ * sets jit_busy (below) to 1 and back to 0; in between it runs no guest
+ * instruction and touches no guest memory and no page table. Another CPU that needs this one's TLB flushed may then
+ * skip waiting for it: it sets flush_all to 1, issues a full barrier and
+ * reads jit_busy with acquire semantics; only if it reads 1 may it go on
+ * without this CPU's answer. When the call returns, kwemu stores 0 to
+ * jit_busy, issues a full barrier, takes flush_all (atomic exchange with
+ * 0) and, if it was set, does what kw_flush_tlb_all() does before it runs
+ * any guest code. So either the flusher sees the window closed (and waits
+ * as usual), or kwemu sees the request. Guest stores before the window are
+ * ordered before its jit_busy = 1 (a release store). Only kwemu clears
+ * flush_all; a kwemu built without atomics (one hart) never sees it set.
  */
 #ifndef KW_EMU_H
 #define KW_EMU_H
@@ -58,7 +73,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 7
+#define KW_ABI_VERSION 8
 
 struct kw_regs {
 	uint64_t x[32];   /* x[0] is ignored and reads as zero */
@@ -112,6 +127,9 @@ struct kw_cpu {
 	uint64_t budget;               /* instructions kw_run may execute */
 	uint64_t icount;               /* total instructions executed (stats) */
 	struct kw_event ev;            /* details of the last event */
+	/* ABI 8, see "Flushes during a JIT compile" above */
+	uint32_t jit_busy;             /* written by kwemu only */
+	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
 };
 
 /* Zero and initialise the whole KW_CPU_SIZE block. */
@@ -209,11 +227,16 @@ void kw_host_reset(struct kw_cpu *cpu);
  *            generated code imports a 32-bit memory);
  *     bit 2: eager, compile blocks on first entry (tests).
  *     Called from kw_cpu_init and kw_host_reset.
- *   int32_t kw_host_jit_compile(const uint8_t *module, size_t len, uint32_t slot);
+ *   int32_t kw_host_jit_compile(const uint8_t *module, size_t len, uint32_t slot,
+ *                               uint32_t flags);
  *     Synchronously compile the module (it imports "env" "memory", i.e.
  *     this memory, and exports function "f", type (i64 i64 i64 i64) -> i64)
  *     and install "f" into table slot `slot`. 0 = installed; < 0 = failed,
- *     slot untouched.
+ *     slot untouched. flags bit 0 (ABI 8; older kwemu passes no flags): f
+ *     called with a second argument of 0 returns 0 at once and touches
+ *     nothing, so a host whose engine compiles a function only at its first
+ *     call can have it compiled here, inside the jit_busy window, by
+ *     calling f(0, 0, 0, 0).
  *   void kw_host_jit_free(uint32_t slot);
  *     Restore the function the slot held before its first compile and drop
  *     the module.

@@ -1166,12 +1166,16 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     the main one among them, count to 900000 through atomic adds, a
     compare-and-swap loop and a pthread mutex, and must have run on at least two CPUs.
   - `lse smp:` (skipped without HWCAP_ATOMICS; on one CPU too, where
-    preemption interleaves): one thread per CPU (2 to 4) hammers shared
+    preemption interleaves): one thread per CPU (2 to 4), each pinned to
+    its own (the check lasts tens of milliseconds, less than the
+    balancer may need to spread two threads that fork placement put on
+    one CPU: one or two ticks; `move:` checks the spreading), hammers shared
     counters with LDADDAL, STADDL, a CASAL loop, SWPAL (every value put
     in comes out exactly once), LDUMAXAL, a CASA/SWPL lock around a plain
     increment and a 128-bit CASPAL counter; every total must be exact,
     and on several CPUs the threads must have run on two at least.
-  - `excl smp:` (on one CPU too): one thread per CPU (2 to 4) counts
+  - `excl smp:` (on one CPU too): one thread per CPU (2 to 4), pinned as
+    in `lse smp:`, counts
     50000 times in its own halfword of one shared word (LDXRH/STXRH: a
     wider store would lose a neighbour's counts) and, all of them, in a
     shared halfword (LDAXRH/STLXRH), byte (LDXRB/STLXRB), word

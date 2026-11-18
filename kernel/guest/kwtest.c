@@ -2667,8 +2667,35 @@ static void smp_checks(void)
 }
 
 /*
+ * Pins the calling thread of a cross-CPU check (thread id of 0..3) to CPU
+ * id % online and returns its old mask (0: one CPU online, nothing done).
+ * These checks run for tens of milliseconds: left to fork placement, both
+ * threads may start on one CPU (the other one busy for a moment) and end
+ * before the balancer's first pull, one or two ticks at HZ=100. `move:`
+ * checks the spreading; these check atomicity across CPUs.
+ */
+static unsigned long smp_pin_self(uint64_t id)
+{
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	unsigned long old = 0, mask;
+
+	if (online < 2 || syscall(SYS_sched_getaffinity, 0, sizeof(old), &old) < 0)
+		return 0;
+	mask = 1UL << (id % (unsigned long)online);
+	syscall(SYS_sched_setaffinity, 0, sizeof(mask), &mask);
+	return old;
+}
+
+static void smp_unpin_self(unsigned long old)
+{
+	if (old)
+		syscall(SYS_sched_setaffinity, 0, sizeof(old), &old);
+}
+
+/*
  * LSE atomics on several CPUs (also run on one, where preemption
- * interleaves the threads): one thread per CPU (2 to 4) hammers shared
+ * interleaves the threads): one thread per CPU (2 to 4), each pinned to
+ * its own (smp_pin_self), hammers shared
  * counters with LDADDAL, STADD, a CASAL loop, SWPAL (every value put in
  * comes out exactly once), LDUMAXAL, a 128-bit CASPAL counter and a lock
  * taken by CASA and released by SWPL around a plain increment; every
@@ -2685,6 +2712,7 @@ static struct {
 static void *lse_worker(void *arg)
 {
 	uint64_t id = (uint64_t)(uintptr_t)arg, sum = 0, cpus = 0;
+	unsigned long aff = smp_pin_self(id);
 	unsigned cpu;
 
 	while (!lse_sh.go)
@@ -2717,6 +2745,7 @@ static void *lse_worker(void *arg)
 			cpus |= 1UL << cpu;
 	}
 	lse_ldaddal_x(&lse_sh.swp_sum, sum);
+	smp_unpin_self(aff);
 	return (void *)(uintptr_t)cpus;
 }
 
@@ -2763,7 +2792,8 @@ static void lse_smp_checks(void)
 
 /*
  * Exclusives and load-acquire/store-release of every size on several CPUs
- * (also on one, where preemption interleaves the threads), long enough for
+ * (each thread pinned to its own, smp_pin_self; also on one, where
+ * preemption interleaves the threads), long enough for
  * their loops to run compiled (the JIT translates them inline, a64.md):
  * each thread counts in its own halfword of one shared word by LDXRH/STXRH
  * (a store wider than its access would lose a neighbour's counts), all of
@@ -2802,6 +2832,7 @@ static void *ex_worker(void *arg)
 	uint64_t id = (uint64_t)(uintptr_t)arg, cpus = 0, v;
 	int lse = !!(getauxval(AT_HWCAP) & (1UL << 8));
 	uint16_t *own = (uint16_t *)&ex_sh.own + id;
+	unsigned long aff = smp_pin_self(id);
 	unsigned cpu;
 
 	while (!ex_sh.go)
@@ -2855,6 +2886,7 @@ static void *ex_worker(void *arg)
 			__asm__ volatile("stlr %0, [%1]" :: "r"(k), "r"(&ex_sh.ack) : "memory");
 		}
 	}
+	smp_unpin_self(aff);
 	return (void *)(uintptr_t)cpus;
 }
 

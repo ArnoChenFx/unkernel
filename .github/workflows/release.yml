@@ -11,7 +11,7 @@
 # Runs:
 #   - by hand from main (Actions > Release > Run workflow): a release with
 #     a generated version <package.json version>-<YYMMDD>-<commit>, e.g.
-#     0.1.0-261115-7e36b21 (the commit's UTC date and short hash). After the
+#     0.2.0-261120-7e36b21 (the commit's UTC date and short hash). After the
 #     build passes it tags the commit v<version>. Unchecking "release" makes
 #     it a smoke run (same build and version, no tag or release).
 #   - on a pushed tag v<version> that points at a commit on main: a release

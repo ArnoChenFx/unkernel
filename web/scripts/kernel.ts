@@ -17,7 +17,7 @@
 // Environment:
 //   KW_KERNEL=<path>          use this bundle instead (copied in), in a build too, e.g.
 //                             KW_KERNEL=../vendor/build/bundle/unkernel-alpine.wasm pnpm build:web
-//   KW_KERNEL_RELEASE=<tag>   this release instead of the newest (v0.1.0-261115-75add72);
+//   KW_KERNEL_RELEASE=<tag>   this release instead of the newest (e.g. v0.2.0);
 //                             the dev server then fetches it too
 //   GITHUB_TOKEN, GH_TOKEN    for the GitHub API (60 requests an hour without
 //                             one; past that, the release feed is used)

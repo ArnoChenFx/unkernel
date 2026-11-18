@@ -1,6 +1,6 @@
 {
   "name": "unkernel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Linux on WebAssembly: boot an Alpine aarch64 userland in Node or the browser",
   "license": "MIT AND GPL-2.0-only",
   "author": "Pooya Parsa <pooya@pi0.io>",

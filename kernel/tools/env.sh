@@ -21,11 +21,13 @@ ALPINE_TARBALL_NAME="alpine-minirootfs-$ALPINE_VERSION-aarch64.tar.gz"
 ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/releases/aarch64/$ALPINE_TARBALL_NAME"
 ALPINE_SHA256=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 
-# Ubuntu Base (the minimal root file system), for kernel/guest/ubuntu-disk.sh.
-UBUNTU_VERSION=24.04.5
+# Ubuntu Base (the minimal root file system), for kernel/guest/ubuntu-disk.sh
+# and the page's Ubuntu demo (web/src/demos/ubuntu.ts pins the same file).
+# The versioned release directory, which does not move on.
+UBUNTU_VERSION=26.10
 UBUNTU_TARBALL_NAME="ubuntu-base-$UBUNTU_VERSION-base-arm64.tar.gz"
-UBUNTU_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION%.*}/release/$UBUNTU_TARBALL_NAME"
-UBUNTU_SHA256=a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2
+UBUNTU_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/$UBUNTU_VERSION/release/$UBUNTU_TARBALL_NAME"
+UBUNTU_SHA256=8b7ea4ed71a92873f7f4e260a3defe0d9ed85cb69c0155b12414208f79fa0f2d
 
 # real_bin NAME: the first NAME on PATH that is an ELF executable, else the
 # first NAME on PATH at all (empty if none). Some hosts put wrapper scripts

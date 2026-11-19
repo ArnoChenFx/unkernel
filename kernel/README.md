@@ -7,7 +7,7 @@ Severin's `arch/wasm`, reworked). User space is unmodified aarch64 Linux ELF
 tables, so fork, mmap and copy-on-write behave like real Linux. A stock
 Alpine aarch64 minirootfs boots to a shell under Node, in
 Chromium, and in WebKit (Safari 27+, whose JSPI it needs), and Ubuntu Base
-24.04 LTS (glibc, apt) boots from a disk image under Node. The browser page
+26.10 (glibc, apt, systemd) boots from a disk image under Node. The browser page
 and the single-file bundle use a 32-bit-memory build of the same kernel, which
 needs no memory64.
 
@@ -39,7 +39,7 @@ node --test test/net.test.ts  # network stack unit tests (synthetic frames)
 node web/test/net.mjs        # apk/wget through Wisp in headless Chromium
 kernel/build.sh disk                                         # vendor/build/disk/alpine.ext4 (needs e2fsprogs)
 node js/cli.ts --disk vendor/build/disk/alpine.ext4   # Alpine on ext4, root=/dev/wda rw, persistent
-kernel/build.sh ubuntu                                       # vendor/build/disk/ubuntu.ext4: Ubuntu Base 24.04 (needs e2fsprogs)
+kernel/build.sh ubuntu                                       # vendor/build/disk/ubuntu.ext4: Ubuntu Base 26.10 (needs e2fsprogs)
 node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot   # Ubuntu on ext4, a root shell (see Ubuntu)
 kernel/build.sh datadisk     # vendor/build/disk/kwdata.kwsparse.gz, the data disk template (needs mke2fs)
 node js/cli.ts --data /tmp/kwdata.img   # Alpine plus the data disk at /data (created from the template if missing)
@@ -139,9 +139,9 @@ and `stats` are separate and not part of `all`):
   shell on hvc0; `::shutdown:/etc/kw-shutdown` kills everything and
   remounts `/` read-only, so `poweroff` leaves the fs clean.
 * **ubuntu** (`guest/ubuntu-disk.sh`, `DISK_SIZE`, default 2G sparse;
-  `UBUNTU_TARBALL=file` overrides the download): Ubuntu Base 24.04.5 arm64
-  (`ubuntu-base-24.04.5-base-arm64.tar.gz` from
-  `cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/`, SHA-256 pinned
+  `UBUNTU_TARBALL=file` overrides the download): Ubuntu Base 26.10 arm64
+  (`ubuntu-base-26.10-base-arm64.tar.gz` from
+  `cdimage.ubuntu.com/ubuntu-base/releases/26.10/release/`, SHA-256 pinned
   in `tools/env.sh`) as `vendor/build/disk/ubuntu.ext4`, built like the
   Alpine disk. See Ubuntu below.
 
@@ -701,10 +701,13 @@ default; the page offers all three.
 
 ## Ubuntu (disk root)
 
-`kernel/build.sh ubuntu` (`guest/ubuntu-disk.sh`) turns Ubuntu Base 24.04.5
-LTS arm64 (glibc 2.39, dpkg, apt 2.8, perl-base; no init system, no
-python) into `vendor/build/disk/ubuntu.ext4`, 2 GiB sparse (`DISK_SIZE`),
-about 143 MiB allocated. Nothing runs as root on the host: the tarball has
+`kernel/build.sh ubuntu` (`guest/ubuntu-disk.sh`) turns Ubuntu Base 26.10
+arm64 (glibc 2.44, dpkg, apt 3.3, perl-base, uutils coreutils; no init
+system, no python) into `vendor/build/disk/ubuntu.ext4`, 2 GiB sparse
+(`DISK_SIZE`), about 165 MiB allocated. 26.10 is the newest release
+(October 2026). Its arm64 baseline is ARMv8.0, so it runs on the guest CPU
+(glibc sees `AT_HWCAP` 0x2209fb and no SVE, BTI or MOPS). The newest LTS,
+26.04.1, is not pinned. Nothing runs as root on the host: the tarball has
 no device nodes and no xattrs or file capabilities, its two hard links
 survive `mke2fs -d`, and `tools/ext4-owners.py` restores the owners and the
 setuid/setgid bits (`su`, `passwd`, `mount`, `unix_chkpwd` root:shadow,
@@ -732,24 +735,22 @@ node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot --append "console
 node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --mem 1024          # persistent: apt-get update && apt-get install ...
 ```
 
-The arm64 image has not been booted yet; everything below was measured
-with the riscv64 image and kwemu's riscv64 JIT.
+Measured on 2026-11-18 (x86-64 host, Node 24, JIT on, `--mem 1024`):
+`apt-get update` (20.4 MB of indexes from archive.ubuntu.com and
+security.ubuntu.com, over the CLI's network) takes 29 s; `apt-get install
+--no-install-recommends htop` 8 s; systemd, systemd-sysv, udev and dbus
+(13 packages) 23 s. Nothing logged an undefined instruction. Not rerun on
+26.10: the kernel that logs every ENOSYS and illegal instruction (.agents/kernel.md,
+Kernel tests), and python3, iproute2 and the other tools that the riscv64
+guest's Ubuntu 24.04 ran on 2026-11-13 without either. After an apt run
+that replaced a file kw-init's bash has mapped (installing systemd does),
+the read-only remount at poweroff fails with "mount point is busy"; ext4's
+journal recovers at the next mount.
 
-Measured on 2026-11-13 (x86-64 host, Node 24, JIT on): `apt-get update`
-(28.6 MB of indexes) takes about 4 minutes, mostly at about 130 kB/s from
-ports.ubuntu.com through the CLI's network; `apt-get install
---no-install-recommends python3 procps iproute2 file xz-utils curl
-ca-certificates` (42 packages, already downloaded) 2 min 38 s. Then
-python3 3.12 (ssl, sqlite3, multiprocessing), `curl https://...`, `ip` over
-netlink and `ps` work. Booting it, the update, the install and those
-programs made no syscall that returned ENOSYS and hit no illegal
-instruction (checked with a kernel that logged both). glibc 2.39 on riscv64
-never calls rseq (the kernel has none) and runs without a vDSO.
-
-The apt install was what found the slice bug fixed by charging kernel entries (see
+An apt install was what found the slice bug fixed by charging kernel entries (see
 Interrupts are polled under Design).
 
-**systemd.** systemd 255 runs as PID 1. Install
+**systemd.** systemd 261 runs as PID 1. Install
 it from the kw-init shell (persistent disk, network):
 
 ```sh
@@ -760,11 +761,14 @@ node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot --mem 1024   # sy
 `systemd-sysv` replaces `/sbin/init`; `init=/usr/local/sbin/kw-init`
 still boots the plain shell (with the network, which nothing configures
 under systemd yet). udev is needed: without it `dev-hvc0.device` never
-appears and the console getty times out after 90 s. On 2026-11-13 (same
-host): `Startup finished in 132ms (kernel) + 7.417s (userspace)`, 8.7 s
-with `--no-jit`; `systemctl is-system-running` says `running`, no failed
-units, 33 processes, and `poweroff` goes through systemd's shutdown and
-leaves `/` clean. What the kernel lacks, and systemd copes with:
+appears and the console getty times out after 90 s. On 2026-11-18 (same
+host): `Startup finished in 183ms (kernel) + 8.116s (userspace)`
+(graphical.target); `systemctl is-system-running` says `running`, no
+failed units, 38 processes, and `poweroff` goes through systemd's
+shutdown. The boot's warnings: no libbpf (cgroup BPF off), no BPF
+firewalling, and sysctls the kernel lacks (`kernel/core_pattern`, IPv6
+`use_tempaddr`, `yama/ptrace_scope`). What the kernel lacks, and systemd
+copes with:
 
 * `bpf` (BPF_SYSCALL off) and `keyctl` (KEYS off) return ENOSYS: no BPF
   firewalling or device control, no session keyrings. These two are the

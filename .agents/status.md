@@ -59,12 +59,17 @@ for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
    show its own terminal windows, web.md). Check first: SharedWorker on Chrome for
    Android, and JSPI inside one. A service worker is unsuitable, since
    browsers stop idle ones.
-6. **Ubuntu**: Ubuntu Base 24.04 boots from a disk (`kernel/build.sh
+6. **Ubuntu**: Ubuntu Base 26.10 arm64 boots from a disk (`kernel/build.sh
    ubuntu`, kernel/README.md), apt works, and systemd boots to
-   multi-user.target once installed from apt. Next: network under systemd
+   multi-user.target once installed from apt; the page's Ubuntu demo runs
+   the same tarball in a chroot on Alpine. Next: network under systemd
    (systemd-networkd or a kw-net unit), a prebuilt systemd image, BPF,
    keys, IPv6 and cgroup controllers if a service needs them (costs in
-   kernel.md), then the page. 25.10 and later need V.
+   kernel.md), the ENOSYS and illegal-instruction logging run on 26.10,
+   and kw-init's poweroff after an apt run that replaced a file its bash
+   maps (the read-only remount fails as busy). 26.10 is an interim
+   release (support ends mid-2027): pin the next one, or 26.04.x LTS,
+   before then.
 7. **Stack switching.** The wasm stack-switching proposal is at Phase 3,
    behind a flag in V8 and missing from WebKit (Node 26:
    `--experimental-wasm-wasmfx`). With a module-defined memory and stub

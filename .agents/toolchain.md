@@ -78,7 +78,7 @@ The API differs from 0.13-0.15. Examples of all of these are in
 
 The kernel base commit and the LLVM tag and commit are in build.sh. The
 SHA-256 sums for Binaryen 133, the Alpine 3.24.4 aarch64 minirootfs and
-Ubuntu Base 24.04.5 arm64 are in build.sh and `kernel/tools/env.sh`
+Ubuntu Base 26.10 arm64 are in build.sh and `kernel/tools/env.sh`
 (`ALPINE_TARBALL=file` overrides the download). wterm (`@wterm/dom`
 0.5.10, Apache-2.0) is an npm dependency of `web/`, pinned exactly and
 locked in `pnpm-lock.yaml` (see web.md).

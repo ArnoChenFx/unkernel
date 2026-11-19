@@ -1239,8 +1239,8 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   check: boot it, and with a network run an `apt-get install`. To list
   what a userland lacks, build a throwaway kernel (`KOUT=` elsewhere) that
   `pr_info`s every `-ENOSYS` in `do_syscall` and every `do_user_trap`
-  (traps.c); Ubuntu 24.04 boot, apt and python3 hit neither, systemd only
-  `bpf` and `keyctl`. For a hang, the same kernel can print each user
+  (traps.c); Ubuntu 24.04 boot, apt and python3 hit neither on the riscv64
+  guest, systemd only `bpf` and `keyctl` (not rerun for 26.10 arm64). For a hang, the same kernel can print each user
   task's state and `x8` (the syscall it sleeps in) from `arch_cpu_idle`
   every 20 s; a busy host can be paused through the Node inspector
   (`kill -USR1`, then `Debugger.pause` over CDP), which shows the wasm

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Ubuntu: Ubuntu Base 24.04.5 LTS riscv64 (glibc 2.39, dpkg, apt 2.8, bash;
-// no init system), fetched at run time from cdimage.ubuntu.com, the tarball
-// kernel/build.sh ubuntu builds its disk from (same SHA-256 as tools/env.sh),
-// and run in a chroot on the Alpine guest. Nothing from Ubuntu is in the page.
+// Ubuntu: Ubuntu Base 26.10 arm64 (glibc 2.44, dpkg, apt 3.3, bash, uutils
+// coreutils; no init system), fetched at run time from cdimage.ubuntu.com,
+// the tarball kernel/build.sh ubuntu builds its disk from (same SHA-256 as
+// kernel/tools/env.sh), and run in a chroot on the Alpine guest. Nothing from
+// Ubuntu is in the page.
 //
-// The page fetches the tarball (31 MB; `downloads`, download.ts) and pushes
+// The page fetches the tarball (35 MB; `downloads`, download.ts) and pushes
 // it into the demo's directory, unless the tree is there already. ubuntu.sh
 // extracts that copy and deletes it; without it (the page's fetch failed)
 // it downloads the tarball itself over https. Either way the tarball is
 // streamed through sha256sum into tar, and a wrong sum deletes what was
-// extracted. The tree (about 75 MB)
+// extracted. The tree (about 110 MB)
 // goes to /data/ubuntu with the data disk (kept: later runs start at once),
-// else /var/lib/ubuntu, on the root in memory (gone at power off). The
-// versioned release directory is used, since releases/24.04/release/ moves on
-// to the next point release.
+// else /var/lib/ubuntu, on the root in memory (gone at power off). A tree
+// whose bash is not an aarch64 program (one a riscv64 guest extracted, on a
+// data disk that the guest's architecture reset adopted) is deleted and
+// extracted again, and its download is not skipped. The release directory
+// is versioned (releases/26.10/release/), so the URL does not move on.
 //
 // Each run enters a private mount namespace (unshare -m, all mounts private),
 // mounts proc, sysfs, /dev (rbind, so /dev/pts too), tmpfs on /run and
@@ -24,21 +27,23 @@
 // Alpine's sh never reads), copies Alpine's resolv.conf in, and runs bash -l as root in the
 // chroot with a clean environment. The mounts go away with the namespace
 // when that shell exits, back to Alpine's shell in the window. apt works
-// (its sources are ports.ubuntu.com over plain http), but apt-get update
-// reads about 30 MB of indexes, minutes in the guest.
+// (its sources are archive.ubuntu.com and security.ubuntu.com over plain
+// http); apt-get update reads about 20 MB of indexes.
 import type { Demo } from "../launcher.ts";
 
-const VER = "24.04.5";
-const NAME = `ubuntu-base-${VER}-base-riscv64.tar.gz`;
+const VER = "26.10";
+const NAME = `ubuntu-base-${VER}-base-arm64.tar.gz`;
 const TARBALL_URL = `https://cdimage.ubuntu.com/ubuntu-base/releases/${VER}/release/${NAME}`;
-const SHA256 = "651c516f291259ec913caa1efd0cfff738cd223adfc6617c884f07af487f08cf";
-const SIZE = 31290214;
+const SHA256 = "8b7ea4ed71a92873f7f4e260a3defe0d9ed85cb69c0155b12414208f79fa0f2d";
+const SIZE = 36245313;
 
-// Where ubuntu.sh puts the tree; the download is skipped when it is there.
+// Where ubuntu.sh puts the tree; the download is skipped when it is there
+// and its bash is an aarch64 program (ELF e_machine 183: bytes b7 00).
 const ROOT_SH = 'if mountpoint -q /data; then R=/data/ubuntu; else R=/var/lib/ubuntu; fi';
+const OURS_SH = '[ "$(od -An -tx1 -j18 -N2 "$R/usr/bin/bash" 2>/dev/null | tr -d " \\n")" = b700 ]';
 
 const UBUNTU_SH = String.raw`#!/bin/sh
-# Ubuntu Base 24.04.5 riscv64 from cdimage.ubuntu.com, in a chroot on this
+# Ubuntu Base 26.10 arm64 from cdimage.ubuntu.com, in a chroot on this
 # Alpine guest. Written by the unkernel launcher's Ubuntu demo.
 set -e
 NAME=${NAME}
@@ -52,12 +57,18 @@ else
 	R=/var/lib/ubuntu WHERE="in memory, gone at power off (no data disk)"
 fi
 
+# A tree of another architecture (a riscv64 guest's): start over.
+if [ -e "$R/usr/bin/bash" ] && ! ${OURS_SH}; then
+	printf "$D%s$N\n" "$R holds Ubuntu for another architecture: deleting it"
+	rm -rf "$R"
+fi
+
 if [ ! -x "$R/usr/bin/bash" ]; then
 	if [ -f "$NAME" ]; then
 		printf "$D%s$N\n" "Extracting $NAME (fetched by the page) into $R"
 		fetch() { cat "$NAME"; }
 	else
-		printf "$D%s$N\n" "Fetching $NAME (31 MB) from cdimage.ubuntu.com into $R"
+		printf "$D%s$N\n" "Fetching $NAME (35 MB) from cdimage.ubuntu.com into $R"
 		fetch() { wget -O - "$URL"; }
 	fi
 	rm -rf "$R.tmp" sum.fifo sum.txt
@@ -95,10 +106,10 @@ fi
 	'[ -f ~/.bashrc ] && . ~/.bashrc' > /root/.bash_profile
 
 . "$R/etc/os-release"
-printf "\n$B%s$N\n" "$PRETTY_NAME (riscv64, from cdimage.ubuntu.com) in a chroot on the Alpine guest"
+printf "\n$B%s$N\n" "$PRETTY_NAME (arm64, from cdimage.ubuntu.com) in a chroot on the Alpine guest"
 printf "$D%s$N\n" "Root: $R, $WHERE; home: /root, shared with Alpine." \
 	"Try: cat /etc/os-release; ldd --version; apt-get update && apt-get install -y htop" \
-	"(apt-get update reads about 30 MB of indexes: a few minutes). exit returns to Alpine."
+	"(apt-get update reads about 20 MB of indexes). exit returns to Alpine."
 
 # A private mount namespace: the mounts go away when the shell exits.
 exec unshare -m /bin/sh -c '
@@ -120,12 +131,12 @@ exec chroot "$R" /usr/bin/env -i HOME=/root TERM="$TERM" LANG=C.UTF-8 \
 export default {
 	id: "ubuntu",
 	title: "Ubuntu",
-	desc: "Ubuntu 24.04 LTS, fetched from cdimage.ubuntu.com and run in a chroot: glibc, bash, dpkg and apt",
+	desc: "Ubuntu 26.10, fetched from cdimage.ubuntu.com and run in a chroot: glibc, bash, dpkg and apt",
 	// Crafted: a ring with three dots, after Ubuntu's Circle of Friends.
 	icon: { svg: '<circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="2.4"/><g stroke="#c34113" stroke-width="1.6"><circle cx="20.6" cy="12" r="2.6"/><circle cx="7.7" cy="19.45" r="2.6"/><circle cx="7.7" cy="4.55" r="2.6"/></g>' },
 	colors: ["#e95420", "#5e2750"],
 	needs: { net: true },
 	files: { "ubuntu.sh": { content: UBUNTU_SH, mode: 0o755 } },
-	downloads: [{ url: TARBALL_URL, sha256: SHA256, size: SIZE, path: NAME, unless: `${ROOT_SH}; test -x "$R/usr/bin/bash"` }],
+	downloads: [{ url: TARBALL_URL, sha256: SHA256, size: SIZE, path: NAME, unless: `${ROOT_SH}; ${OURS_SH}` }],
 	commands: ["./ubuntu.sh"],
 } satisfies Demo;

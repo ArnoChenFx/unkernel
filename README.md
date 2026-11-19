@@ -70,7 +70,7 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   through your host's sockets or a Wisp proxy
   ([Add a network](#add-a-network)).
 - **cgroups, namespaces, userfaultfd, fanotify and TUN**: enough for
-  systemd to boot Ubuntu 24.04 to `multi-user.target`.
+  systemd to boot Ubuntu 26.10 to `multi-user.target`.
 - **Devices**: a [framebuffer (`/dev/fb0`), evdev keyboard, mouse and touch,
   sound through ALSA and `/dev/dsp`](#display-input-and-sound),
   [AF_VSOCK](#talk-over-vsock), and [shared memory](#share-memory) with the
@@ -94,7 +94,7 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   starts with only the `main` repository, because it is about 4x faster that
   way; `community` is added the first time a command needs it.
 - **Run real runtimes and tools**: Node and npm, Python, OpenSSL, curl and
-  `wget`, straight from the distribution. Ubuntu 24.04 boots from a disk,
+  `wget`, straight from the distribution. Ubuntu 26.10 boots from a disk,
   with apt and, once you install it, systemd.
 - **[Write graphics and sound programs](#display-input-and-sound)** against
   `/dev/fb0`, evdev and ALSA. Try `glimmer`, a tiny game with sound.

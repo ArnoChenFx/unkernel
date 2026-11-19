@@ -603,8 +603,9 @@ file, size checked). It skips a file that is in the guest already at that
 size, or whose `unless` passes in the demo's directory. A failure is a toast
 and a log line, not fatal, so the demo's script checks the file itself and
 downloads it when it is missing (Ubuntu does). On 2026-11-15 (Node, the
-default Wisp server) the Ubuntu Base tarball (31 MB) took 1.5 to 4.4 s to
-fetch and 0.2 s to push. A demo with `hidden` set is left out of the launcher. A demo runs once at a time: picking one whose window
+default Wisp server) the riscv64 Ubuntu Base tarball (31 MB) took 1.5 to
+4.4 s to fetch and 0.2 s to push; the arm64 26.10 one (35 MB) took 0.3 s
+to push (Node SDK, 2026-11-18). A demo with `hidden` set is left out of the launcher. A demo runs once at a time: picking one whose window
 is open (a dot under its tile) shows that window. A demo whose `needs`
 (display, net, sound) the page's options rule out is dimmed, with why.
 Launching a demo sets `?demo=<id>` in the URL (`history.replaceState`), and

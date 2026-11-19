@@ -56,7 +56,7 @@
 #   vendor/toolchain/binaryen       Binaryen release (wasm-opt), fetched by `binaryen`
 #   vendor/build/disk/alpine.ext4   Alpine root file system image for kwblk (`disk`)
 #   vendor/build/disk/kwdata.kwsparse.gz  empty ext4 "kwdata" data disk template (`datadisk`)
-#   vendor/build/disk/ubuntu.ext4  Ubuntu Base 24.04 root file system image (`ubuntu`)
+#   vendor/build/disk/ubuntu.ext4  Ubuntu Base 26.10 root file system image (`ubuntu`)
 #   vendor/build/initramfs/         alpine.cpio (also holds /usr/bin/kwtest and kwbench)
 #   vendor/build/bundle/            unkernel-alpine.wasm (vmlinux32.wasm + alpine.cpio + cmdline
 #                                   + the data disk template + the SMP patch in custom sections);

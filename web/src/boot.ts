@@ -21,7 +21,7 @@ import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
 import { createAudioOut } from "./audio.ts";
-import { REPO, UP_ONCE_KEY } from "./config.ts";
+import { INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, fmtSize, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
@@ -674,14 +674,15 @@ export function start(): void {
 	 * suspended session. False if sessionStorage refuses the note, which would
 	 * make the reload try the same again: then the caller reports the failure.
 	 */
-	function bootUpOnce(reason: string, resume = false): boolean {
+	function bootUpOnce(reason: string, resume = false, inline = false): boolean {
 		try {
-			sessionStorage.setItem(UP_ONCE_KEY, reason);
+			sessionStorage.setItem(inline ? INLINE_ONCE_KEY : UP_ONCE_KEY, reason);
 		} catch {
 			return false;
 		}
-		ui.hostLog(`[host] booting on one CPU instead: ${reason}`);
-		KW.term?.notice(`[host] booting on one CPU instead: ${reason}`);
+		const what = inline ? "on the page's thread" : "on one CPU";
+		ui.hostLog(`[host] booting ${what} instead: ${reason}`);
+		KW.term?.notice(`[host] booting ${what} instead: ${reason}`);
 		if (resume) ui.resume(); // sets kw-resume and reloads
 		else location.reload();
 		return true;
@@ -790,7 +791,7 @@ export function start(): void {
 		let dataDisks: BlockDevice[] | DiskSpec[] = [];
 		if (cfg.worker) {
 			// The worker builds the data disk and the network from specs.
-			ui.check("worker", "Worker mode", "pass", cfg.workerParam ? "on (?worker=1)" : `for ${cfg.cpus} CPUs (?cpus=${cfg.smpParam})`,
+			ui.check("worker", "Worker mode", "pass", cfg.workerParam ? (cfg.workerAsked ? "on (?worker=1)" : "on (default)") : `for ${cfg.cpus} CPUs (?cpus=${cfg.smpParam})`,
 				"the kernel, the data disk, the network, the display, input and sound devices run in a Web Worker" + (smp ? ", which starts the other CPUs as workers of its own" : ""));
 			ui.hostLog(`[host] worker mode: the kernel runs in a Web Worker, with the data disk, the network, the display, input and sound${smp ? `; ${cfg.cpus} CPUs` : ""}`);
 			dataDisks = await dataSpec();
@@ -851,8 +852,12 @@ export function start(): void {
 		let workerWatchdog: ReturnType<typeof setTimeout> | undefined;
 		if (cfg.worker) {
 			setLive(" .... ", "Starting the kernel worker");
-			workerWatchdog = setTimeout(() => ui.fail("worker", "The kernel worker did not report back within 20 s (it may have failed to load; the browser console may say why)", "",
-				{ title: "Worker mode failed" }), 20000);
+			workerWatchdog = setTimeout(() => {
+				// A default worker: the page's thread once instead (an asked one is reported).
+				if (!cfg.workerAsked && bootUpOnce("the kernel worker did not report back within 20 s", false, true)) return;
+				ui.fail("worker", "The kernel worker did not report back within 20 s (it may have failed to load; the browser console may say why)", "",
+					{ title: "Worker mode failed" });
+			}, 20000);
 		}
 		const onProgress = (p: BootProgress) => {
 			if (p.stage === "worker") {
@@ -944,9 +949,11 @@ export function start(): void {
 			clearTimeout(workerWatchdog);
 			// The distro image (worker mode opens it in the worker): not a reason to try one CPU.
 			if (/^distro: /.test((e as Error)?.message ?? "")) throw tag(e, "distro", "kernel");
+			const be = e instanceof BootError ? e : undefined;
+			// A default worker that could not start (its JSPI, the module): the page's thread, one CPU.
+			if (cfg.worker && !cfg.workerAsked && be?.stage === "support" && bootUpOnce(`the kernel worker did not start (${be.message})`, false, true)) return;
 			// Several CPUs that did not start (the worker, its JSPI, the shared memory): one CPU.
 			if (smp && bootUpOnce(`booting on ${cfg.cpus} CPUs failed (${(e as Error)?.message ?? e})`)) return;
-			const be = e instanceof BootError ? e : undefined;
 			if (cfg.worker && be?.stage === "support") throw tag(e, "worker", "boot");
 			if (cfg.worker && be?.stage === "download") throw tag(e, "fetch", "kernel");
 			if (cfg.worker && be?.stage === "compile") throw tag(e, "compile", "compile");

@@ -282,13 +282,18 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   after `write()` returned and yields a task (a MessageChannel, which
   background tabs do not throttle) every 16 ms or 256 KiB. `KW.windows`
   is their API. Checked by hand only (no browser test yet).
-- `?worker=1` (experimental, and implied by `?cpus=N`) boots through the SDK's worker mode (js.md):
+- Worker mode (the default where the page is cross-origin isolated, else
+  off; `?worker=0` / `?worker=1` pick; implied by several CPUs) boots through the SDK's worker mode (js.md):
   the page compiles the kernel and passes the `WebAssembly.Module`; disks
   and the network are specs built in the worker. The data disk in worker
   mode follows data-disk.md (Persistence in the browser). `KW.kernel` and
   `globalThis.kernel` stay unset, so the browser tests (whose
-  `page.type()` uses `kernel.sendInput()`) run inline only. Every way the worker can fail
-  ends in `ui.fail`.
+  `page.type()` uses `kernel.sendInput()`) run inline only: lib.mjs
+  `goto()` adds `?worker=0&cpus=1` unless the URL has them. A default
+  worker (no `?worker=`) that does not start (a `support` BootError, or
+  no report within 20 s) reloads once on the page's thread
+  (`bootUpOnce(..., inline)`, sessionStorage `kw-inline-once`); every
+  other way an asked worker can fail ends in `ui.fail`.
 - Sound is an AudioWorklet fed by postMessage, because the kernel calls
   the import from a busy main thread; scheduled buffers are the fallback
   where there is no secure context. Checked by hand only.
@@ -385,13 +390,22 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 
 The CPUs option (System tab, Options, the `#opt-cpus` slider; `?cpus=N`,
 config.ts) boots the SMP kernel on N CPUs (kernel/smp.md; js.md, CPU
-threads). Default 1: the UP kernel, exactly as without the option (the
-same files and code paths). It applies on Reboot, like the
+threads). Default in worker mode where the page can boot the SMP
+kernel: the suggested count (`cfg.cpuDefault`); else 1, the UP kernel.
+`?cpus=1` is the UP kernel (the same files and code paths as before
+the option). The Worker thread and CPUs options go into the URL only
+where they differ from these defaults. It applies on Reboot, like the
 other options.
 
-- Choices: 1, 2, 4 and 8 up to `navigator.hardwareConcurrency` (the
-  kernel's limit is 8), plus the suggested count, min(4,
-  hardwareConcurrency / 2), marked "(suggested)" (none below 4 threads).
+- Choices: 1, 2, 4, 8 and 16 up to `navigator.hardwareConcurrency`, and
+  that count itself (the kernel's limit is 16, `NR_CPUS`), plus the suggested count,
+  hardwareConcurrency / 2 up to `SUGGESTED_CPUS` (4 on desktops, 2 in
+  Firefox, none on phones until measured; config.ts, with the
+  /profile.html numbers behind it), marked
+  "(suggested)" (none below 4 threads, and none in WebKit: Safari 27.2 ran
+  parallel work slower on every added CPU, 2026-11-19; `webkitEngine()`).
+  A count past the suggestion (past one where there is none) is there to
+  try: selected, the slider, its value and its note turn red (`Stop.warn`).
   Half the host's threads stay free for the page, the browser and other
   tabs: a guest CPU whose thread the host deschedules stalls the CPUs
   that wait for it (status.md, SMP, under host load). A larger `?cpus=` is
@@ -415,8 +429,8 @@ other options.
 - Falling back: a failed SMP download or compile, or a `createKernel()`
   that rejects (the worker, its JSPI, the shared memory), calls
   `bootUpOnce()`: it stores the reason in sessionStorage `kw-up-once` and
-  reloads; that load boots on one CPU the usual way (inline unless
-  `?worker=1`) and shows the reason (`cfg.smpWhy`: the Guest CPUs row,
+  reloads; that load boots on one CPU the usual way (in worker mode
+  where that is the default) and shows the reason (`cfg.smpWhy`: the Guest CPUs row,
   the CPUs note, diagnostics). `?cpus=` stays in the URL, so the next
   Reboot tries again. If sessionStorage refuses, the failure is reported
   instead (no reload loop). A kernel worker that cannot start CPU threads

@@ -78,7 +78,8 @@ export default defineConfig({
 		// there must not reload an open dev page, which would end its VM.
 		watch: { ignored: ["**/.output/**", "**/.vercel/**", "**/kernel/release/**", "**/kernel/page/**"] },
 	},
-	build: { target: "esnext" },
+	// profile.html: the defaults profiler (src/profile.ts), a page of its own.
+	build: { target: "esnext", rollupOptions: { input: { main: path.join(import.meta.dirname, "index.html"), profile: path.join(import.meta.dirname, "profile.html") } } },
 	// The SDK's worker mode (?worker=1): js/web/worker.ts starts a module worker.
 	worker: { format: "es" },
 	plugins: [
@@ -160,6 +161,22 @@ export default defineConfig({
 					res.setHeader("cross-origin-opener-policy", "same-origin");
 					res.setHeader("cross-origin-embedder-policy", "require-corp");
 					next();
+				});
+			},
+		},
+		{
+			// Nitro's dev renderer answers every page with index.html: profile.html
+			// here (a build emits it as a page of its own, build.rollupOptions above).
+			name: "unkernel:profile-page",
+			configureServer(server) {
+				server.middlewares.use((req, res, next) => {
+					if ((req.url ?? "").split("?")[0] !== "/profile.html") return next();
+					readFile(path.join(import.meta.dirname, "profile.html"), "utf8")
+						.then((html) => server.transformIndexHtml("/profile.html", html))
+						.then((html) => {
+							res.setHeader("content-type", "text/html; charset=utf-8");
+							res.end(html);
+						}, next);
 				});
 			},
 		},

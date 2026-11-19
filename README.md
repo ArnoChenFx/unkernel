@@ -135,8 +135,8 @@ The page takes a few URL parameters:
 | `?wisp=wss://...` | Use your own [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) proxy |
 | `?jit=0` | Interpreter only |
 | `?data=0` | No persistent disk, a fresh system every time |
-| `?worker=1` | Run the kernel in a Web Worker (experimental) |
-| `?cpus=2` | Boot on several CPUs, each in a Web Worker (experimental; only where the page has the SMP kernel and is cross-origin isolated) |
+| `?worker=0` | Run the kernel on the page's thread (default: in a Web Worker where the page is cross-origin isolated) |
+| `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox, one on phones, in Safari and on iOS, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
 
 Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you
@@ -250,8 +250,8 @@ well behind native.
 
 ### 🚧 Known limits
 
-- One CPU by default. Several CPUs (SMP: `--cpus`, the page's `?cpus=`)
-  are experimental and cannot be suspended.
+- The SDK and CLI boot one CPU by default; the page boots several where
+  it can (`?cpus=`). Several CPUs (SMP) cannot be suspended.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).

@@ -145,10 +145,11 @@ Open:
    constant-time on the host.
 3. A cheaper data-TLB fast path, which also helps without the JIT.
 4. **Worker mode** (`createKernel({ worker: true })`, CLI `--worker`, page
-   `?worker=1`; js.md, Worker mode). Before it becomes the page default:
-   a hand test on the page and on an iPhone over https, the page with
-   `?worker=1` in desktop Safari and Firefox, and browser tests for worker
-   mode. Open:
+   default where the page is cross-origin isolated, `?worker=0` off;
+   js.md, Worker mode). The page default since 2026-11-19, with a
+   one-load fallback to the page's thread (web.md); still to do: a hand
+   test on an iPhone over https, the page in desktop Safari and Firefox,
+   and browser tests for worker mode. Open:
    - Without cross-origin isolation (a plain-http LAN page) input and
      frames wait for the worker's next yield (up to 20 ms while the guest
      is busy).
@@ -252,8 +253,8 @@ Open:
    - Browsers (2026-11-17; js.md, CPU threads; web.md, Several CPUs):
      `js/web/cpu.ts` starts each CPU as a Web Worker, nested in worker
      mode's kernel worker (CPU 0 must be able to block, so not on a
-     page's main thread), and the page has a CPUs option (`?cpus=N`, off
-     by default) that loads the SMP bundle only then and falls back to
+     page's main thread), and the page has a CPUs option (`?cpus=N`, the
+     suggested count by default in worker mode) that loads the SMP bundle only then and falls back to
      one CPU. Run in headless Chromium (2 and 4 CPUs: boot, a terminal
      window, glimmer, the JIT on every CPU, parallel loops scaling) and
      by hand on a deployed build in desktop Chrome, Firefox and on iOS.

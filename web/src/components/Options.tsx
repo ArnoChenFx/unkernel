@@ -14,7 +14,7 @@
 // the browser tests), and the store would miss it. A check box stores its
 // data-on or data-off value, so the options keep the values rebootUrl() reads.
 import { useEffect, useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
-import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED } from "../config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED, webkitEngine } from "../config.ts";
 import { KW } from "../kw.ts";
 import { useStore, type Options as Opts } from "../store.ts";
 import { autoFont } from "../ui.ts";
@@ -75,7 +75,8 @@ function Radio({ id, name, value, current, label }: { id: string; name: keyof Op
 	);
 }
 
-type Stop = { value: string; tick: string; label: string; note?: string };
+/** `warn`: a choice to try, not to keep (red when selected, with `warnNote` under the slider). */
+type Stop = { value: string; tick: string; label: string; note?: string; warn?: boolean };
 
 /**
  * A slider over a few stops (value: the stop's index; data-values maps it
@@ -84,36 +85,38 @@ type Stop = { value: string; tick: string; label: string; note?: string };
  * auto picks). A tick is clickable and lines up with the thumb's centre there.
  * A disabled slider (CPUs where only one is possible) says why in its note.
  */
-function Slider({ id, name, label, value, stops, disabled, note, noteId }: {
-	id: string; name: string; label: string; value: string; stops: Stop[]; disabled?: boolean; note?: string; noteId?: string;
+function Slider({ id, name, label, value, stops, disabled, note, noteId, warnNote }: {
+	id: string; name: string; label: string; value: string; stops: Stop[]; disabled?: boolean; note?: string; noteId?: string; warnNote?: string;
 }) {
 	const i = Math.max(0, stops.findIndex((s) => s.value === value)), last = stops.length - 1;
 	const at = (k: number) => `calc(${last ? k / last : 0} * (100% - var(--thumb)) + var(--thumb) / 2)`;
 	const cur = stops[i]!.label;
+	const warn = !disabled && !!stops[i]!.warn;
+	if (warn && warnNote) note = warnNote;
 	return (
 		<div className="flex flex-col gap-1.5 text-[11.5px] text-faint [--thumb:12px]">
 			<div className="flex items-baseline justify-between gap-2">
 				<label htmlFor={id}>{label}</label>
-				<output htmlFor={id} className="font-mono text-[12px] text-fg tabular-nums">{cur}</output>
+				<output htmlFor={id} className={`font-mono text-[12px] tabular-nums ${warn ? "text-err" : "text-fg"}`}>{cur}</output>
 			</div>
 			<input id={id} name={name} type="range" min={0} max={last} step={1} value={i} data-values={stops.map((s) => s.value).join(",")}
 				disabled={disabled} aria-valuetext={cur} aria-describedby={note ? noteId : undefined} onChange={onField}
-				className="slider w-full disabled:cursor-not-allowed disabled:opacity-50" style={{ "--fill": at(i) } as never} />
+				className="slider w-full disabled:cursor-not-allowed disabled:opacity-50" style={{ "--fill": at(i), ...(warn ? { "--tone": "var(--color-err)" } : {}) } as never} />
 			<div className={`relative font-mono text-[11px] leading-[14px] select-none ${stops.some((s) => s.note) ? "h-7" : "h-3.5"} ${disabled ? "opacity-50" : ""}`} aria-hidden="true">
 				{stops.map((s, k) => (
 					<span key={s.value} onClick={disabled ? undefined : () => pick(name, s.value)} style={{ left: at(k) }}
-						className={`absolute top-0 flex -translate-x-1/2 flex-col items-center tabular-nums ${disabled ? "" : "cursor-pointer hover:text-fg"} ${k === i ? "text-fg" : ""}`}>
+						className={`absolute top-0 flex -translate-x-1/2 flex-col items-center tabular-nums ${disabled ? "" : "cursor-pointer hover:text-fg"} ${k === i ? (warn ? "text-err" : "text-fg") : ""}`}>
 						{s.tick}{s.note && <span className="text-[10px] text-ok">{s.note}</span>}
 					</span>
 				))}
 			</div>
-			{note && <small id={noteId} className="text-[11.5px] text-faint">{note}</small>}
+			{note && <small id={noteId} className={`text-[11.5px] ${warn ? "text-err" : "text-faint"}`}>{note}</small>}
 		</div>
 	);
 }
 
 const SIZES = [64, 128, 256, 512, 1024];
-const CPU_COUNTS = [1, 2, 4, 8];
+const CPU_COUNTS = [1, 2, 4, 8, 16];
 const FONTS = [11, 12, 13, 14, 15, 16, 18];
 
 export function Options() {
@@ -152,12 +155,18 @@ export function Options() {
 	}));
 	const fontValue = fontPref === String(autoPx) ? "auto" : fontPref;
 
-	// CPUs: 1, 2, 4, 8 up to the host's threads, the suggested count and a ?cpus= that is none of them.
-	const cpus: Stop[] = [...new Set([...CPU_COUNTS.filter((n) => n <= cfg.cpuMax), ...(cfg.cpuSuggested ? [cfg.cpuSuggested] : []), cfg.smpParam])].sort((a, b) => a - b)
+	// CPUs: 1, 2, 4, 8, 16 up to the host's threads, the host's threads themselves (the most
+	// there is to try), the suggested count and a ?cpus= that is none of them. Past the
+	// suggestion (one in WebKit) a count is there to try: red when selected.
+	const cpuOk = cfg.cpuSuggested || 1;
+	const cpus: Stop[] = [...new Set([...CPU_COUNTS.filter((n) => n <= cfg.cpuMax), cfg.cpuMax, ...(cfg.cpuSuggested ? [cfg.cpuSuggested] : []), cfg.smpParam])].sort((a, b) => a - b)
 		.map((n) => {
 			const sug = n === cfg.cpuSuggested && n > 1;
-			return { value: String(n), tick: String(n), label: `${n} CPU${n > 1 ? "s" : ""}${sug ? " (suggested)" : ""}`, note: sug ? "suggested" : undefined };
+			return { value: String(n), tick: String(n), label: `${n} CPU${n > 1 ? "s" : ""}${sug ? " (suggested)" : ""}`, note: sug ? "suggested" : undefined, warn: n > cpuOk };
 		});
+	const cpuWarn = webkitEngine()
+		? "To try: in Safari and on iOS, several CPUs ran slower than one (/profile.html)."
+		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 8 MiB of guest memory. No Suspend.`;
 	// More than one CPU runs each in a Web Worker (config.ts: worker), so Worker thread is ticked and locked.
 	const smp = o.cpus !== "1" && !cfg.smpBlocked;
 	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`
@@ -213,7 +222,7 @@ export function Options() {
 			</fieldset>
 
 			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] items-start gap-x-12 gap-y-5">
-				<Slider id="opt-cpus" name="cpus" label="CPUs" value={o.cpus} stops={cpus} disabled={!!cfg.smpBlocked} note={cpuNote} noteId="opt-cpus-note" />
+				<Slider id="opt-cpus" name="cpus" label="CPUs" value={o.cpus} stops={cpus} disabled={!!cfg.smpBlocked} note={cpuNote} noteId="opt-cpus-note" warnNote={cpuWarn} />
 				<Slider id="opt-mem" name="mem" label="Memory" value={memValue} stops={mem} />
 				<Slider id="opt-font" name="font" label="Font size" value={fontValue} stops={fonts} />
 			</div>

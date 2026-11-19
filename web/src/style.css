@@ -97,15 +97,16 @@
 	.select option { background: var(--color-surface); }
 	/* Range: a thin track, filled up to the thumb (--fill, set inline), and a
 	   square thumb, var(--thumb) wide (set on a parent, so the tick labels
-	   under it can line up with it). */
+	   under it can line up with it). --tone: the track and thumb colour (the
+	   CPUs slider: red past the suggested count). */
 	.slider {
 		appearance: none; height: 18px; background: transparent; cursor: pointer;
-		&::-webkit-slider-runnable-track { height: 2px; background: linear-gradient(to right, var(--color-fg) var(--fill), var(--color-line-strong) var(--fill)); }
-		&::-moz-range-track { height: 2px; background: linear-gradient(to right, var(--color-fg) var(--fill), var(--color-line-strong) var(--fill)); }
-		&::-webkit-slider-thumb { appearance: none; width: var(--thumb, 12px); height: 14px; margin-top: -6px; background: var(--color-fg); border: 2px solid var(--color-surface); box-sizing: content-box; }
-		&::-moz-range-thumb { width: var(--thumb, 12px); height: 14px; background: var(--color-fg); border: 2px solid var(--color-surface); border-radius: 0; box-sizing: content-box; }
-		&:hover::-webkit-slider-thumb { background: #fff; }
-		&:hover::-moz-range-thumb { background: #fff; }
+		&::-webkit-slider-runnable-track { height: 2px; background: linear-gradient(to right, var(--tone, var(--color-fg)) var(--fill), var(--color-line-strong) var(--fill)); }
+		&::-moz-range-track { height: 2px; background: linear-gradient(to right, var(--tone, var(--color-fg)) var(--fill), var(--color-line-strong) var(--fill)); }
+		&::-webkit-slider-thumb { appearance: none; width: var(--thumb, 12px); height: 14px; margin-top: -6px; background: var(--tone, var(--color-fg)); border: 2px solid var(--color-surface); box-sizing: content-box; }
+		&::-moz-range-thumb { width: var(--thumb, 12px); height: 14px; background: var(--tone, var(--color-fg)); border: 2px solid var(--color-surface); border-radius: 0; box-sizing: content-box; }
+		&:hover::-webkit-slider-thumb { background: var(--tone, #fff); }
+		&:hover::-moz-range-thumb { background: var(--tone, #fff); }
 		&:focus-visible { outline: none; }
 		&:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 2px var(--color-accent); }
 		&:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(--color-accent); }

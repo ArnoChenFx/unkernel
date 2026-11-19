@@ -117,7 +117,7 @@ export interface Options {
 	data: "on" | "off";
 	root: "overlay" | "safe";
 	worker: "on" | "off";
-	/** CPUs, "1" to "8" (?cpus=). */
+	/** CPUs, "1" to "16" (?cpus=). */
 	cpus: string;
 	/** The distro image (?distro=): a name, or "none". */
 	distro: string;

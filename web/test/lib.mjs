@@ -141,7 +141,14 @@ async function attachTarget(target, name, { shots } = {}) {
 			if (touch) await send("Emulation.setEmitTouchEventsForMouse", { enabled: true, configuration: "mobile" });
 			if (ua) await send("Emulation.setUserAgentOverride", { userAgent: ua });
 		},
-		goto: (url) => send("Page.navigate", { url }),
+		// The page's thread on one CPU unless the URL says otherwise: the tests type
+		// through globalThis.kernel, which worker mode (the page's default) has not.
+		goto: (url) => {
+			const u = new URL(url);
+			if (!u.searchParams.has("worker")) u.searchParams.set("worker", "0");
+			if (!u.searchParams.has("cpus")) u.searchParams.set("cpus", "1");
+			return send("Page.navigate", { url: u.href });
+		},
 		async waitFor(expr, what, ms = 90000) {
 			const end = performance.now() + ms;
 			let v;

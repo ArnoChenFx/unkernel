@@ -459,8 +459,11 @@ export function createUi(cfg: Config) {
 		set("append", append && append !== DEFAULT_CMDLINE ? append : null);
 		set("data", o.data === "off" ? "0" : null);
 		set("root", o.root === "safe" ? "initramfs" : null);
-		set("worker", o.worker === "on" ? "1" : null);
-		set("cpus", o.cpus === "1" ? null : o.cpus);
+		// Worker thread and CPUs: in the URL only where they differ from this device's defaults (config.ts).
+		set("worker", (o.worker === "on") === cfg.workerDefault ? null : o.worker === "on" ? "1" : "0");
+		// The next load's default count: the suggestion in worker mode (config.ts cpuDefault).
+		const cpuNext = o.worker === "on" && !cfg.smpBlocked && cfg.cpuSuggested ? cfg.cpuSuggested : 1;
+		set("cpus", o.cpus === String(cpuNext) ? null : o.cpus);
 		set("distro", o.distro === DEFAULT_DISTRO ? null : o.distro);
 		const q = p.toString();
 		return location.pathname + (q ? `?${q}` : "");

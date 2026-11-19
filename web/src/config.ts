@@ -51,10 +51,13 @@
 //                                      cross-origin isolated (https or localhost; a plain-http
 //                                      LAN page has no SharedArrayBuffer), else as messages,
 //                                      which wait up to 20 ms while the guest is busy. Default:
-//                                      on the page's thread.
-//   ?shared=0                          with ?worker=1: messages even where shared memory works
+//                                      on where the page is cross-origin isolated (a worker that
+//                                      fails to start then reloads once on the page's thread,
+//                                      boot.ts bootUpOnce()), else off; ?worker=0: the page's
+//                                      thread, one CPU unless ?cpus= asks for more.
+//   ?shared=0                          in worker mode: messages even where shared memory works
 //                                      (to compare the two)
-//   ?cpus=N                            boot the SMP kernel on N CPUs (2 to 8, at most
+//   ?cpus=N                            boot the SMP kernel on N CPUs (2 to 16, at most
 //                                      navigator.hardwareConcurrency), each CPU in a Web Worker
 //                                      of its own on one shared memory; implies ?worker=1 (CPU 0
 //                                      blocks while it waits for another CPU, which a page's main
@@ -63,7 +66,11 @@
 //                                      cross-origin isolation (https or localhost); otherwise, or
 //                                      when the SMP kernel fails to load or start, the page boots
 //                                      on one CPU as usual (smpBlocker(), boot.ts). No Suspend.
-//                                      Default (and ?cpus=1): one CPU, the UP kernel.
+//                                      Default in worker mode: the suggested count (half the
+//                                      threads, at most SUGGESTED_CPUS: 4 on desktops, 2 in
+//                                      Firefox; one on phones, on fewer than 4 threads and in
+//                                      WebKit, where several CPUs ran slower), else one.
+//                                      ?cpus=1: one CPU, the UP kernel.
 //   ?demo=<id>                         launch that demo once the guest is up (launcher.ts). The
 //                                      launcher sets it on each launch, so a reload reopens the
 //                                      last demo, and closing its window removes it; read
@@ -137,21 +144,27 @@ export interface Config {
 	root: "initramfs" | null;
 	/** The kernel runs in a Web Worker (with the data disk, network, display, input and sound): ?worker=1, or more than one CPU. */
 	worker: boolean;
-	/** ?worker=1 as given (the Worker thread option). */
+	/** The Worker thread option: ?worker=1 or ?worker=0, else workerDefault. */
 	workerParam: boolean;
+	/** Worker mode by default: where shared memory works (cross-origin isolated), unless this load falls back to the page's thread (INLINE_ONCE_KEY). */
+	workerDefault: boolean;
+	/** ?worker= was given. */
+	workerAsked: boolean;
 	/** The SMP kernel's URL (sdk.ts kernelSmpUrl), or null when the page has none. */
 	kernelSmpUrl: string | null;
-	/** ?cpus= as given (1 to 8; 1 when absent): the CPUs option. */
+	/** The CPUs option: ?cpus= as given (1 to 16), else cpuDefault. */
 	smpParam: number;
+	/** The CPUs this device boots with by default: cpuSuggested where the page can boot the SMP kernel, else 1. */
+	cpuDefault: number;
 	/** CPUs this load boots with: smpParam where possible (capped at cpuMax), else 1. */
 	cpus: number;
 	/** Why this page cannot boot more than one CPU (smpBlocker()), or null. */
 	smpBlocked: string | null;
 	/** Why this load boots on one CPU although ?cpus= asks for more, or null. */
 	smpWhy: string | null;
-	/** The most CPUs offered: navigator.hardwareConcurrency, at most 8 (the kernel's limit). */
+	/** The most CPUs offered: navigator.hardwareConcurrency, at most 16 (the kernel's limit). */
 	cpuMax: number;
-	/** The count the CPUs option suggests, or 0 when this device has too few threads to suggest one. */
+	/** The count the CPUs option suggests (half the threads, at most SUGGESTED_CPUS), or 0 when this device has too few threads to suggest one. */
 	cpuSuggested: number;
 	/** Worker mode: shared memory for input and frames where it works (?shared=0: messages). */
 	shared: boolean;
@@ -165,7 +178,7 @@ export interface Config {
 }
 
 /** The kernel's limit (NR_CPUS in kw_smp.config). */
-export const MAX_CPUS = 8;
+export const MAX_CPUS = 16;
 
 /**
  * Why this page cannot boot the SMP kernel, or null: no SMP kernel in the
@@ -182,12 +195,32 @@ export function smpBlocker(): string | null {
 	return null;
 }
 
+/**
+ * The most CPUs suggested (and booted by default): half the threads up to
+ * this. Profiled with /profile.html (2026-11-19, a 14-thread desktop,
+ * Chrome): 4 CPUs ran 4-wide work 2.5x and 8-wide 3.5x as fast as one; 8
+ * CPUs only gained on 8-wide work (4-5x), 14 no more, for 3-7% on
+ * single-threaded work, 40 ms more boot per CPU past 4 and 8 MiB each.
+ * Firefox and phones are not measured yet: two and one. WebKit
+ * (webkitEngine()) suggests none: in desktop Safari 27.2 (same machine,
+ * 2026-11-19) parallel work got slower with every CPU added (8 CPUs: 0.25-0.4x
+ * of one), so it boots one by default.
+ */
+export const SUGGESTED_CPUS = { desktop: 4, firefox: 2, mobile: 1 };
+
+/** JavaScriptCore: Safari, and every browser on iOS (CriOS and FxiOS are WebKit too, without "Chrome/"). */
+export function webkitEngine(ua = navigator.userAgent): boolean {
+	return /AppleWebKit\//.test(ua) && !/Chrome\/|Chromium\//.test(ua);
+}
+
 /** sessionStorage: boot this tab's next load on one CPU (boot.ts bootUpOnce()), with why. */
 export const UP_ONCE_KEY = "kw-up-once";
-function takeUpOnce(): string | null {
+/** sessionStorage: boot this tab's next load on the page's thread, one CPU (boot.ts bootUpOnce(..., inline)), with why. */
+export const INLINE_ONCE_KEY = "kw-inline-once";
+function takeOnce(key: string): string | null {
 	try {
-		const v = sessionStorage.getItem(UP_ONCE_KEY);
-		sessionStorage.removeItem(UP_ONCE_KEY);
+		const v = sessionStorage.getItem(key);
+		sessionStorage.removeItem(key);
 		return v;
 	} catch {
 		return null;
@@ -206,19 +239,29 @@ export function readConfig(search: string = location.search): Config {
 	const root = params.get("root") === "initramfs" ? "initramfs" : null;
 	const wispParam = params.get("wisp");
 	const wisp = wispParam && wispParam !== "0" ? wispParam.split(",").map((s) => s.trim()).filter(Boolean) : null;
+	// Worker mode by default where shared memory works (input and frames then
+	// skip the worker's message queue); a default worker that failed to start
+	// falls back to the page's thread for one load (boot.ts bootUpOnce()).
+	const inlineOnce = takeOnce(INLINE_ONCE_KEY);
+	const workerAsked = params.has("worker");
+	const workerDefault = !inlineOnce && typeof SharedArrayBuffer === "function" && crossOriginIsolated === true && typeof Worker === "function";
+	const workerParam = workerAsked ? params.get("worker") === "1" : workerDefault;
 	// CPUs: as many as asked where the page can, never more than the host's
-	// threads. The suggestion leaves half of them to the host (the page, the
-	// browser, other tabs): a guest CPU whose thread the host deschedules
-	// stalls the others when they wait for it (.agents/status.md, SMP).
+	// threads; by default the suggestion, in worker mode where the page can
+	// boot the SMP kernel. The suggestion leaves half the threads to the host
+	// (the page, the browser, other tabs): a guest CPU whose thread the host
+	// deschedules stalls the others when they wait for it (.agents/status.md, SMP).
 	const hc = navigator.hardwareConcurrency || 1;
 	const cpuMax = Math.max(1, Math.min(MAX_CPUS, hc));
-	const half = Math.min(4, Math.floor(hc / 2));
-	const smpParam = Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1));
+	const cap = mobile ? SUGGESTED_CPUS.mobile : /Firefox\//.test(navigator.userAgent) ? SUGGESTED_CPUS.firefox : SUGGESTED_CPUS.desktop;
+	const half = Math.min(cap, Math.floor(hc / 2));
+	const cpuSuggested = half >= 2 && !webkitEngine() ? Math.min(half, cpuMax) : 0;
 	const smpBlocked = smpBlocker();
-	const upOnce = smpParam > 1 ? takeUpOnce() : null;
+	const cpuDefault = !smpBlocked && workerParam && cpuSuggested ? cpuSuggested : 1;
+	const smpParam = params.has("cpus") ? Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1)) : cpuDefault;
+	const upOnce = smpParam > 1 ? takeOnce(UP_ONCE_KEY) ?? inlineOnce : null;
 	const smpWhy = smpParam < 2 ? null : smpBlocked ?? upOnce;
 	const cpus = smpWhy ? 1 : Math.min(smpParam, cpuMax);
-	const workerParam = params.get("worker") === "1";
 	// The distro: one of the images ("none": the base shell).
 	const distroAsked = params.get("distro");
 	let distroParam = DEFAULT_DISTRO, distroWhy: string | null = null;
@@ -251,13 +294,16 @@ export function readConfig(search: string = location.search): Config {
 		root,
 		worker: workerParam || cpus > 1,
 		workerParam,
+		workerDefault,
+		workerAsked,
 		kernelSmpUrl: kernelSmpUrl?.pathname ?? null,
 		smpParam,
+		cpuDefault,
 		cpus,
 		smpBlocked,
 		smpWhy,
 		cpuMax,
-		cpuSuggested: half >= 2 ? Math.min(half, cpuMax) : 0,
+		cpuSuggested,
 		shared: params.get("shared") !== "0",
 		verbose: params.get("verbose") === "1",
 		simulate: (params.get("simulate") || "").split(",").filter(Boolean),

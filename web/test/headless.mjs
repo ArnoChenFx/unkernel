@@ -201,12 +201,14 @@ const scenarios = {
 			if (cpus) range("opt-cpus", "1");
 			if (distroDefault) check(distroDefault, true);
 			await tick();
-			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault };
+			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault, workerDefault: KW.config.workerDefault, cpuNext: !KW.config.smpBlocked && KW.config.cpuSuggested || 1 };
 		})()`);
 		const q = new URLSearchParams(opts.all.split("?")[1]);
-		if (opts.before !== "/" || opts.reset !== "/" || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
+		// The page runs at ?worker=0&cpus=1 (lib.mjs goto()): only those, where they differ from the defaults.
+		const home = new URLSearchParams(opts.before.split("?")[1] ?? "");
+		if (opts.before !== opts.reset || [...home.keys()].some((k) => k !== "worker" && k !== "cpus") || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
 			|| q.get("mem") !== "64" || q.get("wisp") !== "wss://a.example/,wss://b.example/" || q.get("jit") !== "0" || q.get("verbose") !== "1"
-			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== "1" || q.get("cpus") !== (opts.cpus ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
+			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== (opts.workerDefault ? null : "1") || q.get("cpus") !== (opts.cpus && opts.cpuNext !== 2 ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
 			throw new Error(`options do not map to the URL: ${JSON.stringify(opts)}`);
 		console.log(`  options -> ${decodeURIComponent(opts.all)}`);
 		await page.click('.tabs [data-tab="log"]');

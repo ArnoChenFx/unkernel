@@ -3,7 +3,7 @@
 //! Unit tests of exclusives, load-acquire/store-release (excl.zig) and the
 //! system space (branch.zig): monitor rules, alignment and precise faults,
 //! the counter, ID registers, register masks, and the encodings that must
-//! stay ILLEGAL. guest/a64/atomictest.c covers the same against qemu.
+//! stay ILLEGAL. test/guest/a64/atomictest.c covers the same against qemu.
 
 const std = @import("std");
 const t = std.testing;

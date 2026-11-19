@@ -3,7 +3,7 @@
 //! Unit tests of the A64 interpreter (native, `zig build test`): the shared
 //! helpers in common.zig against independent references, the run loop's
 //! event contract, and precise faults. Instruction semantics are covered
-//! mostly by the differential guests (guest/a64, test/a64-test.mjs); add a
+//! mostly by the differential guests (test/guest/a64, test/a64-test.mjs); add a
 //! test here for anything a guest cannot reach (traps, faults, edge cases).
 
 const std = @import("std");

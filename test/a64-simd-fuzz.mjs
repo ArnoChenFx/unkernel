@@ -16,8 +16,8 @@
 //     while the PMULL feature is off; anything else is a failure;
 //  2. results: every word legal on both runs under qemu and under the
 //     native harness; V0..V31 and FPSR must hash the same. Default:
-//     guest/a64/simdtest ("W"/"w" mode, 16 integer register states, FPCR
-//     0). --fp: guest/a64/simdfptest (48 FP register states under every
+//     test/guest/a64/simdtest ("W"/"w" mode, 16 integer register states, FPCR
+//     0). --fp: test/guest/a64/simdfptest (48 FP register states under every
 //     FPCR mode, made from a new seed for each batch of words).
 // Exit status 1 on any unexpected difference.
 import { spawnSync } from "node:child_process";

@@ -6,7 +6,7 @@
 // interpreter (kw_debug_run_ref) as a column, the "before" of the tier.
 // usage: node test/kwemu-bench.mjs [zig-out prefix] [--reps N] [--median] [--only name,name]
 //        [--wasm-only|--native-only] [--ref]
-// (sieve+fib = guest/a64/bench.c; mem/fib/fp/sha/interp = guest/kbench.c)
+// (sieve+fib = test/guest/a64/bench.c; mem/fib/fp/sha/interp = test/guest/kbench.c)
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";

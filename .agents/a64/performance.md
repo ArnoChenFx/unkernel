@@ -10,7 +10,7 @@ and rejected designs are in kwemu.md.
 ## Measuring
 
 - **Guest MIPS**: `node test/kwemu-bench.mjs --ref --reps 5 --median`
-  (the A64 guests `guest/a64/bench.c` and `guest/kbench.c` modes, native
+  (the A64 guests `test/guest/a64/bench.c` and `test/guest/kbench.c` modes, native
   and wasm64, tier and reference; `--wasm-only`). The guests are built
   with `-fno-vectorize`, so `fp` is scalar FP.
 - **Alpine**: `test/guest-bench.sh` (20 apk and shell commands timed in the

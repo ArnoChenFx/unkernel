@@ -51,7 +51,7 @@ and stop exec on the whole host until a reboot. So:
 
 The parts that `ls` does not make obvious:
 
-- `src/` is kwemu, with its contract in `include/kw_emu.h`. `guest/` holds
+- `src/` is kwemu, with its contract in `include/kw_emu.h`. `test/guest/` holds
   its test guests.
 - `kernel/build.sh` runs every kernel-side step (`toolchain binaryen kernel
   smp lower alpine disk datadisk bundle all`, plus `ubuntu` and the
@@ -142,7 +142,7 @@ Run the quick check for what you changed. The full matrix in
 
 | Change | Quick check |
 | --- | --- |
-| Emulator (`src/`, `guest/`, `include/`) | `zig build test` |
+| Emulator (`src/`, `test/guest/`, `include/`) | `zig build test` |
 | Kernel, `kw_emu.h`, JIT | `kernel/build.sh kernel`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"` (`kwtest: 0 failure(s)`, exit 0); for JIT changes, again with `--no-jit` |
 | Guest image, anything user space sees | `pnpm test:api`; optional: `node js/cli.ts --timeout 120 --input '{8}uname -a; apk --version\n{2}poweroff\n'` |
 | Display, input, sound (kwfb, kwinput, kwsnd) | `pnpm test:api`; optional: `node test/glimmer-check.mjs --run` |
@@ -167,7 +167,7 @@ Do not run the browser tests (`web/test/`) unless asked. The page is
 tested by hand with `pnpm dev`.
 
 To add a test: for the emulator, a unit test in `src/a64/tests.zig` or a
-guest in `guest/a64/` plus entries in `build.zig` (`a64_guests`) and
+guest in `test/guest/a64/` plus entries in `build.zig` (`a64_guests`) and
 `test/a64-test.mjs`; for the kernel, a `CHECK(...)` in
 `kernel/guest/kwtest.c`.
 

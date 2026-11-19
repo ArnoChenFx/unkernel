@@ -5,7 +5,7 @@
 //! register aliasing (Rs == Rt, Rn == SP, XZR forms), CAS and CASP results,
 //! alignment and precise faults (write permission also for a failing CAS),
 //! the feature switch, ILLEGAL neighbours, the exclusive monitor, and the
-//! shared-memory (SMP) paths on host threads. guest/a64/lsetest.c compares
+//! shared-memory (SMP) paths on host threads. test/guest/a64/lsetest.c compares
 //! every form with qemu.
 
 const std = @import("std");

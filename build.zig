@@ -5,7 +5,7 @@ const std = @import("std");
 // The guest CPU is AArch64: src/a64 on top of the MMU, block cache and JIT
 // core in src/emu and the shared types and softfloat in src/cpu.
 
-/// AArch64 guests (static aarch64-linux-musl C, guest/a64/), run under kwemu's
+/// AArch64 guests (static aarch64-linux-musl C, test/guest/a64/), run under kwemu's
 /// kw_a64_run and under qemu-aarch64 by test/a64-test.mjs (outputs must match).
 const a64_guests = [_][]const u8{
     "hello",
@@ -19,9 +19,9 @@ const a64_guests = [_][]const u8{
     "simdfptest",
     "bench",
 };
-/// A64 builds of portable C guests outside guest/a64 (name, source).
+/// A64 builds of portable C guests outside test/guest/a64 (name, source).
 const a64_ports = [_][2][]const u8{
-    .{ "kbench", "guest/kbench.c" },
+    .{ "kbench", "test/guest/kbench.c" },
 };
 pub fn build(b: *std.Build) void {
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode for the native library and harness (default: ReleaseFast)") orelse .ReleaseFast;
@@ -136,7 +136,7 @@ pub fn build(b: *std.Build) void {
         .abi = .musl,
         .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic },
     });
-    for (a64_guests) |name| addA64Guest(b, a64_target, name, b.fmt("guest/a64/{s}.c", .{name}));
+    for (a64_guests) |name| addA64Guest(b, a64_target, name, b.fmt("test/guest/a64/{s}.c", .{name}));
     for (a64_ports) |p| addA64Guest(b, a64_target, p[0], p[1]);
 
     // A64 coverage classifier (test/a64-coverage.mjs): which raw words the

@@ -4,7 +4,7 @@
 //! opexec.zig (`ld`, `st`, `ld2`, `stN`, `ldrV`), field layout: ops.zig.
 //! Every kind is translated.
 //!
-//! The rule riscv's JIT follows holds here: compute the address into
+//! The rule: compute the address into
 //! cm.l_va, check the data TLB inline (`e.tlbCheck`: tag == vpn of the
 //! access's last byte, so a pair or a Q access checks its whole range
 //! once), and on a miss hand the op back BEFORE it executes (no register,

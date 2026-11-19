@@ -209,12 +209,10 @@ it as native wasm. There is no emulated trap and no emulated kernel mode in
 between. Task switches use JSPI (`WebAssembly.Suspending`), so the kernel
 gets real stacks that it can suspend and resume.
 
-For the riscv64 guest, hot user code goes through a second tier: a JIT that
-compiles riscv64 to wasm modules at run time, with output that matches the
-interpreter bit for bit. The aarch64 CPU runs blocks of guest code
-decoded once into compact ops (what has no op runs through a reference
-interpreter); its JIT shares the riscv64 JIT's core and compiles only a
-few instruction kinds so far.
+kwemu runs blocks of guest code decoded once into compact ops (what has
+no op runs through a reference interpreter), and hot user code goes
+through a second tier: a JIT that compiles those blocks to wasm modules
+at run time, with output that matches the interpreter bit for bit.
 [Benchmarks](#-benchmarks) shows what each tier costs.
 
 Devices are small paravirtual drivers that talk to the JavaScript host:

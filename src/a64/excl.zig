@@ -22,11 +22,11 @@
 //! fail). CLREX (branch.zig), kw_clear_reservation and kw_set_pgd close it.
 //!
 //! One CPU (no wasm atomics): plain accesses; the store passes on a matching
-//! monitor, like riscv SC (src/cpu/core.zig, `amo`). A store by this CPU to
+//! monitor. A store by this CPU to
 //! the monitored address in between does not close the monitor (the Arm ARM
 //! leaves that IMPLEMENTATION DEFINED).
 //!
-//! Several CPUs (`c.smp`, -Dkwemu-atomics), mirroring core.amoShared: every
+//! Several CPUs (`c.smp`, -Dkwemu-atomics): every
 //! access here is a seq_cst wasm atomic, which covers acquire and release
 //! (LDAXR, STLXR, LDAR, STLR) and the ordering of the plain forms. LDXR is an
 //! atomic load, STXR a compare-and-swap against the value LDXR read: it

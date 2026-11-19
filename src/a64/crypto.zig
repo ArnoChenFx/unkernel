@@ -23,7 +23,7 @@
 //! take does not depend on keys or messages (as far as integer
 //! multiplication is constant-time on the host; x86-64 and AArch64 are):
 //! SubBytes is a bitsliced circuit (Boyar-Peralta) over the 16 state bytes,
-//! not the S-box table core.aes (riscv Zkne/Zknd) uses; MixColumns works on
+//! not core.aes's S-box table; MixColumns works on
 //! packed bytes; the carry-less multiply is core.bitmanip's fixed
 //! multiply-and-mask sequence; CRC32 folds every input bit in with a mask
 //! instead of a table lookup.

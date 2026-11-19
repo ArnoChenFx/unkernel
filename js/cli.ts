@@ -545,7 +545,7 @@ async function dumpFrame(file: string): Promise<void> {
 
 // A -Dkwemu-stats kernel (kernel/build.sh stats): the lines the kwemu harness
 // prints with --stats, from the layout in src/emu/kwemu.zig (Stats) and the
-// exit counter indices in src/emu/jit.zig (Jx).
+// exit counter indices in src/emu/jitcore.zig (Jx).
 function printKwemuStats(k: KwemuStats): void {
 	const nk = 192, base = 11 + 2 * nk + 2 + 40, ic = Math.max(k.icount, 1);
 	const w = (i: number): number => k.words[i] ?? 0, jx = (i: number): number => w(base + i);

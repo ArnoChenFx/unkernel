@@ -28,7 +28,7 @@
 //! i32/i64 locals; PMULL (64-bit) is a Karatsuba of three 32x32 carry-less
 //! products, each core.bitmanip's multiply-and-mask sequence. Unlike the
 //! interpreter's bitsliced AES (crypto.zig), the AES tables are indexed by
-//! data, as riscv's compiled Zkne is (kwemu.md).
+//! data (a64.md, JIT).
 
 const std = @import("std");
 const c = @import("../common.zig");

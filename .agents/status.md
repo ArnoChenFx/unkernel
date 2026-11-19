@@ -25,16 +25,17 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Roadmap
 
-1. **JIT**: AMOs and LR/SC, bigger regions (most remaining exits leave
-   full ones), exits into self-loop modules, AES and GHASH codegen (guest
-   HTTPS). Details in kwemu.md (Numbers, Next steps). The op arena keeps
-   countdowns and compiled code across resets (kwemu.md, Cache; measured
-   on aarch64, a64.md, The op arena).
-2. **ISA extensions**: all of RVA23U64 is in except V (and its
-   sub-extensions), Supm (dropped) and Zkt (not advertised: kwemu's AES
-   uses data-indexed tables). Next: V; a constant-time AES (bitsliced
-   S-box) if Zkt is wanted; JIT support for fcvtmod.w.d and Zfhmin if they
-   show up hot.
+1. **JIT**: bigger regions (most remaining exits leave full ones), exits
+   into self-loop modules, cold code, `run`'s entry path and region
+   prologues, NZCV materialisation. Details in a64.md (JIT, What is left)
+   and kwemu.md (Next steps). The op arena keeps countdowns and compiled
+   code across resets (kwemu.md, Cache; a64.md, The op arena).
+2. **A64 features**: ARMv8.0-A with AES, PMULL, SHA1, SHA2, CRC32, LSE,
+   SHA512 and SHA3 is in (a64.md, State). Not implemented: SVE/SME, SM3
+   and SM4, FP16 arithmetic, RNDR, later-architecture encodings (the
+   coverage tool lists what corpora use). The interpreter's AES is
+   bitsliced; compiled AES reads data-indexed tables, so it is not
+   constant-time on the host.
 3. A cheaper data-TLB fast path, which also helps without the JIT.
 4. **Worker mode** (`createKernel({ worker: true })`, CLI `--worker`, page
    `?worker=1`; js.md, Worker mode). Before it becomes the page default:
@@ -176,7 +177,7 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    minutes on 2 and 4 CPUs beside kwstorm with no error; with the flush
    on return from lazy mode removed it reports stale reads and writes
    within seconds. The scratch tools are in `vendor/smp-deferred/tools`.
-   Step 4, the JIT on SMP (2026-11-16; kwemu.md, JIT on several harts):
+   Step 4, the JIT on SMP (2026-11-16; kwemu.md, JIT on several CPUs):
    each CPU's kwemu compiles into its own instance's table through a
    JIT host of its own in that CPU's thread, so the JIT now runs with
    any number of CPUs (it was off because only CPU 0's host had one).
@@ -434,7 +435,7 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
    - No browser test in `web/test/` covers the CPUs option.
    - JIT on SMP, what is left: TLB flushes no longer wait for a CPU
      that compiles or yields to its host (kwemu.md, JIT on several
-     harts, and Numbers, Compile stalls), but other IPIs do (`membarrier()`,
+     CPUs, and Numbers, Compile stalls), but other IPIs do (`membarrier()`,
      other cross-CPU calls; a wakeup onto a compiling CPU starts after
      the compile), and so does a flush whose IPI was already on its way
      when the compile began; modules are not shared between CPUs, so a
@@ -453,7 +454,7 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
      loops (seqcount retries) do not take the timer.
    - Aligned `get_user()` and `put_user()` copy through `memcpy` (wasm
      `memory.copy`), which the wasm spec does not make single-copy
-     atomic on a shared memory, unlike riscv's loads and stores: a
+     atomic on a shared memory, unlike plain wasm loads and stores: a
      futex word read beside user stores on another CPU could tear.
      None seen (2026-11-17: 7.8 million `FUTEX_WAIT` reads of a word
      another CPU flips between 0 and ~0, 2 CPUs), and the futex paths
@@ -614,11 +615,9 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   `run`'s entry path and region prologues (about 5% each of the
   apk/shell rows), NZCV materialisation (about 3%).
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
-  nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
-  `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but
-  it is off by default and `NODE_OPTIONS` does not accept it, and `npx
-  --version` did not change with the rebuilt packages (about 4.1 s,
-  2026-11-16): it is V8 in the node binary.
+  nghttp2) are Alpine's builds. `npx --version` did not change with the
+  rebuilt packages (about 4.1 s, 2026-11-16): it is V8 in the node
+  binary.
 - **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
   --seccomp FD` fails, and GTK programs that load images through glycin
   abort. Workaround in the image: `/usr/local/bin/bwrap`

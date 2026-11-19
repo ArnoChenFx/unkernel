@@ -4,18 +4,17 @@ unkernel runs Linux 7.3, compiled to a single wasm module (`arch/wasm` with an
 MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
 Linux ELF (ARMv8.0-A with FP, AdvSIMD, AES, PMULL, SHA1, SHA2, CRC32, LSE,
 SHA512, SHA3), run
-by kwemu: a Zig interpreter linked into the kernel. README.md is the
-overview, and kernel/README.md covers the kernel side, the devices and the
-guest image.
+by kwemu: a Zig interpreter with a wasm JIT tier, linked into the kernel.
+README.md is the overview, and kernel/README.md covers the kernel side,
+the devices and the guest image.
 
-This branch (`aarch64`) switches the guest CPU to AArch64: `include/kw_emu.h`
-(ABI 10) and the kwemu library are A64 only (src/a64, .agents/a64.md: a
-decoded-op tier over a reference interpreter, and a JIT that compiles a
-few op kinds so far).
-The kernel presents the arm64 user ABI (kernel.md, arm64 user ABI), and
-the guest image is Alpine's aarch64 minirootfs (kernel/README.md, alpine).
-The riscv CPU is kept in src/cpu and src/emu for reference
-(`-Driscv-legacy`).
+kwemu's guest CPU is AArch64 (src/a64, .agents/a64.md: a decoded-op tier
+over a reference interpreter, and a JIT that compiles hot blocks to
+wasm), on an ISA-neutral MMU, block cache and JIT core (src/emu,
+.agents/kwemu.md); its contract with the kernel is `include/kw_emu.h`
+(ABI 2). The kernel presents the arm64 user ABI (kernel.md, arm64 user
+ABI), and the guest image is Alpine's aarch64 minirootfs
+(kernel/README.md, alpine).
 
 `.agents/` has one file per area. Read the one for the area you change:
 
@@ -23,7 +22,7 @@ The riscv CPU is kept in src/cpu and src/emu for reference
 | --- | --- |
 | [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, config |
 | [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, the decoded-op tier and its op set, coherence on SMP, tests, coverage tool, numbers, the JIT (family API, flags contract, tests) |
-| [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs (riscv; MMU, TLBs and the JIT core still shared) |
+| [.agents/kwemu.md](.agents/kwemu.md) | the ISA-neutral core: MMU and TLBs, block cache, JIT core (regions, invariants, SMP, host contract), softfloat, measured numbers, rejected designs |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
@@ -41,9 +40,10 @@ and stop exec on the whole host until a reboot. So:
   Do not use `mount`, `chroot`, `unshare` or `sysctl`, and do not change
   services.
 - No `sudo` and no package installs.
-- Run riscv64 and aarch64 binaries on the host only through an explicit
-  emulator (`qemu-riscv64-static ./bin`, `qemu-aarch64 ./bin`). Never run the guest's `/etc/kw-binfmt.sh`,
-  or any part of it, on the host.
+- Run binaries of another architecture (the aarch64 guests and test
+  programs, or any other) on the host only through an explicit emulator
+  (`qemu-aarch64 ./bin`). Never run the guest's `/etc/kw-binfmt.sh`, or
+  any part of it, on the host.
 - Do not start anything on port 8080: that is `pnpm dev`'s port.
 - Repeat these rules in every subagent brief.
 
@@ -94,7 +94,7 @@ Details are in the area files.
   suspend under JSPI (kernel.md).
 - Every kernel thread needs a `kw_park_point()` in its loop, or parking
   (and so snapshots) fails with EBUSY naming it (kernel.md, Parking).
-- JIT output must match the interpreter exactly (kwemu.md).
+- JIT output must match the interpreter exactly (kwemu.md, Invariants; a64.md, JIT).
 - SMP kernels: a task moves to another CPU only where its JSPI stack
   (that CPU thread's) can be dropped and it can start on a fresh one: a
   user task on its way to user mode, a kernel thread at a restart point.

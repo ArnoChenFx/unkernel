@@ -7,23 +7,22 @@
  * guest registers in a kernel-owned struct kw_regs (normally inside the
  * task's pt_regs).
  *
- * Guest ISA (ABI 9 and later): AArch64, A64 instruction set, ARMv8.0-A user mode
- * (EL0), little-endian, with FP and AdvSIMD. No SVE, pointer authentication
- * or MTE; the PAC and BTI encodings in the hint space run as NOPs. The
- * crypto extensions, LSE atomics (ABI 11), SHA-512 (ABI 12) and SHA-3
- * (ABI 13) are optional features (KW_ISA_*, below), enabled only when this build
- * implements them. .agents/a64.md lists which instructions are
- * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
- * riscv64; that code is kept in src/cpu and src/emu for reference only.)
+ * Guest ISA: AArch64, A64 instruction set, ARMv8.0-A user mode (EL0),
+ * little-endian, with FP and AdvSIMD. No SVE, pointer authentication or
+ * MTE; the PAC and BTI encodings in the hint space run as NOPs. The crypto
+ * extensions, LSE atomics, SHA-512 and SHA-3 are optional features
+ * (KW_ISA_*, below), enabled only when this build implements them.
+ * .agents/a64.md lists which instructions are implemented; every other
+ * encoding raises KW_EV_ILLEGAL.
  *
  * Memory model: kernel and emulator share one wasm64 linear memory. A
  * "physical address" is a linear-memory address minus cpu->phys_base.
  * The emulator walks the kernel's user page tables itself, like hardware:
  * the kernel writes PTEs and calls the flush hooks below.
  *
- * Page-table format (RISC-V Sv39 layout, kept for every guest ISA: 4 KiB
- * pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs; user
- * virtual addresses below 2^38):
+ * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
+ * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
+ * user virtual addresses below 2^38):
  *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
  *   bits 10..53 PPN (physical address >> 12).
  * A valid PTE with R=W=X=0 points to the next level. Leaves are only
@@ -31,7 +30,7 @@
  * The emulator never writes PTEs: an access with A=0, or a store with
  * D=0, raises KW_EV_FAULT so the kernel can set the bits.
  *
- * Decoded-code cache (ABI 10): kw_run decodes guest code into blocks of up
+ * Decoded-code cache: kw_run decodes guest code into blocks of up
  * to 64 instructions inside one page (src/a64/tier.zig) and keeps them in
  * struct kw_cpu, keyed by virtual pc and trusted only under the exec-TLB
  * fill they were checked against. Every flush below (kw_flush_tlb_range()
@@ -54,15 +53,18 @@
  * Decoded blocks hold no state the kernel must save: a task's registers
  * are in struct kw_regs whenever kw_run returns.
  *
- * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
+ * Several CPUs: an SMP kernel gives each CPU its own struct
  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
  * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
  * DSB) full barriers, exclusives and LSE atomics atomic, and IC IVAU
  * visible to every CPU (above); without atomics everything assumes one CPU.
  *
- * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
- * and another CPU may skip waiting for its TLB flush. The A64 build has no
- * JIT yet: it never sets jit_busy, and never sees flush_all set.
+ * jit_busy / flush_all: the window in which a CPU compiles JIT code and
+ * another CPU may skip waiting for its TLB flush. kwemu sets jit_busy while
+ * it compiles (with the JIT built in), a window in which it reads no guest
+ * memory or page table; a CPU that finds it set may set flush_all instead
+ * of waiting for this CPU's TLB flush, and kwemu then flushes its whole TLB
+ * when the compile ends, before it runs guest code again.
  */
 #ifndef KW_EMU_H
 #define KW_EMU_H
@@ -77,7 +79,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 13
+#define KW_ABI_VERSION 2
 
 /*
  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -133,9 +135,8 @@ struct kw_event {
 };
 
 /*
- * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned).
- * ABI 5: 8 MiB (a 3x larger op arena); ABI 2 to 4: 4 MiB (TLBs +
- * decoded-block cache); ABI 1 was 64 KiB.
+ * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned): TLBs,
+ * the decoded-block cache and its op arena, JIT bookkeeping.
  */
 #define KW_CPU_SIZE (8 * 1024 * 1024)
 
@@ -151,7 +152,7 @@ struct kw_cpu {
 	uint64_t budget;               /* instructions kw_run may execute */
 	uint64_t icount;               /* total instructions executed (stats) */
 	struct kw_event ev;            /* details of the last event */
-	/* ABI 8, see "jit_busy / flush_all" above */
+	/* see "jit_busy / flush_all" above */
 	uint32_t jit_busy;             /* written by kwemu only */
 	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
 };
@@ -167,7 +168,7 @@ void kw_cpu_init(struct kw_cpu *cpu);
  * same amount; KW_EV_BUDGET when it reaches exactly 0 (returns at once if
  * 0 on entry). *irq_pending is checked on entry and at the end of every
  * decoded block, which is at least every 64 instructions and at every
- * taken branch out of a block (ABI 10; a branch the decoder followed
+ * taken branch out of a block (a branch the decoder followed
  * inside a page is not a check point). Every event leaves regs (incl. pc)
  * exactly at an instruction boundary. Data accesses may be unaligned
  * (SCTLR_EL1.A = 0); SP alignment is not checked.
@@ -200,11 +201,11 @@ uint32_t kw_abi_version(void);
 #define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
 #define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
 #define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
-#define KW_ISA_LSE	(1ULL << 5)	/* ABI 11: LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
+#define KW_ISA_LSE	(1ULL << 5)	/* LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
 					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
-#define KW_ISA_SHA512	(1ULL << 6)	/* ABI 12: SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
+#define KW_ISA_SHA512	(1ULL << 6)	/* SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
 					   needs KW_ISA_SHA2: kw_set_isa drops it without */
-#define KW_ISA_SHA3	(1ULL << 7)	/* ABI 13: EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
+#define KW_ISA_SHA3	(1ULL << 7)	/* EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
 
 /* The KW_ISA_* features this kwemu build implements. */
 uint64_t kw_isa_supported(void);
@@ -227,10 +228,10 @@ uint64_t kw_set_isa(struct kw_cpu *cpu, uint64_t isa);
 void kw_host_reset(struct kw_cpu *cpu);
 
 /*
- * Optional JIT tier (-Dkwemu-jit; not part of the ABI version). The JIT
- * in src/emu/jit.zig compiles riscv blocks only and is never entered by the
- * A64 kw_run; a library built with it still imports these from wasm module
- * "unkernel" (see src/emu/jit.zig for their contract):
+ * Optional JIT tier (-Dkwemu-jit; not part of the ABI version): hot decoded
+ * blocks are compiled to wasm (src/a64/jit on the ISA-neutral core in
+ * src/emu/jitcore.zig). A library built with it imports these from wasm
+ * module "unkernel" (see src/emu/jitcore.zig for their contract):
  *   uint32_t kw_host_jit_caps(void);
  *   int32_t kw_host_jit_compile(const uint8_t *module, size_t len, uint32_t slot,
  *                               uint32_t flags);

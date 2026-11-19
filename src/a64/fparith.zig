@@ -44,7 +44,7 @@
 //!   recpX                        FPRecpX (FRECPX)
 //!   defaultNaN, isNaN, fpcrRounding
 //!
-//! Every Arm rule is applied here, unlike fpu.zig (RISC-V rules), which
+//! Every Arm rule is applied here, unlike fpu.zig (its own defaults), which
 //! does the core arithmetic of add/sub/mul/div/fma/sqrt and round to
 //! integral:
 //!  - NaNs: operands are checked in the pseudocode's FPProcessNaNs order
@@ -789,7 +789,7 @@ test "a64 fparith: tininess before rounding and flush to zero" {
     const up = f32b(1.0) + 1;
     var fl: u32 = 0;
     try t.expectEqual(@as(u32, 0x0080_0000), mul(u32, below, up, 0, &fl));
-    try t.expectEqual(UFC | IXC, fl); // RISC-V: IXC only
+    try t.expectEqual(UFC | IXC, fl); // fpu.zig alone (tininess after rounding): IXC only
     fl = 0;
     try t.expectEqual(@as(u32, 0x0080_0000), mul(u32, 0x0080_0001, f32b(1.0) - 1, 0, &fl));
     try t.expectEqual(IXC, fl); // above 2^-126 before rounding

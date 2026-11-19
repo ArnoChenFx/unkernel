@@ -1,12 +1,12 @@
-From c91682200e1ea3796732c0e30492c680ae2dea9a Mon Sep 17 00:00:00 2001
+From 782bc9c2d08888e11d0586ae535d4e4fcd564208 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
-Date: Tue, 17 Nov 2026 19:27:42 +0000
-Subject: [PATCH] wasm: run arm64 user space (kwemu ABI 9)
+Date: Wed, 18 Nov 2026 21:04:24 +0000
+Subject: [PATCH] wasm: run arm64 user space
 
-kwemu's guest CPU is now AArch64 (ABI 9: struct kw_regs holds x0..x30,
-sp, pc, nzcv, fpcr, fpsr, tpidr_el0 and v0..v31). Present the arm64 user
-ABI instead of riscv64's, mirroring arch/arm64 without compat and
-without a vDSO:
+kwemu's guest CPU is AArch64 (kwemu ABI 2: struct kw_regs holds
+x0..x30, sp, pc, nzcv, fpcr, fpsr, tpidr_el0 and v0..v31). Present the
+arm64 user ABI instead of riscv64's, mirroring arch/arm64 without compat
+and without a vDSO:
 
 - syscalls: x8 = number, x0..x5 = arguments, x0 = return; the generic
   table with arm64's ABIs (renameat rlimit memfd_secret), arm64's mmap
@@ -22,11 +22,26 @@ without a vDSO:
 - signals: arm64's rt_sigframe with an fpsimd_context record and a
   frame record; handlers return to sa_restorer when SA_RESTORER is set,
   else to the [sigpage] trampoline (mov x8, #139; svc #0);
-- features: AT_HWCAP is FP | ASIMD | the KW_ISA_* features kw_set_isa()
-  enabled (AES, PMULL, SHA1, SHA2, CRC32) | CPUID (kwemu answers the
-  MRS of the ID registers itself, so the kernel emulates none);
-  /proc/cpuinfo in arm64's format for kwemu's MIDR_EL1 (0x000f0000);
-  kw.isa= takes armv8, -feat and +feat.
+- exclusives: every entry to user mode clears the exclusive monitor
+  (user_mode_loop(), before each kw_run()), as ERET does on arm64 and
+  qemu-user does too, so an STXR after a syscall, a fault, an interrupt
+  or a task switch fails and a LDXR/STXR loop retries; that is the only
+  place that clears it;
+- features: AT_HWCAP is FP | ASIMD | CPUID | the KW_ISA_* features
+  kw_set_isa() enables: AES, PMULL, SHA1, SHA2, CRC32, ATOMICS (LSE),
+  SHA3 and SHA512 (SHA512 only together with SHA2). kwemu answers the
+  MRS of the ID registers itself (ID_AA64ISAR0_EL1 from the enabled
+  features), so the kernel emulates none. /proc/cpuinfo is in arm64's
+  format for kwemu's MIDR_EL1 (0x000f0000), with the Features line in
+  HWCAP bit order. kw.isa= takes armv8, -feat and +feat, with the
+  Features names (and "lse" for atomics).
+
+kw_emu.h also states what kwemu's decoded-code cache asks of the kernel:
+the flushes it already does (a page that maps rewritten code,
+kw_flush_tlb_all(), kw_set_pgd()) make kwemu check decoded blocks again;
+*irq_pending is polled at every block end, at least every 64
+instructions; IC IVAU on one CPU reaches the others through kwemu's own
+code epoch.
 
 The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
 ---
@@ -36,7 +51,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/include/asm/elf.h              |  42 ++-
  arch/wasm/include/asm/futex.h            |   6 +-
  arch/wasm/include/asm/hwcap.h            |  15 +-
- arch/wasm/include/asm/kw_emu.h           | 220 +++++-------
+ arch/wasm/include/asm/kw_emu.h           | 250 +++++++------
  arch/wasm/include/asm/processor.h        |  11 +-
  arch/wasm/include/asm/ptrace.h           |  25 +-
  arch/wasm/include/asm/syscall.h          |  42 +--
@@ -44,6 +59,8 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/include/asm/tlbflush.h         |   3 -
  arch/wasm/include/asm/unistd.h           |   4 +-
  arch/wasm/include/uapi/asm/auxvec.h      |  52 +--
+ arch/wasm/include/uapi/asm/bitsperlong.h |   6 +-
+ arch/wasm/include/uapi/asm/byteorder.h   |   6 +-
  arch/wasm/include/uapi/asm/elf.h         | 100 ------
  arch/wasm/include/uapi/asm/fcntl.h       |  30 ++
  arch/wasm/include/uapi/asm/hwcap.h       | 171 ++++++++-
@@ -59,18 +76,18 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/include/uapi/asm/ucontext.h    |  39 +-
  arch/wasm/kernel/Makefile                |   2 +-
  arch/wasm/kernel/Makefile.syscalls       |   6 +-
- arch/wasm/kernel/cpu.c                   | 182 ++++------
- arch/wasm/kernel/process.c               |  25 +-
+ arch/wasm/kernel/cpu.c                   | 194 +++++-----
+ arch/wasm/kernel/process.c               |  30 +-
  arch/wasm/kernel/ptrace.c                |   4 +-
  arch/wasm/kernel/signal.c                | 280 ++++++++++-----
  arch/wasm/kernel/sys.c                   |  27 ++
  arch/wasm/kernel/sys_riscv.c             | 113 ------
  arch/wasm/kernel/syscall_table.c         |   5 +-
- arch/wasm/kernel/traps.c                 |  12 +-
+ arch/wasm/kernel/traps.c                 |  26 +-
  arch/wasm/mm/fault.c                     |   6 +-
  arch/wasm/mm/sigpage.c                   |   7 +-
  arch/wasm/mm/tlb.c                       |  11 -
- 40 files changed, 1541 insertions(+), 1041 deletions(-)
+ 42 files changed, 1595 insertions(+), 1060 deletions(-)
  delete mode 100644 arch/wasm/include/uapi/asm/elf.h
  create mode 100644 arch/wasm/include/uapi/asm/fcntl.h
  delete mode 100644 arch/wasm/include/uapi/asm/hwprobe.h
@@ -275,7 +292,7 @@ index e116408e5c1..4fc957f3bba 100644
  
  #endif /* _ASM_WASM_HWCAP_H */
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 3308c54e1fe..8f7b0ebb667 100644
+index 3308c54e1fe..29c410e441e 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
 @@ -1,21 +1,28 @@
@@ -294,13 +311,13 @@ index 3308c54e1fe..8f7b0ebb667 100644
   *
 - * Guest ISA: riscv64 (rv64gc), user mode only, plus the optional
 - * extensions below (KW_ISA_*) that kwemu implements and the kernel enables.
-+ * Guest ISA (ABI 9): AArch64, A64 instruction set, ARMv8.0-A user mode
-+ * (EL0), little-endian, with FP and AdvSIMD. No LSE, SVE, pointer
-+ * authentication or MTE; the PAC and BTI encodings in the hint space run as
-+ * NOPs. Optional features (KW_ISA_*, below) are enabled only when this
-+ * build implements them. .agents/a64.md lists which instructions are
-+ * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
-+ * riscv64; that code is kept in src/cpu and src/emu for reference only.)
++ * Guest ISA: AArch64, A64 instruction set, ARMv8.0-A user mode (EL0),
++ * little-endian, with FP and AdvSIMD. No SVE, pointer authentication or
++ * MTE; the PAC and BTI encodings in the hint space run as NOPs. The crypto
++ * extensions, LSE atomics, SHA-512 and SHA-3 are optional features
++ * (KW_ISA_*, below), enabled only when this build implements them.
++ * .agents/a64.md lists which instructions are implemented; every other
++ * encoding raises KW_EV_ILLEGAL.
   *
   * Memory model: kernel and emulator share one wasm64 linear memory. A
   * "physical address" is a linear-memory address minus cpu->phys_base.
@@ -309,13 +326,13 @@ index 3308c54e1fe..8f7b0ebb667 100644
   *
 - * Page-table format (RISC-V Sv39 layout, 4 KiB pages, 3 levels, 512
 - * entries per level, 8-byte little-endian PTEs):
-+ * Page-table format (RISC-V Sv39 layout, kept for every guest ISA: 4 KiB
-+ * pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs; user
-+ * virtual addresses below 2^38):
++ * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
++ * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
++ * user virtual addresses below 2^38):
   *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
   *   bits 10..53 PPN (physical address >> 12).
   * A valid PTE with R=W=X=0 points to the next level. Leaves are only
-@@ -23,42 +30,23 @@
+@@ -23,42 +30,41 @@
   * The emulator never writes PTEs: an access with A=0, or a store with
   * D=0, raises KW_EV_FAULT so the kernel can set the bits.
   *
@@ -331,15 +348,31 @@ index 3308c54e1fe..8f7b0ebb667 100644
 - *    the icache. (Rewriting a currently mapped exec page in place with no
 - *    flush at all may keep running the old code until one of those, as an
 - *    incoherent icache would.)
-+ * Code coherence: the A64 interpreter decodes every instruction from
-+ * memory as it runs it, so code rewritten by the guest or the kernel is
-+ * seen at once. Code the kernel rewrites must still be followed by the
-+ * flushes it does anyway (kw_flush_tlb_range() of a page that maps it,
-+ * kw_flush_tlb_all(), kw_set_pgd()), and guests make new code visible with
-+ * IC IVAU (+ ISB), as on hardware with CTR_EL0.DIC = IDC = 0: a later
-+ * decoded-code cache relies on exactly these points.
++ * Decoded-code cache: kw_run decodes guest code into blocks of up
++ * to 64 instructions inside one page (src/a64/tier.zig) and keeps them in
++ * struct kw_cpu, keyed by virtual pc and trusted only under the exec-TLB
++ * fill they were checked against. Every flush below (kw_flush_tlb_range()
++ * of a page that maps the code, kw_flush_tlb_all(), kw_set_pgd()) makes
++ * each block be checked again (same physical page, same instruction
++ * words) before it runs; kw_set_isa() and kw_host_reset() drop them all.
++ * So:
++ *  - Stores by this CPU's guest code into decoded code are tracked exactly
++ *    and take effect at the next instruction (self-modifying code needs no
++ *    flush), including stores through another virtual alias of the page.
++ *  - Code the kernel writes (or another CPU's guest writes) is seen after
++ *    a flush of a page that maps it on this CPU, or after IC IVAU of the
++ *    line by any guest on any CPU (+ ISB), as on hardware with
++ *    CTR_EL0.DIC = IDC = 0. A kernel that rewrites code in place must
++ *    therefore flush the page (it already must when it changes a mapping).
++ *  - Several CPUs: IC IVAU on one CPU is seen by every other CPU at its
++ *    next decoded-block boundary (at most 64 instructions later) or kw_run
++ *    entry, through a code epoch in kwemu's static data; no kernel action
++ *    is needed.
++ * Decoded blocks hold no state the kernel must save: a task's registers
++ * are in struct kw_regs whenever kw_run returns.
   *
-  * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
+- * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
++ * Several CPUs: an SMP kernel gives each CPU its own struct
   * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
 - * built with wasm atomics (zig build -Dkwemu-atomics) makes guest AMOs
 - * atomic read-modify-writes, SC a compare-and-swap against the value LR
@@ -348,8 +381,8 @@ index 3308c54e1fe..8f7b0ebb667 100644
 - * another CPU rewrites is seen after a flush on this one (riscv's
 - * flush_icache syscall, FENCE.I alone is local), as on hardware.
 + * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
-+ * DSB) full barriers and is meant to make exclusives atomic; without
-+ * atomics everything assumes one CPU.
++ * DSB) full barriers, exclusives and LSE atomics atomic, and IC IVAU
++ * visible to every CPU (above); without atomics everything assumes one CPU.
   *
 - * Flushes during a JIT compile (ABI 8): a compile takes a few hundred
 - * microseconds, and the CPU answers no interrupt meanwhile. Around each
@@ -365,18 +398,21 @@ index 3308c54e1fe..8f7b0ebb667 100644
 - * as usual), or kwemu sees the request. Guest stores before the window are
 - * ordered before its jit_busy = 1 (a release store). Only kwemu clears
 - * flush_all; a kwemu built without atomics (one hart) never sees it set.
-+ * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
-+ * and another CPU may skip waiting for its TLB flush. The A64 build has no
-+ * JIT yet: it never sets jit_busy, and never sees flush_all set.
++ * jit_busy / flush_all: the window in which a CPU compiles JIT code and
++ * another CPU may skip waiting for its TLB flush. kwemu sets jit_busy while
++ * it compiles (with the JIT built in), a window in which it reads no guest
++ * memory or page table; a CPU that finds it set may set flush_all instead
++ * of waiting for this CPU's TLB flush, and kwemu then flushes its whole TLB
++ * when the compile ends, before it runs guest code again.
   */
  #ifndef KW_EMU_H
  #define KW_EMU_H
-@@ -73,23 +61,42 @@
+@@ -73,23 +79,42 @@
  extern "C" {
  #endif
  
 -#define KW_ABI_VERSION 8
-+#define KW_ABI_VERSION 9
++#define KW_ABI_VERSION 2
  
 +/*
 + * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -423,7 +459,7 @@ index 3308c54e1fe..8f7b0ebb667 100644
  	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
  };
  
-@@ -105,8 +112,8 @@ struct kw_event {
+@@ -105,29 +130,29 @@ struct kw_event {
  	uint64_t addr;    /* faulting guest virtual address (FAULT: any byte of
  			     the faulting page; MISALIGNED: the address;
  			     ILLEGAL/BREAKPOINT: the pc) */
@@ -434,7 +470,13 @@ index 3308c54e1fe..8f7b0ebb667 100644
  };
  
  /*
-@@ -118,16 +125,17 @@ struct kw_event {
+- * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned).
+- * ABI 5: 8 MiB (a 3x larger op arena); ABI 2 to 4: 4 MiB (TLBs +
+- * decoded-block cache); ABI 1 was 64 KiB.
++ * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned): TLBs,
++ * the decoded-block cache and its op arena, JIT bookkeeping.
+  */
+ #define KW_CPU_SIZE (8 * 1024 * 1024)
  
  /*
   * Only the leading fields are public. The rest of the KW_CPU_SIZE bytes
@@ -451,11 +493,11 @@ index 3308c54e1fe..8f7b0ebb667 100644
  	uint64_t icount;               /* total instructions executed (stats) */
  	struct kw_event ev;            /* details of the last event */
 -	/* ABI 8, see "Flushes during a JIT compile" above */
-+	/* ABI 8, see "jit_busy / flush_all" above */
++	/* see "jit_busy / flush_all" above */
  	uint32_t jit_busy;             /* written by kwemu only */
  	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
  };
-@@ -138,112 +146,72 @@ void kw_cpu_init(struct kw_cpu *cpu);
+@@ -138,112 +163,79 @@ void kw_cpu_init(struct kw_cpu *cpu);
  /*
   * Run guest code from regs until an event. Returns enum kw_event_kind and
   * fills cpu->ev. Never blocks, never re-enters the kernel.
@@ -463,12 +505,13 @@ index 3308c54e1fe..8f7b0ebb667 100644
 + * cpu->budget is decremented per retired instruction (SVC retires;
   * faulting/illegal instructions do not) and cpu->icount advanced by the
   * same amount; KW_EV_BUDGET when it reaches exactly 0 (returns at once if
-- * 0 on entry). *irq_pending is checked on entry and at the end of every
+  * 0 on entry). *irq_pending is checked on entry and at the end of every
 - * decoded block, i.e. at least every 64 instructions (ABI 1: after every
 - * taken branch/jump). The cycle/time/instret CSRs read cpu->icount.
 - * Every event leaves regs (incl. pc) exactly at an instruction boundary.
-+ * 0 on entry). *irq_pending is checked on entry, after every taken branch
-+ * and at least every 64 instructions. Every event leaves regs (incl. pc)
++ * decoded block, which is at least every 64 instructions and at every
++ * taken branch out of a block (a branch the decoder followed
++ * inside a page is not a check point). Every event leaves regs (incl. pc)
 + * exactly at an instruction boundary. Data accesses may be unaligned
 + * (SCTLR_EL1.A = 0); SP alignment is not checked.
   */
@@ -499,7 +542,7 @@ index 3308c54e1fe..8f7b0ebb667 100644
 - * PAUSE, the NTL hints and the Zicbop prefetches are plain RV64GC
 - * encodings that run as no-ops: always there, no bit.)
 + * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
-+ * (they map to the AT_HWCAP bits the kernel reports). Bits 5..63 are
++ * (they map to the AT_HWCAP bits the kernel reports). Bits 8..63 are
 + * reserved. An instruction of a feature that is not implemented, or not
 + * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
 + * kw_isa_supported() says which ones this build implements.
@@ -528,6 +571,11 @@ index 3308c54e1fe..8f7b0ebb667 100644
 +#define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
 +#define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
 +#define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
++#define KW_ISA_LSE	(1ULL << 5)	/* LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
++					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
++#define KW_ISA_SHA512	(1ULL << 6)	/* SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
++					   needs KW_ISA_SHA2: kw_set_isa drops it without */
++#define KW_ISA_SHA3	(1ULL << 7)	/* EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
  
 -/* The KW_ISA_* extensions this kwemu build implements. */
 +/* The KW_ISA_* features this kwemu build implements. */
@@ -570,10 +618,10 @@ index 3308c54e1fe..8f7b0ebb667 100644
 - * table indices are the "slots" below, and the table never grows. See
 - * src/emu/jit.zig and docs/kwemu.md.
 - *
-+ * Optional JIT tier (-Dkwemu-jit; not part of the ABI version). The JIT
-+ * in src/emu/jit.zig compiles riscv blocks only and is never entered by the
-+ * A64 kw_run; a library built with it still imports these from wasm module
-+ * "unkernel" (see src/emu/jit.zig for their contract):
++ * Optional JIT tier (-Dkwemu-jit; not part of the ABI version): hot decoded
++ * blocks are compiled to wasm (src/a64/jit on the ISA-neutral core in
++ * src/emu/jitcore.zig). A library built with it imports these from wasm
++ * module "unkernel" (see src/emu/jitcore.zig for their contract):
   *   uint32_t kw_host_jit_caps(void);
 - *     bit 0: JIT available (0: kwemu never compiles);
 - *     bit 1: memory is 32-bit (module lowered with --memory64-lowering:
@@ -919,6 +967,42 @@ index 95050ebe9ad..743c0b84fd3 100644
 -
 -#endif /* _UAPI_ASM_RISCV_AUXVEC_H */
 +#endif
+diff --git a/arch/wasm/include/uapi/asm/bitsperlong.h b/arch/wasm/include/uapi/asm/bitsperlong.h
+index 7d0b32e3b70..4b88a27775a 100644
+--- a/arch/wasm/include/uapi/asm/bitsperlong.h
++++ b/arch/wasm/include/uapi/asm/bitsperlong.h
+@@ -4,11 +4,11 @@
+  * Copyright (C) 2015 Regents of the University of California
+  */
+ 
+-#ifndef _UAPI_ASM_RISCV_BITSPERLONG_H
+-#define _UAPI_ASM_RISCV_BITSPERLONG_H
++#ifndef _UAPI_ASM_WASM_BITSPERLONG_H
++#define _UAPI_ASM_WASM_BITSPERLONG_H
+ 
+ #define __BITS_PER_LONG (__SIZEOF_POINTER__ * 8)
+ 
+ #include <asm-generic/bitsperlong.h>
+ 
+-#endif /* _UAPI_ASM_RISCV_BITSPERLONG_H */
++#endif /* _UAPI_ASM_WASM_BITSPERLONG_H */
+diff --git a/arch/wasm/include/uapi/asm/byteorder.h b/arch/wasm/include/uapi/asm/byteorder.h
+index f671e16bf6a..9d0c5444c83 100644
+--- a/arch/wasm/include/uapi/asm/byteorder.h
++++ b/arch/wasm/include/uapi/asm/byteorder.h
+@@ -4,9 +4,9 @@
+  * Copyright (C) 2015 Regents of the University of California
+  */
+ 
+-#ifndef _UAPI_ASM_RISCV_BYTEORDER_H
+-#define _UAPI_ASM_RISCV_BYTEORDER_H
++#ifndef _UAPI_ASM_WASM_BYTEORDER_H
++#define _UAPI_ASM_WASM_BYTEORDER_H
+ 
+ #include <linux/byteorder/little_endian.h>
+ 
+-#endif /* _UAPI_ASM_RISCV_BYTEORDER_H */
++#endif /* _UAPI_ASM_WASM_BYTEORDER_H */
 diff --git a/arch/wasm/include/uapi/asm/elf.h b/arch/wasm/include/uapi/asm/elf.h
 deleted file mode 100644
 index 032083d8b99..00000000000
@@ -2543,10 +2627,10 @@ index 7544043aa12..1f43de8537c 100644
 +# scripts/syscall.tbl).
 +syscall_abis_64 += renameat rlimit memfd_secret
 diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
-index f81622e213d..3c41d9060e7 100644
+index f81622e213d..ef54fc24620 100644
 --- a/arch/wasm/kernel/cpu.c
 +++ b/arch/wasm/kernel/cpu.c
-@@ -2,97 +2,55 @@
+@@ -2,97 +2,62 @@
  
  #include <linux/bits.h>
  #include <linux/cpu.h>
@@ -2571,8 +2655,9 @@ index f81622e213d..3c41d9060e7 100644
 + * ASIMD are part of what every kwemu runs (ARMv8.0-A with FP and AdvSIMD).
 + * The optional ones are kwemu's KW_ISA_* features: listed only if kwemu
 + * implements them (kw_set_isa) and kw.isa= leaves them on. Never listed:
-+ * LSE atomics, SVE, SHA3/SHA512, RNG, PAC, BTI and the rest of v8.1+,
-+ * which kwemu does not run (OpenSSL picks code paths from these bits).
++ * SVE, SM3/SM4, RNG, PAC, BTI and the rest of v8.1+ that kwemu does
++ * not run (OpenSSL and gcc's outline atomics pick code paths from these
++ * bits).
   *
 - * kw is the kwemu bit (KW_ISA_*): the extension is on only if kwemu
 - * implements it (kw_set_isa). kw = 0 marks one that every kwemu has: part of
@@ -2611,12 +2696,14 @@ index f81622e213d..3c41d9060e7 100644
 -	bool base;
 +	unsigned long hwcap;
 +	u64 kw;		/* KW_ISA_* bit; 0 for one that is always there */
++	const char *alias;	/* another name kw.isa= takes */
  };
  
 -#define KW_EXT(n, k, h)	{ #n, k, h, 0, false }
 -#define KW_EXT1(n, h)	{ #n, 0, 0, h, false }
 -#define KW_BASE(n)	{ #n, 0, 0, 0, true }
 -
++/* In HWCAP bit order, as the Features line lists them. */
  static const struct kw_isa_ext kw_isa_exts[] = {
 -	KW_EXT(zicbom, KW_ISA_ZICBOM, RISCV_HWPROBE_EXT_ZICBOM),
 -	KW_EXT(zicbop, 0, RISCV_HWPROBE_EXT_ZICBOP),
@@ -2659,22 +2746,27 @@ index f81622e213d..3c41d9060e7 100644
 +	{ "sha1",	HWCAP_SHA1,	KW_ISA_SHA1 },
 +	{ "sha2",	HWCAP_SHA2,	KW_ISA_SHA2 },
 +	{ "crc32",	HWCAP_CRC32,	KW_ISA_CRC32 },
++	{ "atomics",	HWCAP_ATOMICS,	KW_ISA_LSE,	"lse" },
++	{ "cpuid",	HWCAP_CPUID,	0 },	/* only if KW_HWCAP_CPUID */
++	{ "sha3",	HWCAP_SHA3,	KW_ISA_SHA3 },
++	{ "sha512",	HWCAP_SHA512,	KW_ISA_SHA512 },
  };
  
 -/* Entries (bit i = kw_isa_exts[i]) the command line leaves on. */
-+/* The KW_ISA_* features the command line leaves on. */
- static u64 kw_isa_want __initdata = ~0ULL;
+-static u64 kw_isa_want __initdata = ~0ULL;
 -/* What user space sees; the defaults are RV64GC alone. */
 -static char kw_isa_str[256] __ro_after_init = "rv64imafdc_zicsr_zifencei";
 -static u64 kw_isa_ext0 __ro_after_init = RISCV_HWPROBE_IMA_FD | RISCV_HWPROBE_IMA_C;
 -static u64 kw_isa_ext1 __ro_after_init;
++/* The KW_ISA_* features the command line leaves on (all of them). */
++static u64 kw_isa_want __initdata = ~(u64)0;
 +/* What user space sees; the defaults are ARMv8.0-A with FP and AdvSIMD. */
 +static char kw_isa_str[128] __ro_after_init = "fp asimd";
 +unsigned long kw_elf_hwcap __ro_after_init = HWCAP_FP | HWCAP_ASIMD;
  static u64 kw_isa_got __ro_after_init;
  
  u64 kw_isa_enabled(void)
-@@ -101,10 +59,12 @@ u64 kw_isa_enabled(void)
+@@ -101,10 +66,14 @@ u64 kw_isa_enabled(void)
  }
  
  /*
@@ -2686,12 +2778,14 @@ index f81622e213d..3c41d9060e7 100644
 + * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
 + * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
 + * implements it; the names are those of the Features line (aes, pmull,
-+ * sha1, sha2, crc32). For example kw.isa=armv8, kw.isa=-pmull or
-+ * kw.isa=armv8,+crc32.
++ * sha1, sha2, crc32, atomics, sha3, sha512; "lse" is atomics too). For example
++ * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
++ * kwemu runs SHA512 only together with SHA2 (kw_set_isa drops it
++ * otherwise), so -sha2 turns both off.
   */
  static int __init kw_isa_param(char *arg)
  {
-@@ -118,10 +78,8 @@ static int __init kw_isa_param(char *arg)
+@@ -118,25 +87,24 @@ static int __init kw_isa_param(char *arg)
  
  		if (!*tok)
  			continue;
@@ -2704,9 +2798,11 @@ index f81622e213d..3c41d9060e7 100644
  			continue;
  		}
  		if (*tok == '-' || *tok == '+')
-@@ -129,14 +87,14 @@ static int __init kw_isa_param(char *arg)
+ 			on = *tok++ == '+';
  		for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++)
- 			if (!strcmp(tok, kw_isa_exts[i].name))
+-			if (!strcmp(tok, kw_isa_exts[i].name))
++			if (!strcmp(tok, kw_isa_exts[i].name) ||
++			    (kw_isa_exts[i].alias && !strcmp(tok, kw_isa_exts[i].alias)))
  				break;
 -		if (i == ARRAY_SIZE(kw_isa_exts) || kw_isa_exts[i].base) {
 +		if (i == ARRAY_SIZE(kw_isa_exts) || !kw_isa_exts[i].kw) {
@@ -2722,7 +2818,7 @@ index f81622e213d..3c41d9060e7 100644
  	}
  	return 0;
  }
-@@ -146,44 +104,40 @@ early_param("kw.isa", kw_isa_param);
+@@ -146,44 +114,38 @@ early_param("kw.isa", kw_isa_param);
  void __init kw_isa_init(struct kw_cpu *cpu)
  {
  	char *p = kw_isa_str, *end = kw_isa_str + sizeof(kw_isa_str);
@@ -2752,15 +2848,13 @@ index f81622e213d..3c41d9060e7 100644
 -		p += scnprintf(p, end - p, "_%s", e->name);
 -		kw_isa_ext0 |= e->ext0;
 -		kw_isa_ext1 |= e->ext1;
++		if (e->hwcap == HWCAP_CPUID && !KW_HWCAP_CPUID)
++			continue;
 +		hwcap |= e->hwcap;
 +		p += scnprintf(p, end - p, "%s%s", p == kw_isa_str ? "" : " ",
 +			       e->name);
  	}
 -	pr_info("kwemu: isa %s (kwemu implements %#llx, enabled %#llx)\n",
-+	if (KW_HWCAP_CPUID) {
-+		hwcap |= HWCAP_CPUID;
-+		scnprintf(p, end - p, " cpuid");
-+	}
 +	kw_elf_hwcap = hwcap;
 +	pr_info("kwemu: features %s (kwemu implements %#llx, enabled %#llx)\n",
  		kw_isa_str, kw_isa_supported(), got);
@@ -2787,7 +2881,7 @@ index f81622e213d..3c41d9060e7 100644
  static void *c_start(struct seq_file *m, loff_t *pos)
  {
  	if (*pos == nr_cpu_ids)
-@@ -209,11 +163,17 @@ static int c_show(struct seq_file *m, void *v)
+@@ -209,11 +171,17 @@ static int c_show(struct seq_file *m, void *v)
  {
  	unsigned long cpu_id = (unsigned long)v - 1;
  
@@ -2810,10 +2904,29 @@ index f81622e213d..3c41d9060e7 100644
  	return 0;
  }
 diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
-index 05622e66df2..6060d116d89 100644
+index 05622e66df2..8612997cb26 100644
 --- a/arch/wasm/kernel/process.c
 +++ b/arch/wasm/kernel/process.c
-@@ -404,11 +404,12 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -185,9 +185,6 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
+ 	}
+ #endif
+ 
+-	/* Threads sharing an mm must not inherit an LR/SC reservation. */
+-	kw_clear_reservation(wasm_kw_cpu);
+-
+ 	return wasm_arch_switch(prev, next, is_new,
+ 				READ_ONCE(prev->__state) == TASK_DEAD);
+ }
+@@ -288,7 +285,7 @@ void arch_stay_move_to(struct task_struct *p, int cpu)
+  * notify-resume work, another reschedule) is in the TIF flags, which only
+  * the task itself clears; its system call's exit work (tracing, a ptrace
+  * stop, audit) came before the reschedule and is not repeated; pt_regs
+- * (cause, a0 for a restart) are as the old pass left them.
++ * (cause, x0 for a restart) are as the old pass left them.
+  */
+ static void __noreturn kw_user_resume(struct task_struct *prev)
+ {
+@@ -404,11 +401,12 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  		p->thread.fn_arg = args->fn_arg;
  	} else {
  		*childregs = *current_pt_regs();
@@ -2829,7 +2942,7 @@ index 05622e66df2..6060d116d89 100644
  		p->thread.fn = NULL;
  		p->thread.fn_arg = NULL;
  	}
-@@ -434,11 +435,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -434,11 +432,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  	return 0;
  }
  
@@ -2846,7 +2959,7 @@ index 05622e66df2..6060d116d89 100644
  	regs->kernel = 0;
  }
  
-@@ -447,13 +452,13 @@ void show_regs(struct pt_regs *regs)
+@@ -447,13 +449,13 @@ void show_regs(struct pt_regs *regs)
  	int i;
  
  	show_regs_print_info(KERN_DEFAULT);
@@ -2882,7 +2995,7 @@ index 69965b3776b..2e3a46c4655 100644
  	.n = 0,
  };
 diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
-index 5df45d42d6e..8909083ad05 100644
+index 5df45d42d6e..216fc53ef94 100644
 --- a/arch/wasm/kernel/signal.c
 +++ b/arch/wasm/kernel/signal.c
 @@ -1,11 +1,19 @@
@@ -3055,7 +3168,7 @@ index 5df45d42d6e..8909083ad05 100644
  	return 0;
  }
  
-@@ -65,115 +148,118 @@ SYSCALL_DEFINE0(rt_sigreturn)
+@@ -65,115 +148,114 @@ SYSCALL_DEFINE0(rt_sigreturn)
  {
  	struct pt_regs *regs = current_pt_regs();
  	struct rt_sigframe __user *frame;
@@ -3091,7 +3204,7 @@ index 5df45d42d6e..8909083ad05 100644
  
 +	/* Avoid sys_rt_sigreturn() restarting. */
  	regs->cause = PT_CAUSE_NONE;
- 	kw_clear_reservation(wasm_kw_cpu);
+-	kw_clear_reservation(wasm_kw_cpu);
  
 -	return regs->user.x[REG_A0];
 +	return regs->user.x[0];
@@ -3211,13 +3324,11 @@ index 5df45d42d6e..8909083ad05 100644
  		return -EFAULT;
  
 -	/* A handler must not complete an interrupted LR/SC sequence. */
+-	kw_clear_reservation(wasm_kw_cpu);
 +	if (ksig->ka.sa.sa_flags & SA_RESTORER)
 +		sigtramp = (unsigned long)ksig->ka.sa.sa_restorer;
 +	else
 +		sigtramp = current->mm->context.sigpage;
-+
-+	/* A handler must not complete an interrupted LDXR/STXR sequence. */
- 	kw_clear_reservation(wasm_kw_cpu);
  
 -	regs->user.x[REG_RA] = current->mm->context.sigpage;
 +	regs->user.x[0] = ksig->sig;
@@ -3236,7 +3347,7 @@ index 5df45d42d6e..8909083ad05 100644
  
  	return 0;
  }
-@@ -197,8 +283,8 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+@@ -197,8 +279,8 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
  
  	if (syscall) {
  		continue_addr = regs->user.pc;
@@ -3247,7 +3358,7 @@ index 5df45d42d6e..8909083ad05 100644
  
  		/* Avoid additional syscall restarting */
  		regs->cause = PT_CAUSE_NONE;
-@@ -208,7 +294,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+@@ -208,7 +290,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
  		case -ERESTARTSYS:
  		case -ERESTARTNOINTR:
  		case -ERESTART_RESTARTBLOCK:
@@ -3256,7 +3367,7 @@ index 5df45d42d6e..8909083ad05 100644
  			regs->user.pc = restart_addr;
  			break;
  		}
-@@ -220,7 +306,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+@@ -220,7 +302,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
  		     retval == -ERESTART_RESTARTBLOCK ||
  		     (retval == -ERESTARTSYS &&
  		      !(ksig.ka.sa.sa_flags & SA_RESTART)))) {
@@ -3265,7 +3376,7 @@ index 5df45d42d6e..8909083ad05 100644
  			regs->user.pc = continue_addr;
  		}
  
-@@ -230,14 +316,16 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+@@ -230,14 +312,16 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
  
  	if (syscall && regs->user.pc == restart_addr &&
  	    retval == -ERESTART_RESTARTBLOCK)
@@ -3458,7 +3569,7 @@ index 51e05d3b9f8..ae0e91d3201 100644
  #define __SYSCALL(nr, call)	asmlinkage long __wasm_##call(const struct pt_regs *);
  #include <asm/syscall_table_64.h>
 diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
-index 017d8284512..7587e52e17f 100644
+index 017d8284512..9b2e701ea82 100644
 --- a/arch/wasm/kernel/traps.c
 +++ b/arch/wasm/kernel/traps.c
 @@ -1,7 +1,7 @@
@@ -3494,6 +3605,27 @@ index 017d8284512..7587e52e17f 100644
  	}
  
  	syscall_exit_to_user_mode(regs);
+@@ -142,8 +142,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 			kw_park_user();
+ 
+ 		/*
+-		 * "sret": user mode runs with interrupts enabled. On SMP without
+-		 * taking what is pending here: kw_run() sees it at once
++		 * Each entry to user mode is an exception return, and on arm64
++		 * ERET clears the local exclusive monitor (qemu-user does the
++		 * same): an STXR after a syscall, a fault, an interrupt or a
++		 * task switch fails, whatever the kernel ran meanwhile. This is
++		 * the only call of kw_run() and nothing runs in between, so a
++		 * task switch, signal delivery or sigreturn need not clear it.
++		 */
++		kw_clear_reservation(cpu);
++
++		/*
++		 * As after ERET, user mode runs with interrupts enabled. On SMP
++		 * without taking what is pending here: kw_run() sees it at once
+ 		 * (KW_EV_INTERRUPT), and do_user_interrupt() then takes it on
+ 		 * the way to user mode, where a reschedule is honoured.
+ 		 */
 diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
 index 959f2396685..fd26889ddab 100644
 --- a/arch/wasm/mm/fault.c

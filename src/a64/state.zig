@@ -33,8 +33,8 @@ pub const Regs = extern struct {
 
 /// The A64 part of kwemu's private area in struct kw_cpu. Everything here
 /// is emulator-private (not ABI); the exclusive monitor's address is
-/// `core.Hart.resv` (cleared by kw_clear_reservation and kw_set_pgd, shared
-/// with riscv's LR/SC), its first value `Hart.resv_val`.
+/// `core.Hart.resv` (cleared by kw_clear_reservation and kw_set_pgd), its
+/// first value `Hart.resv_val`.
 pub const Priv = extern struct {
     /// Enabled optional features (common.Feature bits, a subset of
     /// common.implemented); kw_set_isa.

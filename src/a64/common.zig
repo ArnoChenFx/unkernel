@@ -438,8 +438,8 @@ pub inline fn barrier(s: St) void {
 
 // ---- FP status -----------------------------------------------------------------
 //
-// FP arithmetic is fpu.zig (exact for all rounding modes and flags, RISC-V
-// conventions). Mapping to Arm: FPCR.RMode via `fpRound`, fpu flags to FPSR
+// FP arithmetic is fpu.zig (exact for all rounding modes and flags, its own
+// defaults, see there). Mapping to Arm: FPCR.RMode via `fpRound`, fpu flags to FPSR
 // via `fpsrBits` (or `fpRaise`). Differences the FP code must handle itself:
 // fpu returns the default NaN for every NaN result, Arm propagates NaN
 // operands unless FPCR.DN (use `processNaNs` first); fpu detects tininess

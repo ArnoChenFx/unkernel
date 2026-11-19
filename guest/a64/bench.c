@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-/* CPU benchmark: sieve of Eratosthenes + recursive fib (the A64 port of
- * guest/bench.zig). usage: bench [sieve_limit] [rounds] [fib_n] */
+/* CPU benchmark: sieve of Eratosthenes + recursive fib.
+ * usage: bench [sieve_limit] [rounds] [fib_n] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

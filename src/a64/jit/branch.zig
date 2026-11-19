@@ -15,8 +15,8 @@
 //!    a `select` between the target and b.end_pc for a conditional one, the
 //!    register for br/blr) and fall through to the block's end; in a region
 //!    the core then calls `memberTail`, which branches to the members the
-//!    terminator may reach (br/blr compare l_npc with every member's pc, as
-//!    riscv's jalr does; a target that is no member, misaligned or not,
+//!    terminator may reach (br/blr compare l_npc with every member's pc; a
+//!    target that is no member, misaligned or not,
 //!    leaves to `run`, which raises what the interpreter would);
 //!  - a terminator of a block compiled on its own whose target is the
 //!    block's start (`at.self_loop`) is `e.backEdge(at.b)`: poll (*irqp,

@@ -66,9 +66,9 @@ and `stats` are separate and not part of `all`):
   is based on Joel Severin's linux-wasm port),
   and builds `vmlinux` with `kw_defconfig`. Kbuild drives the toolchain
   through `tools/fake-llvm/llvm-wrapper.py`. The emulator comes from
-  `zig-out/lib/libkwemu.a` (`zig build -Dkwemu-jit=false`, run first;
-  the JIT tier compiles riscv blocks only, so it is off unless
-  `KWEMU_JIT=1`; `KWEMU=path` takes a prebuilt library as is); with
+  `zig-out/lib/libkwemu.a` (`zig build -Dkwemu-jit=true`, run first;
+  `KWEMU_JIT=0` leaves the JIT tier out; `KWEMU=path` takes a prebuilt
+  library as is); with
   `KWEMU=none` a stub is linked
   instead. `include/kw_emu.h` is copied over the kernel's
   `arch/wasm/include/asm/kw_emu.h` (with a warning) if the two differ. It
@@ -764,8 +764,8 @@ one-liner under kw-init). The config it needs: CGROUPS,
 NAMESPACES (UTS, IPC, PID, NET), KCMP, FANOTIFY, AUTOFS_FS and
 EXT4_FS_SECURITY, about 180 KiB more kernel.
 
-Patch 0040 (2026-11-14) adds small options that tools and services probe
-for: the `pids` controller, user namespaces (`unshare -r`, bubblewrap),
+Since 2026-11-14 `kw_defconfig` also has small options that tools and
+services probe for: the `pids` controller, user namespaces (`unshare -r`, bubblewrap),
 CHECKPOINT_RESTORE (`/proc/PID/task/TID/children`), PSI
 (`/proc/pressure`), task I/O accounting (`/proc/PID/io`), userfaultfd,
 IP multicast, `ss` for unix, packet and netlink sockets, loop devices
@@ -927,10 +927,10 @@ from source). Everything is self-hosted except the Wisp fallback.
 * **MMU=y without hardware.**
   * The kernel runs only in the direct map: virtual address = physical
     address = linear address, and `phys_base` is 0.
-  * User page tables use the Sv39 layout (kept from the riscv64 guest; kwemu
-    walks it for every guest ISA). The PTE bits are riscv's, with
-    `_PAGE_PROT_NONE` = G and the riscv swap format, in a 3-level table with
-    the PUD folded.
+  * User page tables use the RISC-V Sv39 layout, whatever the guest ISA
+    (kwemu walks it like hardware). The PTE bits are Sv39's, with
+    `_PAGE_PROT_NONE` = G and arch/riscv's swap format, in a 3-level table
+    with the PUD folded.
   * kwemu walks the tables and raises `KW_EV_FAULT`. The kernel either
     fixes the A/D bits directly (Svadu-like fast path) or calls
     `handle_mm_fault` through `lock_mm_and_find_vma`.

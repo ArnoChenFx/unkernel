@@ -433,7 +433,7 @@ parts that are easy to get wrong.
     a task on CPU 1 reaches the host about 0.1-0.3 ms after it was
     written also while CPU 0 runs user code (before: at CPU 0's next
     yield, 10 ms at the median).
-- The JIT per CPU (kwemu.md, JIT on several harts): each CPU's thread
+- The JIT per CPU (kwemu.md, JIT on several CPUs): each CPU's thread
   has a `JitHost` of its own (`CpuInit.jit`, `memory64`), attached to
   its instance's `__indirect_function_table` before the kernel runs
   there, so a CPU compiles into its own table and never sees another's
@@ -449,7 +449,7 @@ parts that are easy to get wrong.
   the host calls the new `f` once with `cpu` = 0 (it returns at once), so
   that V8's lazy compile of it happens inside the import, in kwemu's
   compile window, where other CPUs do not wait for this one (kwemu.md,
-  JIT on several harts).
+  JIT on several CPUs).
 - `JitHost.caps()` offers SIMD (bit 5, `CAP_SIMD`) when
   `WebAssembly.validate` accepts a small module with v128 code
   (`jitSimd()`, exported by the SDK, asked once per host). Every engine with JSPI has SIMD; V8

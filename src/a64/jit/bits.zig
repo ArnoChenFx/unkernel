@@ -6,8 +6,8 @@
 //! as constants: ubfm/sbfm/bfm are shl/shr(_s)/shl (+ and), extr a
 //! shr/shl/or; the variable shifts use wasm's own count masking (i64 ops for
 //! X, i32 ops on the low halves for W, zero-extended); madd/maddl i64.mul;
-//! umulh/smulh the 32x32 decomposition of riscv's jit.zig `mulhu` and
-//! `mulCorr` (wasm has no 64x64 -> 128 multiply); udiv/sdiv guard the zero
+//! umulh/smulh a 32x32 decomposition (`mulhu`, plus a sign correction for
+//! smulh; wasm has no 64x64 -> 128 multiply); udiv/sdiv guard the zero
 //! divisor (result 0) and, for sdiv, MIN / -1 (wasm traps on both; -1 is
 //! done as a negation), W forms on the low halves as dp_reg.sdiv does;
 //! rev1: i64.clz/i32.clz, byte and bit reversals by mask swaps (MVP wasm
@@ -81,7 +81,7 @@ fn swap(e: *Emit, l: u32, s: u64, m: u64) void {
 }
 
 /// Push the high 64 bits of the unsigned product of slots b and c (l_t +
-/// 0..4; riscv's jit.zig `mulhu`).
+/// 0..4).
 fn mulhu(e: *Emit, b: u8, c: u8) void {
     const t0 = cm.l_t;
     const t1 = cm.l_t + 1;

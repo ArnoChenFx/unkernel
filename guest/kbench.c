@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-/* kwemu micro-benchmarks (rv64gc, static musl). usage: kbench <name> [n]
+/* kwemu micro-benchmarks (portable C, static musl). usage: kbench <name> [n]
  *   mem    read-modify-write + memcpy over an 8 MiB buffer
  *   fib    recursive fib (call-heavy)
  *   fp     double-precision matrix multiply + nbody-ish update

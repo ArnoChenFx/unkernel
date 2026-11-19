@@ -2,14 +2,9 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 const std = @import("std");
 
-// The guest CPU is AArch64 (src/a64). The riscv64 CPU (src/cpu, src/emu
-// exec/jit) and its guests are kept for reference: built and unit-tested
-// only with -Driscv-legacy (zig build test-riscv); the harness is A64-only.
+// The guest CPU is AArch64: src/a64 on top of the MMU, block cache and JIT
+// core in src/emu and the shared types and softfloat in src/cpu.
 
-/// riscv Zig guests (rv64imac, soft-float, no libc; see guest/rt.zig); -Driscv-legacy only.
-const zig_guests = [_][]const u8{ "hello", "bench" };
-/// riscv hard-float (rv64gc, lp64d) static musl C guests; -Driscv-legacy only.
-const gc_guests = [_][]const u8{ "fptest", "isatest", "atomics", "kbench", "aestest", "bktest", "zbtest", "rvatest", "zfatest", "zfhtest", "jalrtest" };
 /// AArch64 guests (static aarch64-linux-musl C, guest/a64/), run under kwemu's
 /// kw_a64_run and under qemu-aarch64 by test/a64-test.mjs (outputs must match).
 const a64_guests = [_][]const u8{
@@ -28,42 +23,9 @@ const a64_guests = [_][]const u8{
 const a64_ports = [_][2][]const u8{
     .{ "kbench", "guest/kbench.c" },
 };
-/// Optional extensions (core.Ext) a gc guest is built with on top of rv64gc.
-fn guestExts(name: []const u8) std.Target.Cpu.Feature.Set {
-    if (std.mem.eql(u8, name, "aestest")) return std.Target.riscv.featureSet(&.{ .zkne, .zknd });
-    if (std.mem.eql(u8, name, "bktest")) return std.Target.riscv.featureSet(&.{ .zbc, .zbkb, .zbkc, .zbkx });
-    if (std.mem.eql(u8, name, "zbtest")) return std.Target.riscv.featureSet(&.{ .zba, .zbb, .zbs, .zicond });
-    if (std.mem.eql(u8, name, "zfatest")) return std.Target.riscv.featureSet(&.{.zfa});
-    if (std.mem.eql(u8, name, "zfhtest")) return std.Target.riscv.featureSet(&.{.zfhmin});
-    if (std.mem.eql(u8, name, "rvatest")) return std.Target.riscv.featureSet(&.{ .zba, .zbb, .zcb, .zimop, .zcmop, .zicbom, .zicboz, .zawrs });
-    return .empty;
-}
-
 pub fn build(b: *std.Build) void {
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode for the native library and harness (default: ReleaseFast)") orelse .ReleaseFast;
     const native = b.standardTargetOptions(.{});
-    const riscv_legacy = b.option(bool, "riscv-legacy", "Also build the riscv64 guests and the riscv unit tests (zig build test-riscv; the riscv CPU is kept for reference only; default: false)") orelse false;
-
-    // ---- guest programs (riscv64, rv64imac, soft-float) -------------------------
-    const guest_target = b.resolveTargetQuery(.{
-        .cpu_arch = .riscv64,
-        .os_tag = .linux,
-        .cpu_model = .{ .explicit = &std.Target.riscv.cpu.generic_rv64 },
-        .cpu_features_add = std.Target.riscv.featureSet(&.{ .m, .a, .c }),
-    });
-    const rt = b.createModule(.{ .root_source_file = b.path("guest/rt.zig"), .target = guest_target });
-    if (riscv_legacy) for (zig_guests) |name| {
-        const exe = b.addExecutable(.{
-            .name = name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(b.fmt("guest/{s}.zig", .{name})),
-                .target = guest_target,
-                .optimize = .ReleaseSmall,
-                .imports = &.{.{ .name = "rt", .module = rt }},
-            }),
-        });
-        installGuest(b, exe, name);
-    };
 
     // ---- kwemu: the CPU core as a library for the real kernel -----------------
     // wasm64 relocatable object + static archive with the C ABI of
@@ -71,26 +33,20 @@ pub fn build(b: *std.Build) void {
     // threads/atomics/TLS/bulk-memory/sign-ext/nontrapping-fptoint, unless
     // -Dkwemu-atomics (below).
     const lib_optimize = b.option(std.builtin.OptimizeMode, "lib-optimize", "Optimization mode for libkwemu (default: ReleaseFast)") orelse .ReleaseFast;
-    // Tail-call threaded dispatch (one function per op, return_call_indirect
-    // chains). Adds the wasm `tail_call` feature to the object, so the
-    // kernel's toolchain/runtime must support it. Off by default.
-    const tail_call = b.option(bool, "kwemu-tail-call", "kwemu: tail-call threaded dispatch (wasm tail_call feature; default: false)") orelse false;
     const stats = b.option(bool, "kwemu-stats", "kwemu: block-cache counters (kw_debug_stats export, printed by the harness; default: false)") orelse false;
-    // JIT tier (src/emu/jit.zig): hot blocks are compiled to wasm through the
+    // JIT tier (src/emu/jitcore.zig, src/a64/jit): hot blocks are compiled to wasm through the
     // optional host imports unkernel.kw_host_jit_{caps,compile,free}. wasm64
     // only; off by default (the object then has no `unkernel` imports). The
     // tests build a JIT-enabled harness and unit-test module regardless.
     const jit = b.option(bool, "kwemu-jit", "kwemu: wasm JIT tier, needs the unkernel.kw_host_jit_* host imports (default: false)") orelse false;
     const jit_threshold = b.option(u32, "kwemu-jit-threshold", "kwemu: retired instructions in a block before it is compiled (default: 131072)") orelse 1 << 17;
     const jit_grow = b.option(u32, "kwemu-jit-grow", "kwemu: exits from a region towards a compiled block before it joins the region (default: 8192 per KiB of the region's module; 0 = never)") orelse 8192;
-    // Operand sets per op of the randomized F/D differential unit test
-    // (interpreter vs JIT, wasm64 unit tests only); 0 = its small default.
-    const fp_fuzz = b.option(u32, "kwemu-fp-fuzz", "kwemu: random operand sets per op in the F/D JIT differential test (default: 0 = 4096)") orelse 0;
     // wasm atomics + bulk memory in the wasm64 objects, so that a kernel
     // linked with --shared-memory (wasm-ld refuses objects without both)
-    // can include kwemu. With them (core.smp) guest AMOs are atomic
-    // read-modify-writes, SC a compare-and-swap against the value LR read,
-    // and FENCE a full barrier, for an SMP kernel's harts on one memory.
+    // can include kwemu. With them (core.smp) exclusives and LSE atomics
+    // are atomic, a store-exclusive a compare-and-swap against the value the
+    // load-exclusive read, and barriers full barriers, for an SMP kernel's
+    // CPUs on one memory.
     const atomics = b.option(bool, "kwemu-atomics", "kwemu: build the wasm64 objects with the atomics and bulk-memory features, for a shared-memory kernel (default: false)") orelse false;
     // kw_run = the A64 reference loop (src/a64/run.zig runRef) instead of
     // the decoded-op tier: the oracle, for comparisons in the kernel.
@@ -99,18 +55,13 @@ pub fn build(b: *std.Build) void {
     // in `zig build test`, and the first seed.
     const a64_fuzz = b.option(u32, "kwemu-a64-fuzz", "kwemu: programs in the A64 tier-vs-reference block fuzz of zig build test (default: 0 = 300)") orelse 0;
     const a64_fuzz_seed = b.option(u64, "kwemu-a64-fuzz-seed", "kwemu: first seed of the A64 block fuzz (default: 1)") orelse 1;
-    const kw_opts_mod = kwOptions(b, tail_call, stats, jit, jit_threshold, jit_grow, fp_fuzz, a64_ref, a64_fuzz, a64_fuzz_seed);
-    const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, tail_call, stats, true, jit_threshold, jit_grow, fp_fuzz, a64_ref, a64_fuzz, a64_fuzz_seed);
+    const kw_opts_mod = kwOptions(b, stats, jit, jit_threshold, jit_grow, a64_ref, a64_fuzz, a64_fuzz_seed);
+    const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, stats, true, jit_threshold, jit_grow, a64_ref, a64_fuzz, a64_fuzz_seed);
     const wasm64 = b.resolveTargetQuery(.{
         .cpu_arch = .wasm64,
         .os_tag = .freestanding,
         .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
-        .cpu_features_add = blk: {
-            var f: std.Target.Cpu.Feature.Set = .empty;
-            if (tail_call) f.addFeatureSet(std.Target.wasm.featureSet(&.{.tail_call}));
-            if (atomics) f.addFeatureSet(std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }));
-            break :blk f;
-        },
+        .cpu_features_add = if (atomics) std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }) else .empty,
     });
     const kw_h_wasm = kwHeader(b, wasm64, lib_optimize);
     const kw_h_native = kwHeader(b, native, optimize);
@@ -177,16 +128,6 @@ pub fn build(b: *std.Build) void {
     const obj_wasm_jit = if (jit) obj_wasm else b.addObject(.{ .name = "kwemu-jit", .root_module = kwemuModule(b, wasm64, lib_optimize, kw_h_wasm, kw_opts_jit_mod) });
     b.getInstallStep().dependOn(&b.addInstallLibFile(obj_wasm_jit.getEmittedBin(), "kwemu-jit.o").step);
 
-    // Hard-float guests: riscv64-linux-musl, default CPU = rv64gc (lp64d).
-    if (riscv_legacy) for (gc_guests) |name| {
-        const gc_target = b.resolveTargetQuery(.{ .cpu_arch = .riscv64, .os_tag = .linux, .abi = .musl, .cpu_features_add = guestExts(name) });
-        const mod = b.createModule(.{ .target = gc_target, .optimize = .ReleaseFast, .link_libc = true });
-        mod.addCSourceFile(.{ .file = b.path(b.fmt("guest/{s}.c", .{name})), .flags = &.{ "-std=c11", "-Wall", "-frounding-math" } });
-        mod.linkSystemLibrary("m", .{});
-        const exe = b.addExecutable(.{ .name = name, .root_module = mod, .linkage = .static });
-        installGuest(b, exe, name);
-    };
-
     // A64 guests: ARMv8.0-A (the generic cpu: FP and AdvSIMD, no LSE), no
     // auto-vectorization in the test code itself (libc is what it is).
     const a64_target = b.resolveTargetQuery(.{
@@ -212,36 +153,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(a64_classify);
 
     // ---- tests -------------------------------------------------------------------
-    const unit = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = native,
-            .optimize = .Debug,
-            .imports = &.{ .{ .name = "kw_h", .module = kw_h_native }, .{ .name = "kwemu_options", .module = kw_opts_mod } },
-        }),
-    });
-    // The kwemu unit tests again as wasm64 with the JIT tier, run under Node
-    // by test/kwemu-unit-wasm.mjs (a JS host for the JIT imports).
-    const unit_wasm = b.addTest(.{
-        .name = "kwemu-unit-jit",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests_wasm.zig"),
-            .target = wasm64,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-            .imports = &.{ .{ .name = "kw_h", .module = kw_h_wasm }, .{ .name = "kwemu_options", .module = kw_opts_jit_mod } },
-        }),
-        .test_runner = .{ .path = b.path("src/test_runner_wasm.zig"), .mode = .simple },
-        .filters = &.{"kwemu"}, // not the softfloat tests (cpu/fpu.zig) pulled in through imports
-    });
-    unit_wasm.entry = .disabled;
-    unit_wasm.rdynamic = true;
-    unit_wasm.export_table = true;
-    const unit_wasm_run = b.addSystemCommand(&.{"node"});
-    unit_wasm_run.addFileArg(b.path("test/kwemu-unit-wasm.mjs"));
-    unit_wasm_run.addFileArg(unit_wasm.getEmittedBin());
-    unit_wasm_run.has_side_effects = true;
-
     // A64 guests under kwemu (native and wasm64) against qemu-aarch64 (the
     // comparison is skipped, with a note, without qemu-aarch64 on PATH).
     const a64_e2e = b.addSystemCommand(&.{"node"});
@@ -298,37 +209,17 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&unit_a64_wasm_run.step);
     test_step.dependOn(&unit_a64_wasm_nosimd.step);
     test_step.dependOn(&a64_e2e.step);
-    if (riscv_legacy) {
-        const test_riscv = b.step("test-riscv", "Run the riscv unit tests (native, and wasm64 with the JIT tier); reference code only");
-        test_riscv.dependOn(&b.addRunArtifact(unit).step);
-        test_riscv.dependOn(&unit_wasm_run.step);
-    }
-
-    // `zig build fuzz -- N [SEED]`: the wasm64 unit tests with N seeds of the
-    // randomized interpreter-vs-JIT test (src/emu/kwemu_test.zig, "kwemu jit fuzz").
-    if (!riscv_legacy) return;
-    const fuzz_run = b.addSystemCommand(&.{"node"});
-    fuzz_run.addFileArg(b.path("test/kwemu-unit-wasm.mjs"));
-    fuzz_run.addFileArg(unit_wasm.getEmittedBin());
-    if (b.args) |a| {
-        fuzz_run.addArgs(&.{ "--fuzz", a[0] });
-        if (a.len > 1) fuzz_run.addArgs(&.{ "--seed", a[1] });
-    }
-    fuzz_run.has_side_effects = true;
-    b.step("fuzz", "Run the wasm64 unit tests with a long randomized interpreter-vs-JIT run (zig build fuzz -- N [SEED])").dependOn(&fuzz_run.step);
 }
 
-fn kwOptions(b: *std.Build, tail_call: bool, stats: bool, jit: bool, jit_threshold: u32, jit_grow: u32, fp_fuzz: u32, a64_ref: bool, a64_fuzz: u32, a64_fuzz_seed: u64) *std.Build.Module {
+fn kwOptions(b: *std.Build, stats: bool, jit: bool, jit_threshold: u32, jit_grow: u32, a64_ref: bool, a64_fuzz: u32, a64_fuzz_seed: u64) *std.Build.Module {
     const o = b.addOptions();
     o.addOption(bool, "a64_ref", a64_ref);
     o.addOption(u32, "a64_fuzz", a64_fuzz);
     o.addOption(u64, "a64_fuzz_seed", a64_fuzz_seed);
-    o.addOption(bool, "tail_call", tail_call);
     o.addOption(bool, "stats", stats);
     o.addOption(bool, "jit", jit);
     o.addOption(u32, "jit_threshold", jit_threshold);
     o.addOption(u32, "jit_grow", jit_grow);
-    o.addOption(u32, "fp_fuzz", fp_fuzz);
     return o.createModule();
 }
 

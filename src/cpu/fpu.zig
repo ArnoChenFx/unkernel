@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-//! RISC-V F/D arithmetic with exact rounding modes and exception flags.
+//! IEEE 754 binary32/binary64 arithmetic with exact rounding modes and
+//! exception flags, the base of A64's FP (src/a64/fparith.zig applies the
+//! Arm rules on top: NaN propagation, tininess before rounding, FPCR modes).
 //!
 //! Every operation has an integer ("softfloat") implementation that is exact
-//! for all five rounding modes and all five flags, with RISC-V semantics:
+//! for all five rounding modes and all five flags, with these defaults:
 //! tininess detected after rounding, canonical NaN results, no NaN payload
-//! propagation, fmin/fmax per the 2.2+ spec (minimumNumber, -0 < +0).
+//! propagation, min/max as IEEE 754-2019 minimumNumber/maximumNumber
+//! (-0 < +0).
 //!
 //! Round-to-nearest-even (the case real code runs in) takes a fast path
 //! through host IEEE f32/f64 ops (wasm and x86-64 SSE are both strict RNE)
@@ -63,12 +66,6 @@ pub fn mulh(a: u64, b: u64) u64 {
     var hi = mul64(a, b).hi;
     if (@as(i64, @bitCast(a)) < 0) hi -%= b;
     if (@as(i64, @bitCast(b)) < 0) hi -%= a;
-    return hi;
-}
-/// High 64 bits of signed a x unsigned b.
-pub fn mulhsu(a: u64, b: u64) u64 {
-    var hi = mul64(a, b).hi;
-    if (@as(i64, @bitCast(a)) < 0) hi -%= b;
     return hi;
 }
 
@@ -686,41 +683,10 @@ pub fn Fmt(comptime B: type) type {
             if (h(b) > h(a)) return b;
             return a & b; // equal: +0 wins
         }
-        /// fminm / fmaxm (Zfa): like min / max, but a NaN operand gives the
-        /// canonical NaN.
-        pub fn minm(a: B, b: B, fl: *u32) B {
-            if (isNan(a) or isNan(b)) {
-                if (isSnan(a) or isSnan(b)) fl.* |= NV;
-                return qnan;
-            }
-            return min(a, b, fl);
-        }
-        pub fn maxm(a: B, b: B, fl: *u32) B {
-            if (isNan(a) or isNan(b)) {
-                if (isSnan(a) or isSnan(b)) fl.* |= NV;
-                return qnan;
-            }
-            return max(a, b, fl);
-        }
-        /// fltq / fleq (Zfa): quiet compares (NV only for a signalling NaN).
-        pub fn ltq(a: B, b: B, fl: *u32) bool {
-            if (isNan(a) or isNan(b)) {
-                if (isSnan(a) or isSnan(b)) fl.* |= NV;
-                return false;
-            }
-            return h(a) < h(b);
-        }
-        pub fn leq(a: B, b: B, fl: *u32) bool {
-            if (isNan(a) or isNan(b)) {
-                if (isSnan(a) or isSnan(b)) fl.* |= NV;
-                return false;
-            }
-            return h(a) <= h(b);
-        }
-        /// fround / froundnx (Zfa): round to an integral value in this
-        /// format with rm. A NaN gives the canonical NaN (NV if signalling),
-        /// infinities and zeros stay as they are, a result of zero keeps the
-        /// sign. Only froundnx (`nx`) raises NX, when the value changes.
+        /// Round to an integral value in this format with rm. A NaN gives
+        /// the canonical NaN (NV if signalling), infinities and zeros stay
+        /// as they are, a result of zero keeps the sign. NX only with `nx`,
+        /// when the value changes.
         pub fn roundInt(a: B, rm: u32, nx: bool, fl: *u32) B {
             if (isNan(a)) {
                 if (isSnan(a)) fl.* |= NV;
@@ -848,42 +814,9 @@ pub fn Fmt(comptime B: type) type {
 
 pub const F32 = Fmt(u32);
 pub const F64 = Fmt(u64);
-/// Half precision (Zfhmin): only loads, stores, moves and the conversions
-/// to and from F32/F64 (`fromOther`, which is exact for these formats).
+/// Half precision: no arithmetic here, only the conversions to and from
+/// F32/F64 (`fromOther`, which is exact for these formats).
 pub const F16 = Fmt(u16);
-
-/// fcvtmod.w.d (Zfa): the double truncated to an integer, modulo 2^32,
-/// sign-extended. NaN and infinity give 0; NV when the integer does not fit
-/// in 32 bits (then no NX), else NX when the value was not integral.
-pub fn fcvtmodWD(a: u64, fl: *u32) u64 {
-    const ef: i32 = @intCast((a >> 52) & 0x7ff);
-    if (ef == 0x7ff) {
-        fl.* |= NV;
-        return 0;
-    }
-    const m = a & ((@as(u64, 1) << 52) - 1);
-    if (ef == 0) { // zero or subnormal
-        if (m != 0) fl.* |= NX;
-        return 0;
-    }
-    const sig = m | (@as(u64, 1) << 52);
-    const e = ef - 1023; // a = sig * 2^(e - 52)
-    var low: u64 = 0; // the integer part modulo 2^64
-    var inexact = true;
-    if (e >= 0 and e <= 52) {
-        const k: u6 = @intCast(52 - e);
-        low = sig >> k;
-        inexact = sig & ((@as(u64, 1) << k) - 1) != 0;
-    } else if (e > 52) {
-        low = if (e - 52 < 64) sig << @intCast(e - 52) else 0;
-        inexact = false;
-    }
-    const s = a >> 63 != 0;
-    const fits = e < 31 or (e == 31 and s and low == 1 << 31);
-    if (!fits) fl.* |= NV else if (inexact) fl.* |= NX;
-    const r: u32 = @truncate(if (s) 0 -% low else low);
-    return @bitCast(@as(i64, @as(i32, @bitCast(r))));
-}
 
 // ---- tests -----------------------------------------------------------------------
 

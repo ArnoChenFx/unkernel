@@ -395,8 +395,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
 }
 
 /// -Dkwemu-stats, A64: why instructions ran outside compiled code, in
-/// JitStats.hb_gen (riscv's classes of generic hand-backs; A64 does not use
-/// those). Interpreted instructions (ops other than `goto`) by the state of
+/// JitStats.hb_gen. Interpreted instructions (ops other than `goto`) by the state of
 /// their block: never compiled (`never`: its first op is not translated, its
 /// compile failed, or no JIT), counting towards the threshold (`countdown`),
 /// the rest of a pass after compiled code handed back an op that is not

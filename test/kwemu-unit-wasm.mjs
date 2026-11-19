@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Runs the kwemu unit tests built as wasm64 with the JIT tier
-// (src/tests_wasm.zig + src/test_runner_wasm.zig, run by `zig build test`)
-// against an eager JS JIT host, and checks the host's slot bookkeeping:
+// (src/tests_a64_wasm.zig + src/test_runner_wasm.zig, run by `zig build
+// test`) against an eager JS JIT host, and checks the host's slot bookkeeping:
 // every compile goes into a free slot, every free into an installed one,
 // no module fails to compile, and nothing is left installed at the end
 // (each test's Machine.deinit resets the block cache).
-// usage: node test/kwemu-unit-wasm.mjs <unit-test.wasm> [--name NAME] [--fuzz N] [--seed S]
-//   --name: the label in the output (default kwemu; the A64 tests: a64)
-//   --fuzz N: the randomized interpreter-vs-JIT test ("kwemu jit fuzz") runs
-//   N seeds from S (default 0) instead of its default count (`zig build fuzz -- N [S]`)
+// usage: node test/kwemu-unit-wasm.mjs <unit-test.wasm> [--name NAME]
+//   --name: the label in the output (default a64)
 import { readFile } from "node:fs/promises";
 import { createJitHost } from "./kwemu-jit-host.mjs";
 
 const dec = new TextDecoder();
 const jit = createJitHost({ eager: true, strict: true });
-const arg = (name) => {
-  const i = process.argv.indexOf(name);
-  return i > 0 ? BigInt(process.argv[i + 1]) : 0n;
-};
-const fuzz = [arg("--fuzz"), arg("--seed")];
-const name = process.argv.includes("--name") ? process.argv[process.argv.indexOf("--name") + 1] : "kwemu";
+const name = process.argv.includes("--name") ? process.argv[process.argv.indexOf("--name") + 1] : "a64";
 let mem, out = "";
 const { instance } = await WebAssembly.instantiate(await readFile(process.argv[2]), {
   env: {
@@ -29,7 +22,6 @@ const { instance } = await WebAssembly.instantiate(await readFile(process.argv[2
       if (fd === 2) process.stderr.write(s);
       else out += s;
     },
-    kwemu_fuzz_config: (which) => fuzz[which] ?? 0n,
   },
   unkernel: jit.imports,
 });

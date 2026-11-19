@@ -48,16 +48,13 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   block and the spinlocks taken out of turn (below, SMP, Waiting for
   another CPU). There
   `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
-- The switch to an arm64 user ABI (kwemu ABI 9) is, for now, one more
-  patch at the end, `wasm: run arm64 user space (kwemu ABI 9)`, on top
-  of the riscv series (whose arch and ISA patches it rewrites: registers,
-  syscalls, uapi, ELF, signals, cpuinfo), followed by the arm64 fixes
-  made since (`wasm: clear the exclusive monitor on every return to user
-  mode`) and the kwemu ABI steps (`wasm: kwemu ABI 10: the A64
-  decoded-op tier`, `wasm: kwemu ABI 11: LSE atomics`, `wasm: kwemu ABI
-  12: SHA-512`, `wasm: kwemu ABI 13: SHA-3`, each with the
-  header and what the kernel advertises); fold them into the arch and
-  ISA patches once the port settles.
+- The arm64 user ABI is the last patch, `wasm: run arm64 user space`, on
+  top of the riscv64 series (whose arch and ISA patches it rewrites:
+  registers, syscalls, uapi, ELF, signals, cpuinfo, the feature table and
+  `kw.isa=`, the exclusive monitor on the way to user mode, and the
+  kernel's copy of `kw_emu.h`). An arm64 fix, or a kwemu ABI change that
+  changes the header or what the kernel advertises, is a fixup of that
+  patch.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
   built with `KSRC=/path/x KOUT=vendor/build/kernel-x kernel/build.sh kernel`.
@@ -102,11 +99,15 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 13 (A64 since 9; 1 to 8 were riscv64). `tlb.c` compares it with `kw_abi_version()` at
-  boot and panics on a mismatch. Bump it, in both copies, on any change to
-  the layout or the semantics. A new `KW_ISA_*` bit is an ABI change;
+- `KW_ABI_VERSION` is 2 (1 was the riscv64 guest's contract as a whole,
+  2 the arm64 one). `tlb.c` compares it with `kw_abi_version()` at boot
+  and panics on a mismatch. Bump it, in both copies, on any change to the
+  layout or the semantics; the header describes the current contract
+  only, no list of steps. A new `KW_ISA_*` bit is an ABI change;
   implementing an extension that already has a bit is not. Host imports
-  (below) are not part of it.
+  (below) are not part of it. Nothing persistent keys on the number
+  (snapshots check the kernel's fingerprint), so a bump needs no
+  migration.
 - Optional ISA extensions: `kw_cpu_init` enables every one kwemu
   implements, and `tlb.c` then calls `kw_isa_init()` (cpu.c), which calls
   `kw_set_isa()` once with what `kw.isa=` leaves on and advertises exactly
@@ -118,8 +119,8 @@ patch re-export.
   drops all decoded code.
 - `KW_CPU_SIZE` is 8 MiB, reserved statically (`kw_cpu_storage`), so it
   comes out of guest RAM. Zig checks its layouts against the header at
-  compile time through translate-c. About 53 KiB of it is spare
-  (kwemu.md, Sizes).
+  compile time through translate-c. About 28 KiB of it is spare with the
+  JIT (kwemu.md, Sizes).
 - kwemu has no allocator and no globals. All state lives in `struct kw_cpu`
   and `struct kw_regs`, which the kernel owns. One exception: the atomics
   build (SMP kernels) has one static word, `pair_lock` (128-bit STXP and
@@ -133,11 +134,15 @@ patch re-export.
   `flush_tlb_*` and `update_mmu_cache`, and `kw_set_pgd` from `switch_mm`.
   Code the kernel or the host writes (COW copies, page reuse, file data,
   kwshm) becomes visible only after one of these calls or a guest IC IVAU.
-  The A64 interpreter decodes from memory every time, so it sees guest
-  stores into code at once (kw_emu.h, Code coherence).
-- `kw_clear_reservation` must be called on every context switch, signal
-  delivery and sigreturn (process.c, signal.c), or the exclusive monitor
-  (LDXR/STXR) breaks.
+  kwemu tracks a CPU's own guest stores into decoded code exactly, so they
+  need no flush (kw_emu.h, Decoded-code cache).
+- `kw_clear_reservation` runs before every `kw_run()` in
+  `user_mode_loop()` (traps.c), as ERET clears the exclusive monitor on
+  arm64, so an STXR after a syscall, a fault, an interrupt or a task
+  switch fails. That is the only call of `kw_run()`, and nothing runs
+  between the two (UP `local_irq_enable()` only sets a flag, SMP sets the
+  flag without delivering, and there is no preemption), so a context
+  switch, signal delivery and sigreturn need no call of their own.
 - kwemu polls `*irq_pending` (`&wasm_host_irqs`) on entry and at every
   block end, so at least every 64 instructions, and returns
   `KW_EV_INTERRUPT`.
@@ -154,8 +159,7 @@ patch re-export.
   are NOPs.
 - The JIT imports (`unkernel.kw_host_jit_caps`/`compile`/`free`) are not
   part of the ABI version (a host takes a missing `flags` argument of
-  `compile`, from a kwemu before ABI 8, as 0), and the kernel never calls
-  them. Only a kwemu built with `-Dkwemu-jit=true` imports them (it then
+  `compile` as 0), and the kernel never calls them. Only a kwemu built with `-Dkwemu-jit=true` imports them (it then
   owns 1024 stub functions in the kernel's exported
   `__indirect_function_table`; kwemu.md, a64.md JIT), which build.sh
   does unless `KWEMU_JIT=0`; the kernel then has no JIT imports at all.
@@ -164,9 +168,9 @@ patch re-export.
 
 - The kernel runs only in the direct map: virtual = physical = linear
   address, and `phys_base` is 0.
-- User page tables use the Sv39 layout with riscv's PTE bits
-  (`_PAGE_PROT_NONE` = G, the riscv swap format), in 3 levels with the PUD
-  folded.
+- User page tables use the RISC-V Sv39 layout and PTE bits, whatever the
+  guest ISA (`_PAGE_PROT_NONE` = G, arch/riscv's swap format), in 3 levels
+  with the PUD folded.
 - vmalloc returns direct-mapped memory, so `vmap()` of scattered pages
   fails (nothing in this config hits that). There is no `VMAP_STACK` and no
   stack guard, and per-cpu memory uses `percpu-km`.
@@ -767,7 +771,7 @@ numbers and open issues: status.md item 8.
   store, so the user stores made before the compile are visible); kwemu
   clears `jit_busy`, then takes `flush_all` and flushes everything before
   it runs user code (`kw_flush_later()`, tlb.c; kwemu.md, JIT on several
-  harts). `flush_tlb_all()` skips both kinds too. Unlike on x86 this
+  CPUs). `flush_tlb_all()` skips both kinds too. Unlike on x86 this
   holds when page tables are freed too: a lazy CPU runs no user code and
   no uaccess walk for the mm, and kwemu walks the table only while it
   runs user code and caches no table entries. `update_mmu_cache_range()`
@@ -905,7 +909,7 @@ numbers and open issues: status.md item 8.
 - **kwemu** gets a `struct kw_cpu` per CPU, with the ISA CPU 0 enabled,
   and a JIT tier per CPU: each CPU's kwemu compiles into its own
   instance's function table through its own host (kwemu.md, JIT on
-  several harts). A `kw_cpu` is only ever used by its CPU's instance
+  several CPUs). A `kw_cpu` is only ever used by its CPU's instance
   (`wasm_kw_cpu` is `kw_cpus[smp_processor_id()]`, and a task that moves
   starts afresh on the new CPU), so nothing compiled on one CPU is
   reachable from another. Its atomics build makes exclusives and
@@ -1197,7 +1201,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     must start their new image on another CPU; `/proc/kwmove` must show
     moves and no lost drops.
   - `jit:` (more than one CPU online; skipped otherwise; compiled code on
-    several CPUs, kwemu.md, JIT on several harts): `hot()` and `fphot()`
+    several CPUs, kwemu.md, JIT on several CPUs): `hot()` and `fphot()`
     three times each on every CPU at once (one pinned thread per CPU),
     while the main thread sends each a signal every millisecond whose
     handler sets FE_TOWARDZERO and raises DZ (sigreturn must undo both);

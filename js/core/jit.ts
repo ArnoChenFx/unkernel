@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Host side of kwemu's JIT tier (src/emu/jit.zig; contract in
+// Host side of kwemu's JIT tier (src/emu/jitcore.zig; contract in
 // include/kw_emu.h and .agents/kwemu.md).
 //
 // A kernel whose kwemu is built with the tier (kernel/build.sh does so by
@@ -100,7 +100,7 @@ export interface KwemuStats {
 	/**
 	 * kwemu.Stats as 64-bit words, in the layout of src/emu/kwemu.zig: 11
 	 * counters, op_hist[192], JIT insns, hand-backs, hb[192], hb_gen[40],
-	 * jx[64] (indices in src/emu/jit.zig Jx), gen_words[3 * 512] (A64:
+	 * jx[64] (indices in src/emu/jitcore.zig Jx), gen_words[3 * 512] (A64:
 	 * `generic` ops by word, kwemu.zig countGenWord).
 	 */
 	words: number[];

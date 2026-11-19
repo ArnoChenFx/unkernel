@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! kwemu JIT tier, the ISA-neutral core (optional: `-Dkwemu-jit`, wasm64
-//! builds only). Two users: riscv's emitter (src/emu/jit.zig, kept for
-//! reference) and A64's (src/a64/jit/emit.zig). Each instantiates `Jit(I)`
-//! with its ISA hooks `I` (see `Jit`), as kwemu.Cpu.lookupIn does for the
-//! block cache.
+//! builds only). The ISA's emitter (A64: src/a64/jit/emit.zig)
+//! instantiates `Jit(I)` with its ISA hooks `I` (see `Jit`), as
+//! kwemu.Cpu.lookupIn does for the block cache.
 //!
 //! Hot decoded blocks (see `Block` in kwemu.zig) are translated into small
 //! wasm modules that the host compiles and installs into a slot of the
@@ -39,7 +38,7 @@
 //! installed is harmless. The table never grows.
 //!
 //! Generated function: f(x, cpu, irqp, jl: i64) -> i64, where x = &regs.x
-//! (x[32] = pc on both ISAs), irqp = cpu->irq_pending or a zero word, jl =
+//! (x[32] is pc in struct kw_regs), irqp = cpu->irq_pending or a zero word, jl =
 //! budget for extra self-loop iterations and region members (`run` has
 //! already charged the first pass). It returns (jl_left << 8) | code:
 //!   0..63    handed back before op k (not executed), registers written back;
@@ -192,12 +191,12 @@ pub const State = if (enabled) extern struct {
     /// Per pool entry: module size in bytes.
     size: [npool]u16,
     /// AES tables the compiled AES ops read cpu-relative (`AesTab`;
-    /// riscv's Zkne/Zknd, A64's AESE/AESD/AESMC/AESIMC).
+    /// A64's AESE/AESD/AESMC/AESIMC).
     aes: AesTab,
     buf: [buf_size]u8,
 } else extern struct {};
 
-/// Tables for the compiled AES ops (riscv, A64), filled by `init` from core.aes
+/// Tables for the compiled AES ops, filled by `init` from core.aes
 /// (compiled code may only address cpu-relative data, never the library's
 /// own constants). te[x]: MixColumns of the column (S[x], 0, 0, 0); a byte
 /// in row r contributes rotl(te[x], 8 r). td[x]: InvMixColumns of (S^-1[x],
@@ -419,10 +418,10 @@ fn allocSlot(cpu: *Cpu) usize {
 
 /// A compile (gathering a region, emitting its module, the host's compile
 /// and the slot bookkeeping) is a window in which other CPUs need not wait
-/// for this one's TLB flushes (kw_emu.h, "Flushes during a JIT compile"):
+/// for this one's TLB flushes (kw_emu.h, "jit_busy / flush_all"):
 /// nothing in it runs guest code or reads guest memory or a page table
 /// (only struct kw_cpu: decoded ops, exec-TLB generations, the emit
-/// buffer). Without atomics (one hart) nobody sets flush_all, and these
+/// buffer). Without atomics (one CPU) nobody sets flush_all, and these
 /// are plain stores and loads.
 inline fn windowOpen(cpu: *Cpu) void {
     @atomicStore(u32, &cpu.jit_busy, 1, .seq_cst);

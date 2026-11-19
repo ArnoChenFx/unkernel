@@ -148,8 +148,7 @@ fn system(s: c.St, inst: u32) c.Error!c.Exit {
 
 /// Complete an MRS CNTVCT_EL0 (Hart.trap == .counter, Hart.trap_val = Rt):
 /// `now` is the number of instructions this CPU retired before it
-/// (kw_cpu.icount plus the current run's), the A64 counterpart of riscv's
-/// time CSR. The caller counts it as retired.
+/// (kw_cpu.icount plus the current run's). The caller counts it as retired.
 pub fn finishCounter(s: c.St, now: u64) void {
     c.setX(s, @intCast(s.h.trap_val), now);
     s.r.pc +%= 4;

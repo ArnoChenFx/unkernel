@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Host side of kwemu's optional JIT imports (src/emu/jit.zig), for the
+// Host side of kwemu's optional JIT imports (src/emu/jitcore.zig), for the
 // tests and benchmarks: compiles each module synchronously against the
 // instance's memory and installs its "f" into the requested slot of the
 // exported __indirect_function_table (table64: BigInt indices), saving the

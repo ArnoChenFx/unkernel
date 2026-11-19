@@ -20,7 +20,10 @@ a separate chunk loaded only after the preflight passes), `windows.ts`
 it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
-`preview.ts` (the guest preview's page side), `sw.ts` (the service
+`preview.ts` (the guest preview's page side), `open.ts` (the guest's
+`open` and `xdg-open`, host commands: a URL on the guest's own address in
+the preview, any other http(s) URL in a new tab, each only after the user
+confirms), `sw.ts` (the service
 worker's registration and the update check), `launcher.ts` (how a demo
 runs; the demos are in `src/demos/`), `style.css`
 (Tailwind theme, the dialog, wterm's colours). `src/components/`: `App.tsx`
@@ -562,7 +565,8 @@ docked right of the stage (`Preview.tsx`), or in a tab of its own, at
 (`preview.ts`). Ways to open it: Ctrl-A p (it opens on the last port, or
 8000; pressed again it hides or shows the panel), the Preview section in
 the Guest tab, the status line's globe icon on the right (`#bar-preview`,
-which hides and shows it; the port is in its tooltip), and `KW.preview.open(port)`. On wide screens the panel takes part of the
+which hides and shows it; the port is in its tooltip), `KW.preview.open(port)`, and in the guest
+`open` or `xdg-open http://localhost:<port>/<path>` (`open.ts`, after a confirm). On wide screens the panel takes part of the
 stage's width, so the terminal (and the display offered to the guest) gets
 narrower; its left edge sets the split (localStorage `kw.previewSplit`,
 default 40%) and `[□]` fills the stage. On narrow ones (under 720 px) it
@@ -783,6 +787,9 @@ npm dependencies and start the built server (`--dev` starts the Vite dev
 server). They use the newest Playwright Chromium in `~/.cache/ms-playwright`
 unless `--chrome PATH` or `CHROME=` is given. There is no WebKit test
 script.
+
+`open.test.ts` is no browser test: a plain unit test of `src/open.ts`
+(`node --test web/test/open.test.ts`).
 
 ## Engines
 

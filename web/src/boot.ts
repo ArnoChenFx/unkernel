@@ -27,7 +27,8 @@ import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
 import { showcaseFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
-import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.ts";
+import { openCommand } from "./open.ts";
+import { attachPreview, closePreview, openPreview, previewSupported, previewUrl } from "./preview.ts";
 import { writeReadme } from "./readme.ts";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
@@ -970,6 +971,17 @@ export function start(): void {
 		KW.vm = vm;
 		// The guest preview (preview.ts) relays /vm/<id>/<port>/ to vm.fetch().
 		attachPreview(vm);
+		// The guest's open and xdg-open (open.ts): its URLs, in the preview or a
+		// new tab once the user confirms. Added once the kernel runs rather than
+		// as createKernel's commands: spawn() and exec() (the windows, the demos)
+		// would wait for those, and fail if linking them failed.
+		const openUrl = openCommand({
+			ask: (q) => ui.ask(q), dismiss: () => ui.answer(false), previewSupported,
+			preview: (port, path) => { openPreview(port, path); },
+			tab: (url) => { window.open(url, "_blank", "noopener,noreferrer"); },
+		});
+		for (const name of ["open", "xdg-open"])
+			vm.addCommand(name, openUrl, { timeout: 120000 }).catch((e: Error) => ui.hostLog(`[host] the guest's ${name}: ${e.message}`));
 		checkReady();
 		const inst = local();
 		if (inst) {

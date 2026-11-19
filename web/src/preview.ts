@@ -177,12 +177,12 @@ const portOf = (v: unknown): number | null => {
 /** The port opened last (kept in localStorage), else 8000. */
 export const lastPreviewPort = (): number => portOf(store("previewPort")) ?? 8000;
 
-/** Open the preview panel on a guest port (shown; replaces the port shown). False: not a port. */
-export function openPreview(port: number | string = lastPreviewPort()): boolean {
+/** Open the preview panel on a guest port, at path (shown; replaces the page shown). False: not a port. */
+export function openPreview(port: number | string = lastPreviewPort(), path = "/"): boolean {
 	const n = portOf(port);
 	if (n === null) return false;
 	store("previewPort", String(n));
-	ui$().set((s) => ({ preview: { port: n, shown: true, fill: s.preview?.fill ?? false } }));
+	ui$().set((s) => ({ preview: { port: n, path, shown: true, fill: s.preview?.fill ?? false } }));
 	return true;
 }
 

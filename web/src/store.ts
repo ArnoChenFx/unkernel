@@ -51,8 +51,12 @@ export const MAX_WINDOWS = 9;
 /** fg: the program in the foreground of a tty N window, when it is not the shell (windows.ts); else "". */
 export interface Win { n: number; name: string; state: "opening" | "open" | "ended"; note: string; fg: string }
 
-/** A question in the confirm dialog; `cancel` labels the other button (default "Cancel"). */
-export interface Ask { title: string; msg: string; ok: string; cancel?: string; danger?: boolean; id: number }
+/**
+ * A question in the confirm dialog; `cancel` labels the other button (default "Cancel"), `url` shows
+ * under the message. `untrusted` (the guest asks, open.ts): OK (focused, as always), Enter and y
+ * confirm only after a moment, so a key or a click meant for the terminal does not confirm it.
+ */
+export interface Ask { title: string; msg: string; ok: string; cancel?: string; danger?: boolean; url?: string; untrusted?: boolean; id: number }
 
 export interface UiState {
 	state: State;
@@ -97,8 +101,8 @@ export interface UiState {
 	win: number;
 	/** The terminal windows besides window 0, by number. */
 	wins: Win[];
-	/** The guest preview panel (preview.ts, components/Preview.tsx): the guest port shown, whether it is shown or hidden, and whether it fills the stage ([□]); null: closed. */
-	preview: { port: number; shown: boolean; fill: boolean } | null;
+	/** The guest preview panel (preview.ts, components/Preview.tsx): the guest port shown and the path it opened on (default /), whether it is shown or hidden, and whether it fills the stage ([□]); null: closed. */
+	preview: { port: number; path?: string; shown: boolean; fill: boolean } | null;
 	/** The demo launcher (components/Launcher.tsx) covers the page. */
 	launcher: boolean;
 	/** The Options as chosen (components/Options.tsx), read by nextSettings(). */

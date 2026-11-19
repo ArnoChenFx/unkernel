@@ -85,20 +85,33 @@ export function PasteDialog() {
 	);
 }
 
+/** How long OK waits before it confirms, for a question from the guest. */
+const UNTRUSTED_MS = 700;
+
 /**
  * The confirm dialog (ui.ask()): a native modal <dialog>, so the page under
  * it is inert, focus stays in it and Esc cancels, with the browser doing it.
  * OK has focus, so Enter confirms, as with confirm(); y confirms and n
- * cancels too, as in tmux. Closing returns focus to where it was.
+ * cancels too, as in tmux. Closing returns focus to where it was. A question
+ * from the guest (`untrusted`, open.ts) has OK focused too, but OK, Enter
+ * and y confirm only after UNTRUSTED_MS (OK is dimmed until then, not
+ * disabled, which would lose the focus), so a key or a click meant for the
+ * terminal does not confirm it.
  */
 export function Confirm() {
 	const ask = useStore((s) => s.ask);
 	const ref = useRef<HTMLDialogElement>(null), ok = useRef<HTMLButtonElement>(null);
+	const [armed, setArmed] = useState(0);
 	useEffect(() => {
 		const d = ref.current!;
-		if (ask && !d.open) { d.showModal(); ok.current?.focus(); }
-		else if (!ask && d.open) d.close();
+		if (!ask) { if (d.open) d.close(); return; }
+		if (!d.open) d.showModal();
+		ok.current?.focus();
+		if (!ask.untrusted) return;
+		const t = setTimeout(() => setArmed(ask.id), UNTRUSTED_MS);
+		return () => clearTimeout(t);
 	}, [ask]);
+	const waiting = !!ask?.untrusted && armed !== ask.id;
 	const ui = KW.ui!;
 	return (
 		<dialog id="confirm" ref={ref} aria-labelledby="confirm-title" aria-describedby="confirm-msg"
@@ -106,6 +119,7 @@ export function Confirm() {
 			onKeyDown={(e) => {
 				if (e.ctrlKey || e.altKey || e.metaKey || e.repeat || (e.key !== "y" && e.key !== "n")) return;
 				e.preventDefault();
+				if (e.key === "y" && waiting) return;
 				ui.answer(e.key === "y");
 			}}
 			className="m-auto w-[min(420px,calc(100%-24px))] overflow-visible border border-line-strong bg-bg px-4 pt-5 pb-4 font-mono text-[12.5px] text-fg shadow-[0_16px_48px_rgba(0,0,0,.8)] backdrop:bg-black/65">
@@ -113,9 +127,10 @@ export function Confirm() {
 				<>
 					<h2 id="confirm-title" className="absolute -top-2 left-3 bg-bg px-1.5 text-[12px] leading-4 font-normal"><span className="text-faint">┤</span> {ask.title} <span className="text-faint">├</span></h2>
 					<p id="confirm-msg" className="leading-relaxed text-muted">{ask.msg}</p>
+					{ask.url && <p id="confirm-url" className="mt-3 max-h-40 overflow-y-auto border border-line px-2 py-1.5 break-all text-fg">{ask.url}</p>}
 					<div className="mt-4 flex justify-end gap-2">
 						<button id="confirm-cancel" type="button" title="Cancel (n, Esc)" className="btn btn-sm" onClick={() => ui.answer(false)}>{ask.cancel ?? "Cancel"}</button>
-						<button id="confirm-ok" ref={ok} type="button" title={`${ask.ok} (y, Enter)`} className={`btn btn-sm ${ask.danger ? "btn-danger" : "btn-primary"}`} onClick={() => ui.answer(true)}>{ask.ok}</button>
+						<button id="confirm-ok" ref={ok} type="button" aria-disabled={waiting || undefined} title={`${ask.ok} (y, Enter)`} className={`btn btn-sm ${waiting ? "cursor-default opacity-50" : ""} ${ask.danger ? "btn-danger" : "btn-primary"}`} onClick={() => { if (!waiting) ui.answer(true); }}>{ask.ok}</button>
 					</div>
 				</>
 			)}

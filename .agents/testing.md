@@ -25,7 +25,7 @@ Run the row for what you changed, and no more.
 | Network | `pnpm test:net` |
 | SMP code (`CONFIG_SMP` paths, per-CPU data, IPIs, CPU parking, `js/core/cpu.ts`; kernel/smp.md) | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--cpus 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
 | Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |
-| Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
+| Page (`web/`) | `pnpm typecheck:web`; `node --test web/test/open.test.ts`; `pnpm build:web` |
 
 The optional checks boot the same bundle as `pnpm test:api`, which already
 runs shell commands and `glimmer --test` inline and in worker mode (most of
@@ -61,7 +61,7 @@ contains changes to that area.
 | Network (SDK or kwnet) | `pnpm test:net`; `UNKERNEL_TEST_WISP=1 node --test test/api.test.ts` |
 | SDK (`js/`, `package.json`, `build.config.ts`) | `pnpm typecheck`; `pnpm test:tty`; `pnpm test:http`; `pnpm test:9p`; `pnpm test:api`; `pnpm test:distro`; `pnpm build`, then the kwtest and userland rows with `node dist/cli.mjs`, `UNKERNEL_DIST=1 node --test test/api.test.ts`, and `npm pack --dry-run`; after a change to `fetchDistro()` or the CLI's `--distro`, the installed package (`npm pack`, unpacked elsewhere) against a local copy of a release (a static server over a directory with `distros.json` and the images, `UNKERNEL_RELEASE_URL=http://127.0.0.1:PORT/ UNKERNEL_CACHE_DIR=/tmp/c node PKG/dist/cli.mjs`): a download, a second run from the cache, a corrupted cache file downloaded again, and the server stopped (an error naming `--distro none` without a cache, the cached image with one) |
 | Host file systems (`fs.ts`, `9p.ts`, `memfs.ts`, `mounts.ts`, `nodefs.ts`, `kw9p.c`) | after a kw9p change `kernel/build.sh base`; `pnpm test:9p`; `pnpm test:api`; `node test/9p-bench.ts` and with `--worker`, against js.md's table |
-| Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` (it uses a local build when there is one, else the newest release's base bundle and distro images, and refuses a release without them or of another kwemu ABI; web.md, The page's kernel and distro images) |
+| Page (`web/`) | `pnpm typecheck:web`; `node --test web/test/open.test.ts`; `pnpm build:web` (it uses a local build when there is one, else the newest release's base bundle and distro images, and refuses a release without them or of another kwemu ABI; web.md, The page's kernel and distro images) |
 
 `node test/glimmer-check.mjs --run` takes `--no-sound` (no sound card)
 and `--worker` (through the CLI's `--worker`, with input and frames in

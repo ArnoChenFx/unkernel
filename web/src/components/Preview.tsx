@@ -75,8 +75,8 @@ export function Preview() {
 	}, [port]);
 
 	if (!p) return null;
-	const url = wait === null ? previewUrl(port) : "";
-	const prefix = url.slice(0, -1);
+	const url = wait === null ? previewUrl(port, p.path) : "";
+	const prefix = url && previewUrl(port, "");
 	const fill = p.fill, docked = !narrow && !fill;
 
 	const resize = (e: ReactPointerEvent<HTMLElement>) => dragSplit(e, split, setSplit, setDragging, "previewSplit");

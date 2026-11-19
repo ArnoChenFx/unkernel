@@ -36,7 +36,7 @@
 //                                      plays; the first tap or key press after that unmutes.
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
-//                                      mounted (the panel's Safe mode button; kernel/README.md)
+//                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
 //   ?worker=1                          experimental: run the kernel in a Web Worker (the SDK's
 //                                      createKernel({ worker: true })), so it never blocks the
 //                                      page. The data disk and the Wisp network are built in the

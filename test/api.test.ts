@@ -45,7 +45,7 @@ const kernelImports = WebAssembly.Module.imports(await WebAssembly.compile(kerne
 const kernelHas9p = kernelBytes.includes("9P2000.L");
 const kernelHasVsock = kernelImports.some((i) => i.name === "wasm_driver_vsock_init");
 const kernelHasShm = kernelImports.some((i) => i.name === "wasm_driver_shm_init");
-/** Was kwemu built with its JIT tier (kw_host_jit_*)? Not yet for the A64 guest CPU (.agents/a64.md). */
+/** Was kwemu built with its JIT tier (kw_host_jit_*)? kernel/build.sh builds it unless KWEMU_JIT=0 (.agents/a64/jit.md). */
 const kernelHasJit = kernelImports.some((i) => i.name === "kw_host_jit_caps");
 
 type BootOptions = NonNullable<Parameters<typeof createKernel>[0]>;

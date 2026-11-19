@@ -5,8 +5,8 @@ MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
 Linux ELF (ARMv8.0-A with FP and AdvSIMD, plus AES, PMULL, SHA1, SHA2,
 CRC32, LSE, SHA512 and SHA3), run by kwemu, a software CPU in Zig linked
 into the kernel: a reference interpreter, a decoded-op tier and a wasm
-JIT. README.md is the overview, and kernel/README.md covers the kernel
-side, the devices and the guest image.
+JIT. README.md is the overview, and kernel/README.md maps the kernel
+directory and its build steps.
 
 kwemu's guest CPU is AArch64 (src/a64, .agents/a64.md: a decoded-op tier
 over a reference interpreter, and a JIT that compiles hot blocks to
@@ -14,15 +14,15 @@ wasm), on an ISA-neutral MMU, block cache and JIT core (src/emu,
 .agents/kwemu.md); its contract with the kernel is `include/kw_emu.h`
 (ABI 2). The kernel presents the arm64 user ABI (kernel.md, arm64 user
 ABI), and the guest image is Alpine's aarch64 minirootfs
-(kernel/README.md, alpine).
+(.agents/kernel/guest.md).
 
 `.agents/` has one file per area. Read the one for the area you change:
 
 | File | Covers |
 | --- | --- |
-| [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, config |
-| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, the decoded-op tier and its op set, coherence on SMP, tests, coverage tool, numbers, the JIT (family API, flags contract, tests) |
-| [.agents/kwemu.md](.agents/kwemu.md) | the ISA-neutral core: MMU and TLBs, block cache, JIT core (regions, invariants, SMP, host contract), softfloat, measured numbers, rejected designs |
+| [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, the two builds and two kernels; `.agents/kernel/` holds SMP, parking and snapshots, devices, config, kernel tests, guest images |
+| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, group-file conventions, adding instructions, tests; `.agents/a64/` holds instruction semantics and the coverage tool (`isa.md`), the decoded-op tier (`tier.md`), the JIT (`jit.md`), numbers, rejected designs and levers (`performance.md`) |
+| [.agents/kwemu.md](.agents/kwemu.md) | the ISA-neutral core: MMU and TLBs, block cache, JIT core (regions, invariants, SMP, compile window, host contract), softfloat, measuring, rejected designs |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
@@ -94,7 +94,7 @@ Details are in the area files.
   suspend under JSPI (kernel.md).
 - Every kernel thread needs a `kw_park_point()` in its loop, or parking
   (and so snapshots) fails with EBUSY naming it (kernel.md, Parking).
-- JIT output must match the interpreter exactly (kwemu.md, Invariants; a64.md, JIT).
+- JIT output must match the interpreter exactly (kwemu.md, Invariants; a64/jit.md).
 - SMP kernels: a task moves to another CPU only where its JSPI stack
   (that CPU thread's) can be dropped and it can start on a fresh one: a
   user task on its way to user mode, a kernel thread at a restart point.
@@ -113,7 +113,7 @@ Details are in the area files.
   there; `alpine.sh` stops until they match (guest-packages.md).
 - Guest C programs in the image (`kernel/guest/*.c`) are built for the
   generic ARMv8.0 CPU. Check new code with the coverage classifier
-  (a64.md, Coverage tool): it lists what kwemu rejects (later architecture
+  (a64/isa.md, Coverage tool): it lists what kwemu rejects (later architecture
   features: SVE, SM3, SM4, ...).
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.

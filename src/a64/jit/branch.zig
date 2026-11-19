@@ -25,7 +25,7 @@
 //!  - b_f emits nothing, bl_f and bl set x30, blr sets x30 after reading
 //!    its target (BLR X30 jumps to the old x30).
 //! Conditions come from alu.zig's NZCV model, only through `alu.cond(e,
-//! mask)` (a64.md, the NZCV contract); every exit path syncs it first
+//! mask)` (a64/jit.md, NZCV); every exit path syncs it first
 //! (`e.exit`, `e.backEdge`, `e.toMember` do; the select path calls
 //! `jit.sync` itself).
 //!

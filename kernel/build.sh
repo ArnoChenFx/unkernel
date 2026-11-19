@@ -207,7 +207,7 @@ prepare_kernel_tree() {
 }
 
 # The zig build option for the kwemu JIT tier (src/emu/jitcore.zig, A64:
-# src/a64/jit/; .agents/a64.md, JIT), on unless KWEMU_JIT=0. Hosts without
+# src/a64/jit/; .agents/a64/jit.md), on unless KWEMU_JIT=0. Hosts without
 # the JIT simply answer kw_host_jit_caps() with 0.
 kwemu_jit_flag() {
 	if [ "${KWEMU_JIT:-1}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi

@@ -17,7 +17,7 @@ scanelf.
 What the rebuild avoids: kwemu's JIT compiles integer, load/store and
 branch instructions best; FP and AdvSIMD code is translated only in part
 (scalar FP with a fast path, and where the host has wasm SIMD the integer
-AdvSIMD and crypto instructions; a64.md, JIT), and the rest are calls of
+AdvSIMD and crypto instructions; a64/jit.md), and the rest are calls of
 the interpreter (`generic` ops). Alpine's `-Os` code is almost free of
 them, but gcc's `-O2` is not (the vectorizer, FP registers as spill
 space, scalar AdvSIMD idioms such as `uqsub`). libcrypto keeps
@@ -55,7 +55,7 @@ ones (Measurements).
   registers at all, of libcrypto's 782 C objects 12, of apk-tools' 69 six,
   of zlib's 19 one.
   gcc's outline atomics stay (`-moutline-atomics`, the default: on musl
-  they always take the exclusive path, a64.md, The image).
+  they always take the exclusive path, a64/isa.md, LSE atomics).
 - **Variadic functions keep their FP registers.** A variadic function
   compiled with `-mgeneral-regs-only` does not save the FP argument
   registers in its prologue, so a `double` passed to it reads as garbage
@@ -69,8 +69,8 @@ ones (Measurements).
   kwemu advertises them (`OPENSSL_armcap=0x8fd`; `OPENSSL_armcap` in the
   environment still overrides). Until 2026-11-18 a patch here returned no
   capabilities, because those paths were interpreter calls and slower
-  than the integer code; with the JIT's translation (a64.md, AdvSIMD and
-  crypto in compiled code) they are 1.2-8x faster (Measurements). A host
+  than the integer code; with the JIT's translation (a64/jit.md, AdvSIMD and
+  crypto) they are 1.2-8x faster (Measurements). A host
   without wasm SIMD (or `--no-jit`) runs them as interpreter calls again,
   which is slower for most of them (Measurements).
 - **The linker.** lld (zig's `ld.lld`, through `-fuse-ld=lld -B`), not
@@ -186,7 +186,7 @@ libcrypto with its Zkn/Zbkb code; "integer paths" is the rebuilt
 libcrypto while a patch hid AT_HWCAP from it (2 boots, medians), "HWCAP
 paths" the image now (2026-11-18, the JIT with AdvSIMD and crypto
 translation and SHA512 on, `OPENSSL_armcap=0x8fd`; medians of 3 boots,
-a64.md, AdvSIMD and crypto in compiled code).
+a64/jit.md, AdvSIMD and crypto).
 
 | | riscv64 | aarch64, Alpine's (before the translation) | aarch64, integer paths | **aarch64, HWCAP paths** |
 | --- | ---: | ---: | ---: | ---: |

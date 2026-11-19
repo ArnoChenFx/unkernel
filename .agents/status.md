@@ -174,11 +174,12 @@ Open:
 
 1. **JIT**: bigger regions (most remaining exits leave full ones), exits
    into self-loop modules, cold code, `run`'s entry path and region
-   prologues, NZCV materialisation. Details in a64.md (JIT, What is left)
+   prologues, NZCV materialisation. Details in a64/performance.md (Next levers)
    and kwemu.md (Next steps). The op arena keeps countdowns and compiled
-   code across resets (kwemu.md, Cache; a64.md, The op arena).
+   code across resets (kwemu.md, Interpreter machinery; a64/tier.md,
+   The op arena).
 2. **A64 features**: ARMv8.0-A with AES, PMULL, SHA1, SHA2, CRC32, LSE,
-   SHA512 and SHA3 is in (a64.md, State). Not implemented: SVE/SME, SM3
+   SHA512 and SHA3 is in (a64/isa.md, What is implemented). Not implemented: SVE/SME, SM3
    and SM4, FP16 arithmetic, RNDR, later-architecture encodings (the
    coverage tool lists what corpora use). The interpreter's AES is
    bitsliced; compiled AES reads data-indexed tables, so it is not
@@ -208,12 +209,12 @@ Open:
    Android, and JSPI inside one. A service worker is unsuitable, since
    browsers stop idle ones.
 6. **Ubuntu**: Ubuntu Base 26.10 arm64 boots from a disk (`kernel/build.sh
-   ubuntu`, kernel/README.md), apt works, and systemd boots to
+   ubuntu`, kernel/guest.md), apt works, and systemd boots to
    multi-user.target once installed from apt; the page's Ubuntu demo runs
    the same tarball in a chroot on Alpine. Next: network under systemd
    (systemd-networkd or a kw-net unit), a prebuilt systemd image, BPF,
    keys, IPv6 and cgroup controllers if a service needs them (costs in
-   kernel.md), the ENOSYS and illegal-instruction logging run on 26.10,
+   kernel/config.md), the ENOSYS and illegal-instruction logging run on 26.10,
    and kw-init's poweroff after an apt run that replaced a file its bash
    maps (the read-only remount fails as busy). 26.10 is an interim
    release (support ends mid-2027): pin the next one, or 26.04.x LTS,
@@ -224,7 +225,7 @@ Open:
    (or `fd_pread`-backed) kwblk/kwnet imports, that is what a standalone
    WASI runtime still needs. The generic services already use WASI
    preview 1.
-8. **SMP** (experimental; kernel.md, SMP; js.md, CPU threads; web.md,
+8. **SMP** (experimental; kernel/smp.md; js.md, CPU threads; web.md,
    Several CPUs). The SMP kernel is a second build of the same tree, one
    kernel instance per CPU thread on a shared memory (so cross-origin
    isolation and a secure context in browsers), with per-CPU kwemu state
@@ -233,7 +234,7 @@ Open:
    bundles carry the patch to it. JSPI-suspended stacks cannot move
    between threads, so a task moves only where its stack can be dropped
    and it can start on a fresh one (step 3); parking assumes UP in the
-   places listed in kernel.md, Parking. The steps that built it follow
+   places listed in kernel/parking.md. The steps that built it follow
    with their measurements, taken on the riscv64 guest the project had
    then (2026-11-16 and 17); what is open comes after them.
    Step 1, toolchain (2026-11-16, on the `smp` branches): the UP kernel
@@ -268,7 +269,7 @@ Open:
    `SetPageAnonExclusive`) are needed on SMP, which also adds spinlocks
    (PTE lock, pcp lock: about 4 more locked ops per fault). Fork stays
    at +33% unless folios grow beyond a page.
-   Step 2, an SMP kernel in Node (2026-11-16; kernel.md, SMP; js.md, CPU
+   Step 2, an SMP kernel in Node (2026-11-16; kernel/smp.md; js.md, CPU
    threads): `kw_smp.config` builds it, and `node js/cli.ts --kernel
    <its vmlinux32.wasm> --smp 2` boots Alpine to a shell on two CPUs
    (worker mode, interpreter only). kwtest passes on 2 CPUs (40 of 40
@@ -283,7 +284,7 @@ Open:
    process +58% (atomics, spinlocks, per-CPU offsets, the interrupt
    check on every enable); on two CPUs fork costs +85-92% (the child
    starts on the other CPU: two cross-CPU wakeups).
-   Step 3, moving tasks (2026-11-16; kernel.md, SMP): a user task may
+   Step 3, moving tasks (2026-11-16; kernel/smp.md): a user task may
    move at the reschedule on its way to user mode (after a system call,
    a fault or a slice end) and starts on a fresh stack on its new CPU,
    so the load balancer and affinity changes now move tasks; one asleep
@@ -315,7 +316,7 @@ Open:
    0, which a CPU takes even while spinning with interrupts off, so the
    session ends with that CPU's code (a panic and a poweroff on CPU 1
    were run; the spinning case only by reading the code).
-   TLB flushes and clocks (2026-11-16; kernel.md, SMP, MM and Costs):
+   TLB flushes and clocks (2026-11-16; kernel/smp.md, MM and Costs):
    a flush no longer waits for a CPU in lazy TLB mode (it flushes when
    it uses the mm again), a PTE that only gained access is flushed on
    this CPU alone, the teardown of a whole mm clears PTEs without
@@ -353,7 +354,7 @@ Open:
    gzip/bzip2/awk jobs 1.94x and 3.81x; compiled code runs as fast as
    on the UP build (kwemu.md, Numbers). Shootdown answers from a CPU in
    compiled code take 1.8 µs at the median.
-   Step 5, the host devices on SMP (2026-11-16; kernel.md, SMP,
+   Step 5, the host devices on SMP (2026-11-16; kernel/smp.md,
    Devices): kwblk, kwshm, kwfb, kwinput and kwsnd now work on SMP; every
    device import still runs on CPU 0. kwblk hands another CPU's requests
    to CPU 0 through a list and IRQ 3; the others call their imports
@@ -378,7 +379,7 @@ Open:
    writeback) and as fast as CPU 0 with it off. The SMP build on one CPU
    read and wrote sequentially at UP's rates and created small files
    about 25% slower (its general cost, step 2).
-   Step 6, waits under host load (2026-11-16; kernel.md, SMP, Waiting
+   Step 6, waits under host load (2026-11-16; kernel/smp.md, Waiting
    for another CPU; study in `vendor/smp-deferred/load/README.md`): a
    CPU that waits for another (a spinlock, a cross-CPU call's answer,
    `smp_cond_load_*()`) spins 20 µs and then blocks its thread until an
@@ -403,7 +404,7 @@ Open:
    kwstorm with kwmmstress and with kwtlb on 2 and 4 CPUs, the block
    scenario of step 5, glimmer-check and the api tests on 2 CPUs pass;
    the UP build is the same binary.
-   Step 7, spinlocks taken out of turn (2026-11-17; kernel.md, SMP,
+   Step 7, spinlocks taken out of turn (2026-11-17; kernel/smp.md,
    Waiting for another CPU; evaluation in
    `vendor/smp-deferred/load/README.md`, Patch 2 on realistic
    workloads): with `kw_spin_unfair=1`, the default, a CPU takes a
@@ -486,8 +487,8 @@ Open:
    ring's full paths with worker threads (4 KiB and 16 KiB rings, a
    reader busy 30 of every 40 ms) lost and reordered nothing, and a
    reader stuck for 0.6 s made "post" writers drop rather than wait.
-   Uaccess races (2026-11-17, after step 7; kernel.md, Memory model and
-   SMP, MM): a system call could fail with EFAULT on a valid address
+   Uaccess races (2026-11-17, after step 7; kernel.md, Memory model, and
+   kernel/smp.md, MM): a system call could fail with EFAULT on a valid address
    (kwmmstress's `getcpu()` once). `kw_user_addr()` gave up after three
    faults, and other threads of the mm can take the page away again
    between a fault that succeeded and the next walk: `MADV_DONTNEED` zaps
@@ -522,7 +523,7 @@ Open:
    api tests on 2 CPUs pass. The UP build changes in `kw_user_addr()`,
    `kw_handle_fault()` and the futex callers. The kernel changes are
    folded into the arch patch and `wasm: SMP`.
-   Placement (2026-11-17; kernel.md, SMP, Placement): what holding a
+   Placement (2026-11-17; kernel/smp.md, Placement): what holding a
    task on its CPU while it is in the kernel cost, measured with a
    scratch suite (`kwmig`: CPU-bound children by fork, fork+exec,
    vfork+exec, shell `&` and `xargs -P`; pipelines; a thread pool fed
@@ -582,7 +583,7 @@ Open:
      per request from another CPU (step 5); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.
    - Parking and snapshots: deferred (decided 2026-11-17). They stay
-     UP only (`KW_PARK` depends on `!SMP`; kernel.md, Parking lists what
+     UP only (`KW_PARK` depends on `!SMP`; kernel/parking.md lists what
      they would need), and the page hides Suspend with several CPUs.
    - Console ring (js.md, CPU threads), paths that never ran: the
      reader's 4 ms polling where the main thread has no
@@ -597,8 +598,8 @@ Open:
      the compile), and so does a flush whose IPI was already on its way
      when the compile began; modules are not shared between CPUs, so a
      task that moves compiles its hot code again; exclusive pairs and
-     CASP stay interpreter calls in compiled code (a64.md, Exclusives and
-     atomics in compiled code).
+     CASP stay interpreter calls in compiled code (a64/jit.md, Atomics in
+     compiled code).
    - Under host load (after steps 6 and 7): a synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
      again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);
@@ -666,7 +667,7 @@ Open:
    exists without a kernel patch.
 10. **Snapshots** (save and restore the machine). Parking and snapshots
     with the console, disks, display, input, sound, shm, vsock and network
-    are in (kernel.md, Parking; js.md; data-disk.md): the SDK's
+    are in (kernel/parking.md; js.md; data-disk.md): the SDK's
     `snapshot({ stop })` and `restore` (inline and in worker mode), the
     CLI's `{save=FILE}`, `{suspend=FILE}` and `--restore`, and the page's
     Suspend and resume offer (web.md). A snapshot stays restorable only
@@ -693,8 +694,8 @@ Open:
     - **Size**: dropping clean page cache before the seal pays off only
       with a root on a disk (the default root is tmpfs: no gain measured,
       2026-11-15).
-    - **SMP**: parking assumes UP in the places listed in kernel.md,
-      Parking (the idle check, unpark while the old stack may still run
+    - **SMP**: parking assumes UP in the places listed in
+      kernel/parking.md, SMP (the idle check, unpark while the old stack may still run
       on another CPU, the idle restart under TINY_RCU, the per-CPU page
       lists drained before the free-page walk).
     Known costs: parking makes epoll_wait and socket-timeout waits return
@@ -704,7 +705,7 @@ Open:
 ## Host file systems: follow-ups
 
 - The patch `9p: add metatimeout` is not upstream. It refuses
-  write-back cache modes (EINVAL; kernel.md, 9p); making it work with
+  write-back cache modes (EINVAL; kernel/devices.md, 9p); making it work with
   them would need a flush of dirty pages before each refresh.
 - An adapter from mountx drivers (MIT) to the `Fs` handler interface is a
   possible follow-up.
@@ -718,7 +719,7 @@ Open:
 ## Open issues
 
 - **aarch64: FMA, AdvSIMD FP and system instructions are calls of the
-  interpreter in compiled code.** The A64 JIT (a64.md, JIT)
+  interpreter in compiled code.** The A64 JIT (a64/jit.md)
   translates every ALU, memory and branch op, the frequent FP moves,
   compares and AdvSIMD moves, scalar FP arithmetic and conversions (with
   a fast path that needs FPCR's defaults and calls the interpreter off
@@ -729,8 +730,8 @@ Open:
   interpreter through the kernel's function table, with the module's
   registers spilled around them (2026-11-18). Exclusives, LDAR/STLR and
   the LSE atomics are inline too, with wasm atomics in SMP builds
-  (atomic.zig); pairs and CASP stay calls. The largest counts left are
-  FMADD and DC ZVA (a64.md, What is left).
+  (atomic.zig); pairs and CASP stay calls. The largest count left is
+  FMADD (a64/performance.md, Where the time goes).
 - **aarch64: OpenSSL's NEON and crypto paths need wasm SIMD in the
   host.** The image's libcrypto now picks its code from HWCAP and the
   kernel enables SHA512 by default, because the JIT translates those
@@ -760,15 +761,15 @@ Open:
   guest-packages.md). The cause on the kwemu or kernel side is not known.
 - **aarch64 apk is still slower than riscv64.** With the rebuilt
   packages and the JIT's generic calls and inline forms (2026-11-18,
-  a64.md, Where apk's time goes) the apk commands take 6-25% longer than
+  a64/performance.md, Where the time goes) the apk commands take 6-25% longer than
   on riscv64, although they run about 12% fewer instructions; sort is
   level, gzip 10% faster, the ash loop 10% slower. apk runs 13-24% of its
   instructions in blocks still counting down to the compile threshold
   (node's npm 55%); a lower threshold and a heat table across processes
   did not pay (compiles cost about 0.3 ms each), nor did a bigger exec
   TLB, a 16 MiB `KW_CPU_SIZE` or chaining interpreted blocks in `runOps`
-  (2026-11-18). The ranked levers left are in a64.md (JIT, What is
-  left): cold code (`runOps` itself, first decodes of each new process),
+  (2026-11-18). The ranked levers left are in a64/performance.md (Next
+  levers): cold code (`runOps` itself, first decodes of each new process),
   `run`'s entry path and region prologues (about 5% each of the
   apk/shell rows), NZCV materialisation (about 3%).
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,

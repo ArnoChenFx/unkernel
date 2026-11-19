@@ -1,9 +1,10 @@
 # Data disk and overlay root
 
-kernel/README.md (Block devices) has the full user-facing description: the
-data disk, the overlay root, safe mode, `kw-overlay`, image updates and
-cut-off apk runs, plus the tested failure cases. This file lists what a
-change must preserve.
+The data disk, the overlay root on it, safe mode, image updates and
+cut-off apk runs: what they do and what a change must preserve. The
+template is built by `kernel/build.sh datadisk` (kernel/guest.md), the
+block device is kwblk (kernel/devices.md), the host side `js/core/block.ts`
+(js.md, Disks).
 
 ## Pieces
 
@@ -27,6 +28,24 @@ change must preserve.
   mounted.
 - `/etc/kw-shutdown` stops all processes, then unmounts `/data`, or under
   the overlay root remounts `/` and `/data` read-only, so ext4 is clean.
+- The switch (`root.sh`): mount the overlay at `/mnt` with `lowerdir=/`,
+  check it (Safe mode, below), remount rootfs read-only, move `/data`,
+  `/dev`, `/proc`, `/sys` and `/run` into it, mount a tmpfs on `/tmp` (it
+  stays in memory, as on the plain root) and `pivot_root`.
+- `kw-overlay`: `status` (root, image, safe mode and why, this boot's
+  messages, the attempt count, image updates, set-aside directories),
+  `restore` (leave safe mode from the next boot), `discard` (alias
+  `reset`: move the changes to `/data/overlay/discarded-TIME` and start
+  over from the image; at once on a plain root, at the next boot on the
+  overlay root).
+- Differences from the plain root: renaming a directory from the image
+  fails with EXDEV and `mv` copies; hard links to image files work (copy-up
+  first); a full data disk is a full root; the shell history persists.
+- A test image by hand: `mke2fs -t ext4 -b 4096 -L kwdata -m 0 -J size=8
+  -E lazy_itable_init=0,lazy_journal_init=0 data.ext4 4G`, then `node
+  js/cli.ts --data data.ext4` (or `--data new.img`, created from the
+  template). Under Node, `--append "console=hvc0 rdinit=/init
+  kw.root=initramfs"` is the escape hatch.
 
 ## Invariants
 
@@ -54,7 +73,24 @@ change must preserve.
     or by `bootwatch` when the system stays empty for 3 s before a prompt
     (a console shell that keeps exiting). `bootwatch` does not count
     `kwtty` (always running) as activity; a kwtty session's shell at its
-    prompt confirms a boot like the console's.
+    prompt confirms a boot like the console's. A prompt is a session
+    leader with a tty that is a shell (or getty or login), sleeping, with
+    the terminal in its own foreground process group and no children, the
+    same process in two samples 0.25 s apart. One reload in the middle of
+    a boot does not trip the count. If a prompt appears after bootwatch
+    wrote `safe`, it takes that back; after 20 s without a prompt it prints
+    how to get out.
+  - Safe mode is sticky because its evidence is not deterministic, and
+    flapping between a broken and a plain root helps nobody. It leaves the
+    changes in place rather than moving them aside: nothing diverges, a
+    false alarm costs one command, and the evidence stays.
+  - Tested (`test/overlay-node.mjs`, `web/test/data.mjs` step 2b, one case
+    under WebKit): garbage `/etc/inittab`, a deleted `/bin/sh` and a
+    truncated `/lib/ld-musl-aarch64.so.1` fall back at the next boot;
+    `/etc/profile` ending in `exit` is caught by bootwatch within about
+    3 s; a `profile.d` script that hangs or spins gives two boots without a
+    prompt, then safe mode; a broken `/sbin/init` gives two kernel panics,
+    then safe mode; a boot killed once before its prompt does not.
 - The console line `kw-overlay: SAFE MODE: <reason>` is what the page
   watches for (`web/src/boot.ts`). Keep that prefix.
 - `kw.root=initramfs` on the command line boots the plain root once, with
@@ -68,12 +104,38 @@ change must preserve.
   in `/data/overlay/image`. Upper copies of new-image package files outside
   `/etc` move to `/data/overlay/rebase-TIME`. It deletes nothing, and a
   rerun gives the same result. It runs offline, before the overlay is
-  mounted.
+  mounted. It writes what apk would have if the user's commands had been
+  run on the new image: the new image's database entries, minus image
+  packages the user removed, plus the user's own packages (with
+  dependencies); the world likewise; `scripts.tar.gz` and `triggers`
+  follow the packages; `/etc` stays as the user left it. Boot prints what
+  was kept, replaced and moved and appends to `/data/overlay/history`.
+  Tested with two images whose package sets differ (nano, libncursesw and
+  ncurses-terminfo-base added, zlib 1.3.2-r1 to 1.4-r0) after `apk add
+  htop tree`, `apk upgrade zlib` and `apk del musl-utils` on the first:
+  `apk info -v` is the new set minus musl-utils and scanelf plus htop, lsof
+  and tree, `apk audit` matches the new image, `apk fix --simulate` has
+  nothing to do.
 - **Cut-off apk runs**: `/etc/apk/commit_hooks.d/kw-overlay.hook` creates
   the marker `lib/apk/db/kw-commit` before each commit and removes it after.
   If the marker survives, `/usr/lib/kw-overlay/apk-cleanup` removes the
   `.apk.<hash>` temporaries and unowned files newer than the marker at the
-  next boot, before the mount.
+  next boot, before the mount (apk 3 unpacks to temporaries, renames once
+  a package is unpacked, and writes its database only at the end; the hook
+  runs even when a package fails). It skips `/root`, `/home`, `/tmp`,
+  `/var/tmp`, `/run` and `/data`, then removes empty unowned directories
+  made since, and logs to `/data/overlay/apk-cleanup.log`. A normal boot
+  pays one file test.
+
+## Numbers
+
+Measured 2026-11 on the riscv64 guest (before 2026-11-19), not rerun:
+boot to a shell 0.34-0.35 s with a fresh data disk and with python3, htop
+and nano installed (0.23 s without a data disk), 479 MiB of 499 free with
+python3 installed; the first boot after an image update with python3
+installed 3.6 s (the rebase), the next 0.29 s; after a cut-off `apk add
+python3` 1.98 s (494 files, 17.5 MiB removed). `apk add` takes as long as
+on the plain root. overlayfs adds 116 KiB (43 KiB gzip) to the kernel.
 
 ## Guest architecture
 
@@ -226,3 +288,6 @@ this narrow.
   automatically.
 - There is no e2fsck in the initramfs. After an unclean stop, the journal is
   replayed on the next mount.
+- An export or import of the data disk is held in memory as a whole.
+- Without a data disk the root is the initramfs, so `apk add` must fit in
+  RAM.

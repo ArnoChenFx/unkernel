@@ -662,8 +662,9 @@ pub fn runOps(o0: [*]const Op, x: [*]u64, cpu: *Cpu, end_pc: u64, pc0: u64, n: u
     var w = word(o);
     // One central dispatch (a plain loop around the switch); see kwemu.md.
     // What follows an op that does not continue is outside the switch, so
-    // `inline else` does not copy it into every kind that can leave (a64.md,
-    // Numbers: the smaller function runs cold code 4-8% faster).
+    // `inline else` does not copy it into every kind that can leave
+    // (a64/performance.md, Rejected designs: the smaller function runs cold
+    // code 4-8% faster).
     while (true) {
         const r: Next = switch (@as(H, @enumFromInt(@as(u8, @truncate(w))))) {
             inline else => |h| blk: {

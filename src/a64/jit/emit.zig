@@ -4,7 +4,7 @@
 //! slot pool, compile policy, module skeleton, regions; this file is its
 //! hook namespace `I`, `C = jc.Jit(@This())`) and the dispatch to the op
 //! families, one file each so that the JIT streams own disjoint files
-//! (a64.md, "JIT"):
+//! (a64/jit.md):
 //!
 //!   alu.zig     moves, ALU immediate and register, logical, CSEL, CCMP,
 //!               ADC, and the NZCV model (lazy flags) the others consume

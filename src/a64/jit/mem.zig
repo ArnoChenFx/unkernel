@@ -16,8 +16,8 @@
 //! Rt, then Rt2) matters only where registers coincide: a writeback whose
 //! base is also a loaded register is dropped, Rt2 is written after Rt.
 //! Store data is read before the writeback (STR Xn, [Xn], #8 stores the
-//! old base). Q registers are two i64 locals (MVP wasm, no SIMD128; a64.md,
-//! JIT). Guest data takes plain wasm loads and stores, also on a shared
+//! old base). Q registers move as one v128 where the host has SIMD, else as
+//! two i64 locals (a64/jit.md, Memory). Guest data takes plain wasm loads and stores, also on a shared
 //! memory, as the tier's fast path takes plain host accesses.
 
 const std = @import("std");

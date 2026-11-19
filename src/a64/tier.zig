@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-//! The A64 decoded-op tier behind kw_run (a64.md, "Decoded-op tier"): the
+//! The A64 decoded-op tier behind kw_run (a64/tier.md): the
 //! block hooks of kwemu.Cpu's block cache (decode, validate), `run`, and
 //! code coherence (IC IVAU and the cross-CPU code epoch).
 //!

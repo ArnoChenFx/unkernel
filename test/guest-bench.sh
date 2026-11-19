@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa
 #
-# The apk and shell bench that .agents/a64.md and guest-packages.md quote:
+# The apk and shell bench that .agents/a64/performance.md and guest-packages.md quote:
 # 20 commands, each timed in the guest from /proc/uptime (10 ms steps).
 # Run it inside the guest (a network for apk; it installs jq, git and
 # python3), e.g. with the directory mounted:
 #   node js/cli.ts --mount test:/t --timeout 600 --input '{8}sh /t/guest-bench.sh\n'
 # Each command prints "RES name seconds rc=N", then "ALL-DONE". Compare
-# builds with boots interleaved and medians (kwemu.md, Numbers).
+# builds with boots interleaved and medians (a64/performance.md, Measuring).
 t() { n=$1; shift; read s _ </proc/uptime; "$@" >/dev/null 2>&1; rc=$?; read e _ </proc/uptime; echo "RES $n $(awk "BEGIN{printf \"%.2f\", $e-$s}") rc=$rc"; }
 t apk-version apk --version
 t apk-update apk update

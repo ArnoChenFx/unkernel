@@ -530,10 +530,10 @@ pnpm install && pnpm dev   # the web page at http://localhost:8080
 zig build test          # emulator tests
 ```
 
-[kernel/README.md](kernel/README.md) covers the kernel, its devices and the
-guest image. [AGENTS.md](AGENTS.md) and [.agents/](.agents/) hold the
-contributor notes: invariants, workflows, which tests to run, and the
-[roadmap](.agents/status.md).
+[kernel/README.md](kernel/README.md) maps the kernel directory and its
+build steps. [AGENTS.md](AGENTS.md) and [.agents/](.agents/) hold the
+contributor notes: the kernel, its devices and the guest image, invariants,
+workflows, which tests to run, and the [roadmap](.agents/status.md).
 
 ## 🙏 Credits
 

@@ -4,8 +4,8 @@ A static page: a full-screen terminal ([wterm](https://wterm.dev/)), with
 more terminal windows over vsock, a tmux-style status line at the bottom
 and terminal-style dialogs, built with React and Tailwind (v4, a black
 theme after Vercel's Geist), Vite (client) and Nitro (server and route
-rules), on the SDK from source. kernel/README.md (Browser page) describes
-it for users.
+rules), on the SDK from source. The top-level README.md describes it for
+users.
 
 ## Files
 
@@ -127,6 +127,16 @@ the dev server's own responses) and `__KW_BUILD__`.
   rounded down, unless the keyboard is up, because iOS can report a shorter viewport there.
 - An unknown or failed boot step must end in `ui.fail(...)`, so the
   indicator turns red and the panel opens. The page must never stay blank.
+  `index.html` installs `error`/`unhandledrejection` handlers first and
+  reports the page module if it has not run after 8 s; `main.tsx` imports
+  the boot chunk only after `checkSupport()` passed. A missing feature, a
+  module that fails to load, a 404, a failed allocation, a panic or a trap
+  all end there.
+- Memory: the default is the SDK's `autoMemoryMiB()` (512 MiB on desktops,
+  256 on phones, less with a low `navigator.deviceMemory`); if the browser
+  refuses the allocation the runtime retries with
+  `DEFAULT_MEMORY_FALLBACK_MIB` (384 down to 64, `js/web/memory.ts`).
+  Alpine boots in 48 MiB.
 - Keyboard shortcuts (`shortcuts.ts`): Ctrl-A is a prefix as in GNU
   screen, and ⌘A too on Apple devices (it takes nothing from the guest). Digits
   are windows, as in screen and tmux (also Ctrl-Shift-digit, which
@@ -181,7 +191,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   `/var/cache/apk` through `vm.exec()`, so apk skips its own index download.
   That covers the enabled repositories and the lazy ones in
   `/etc/kw-apk-lazy` (community), which kw-apk-install reads before it
-  enables one (kernel/README.md). It fetches them as plain http over its own Wisp connection (the mirrors
+  enables one (kernel/guest.md). It fetches them as plain http over its own Wisp connection (the mirrors
   send no CORS headers; apk checks the signature on every load) and keeps
   them in the Cache API (`kw-apk-index-v1`), revalidated after 1 h. The
   pushed file's mtime is the time the mirror last confirmed it. Off with
@@ -226,7 +236,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 ## Several CPUs
 
 The CPUs option (System tab, Options, `#opt-cpus-<n>` radios; `?smp=N`,
-config.ts) boots the SMP kernel on N CPUs (kernel.md, SMP; js.md, CPU
+config.ts) boots the SMP kernel on N CPUs (kernel/smp.md; js.md, CPU
 threads). Default 1: the UP kernel, exactly as without the option (the
 same files and code paths; `#opt-cpus-1`). It applies on Reboot, like the
 other options.

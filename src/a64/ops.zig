@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! The decoded-op tier's op format and its decoder: one raw A64 word to one
-//! 16-byte `Op` (a64.md, "Decoded-op tier"). The semantics are in
+//! 16-byte `Op` (a64/tier.md). The semantics are in
 //! opexec.zig, the block cache and run loop in tier.zig.
 //!
 //! Rules:
@@ -22,7 +22,7 @@
 //!    folded, branch targets and pc-relative addresses absolute);
 //!  - variants of one operation share a kind when a field selects the
 //!    variant without a branch (masks, shift counts), because every kind
-//!    costs dispatch code (kwemu.md, Interpreter).
+//!    costs dispatch code (kwemu.md, Interpreter machinery).
 
 const std = @import("std");
 const c = @import("common.zig");

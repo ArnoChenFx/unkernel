@@ -429,7 +429,7 @@ static void isa_checks(void)
 	midr_ok &= read_line("/proc/cpuinfo", "BogoMIPS", 1, line, sizeof(line));
 	CHECK(midr_ok, "cpuinfo: CPU implementer 0x00, architecture 8, part 0x000, BogoMIPS");
 
-	/* EL0's system registers (.agents/a64.md): CTR, DCZID, TPIDRRO, MIDR, TPIDR. */
+	/* EL0's system registers (.agents/a64/isa.md): CTR, DCZID, TPIDRRO, MIDR, TPIDR. */
 	unsigned long ctr = MRS(ctr_el0), dczid = MRS(dczid_el0), tpidrro = MRS(tpidrro_el0);
 	unsigned long midr = MRS(midr_el1), tp = MRS(tpidr_el0);
 	CHECK(ctr == 0x8444c004 && dczid == 4 && tpidrro == 0 && midr == 0x000f0000 &&
@@ -1411,7 +1411,7 @@ static void fp_checks(char *self)
 	}
 	CHECK(!bad, "fp: FPSR flags (IOC, DZC, OFC, UFC, IXC, IDC, sticky), FZ and DN: %d wrong", bad);
 
-	/* What FPCR and FPSR keep (.agents/a64.md: AHP, DN, FZ, RMode; QC, IDC, IXC..IOC). */
+	/* What FPCR and FPSR keep (.agents/a64/isa.md: AHP, DN, FZ, RMode; QC, IDC, IXC..IOC). */
 	__asm__ volatile("msr fpcr, %2\n\tmrs %0, fpcr\n\tmsr fpcr, %3\n\tmsr fpsr, %2\n\tmrs %1, fpsr\n\tmsr fpsr, xzr"
 			 : "=&r"(fpcr_rb), "=&r"(fpsr_rb) : "r"(~0UL), "r"(old));
 	CHECK(fpcr_rb == 0x07c00000 && fpsr_rb == 0x0800009f, "fp: FPCR reads back %#lx (want 0x7c00000), FPSR %#lx (want 0x800009f)",
@@ -2794,7 +2794,7 @@ static void lse_smp_checks(void)
  * Exclusives and load-acquire/store-release of every size on several CPUs
  * (each thread pinned to its own, smp_pin_self; also on one, where
  * preemption interleaves the threads), long enough for
- * their loops to run compiled (the JIT translates them inline, a64.md):
+ * their loops to run compiled (the JIT translates them inline, a64/jit.md):
  * each thread counts in its own halfword of one shared word by LDXRH/STXRH
  * (a store wider than its access would lose a neighbour's counts), all of
  * them in a shared halfword (LDAXRH/STLXRH), a shared byte (LDXRB/STLXRB)
@@ -3541,7 +3541,7 @@ static void move_checks(void)
 }
 
 /*
- * The JIT on SMP (more than one CPU online; kwemu.md, Several harts): each
+ * The JIT on SMP (more than one CPU online; kwemu.md, JIT on several CPUs): each
  * CPU's kwemu compiles what it runs hot into its own code, so these run
  * compiled loops on several CPUs at once:
  *  - hot() and fphot() on every CPU, each thread pinned, while the main

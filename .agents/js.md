@@ -78,7 +78,7 @@ parts that are easy to get wrong.
   false after the timeout (3 s by default). It then clears the bit itself,
   because a kernel without IRQ 4 never does. Host file systems need no
   sync: each guest write(2) reaches the handler before it returns.
-- Snapshots (`js/core/snapshot.ts`; kernel.md, Parking), inline and in
+- Snapshots (`js/core/snapshot.ts`; kernel/parking.md), inline and in
   worker mode (Worker mode below). `KernelInstance.snapshot({ stop })`
   (`Kernel.snapshot()`) raises IRQ 8 and, when the kernel calls `wasm_snapshot_point` at its consistent
   point, copies the memory (without the pages the kernel reports free,
@@ -149,7 +149,7 @@ parts that are easy to get wrong.
     Connections do not survive, except host file systems' (`mounts`,
     below): after a restore the kernel resets every connected socket the
     host does not keep (kwvsock's park restore notifier asks
-    `wasm_driver_vsock_keep`, answered from `VsockDevice.keep`, kernel.md),
+    `wasm_driver_vsock_keep`, answered from `VsockDevice.keep`, kernel/parking.md),
     so kwtty's programs, `--forward` and `connect()` relays and guest
     clients end, and listeners stay. The CLI's `--forward` listeners and
     the SDK's `vsock.listen()` are the new host's own.
@@ -190,7 +190,7 @@ parts that are easy to get wrong.
   mount, and a MemoryFs mount, across a restore.
 - Any host that instantiates the kernel itself must provide the three
   `unkernel.kw_host_jit_*` imports (caps returning 0 is enough), and the
-  display, input, sound, vsock and shm imports (kernel.md; `_init`
+  display, input, sound, vsock and shm imports (kernel/devices.md; `_init`
   returning -1 is enough, as `test/wasi-node.ts` does, which also answers
   `wasm_driver_vsock_keep` with 0). `Kernel.imports()`
   fills a missing import with a stub that throws when called, so an old
@@ -366,7 +366,7 @@ parts that are easy to get wrong.
 
 ## CPU threads (SMP kernels, `js/core/cpu.ts`)
 
-- An SMP kernel (kernel.md, SMP) imports `wasm_init_flag`,
+- An SMP kernel (kernel/smp.md) imports `wasm_init_flag`,
   `wasm_cpu_count` and `wasm_cpu_start`. `CreateKernelOptions.cpus` (CLI
   `--smp N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
   CPUs `Kernel` offers. A UP kernel ignores it with a log line, so does a
@@ -402,7 +402,7 @@ parts that are easy to get wrong.
   only once CPU 0 suspends, and CPU 0 may be spinning or blocked
   (`memory.atomic.wait32`, which the notify ends) waiting for this CPU; the
   kernel takes that bit even with interrupts off and parks CPU 0
-  (kernel.md, SMP). Its idle blocks in the kernel
+  (kernel/smp.md). Its idle blocks in the kernel
   (`memory.atomic.wait32`), so it needs no event loop.
 - Console output with more than one CPU (`js/core/console-ring.ts`,
   described at its top): every CPU's console writes, CPU 0's too, go into
@@ -459,10 +459,10 @@ parts that are easy to get wrong.
   (`jitSimd()`, exported by the SDK, asked once per host). Every engine with JSPI has SIMD; V8
   on an x86-64 without SSE4.1 refuses it, and kwemu then keeps the i64
   register locals and calls its interpreter for AdvSIMD and crypto
-  (a64.md, AdvSIMD and crypto in compiled code). The test host
+  (a64/jit.md, AdvSIMD and crypto). The test host
   (`test/kwemu-jit-host.mjs`) offers it unless `KWEMU_JIT_SIMD=0`.
 - `sched_yield` is a Suspending import here too (the kernel yields on
-  every CPU, kernel.md, SMP): it returns through `yieldToEventLoop()`.
+  every CPU, kernel/smp.md): it returns through `yieldToEventLoop()`.
   This thread otherwise never reaches its event loop (it idles in the
   kernel), and V8 runs FinalizationRegistry callbacks and the second
   pass of its collections (which frees a collected module's code) only
@@ -474,9 +474,9 @@ parts that are easy to get wrong.
 - A task the kernel moves to another CPU starts there on a fresh stack
   (`isNew`), and its old stack's CPU then calls `wasm_stack_drop(task)`
   (CPU 0's `Kernel` and `runCpu()` both answer it): the host forgets
-  that resumer, whose stack never runs again (kernel.md, SMP).
+  that resumer, whose stack never runs again (kernel/smp.md).
 - Devices stay with CPU 0's `Kernel`: the kernel calls every device
-  import there (kernel.md, SMP, Devices), and the host reads and writes
+  import there (kernel/smp.md, Devices), and the host reads and writes
   their memory (block data, pixels, shm pages, PCM) while other CPUs run.
   Every IRQ bit goes through `Kernel.setIrqBits` (`BlockHost.raise()`
   too): a plain read-modify-write of `wasm_host_irqs` would drop an IPI
@@ -666,7 +666,7 @@ parts that are easy to get wrong.
 
 ## vsock (`js/core/vsock.ts`)
 
-- The host side of kwvsock (kernel.md). `VsockDevice` (`Kernel.vsock`) is
+- The host side of kwvsock (kernel/devices.md). `VsockDevice` (`Kernel.vsock`) is
   the kernel's packet pipe; `VsockHost` is the host's end of virtio-vsock
   at CID 2, behind `vm.vsock`.
 - Credit: each connection advertises `bufferSize` (256 KiB default) and
@@ -879,7 +879,7 @@ parts that are easy to get wrong.
   ignored, setattr on a symlink changes only its times. CLI: `--mount
   HOSTDIR:GUESTPATH[:ro]`, repeatable.
 - Cache mode (the only one): `cache=readahead` (CACHE_FILE) with
-  `metatimeout=1000` (the `9p: add metatimeout` patch, kernel.md), which adds CACHE_META with
+  `metatimeout=1000` (the `9p: add metatimeout` patch, kernel/devices.md), which adds CACHE_META with
   a 1 s limit. A name or attribute the guest has looked up is reused for
   up to 1 s without asking the host; the next lookup or stat after that
   revalidates it with one getattr, which drops a name that is gone or now
@@ -932,7 +932,7 @@ parts that are easy to get wrong.
 
 ## shm (`js/core/shm.ts`)
 
-- The host side of kwshm (kernel.md): guest shmem files read and written
+- The host side of kwshm (kernel/devices.md): guest shmem files read and written
   in place. `ShmDevice` (`Kernel.shm`) is the kernel's end (each live
   export's page list merged into runs of consecutive pages); `ShmClient`
   is the API (`vm.shm`) on a backend that runs `ShmCall`s: the ShmDevice

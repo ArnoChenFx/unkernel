@@ -29,7 +29,7 @@
 // A demo runs once at a time: launching one whose window is open (a window
 // named after it, even after run.sh ended) shows that window instead.
 // Packages come from main; a demo with `community` enables community first
-// (lazy in the image, kernel/README.md), once per guest.
+// (lazy in the image, .agents/kernel/guest.md), once per guest.
 // A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
 // but disabled, with why.
 // Launching a demo sets ?demo=<id> in the page's URL (history.replaceState),

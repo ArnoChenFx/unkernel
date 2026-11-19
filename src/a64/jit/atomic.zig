@@ -26,7 +26,7 @@
 //!                                    interpreter's c.store also on SMP)
 //!
 //! Pairs (LDXP/STXP, LDAXP/STLXP) and CASP stay interpreter calls: no
-//! workload measured runs them (a64.md, Generic ops by word).
+//! workload measured runs them (a64/performance.md, Measuring).
 //!
 //! Faults: a misaligned address and every data-TLB miss (unmapped, no
 //! permission, a page holding decoded code: code_flag in the write TLB)

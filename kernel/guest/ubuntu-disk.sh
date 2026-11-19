@@ -164,7 +164,7 @@ chmod 755 "$stage"/usr/local/sbin/{kw-init,kw-net,poweroff,reboot,halt}
 ln -s ../local/sbin/kw-init "$stage/usr/sbin/init"
 
 # Once systemd is installed (apt-get install systemd systemd-sysv udev;
-# kernel/README.md, Ubuntu): root logged in on the console, as on Alpine.
+# .agents/kernel/guest.md, Ubuntu): root logged in on the console, as on Alpine.
 mkdir -p "$stage/etc/systemd/system/serial-getty@hvc0.service.d"
 cat > "$stage/etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf" <<'EOF'
 [Service]

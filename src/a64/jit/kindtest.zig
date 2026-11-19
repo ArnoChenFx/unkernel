@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! Per-kind JIT tests (core stream; the families call `kind` with one line
-//! per op kind, a64.md "JIT"): random programs built from one generator run
+//! per op kind, a64/jit.md): random programs built from one generator run
 //! on a kw_run machine (in the wasm64 unit tests: the JIT with an eager host,
 //! so every block compiles on its first entry) and on a reference machine
 //! (`run.runRef`, the oracle), from the same edge and random register values

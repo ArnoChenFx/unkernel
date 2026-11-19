@@ -8,12 +8,22 @@
 // harness and stops at the first event, register or memory difference. Without qemu-aarch64 on PATH (or
 // $QEMU_AARCH64) the comparison is skipped with a note, and the kwemu runs
 // must still exit with the status the guest expects.
+// The JIT modes run zig-out/bin/kwemu-harness-jit.wasm with the JS host of
+// test/kwemu-jit-host.mjs: eager (every block compiled on its first entry),
+// at the default threshold, and lowered to memory32 as the kernel is (with
+// Binaryen's wasm-opt: $WASM_OPT or vendor/toolchain/binaryen/bin/wasm-opt;
+// skipped with a note without it). Each must retire exactly as many
+// instructions as the wasm64 interpreter.
 // Also checks that the wasm64 object imports nothing the kernel does not
 // provide (compiler-rt helpers such as __multi3 for u128 arithmetic).
 // usage: node test/a64-test.mjs <zig-out prefix>
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { createJitHost } from "./kwemu-jit-host.mjs";
 
 const prefix = resolve(process.argv[2] ?? "zig-out");
 const guestDir = join(prefix, "guest", "a64");
@@ -66,9 +76,28 @@ function runLockstep(elf, args) {
 }
 
 const wasmModule = await WebAssembly.compile(await readFile(join(prefix, "bin", "kwemu-harness.wasm")));
-async function runWasm(elf, args) {
+const jitPath = join(prefix, "bin", "kwemu-harness-jit.wasm");
+const jitModule = await WebAssembly.compile(await readFile(jitPath));
+
+// memory32 variant of the JIT harness (lowered like vmlinux32.wasm)
+let jit32Module = null, jit32Note = "";
+{
+  const wasmOpt = process.env.WASM_OPT ?? fileURLToPath(new URL("../vendor/toolchain/binaryen/bin/wasm-opt", import.meta.url));
+  if (!existsSync(wasmOpt)) jit32Note = `skipped a64 wasm32+jit: ${wasmOpt} not found (set WASM_OPT)`;
+  else {
+    const dir = await mkdtemp(join(tmpdir(), "kwemu-a64-jit32-"));
+    const out = join(dir, "kwemu-harness-jit32.wasm");
+    const p = spawnSync(wasmOpt, ["-g", "--enable-memory64", "--enable-bulk-memory", "--enable-threads", "--memory64-lowering", "--table64-lowering", jitPath, "-o", out], { encoding: "utf8" });
+    if (p.status !== 0) jit32Note = `FAIL a64 wasm-opt lowering: ${p.stderr}`;
+    else jit32Module = await WebAssembly.compile(await readFile(out));
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runWasm(elf, args, module = wasmModule, jit = null) {
   let out = "", err = "", mem;
-  const stub = () => 0; // a library built with -Dkwemu-jit imports the JIT host; never used by A64
+  // a library built with -Dkwemu-jit=true: its plain harness imports the host too
+  if (!jit && WebAssembly.Module.imports(module).some((i) => i.module === "unkernel")) jit = createJitHost({ available: false });
   const imports = {
     env: {
       host_write: (fd, ptr, len) => {
@@ -77,11 +106,12 @@ async function runWasm(elf, args) {
       },
       host_now_ns: () => Number(process.hrtime.bigint()),
     },
-    unkernel: { kw_host_jit_caps: stub, kw_host_jit_compile: () => -1, kw_host_jit_free: () => {} },
   };
-  const inst = await WebAssembly.instantiate(wasmModule, imports);
+  if (jit) imports.unkernel = jit.imports;
+  const inst = await WebAssembly.instantiate(module, imports);
   const ex = inst.exports;
   mem = ex.memory;
+  jit?.attach(ex);
   const image = await readFile(elf);
   const argBytes = new TextEncoder().encode([elf, ...args].join("\0") + "\0");
   const total = image.length + argBytes.length;
@@ -90,12 +120,20 @@ async function runWasm(elf, args) {
   new Uint8Array(mem.buffer, ptr, total).set(image);
   new Uint8Array(mem.buffer, ptr + image.length, argBytes.length).set(argBytes);
   const status = ex.kwh_run(BigInt(image.length), BigInt(argBytes.length), 1);
+  if (jit) {
+    const s = jit.stats;
+    if (s.errors.length) {
+      err += s.errors.map((e) => `jit host: ${e}\n`).join("");
+      return { status: -1, out, err };
+    }
+    if (s.compiles) return { status, out, err, jit: `${s.compiles} compiled, ${(s.bytes / 1024).toFixed(0)} KiB, ${(Number(s.compileNs) / 1e6).toFixed(0)} ms` };
+  }
   return { status, out, err };
 }
 
 function stats(r) {
   const m = /instret=(\d+).*MIPS=([\d.]+)/.exec(r.err);
-  return m ? `${(Number(m[1]) / 1e6).toFixed(2)}M insns, ${m[2]} MIPS` : "";
+  return (m ? `${(Number(m[1]) / 1e6).toFixed(2)}M insns, ${m[2]} MIPS` : "") + (r.jit ? `; jit: ${r.jit}` : "");
 }
 
 /** First differing line of two outputs, for the failure message. */
@@ -106,6 +144,16 @@ function firstDiff(a, b) {
   return "";
 }
 
+const modes = [
+  ["native", runNative],
+  ["wasm64", (elf, args) => runWasm(elf, args)],
+  ["wasm64+jit", (elf, args) => runWasm(elf, args, jitModule, createJitHost({ eager: true }))],
+  ["wasm64+jit/thr", (elf, args) => runWasm(elf, args, jitModule, createJitHost())],
+  ["lockstep", runLockstep],
+];
+if (jit32Module) modes.splice(4, 0, ["wasm32+jit", (elf, args) => runWasm(elf, args, jit32Module, createJitHost({ eager: true, mem32: true }))]);
+const width = Math.max(...modes.map(([m]) => m.length));
+
 if (!haveQemu) console.log(`skipped a64 qemu comparison: ${qemu} not found (only the exit statuses are checked)`);
 for (const c of cases) {
   const elf = join(guestDir, `${c.guest}.elf`);
@@ -115,16 +163,24 @@ for (const c of cases) {
     console.log(`FAIL a64 qemu ${c.guest}: status ${ref.status}, want ${c.status}\n${ref.err}`);
     continue;
   }
-  for (const [mode, run] of [["native", runNative], ["wasm64", runWasm], ["lockstep", runLockstep]]) {
+  let instret = null; // the wasm64 interpreter's: the JIT modes must retire exactly as many
+  for (const [mode, run] of modes) {
     const r = await run(elf, c.args);
+    const n = /instret=(\d+)/.exec(r.err)?.[1];
+    if (mode === "wasm64") instret = n;
     let why = "";
     if (r.status !== c.status) why = `status ${r.status}, want ${c.status}`;
     else if (ref && r.out !== ref.out) why = `stdout differs from qemu-aarch64 (${firstDiff(ref.out, r.out)})`;
+    else if (mode.includes("jit") && n !== instret) why = `instret ${n}, the wasm64 interpreter retired ${instret}`;
     if (why) {
       failed++;
       console.log(`FAIL a64 ${mode} ${c.guest}: ${why}\n--- stdout ---\n${r.out}--- stderr ---\n${r.err}`);
-    } else console.log(`ok   a64 ${mode.padEnd(8)} ${c.guest.padEnd(12)} ${ref ? "= qemu" : ""} (${stats(r)})`);
+    } else console.log(`ok   a64 ${mode.padEnd(width)} ${c.guest.padEnd(12)} ${ref ? "= qemu" : ""} (${stats(r)})`);
   }
+}
+if (jit32Note) {
+  console.log(jit32Note);
+  if (jit32Note.startsWith("FAIL")) failed++;
 }
 
 if (failed) {

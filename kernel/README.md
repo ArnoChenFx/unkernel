@@ -3,7 +3,7 @@
 This directory holds the Linux kernel built as a single wasm64 module (Joel
 Severin's `arch/wasm`, reworked). User space is unmodified aarch64 Linux ELF
 (ARMv8.0-A), run by the kwemu software CPU (`src/a64`, contract in
-`include/kw_emu.h`; a decoded-op interpreter, no JIT yet). The CPU walks real page
+`include/kw_emu.h`; a decoded-op interpreter and an early JIT). The CPU walks real page
 tables, so fork, mmap and copy-on-write behave like real Linux. A stock
 Alpine aarch64 minirootfs boots to a shell under Node, in
 Chromium, and in WebKit (Safari 27+, whose JSPI it needs), and Ubuntu Base

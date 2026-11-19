@@ -1,749 +1,279 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-//! kwemu JIT tier (optional: `-Dkwemu-jit`, wasm64 builds only).
-//!
-//! Hot decoded blocks (see `Block` in kwemu.zig) are translated into small
-//! wasm modules that the host compiles and installs into a slot of the
-//! module's function table; `run` then enters a block through
-//! `call_indirect` instead of interpreting its ops. Everything the JIT knows
-//! comes from the decoded ops, so the existing block-cache rules (tgen
-//! check, revalidation, SMC tracking) decide when compiled code may run.
-//!
-//! Host imports (wasm import module "unkernel"; only referenced when the
-//! JIT is compiled in, so the default object has no such imports):
-//!   kw_host_jit_caps() -> u32
-//!       bit 0: JIT available; bit 1: the memory is 32-bit (memory64-lowered
-//!       module: the generated code imports a 32-bit memory and wraps every
-//!       address); bit 2: eager (compile on the first entry; tests);
-//!       bit 3: the memory is shared (the generated code declares its
-//!       import shared, with the largest maximum of its type).
-//!       Called once, by kw_cpu_init.
-//!   kw_host_jit_compile(ptr, len, slot: u32, flags: u32) -> i32
-//!       Compile the `len` bytes at `ptr` (a module importing env.memory and
-//!       exporting function "f") and install "f" into table slot `slot`.
-//!       0 = installed, < 0 = failed (the slot is left as it was). flags
-//!       bit 0 (`compile_warm`): f(x, 0, irqp, jl) returns 0 at once, so the
-//!       host may call it to make a lazy engine compile f inside the call.
-//!   kw_host_jit_free(slot: u32)
-//!       Put the slot's original function back and drop the module.
-//!
-//! Slots: kwemu owns `npool` stub functions; their table indices are the
-//! slots. A stub returns "handed back at op 0", so a slot whose code is not
-//! installed is harmless. The table never grows.
-//!
-//! Generated function: f(x, cpu, irqp, jl: i64) -> i64, where x = &regs.x
-//! (x[32] = pc), irqp = cpu->irq_pending or a zero word, jl = budget for
-//! extra self-loop iterations (`run` has already charged the first pass).
-//! It returns (jl_left << 8) | code:
-//!   0..63    handed back before op k (not executed), registers written back;
-//!   64       done: the terminator retired, pc in x[32];
-//!   128 + k  side exit taken at op k, pc in x[32].
-//! Guest registers live in wasm locals (loaded on entry, written back at the
-//! single exit). Loads and stores inline the data-TLB fast path; a miss
-//! (fault, straddle, store into a page holding code, ...) hands the op back
-//! to the interpreter. The code depends only on pc and the raw instruction
-//! bits (via the ops), never on host addresses or generations, so a block
-//! that is revalidated keeps its slot.
-//!
-//! A module may hold a region of several blocks, also of several pages (see
-//! "regions" below); the code then refers to the block it left from, which
-//! it names in cpu.jit.cur (`lastBlock`), and it returns "done" instead of a
-//! side exit (having refunded the rest of that block itself).
+//! riscv's JIT emitter (kept for reference; `-Driscv-legacy`): the ISA hooks
+//! of the ISA-neutral JIT core (src/emu/jitcore.zig, which documents the
+//! generated function, the slot pool, the compile policy and regions) and
+//! everything riscv-specific below them: which ops are translated
+//! (`opSupported`), their register usage, `emitOp` (ALU, M, loads and
+//! stores, branches, F/D with `fcsr`, Zkne/Zknd, Zb*), the register file in
+//! locals (x1..x31, f0..f31, fcsr) and the FMA, AES and clmul/xperm helper
+//! functions. This file is the hook namespace `I` of `jc.Jit(@This())`; it
+//! also re-exports what kwemu.zig's riscv `run` and the riscv unit tests use.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const options = @import("kwemu_options");
 const kwemu = @import("kwemu.zig");
 const exec = @import("exec.zig");
 const core = @import("../cpu/core.zig");
+const jc = @import("jitcore.zig");
 const Cpu = kwemu.Cpu;
 const Block = kwemu.Block;
-const Op = exec.Op;
+pub const Op = exec.Op;
+const W = jc.W;
+const Region = jc.Region;
+const State = jc.State;
+const AesTab = jc.AesTab;
+const jit_off = jc.jit_off;
+pub const code_done = jc.code_done;
+pub const code_side = jc.code_side;
+const l_x = jc.l_x;
+const l_cpu = jc.l_cpu;
+const l_irq = jc.l_irq;
+const l_jl = jc.l_jl;
 
-pub const enabled = options.jit and builtin.cpu.arch == .wasm64;
+const JC = jc.Jit(@This());
+const Emit = JC.Emit;
 
-/// Table slots (stub functions) owned by kwemu.
-pub const npool = 1024;
-/// Module emit buffer.
-pub const buf_size = 16 * 1024;
-/// Largest `jl` passed in (keeps `jl << 8` in 63 bits).
-pub const max_jl: u64 = 1 << 55;
-/// Result codes (low 8 bits of `enter`'s result): below code_done, op k
-/// was handed back; code_done up to code_side, the pass is done and `run`
-/// refunds nothing; from code_side, a side exit at op code - code_side.
-/// The done codes say why (only statistics look at that): the terminator
-/// left (code_done), a region's side exit left (code_done_side, the region
-/// already refunded the rest of its member), or a budget, interrupt or
-/// member check stopped the code at a block's start (code_done_stop).
-pub const code_done = 64;
-pub const code_done_side = code_done + 1;
-pub const code_done_stop = code_done + 2;
-pub const code_side = 128;
+// ---- what kwemu.zig and the riscv tests use -------------------------------------
 
-pub const cap_available: u32 = 1;
-pub const cap_mem32: u32 = 2;
-pub const cap_eager: u32 = 4;
-pub const cap_shared: u32 = 8;
-/// Most blocks in one compiled region (see "regions" below).
-pub const max_members = 16;
+pub const enabled = jc.enabled;
+pub const npool = jc.npool;
+pub const buf_size = jc.buf_size;
+pub const max_jl = jc.max_jl;
+pub const max_members = jc.max_members;
+pub const code_done_side = jc.code_done_side;
+pub const code_done_stop = jc.code_done_stop;
+pub const BlockState = jc.BlockState;
+pub const Jx = jc.Jx;
+pub const Xr = jc.Xr;
+pub const Nx = jc.Nx;
+pub const slotOf = jc.slotOf;
+pub const memberOf = jc.memberOf;
+pub const slotIndex = jc.slotIndex;
+pub const enter = jc.enter;
+pub const handedBack = jc.handedBack;
+pub const lastBlock = jc.lastBlock;
+pub const loopLimit = jc.loopLimit;
+pub const loopDone = jc.loopDone;
+pub const ready = JC.ready;
+pub const noteExit = JC.noteExit;
+pub const countExit = JC.countExit;
+pub const countNext = JC.countNext;
 
-// Block JIT state (`BlockState.st`): one word, so the per-pass test is a
-// single load.
-/// Not compiled, and never will be (first op unsupported, compile failed,
-/// JIT unavailable).
-const never: u32 = 0;
-/// 1 .. ref_bit-1: interpreted instructions left before the block is
-/// compiled. With `compiled` set: member `(st >> member_shift) & 0xff` of
-/// the region in pool entry `st & slot_mask`; `ref_bit` is the clock's
-/// referenced bit.
-const compiled: u32 = 1 << 31;
-const ref_bit: u32 = 1 << 30;
-const member_shift = 16;
-const slot_mask: u32 = (1 << member_shift) - 1;
+// ---- ISA hooks (jitcore.zig, `Jit`) ----------------------------------------------
 
-extern "unkernel" fn kw_host_jit_caps() u32;
-extern "unkernel" fn kw_host_jit_compile(ptr: [*]const u8, len: usize, slot: u32, flags: u32) i32;
-/// kw_host_jit_compile flags: every module returns 0 at once when called
-/// with cpu = 0 (see `emitModule`).
-const compile_warm: u32 = 1;
-extern "unkernel" fn kw_host_jit_free(slot: u32) void;
-
-/// Per-block fields. Empty without the JIT, so the default build keeps the
-/// block layout it always had.
-pub const BlockState = if (enabled) extern struct {
-    /// never / countdown / compiled | ref_bit? | pool entry (see above).
-    st: u32 = never,
-    /// Times `run` entered this compiled block right after compiled code
-    /// of another region left towards it (see `noteExit`).
-    hits: u32 = 0,
-} else extern struct {};
-
-/// JIT bookkeeping inside struct kw_cpu (empty without the JIT).
-pub const State = if (enabled) extern struct {
-    caps: u32,
-    /// `st` of a new block: the compile threshold (`never`: JIT unavailable).
-    threshold: u32,
-    /// *irq_pending stand-in when cpu->irq_pending is NULL.
-    zero: u32,
-    /// Written by the stubs (their distinct side effect).
-    last_stub: u32,
-    /// Clock hand over `owner`.
-    hand: u32,
-    /// Largest module emitted so far (bytes).
-    max_bytes: u32,
-    /// Most members per region (`max_members`; tests lower it).
-    region_max: u32,
-    /// Exits from a region towards a compiled block of another region, per
-    /// KiB of the region's module, after which that block joins the region
-    /// (`noteHot`; -Dkwemu-jit-grow, tests change it).
-    grow_threshold: u32,
-    /// Set by `enter`: the entered block; on return, the block the result
-    /// code refers to (a region stores the member it left from).
-    cur: u64,
-    /// Regions recompiled with an added block (a block of their page that
-    /// got hot / a block they often left towards), and member blocks
-    /// compiled.
-    grows: u64,
-    exit_grows: u64,
-    members_total: u64,
-    compiles: u64,
-    frees: u64,
-    /// Calls into compiled code.
-    entries: u64,
-    /// Calls that ended "handed back at op k" (counted by `handedBack`).
-    handbacks: u64,
-    /// Host compile failures and oversized modules.
-    fails: u64,
-    /// Modules emitted again for a shorter prefix (did not fit the buffer).
-    shortened: u64,
-    /// Blocks whose first op is not supported.
-    skips: u64,
-    evictions: u64,
-    /// Block index + 1 per pool entry, 0 = free.
-    owner: [npool]u32,
-    /// Per pool entry: block index + 1 of each region member (0: none).
-    /// A member that was re-decoded since is dead: its `st` no longer
-    /// names this entry, and the region's code never enters it again.
-    members: [npool][max_members]u16,
-    /// Per pool entry: the low 16 bits of each member's `op` when it was
-    /// compiled (its code is that decode; see `noteHot`).
-    member_op: [npool][max_members]u16,
-    /// Per pool entry: virtual page of the region (of the block it was
-    /// first compiled for); | page_closed when it takes no further members.
-    page: [npool]u64,
-    /// Per pool entry: module size in bytes.
-    size: [npool]u16,
-    /// AES tables the compiled Zkne/Zknd ops read cpu-relative (`AesTab`).
-    aes: AesTab,
-    buf: [buf_size]u8,
-} else extern struct {};
-
-/// Tables for compiled AES ops, filled by `init` from core.aes (compiled code
-/// may only address cpu-relative data, never the library's own constants).
-/// te[x]: MixColumns of the column (S[x], 0, 0, 0); a byte in row r
-/// contributes rotl(te[x], 8 r). td[x]: InvMixColumns of (S^-1[x], 0, 0, 0).
-/// im[x]: InvMixColumns of (x, 0, 0, 0). s, is: the S-box and its inverse.
-pub const AesTab = extern struct {
-    te: [256]u32,
-    td: [256]u32,
-    im: [256]u32,
-    s: [256]u8,
-    is: [256]u8,
+pub const EmitExt = struct {
+    /// The frm == RNE test for dynamic rounding modes has been emitted (frm
+    /// cannot change inside compiled code, so the first test covers every
+    /// later op of the pass). Per region member: a member can be entered
+    /// without running the code of the members emitted before it.
+    frm_checked: bool = false,
+    /// Function indices of the FMA helpers (0 = not in this module).
+    fn_fmad: u32 = 0,
+    fn_fmas: u32 = 0,
+    /// FMA bodies are emitted inline (see fma_inline_max).
+    fma_inline: bool = false,
+    /// Function indices of the AES helpers per `AesK` (0 = not in this module).
+    fn_aes: [n_aes_k]u32 = @splat(0),
+    /// AES bodies are emitted inline (see aes_inline_max).
+    aes_inline: bool = false,
+    /// Function indices of the clmul/xperm helpers per `BkK` (0 = not in
+    /// this module).
+    fn_bk: [n_bk_k]u32 = @splat(0),
+    /// clmul/xperm bodies are emitted inline (see bk_inline_max).
+    bk_inline: bool = false,
+    /// While an inline FMA body is emitted: the nesting level of its
+    /// result block (its "return" is a br there).
+    fma_nest: u32 = 0,
 };
 
-// ---- slots -----------------------------------------------------------------------
+pub fn ops(cpu: *Cpu, b: *const Block) []const Op {
+    return cpu.priv.ops[b.op..][0..b.n];
+}
 
-pub const JitFn = *const fn (x: u64, cpu: u64, irqp: u64, jl: u64) callconv(.c) u64;
+pub fn supported(o: Op) bool {
+    return opSupported(o);
+}
 
-fn Stub(comptime id: u32) type {
-    return struct {
-        fn f(x: u64, cpu: u64, irqp: u64, jl: u64) callconv(.c) u64 {
-            _ = x;
-            _ = irqp;
-            const off = @offsetOf(Cpu, "priv") + @offsetOf(@FieldType(Cpu, "priv"), "jit") + @offsetOf(State, "last_stub");
-            const p: *volatile u32 = @ptrFromInt(cpu + off);
-            p.* = id;
-            return jl << 8; // handed back at op 0, nothing retired
-        }
+pub const nextPc = kwemu.nextPc;
+
+/// Usage of a translated prefix; helper usage only if its FMAs (AES ops,
+/// clmul/xperm ops) are too many to inline (see `helpers`).
+pub fn blockUse(o: []const Op) Use {
+    var u: Use = .{};
+    for (o) |x| u.add(usage(x));
+    helpers(&u);
+    return u;
+}
+
+/// Per block / member: frm not tested yet; FMA, AES and clmul/xperm bodies
+/// inline when the member has few of them.
+pub fn beginMember(e: *Emit, o: []const Op) void {
+    e.x.frm_checked = false;
+    var u: Use = .{};
+    for (o) |x| u.add(usage(x));
+    e.x.fma_inline = u.nfma <= fma_inline_max;
+    e.x.aes_inline = u.naes <= aes_inline_max;
+    e.x.bk_inline = u.nbk <= bk_inline_max;
+}
+
+pub fn helperCount(e: *Emit, use: Use) u32 {
+    var nfn: u32 = 1;
+    if (use.fmad) {
+        e.x.fn_fmad = nfn;
+        nfn += 1;
+    }
+    if (use.fmas) {
+        e.x.fn_fmas = nfn;
+        nfn += 1;
+    }
+    for (0..n_aes_k) |i| {
+        if (use.aes & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        e.x.fn_aes[i] = nfn;
+        nfn += 1;
+    }
+    for (0..n_bk_k) |i| {
+        if (use.bk & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        e.x.fn_bk[i] = nfn;
+        nfn += 1;
+    }
+    return nfn - 1;
+}
+
+/// i64 x n_i64, f64 x n_f64, and a region's i64 x n_region_locals.
+pub fn locals(e: *Emit, region: bool) void {
+    e.op(if (region) 0x03 else 0x02);
+    e.uleb(n_i64);
+    e.op(W.i64_t);
+    e.uleb(n_f64);
+    e.op(W.f64_t);
+    if (region) {
+        e.uleb(jc.n_region_locals);
+        e.op(W.i64_t);
+    }
+}
+
+pub fn prologue(e: *Emit, use: Use) void {
+    const live = use.read | use.write;
+    const flive = use.fread | use.fwrite;
+    for (1..32) |r| {
+        if (live & (@as(u32, 1) << @intCast(r)) == 0) continue;
+        e.get(l_x);
+        e.addr();
+        e.mem(W.i64_load, 3, r * 8);
+        e.set(lreg(@intCast(r)));
+    }
+    for (0..32) |r| {
+        if (flive & (@as(u32, 1) << @intCast(r)) == 0) continue;
+        e.get(l_x);
+        e.addr();
+        e.mem(W.i64_load, 3, f_off + r * 8);
+        e.set(lf(@intCast(r)));
+    }
+    if (use.fcsr_r or use.fcsr_w) {
+        e.get(l_x);
+        e.addr();
+        e.mem(W.i64_load32_u, 2, fcsr_off);
+        e.set(l_fcsr);
+    }
+}
+
+pub fn epilogue(e: *Emit, use: Use) void {
+    for (1..32) |r| {
+        if (use.write & (@as(u32, 1) << @intCast(r)) == 0) continue;
+        e.get(l_x);
+        e.addr();
+        e.get(lreg(@intCast(r)));
+        e.mem(W.i64_store, 3, r * 8);
+    }
+    for (0..32) |r| {
+        if (use.fwrite & (@as(u32, 1) << @intCast(r)) == 0) continue;
+        e.get(l_x);
+        e.addr();
+        e.get(lf(@intCast(r)));
+        e.mem(W.i64_store, 3, f_off + r * 8);
+    }
+    if (use.fcsr_w) {
+        e.get(l_x);
+        e.addr();
+        e.get(l_fcsr);
+        e.mem(W.i64_store32, 2, fcsr_off);
+    }
+}
+
+pub fn emitHelpers(e: *Emit) void {
+    if (e.x.fn_fmad != 0) fmaBody(e, u64, false);
+    if (e.x.fn_fmas != 0) fmaBody(e, u32, false);
+    for (0..n_aes_k) |i| if (e.x.fn_aes[i] != 0) aesHelper(e, @enumFromInt(i));
+    for (0..n_bk_k) |i| if (e.x.fn_bk[i] != 0) bkHelper(e, @enumFromInt(i));
+}
+
+pub fn selfLoop(last: Op, b: *const Block) bool {
+    return switch (last.h) {
+        .beq, .bne, .blt, .bge, .bltu, .bgeu, .jal, .goto => last.imm == b.pc,
+        else => false,
     };
 }
 
-/// The stubs; pool entry i lives in table slot @intFromPtr(pool[i]).
-const pool: [npool]JitFn = blk: {
-    @setEvalBranchQuota(20 * npool);
-    var p: [npool]JitFn = undefined;
-    for (0..npool) |i| p[i] = &Stub(i).f;
-    break :blk p;
-};
-
-inline fn tableSlot(i: usize) u32 {
-    return @intCast(@intFromPtr(pool[i]));
-}
-
-fn blockIndex(cpu: *Cpu, b: *const Block) u32 {
-    return @intCast((@intFromPtr(b) - @intFromPtr(&cpu.priv.blocks)) / @sizeOf(Block));
-}
-
-/// Ask the host what it offers and set the compile threshold from it.
-fn askHost(st: *State) void {
-    st.caps = kw_host_jit_caps();
-    st.threshold = if (st.caps & cap_available == 0)
-        never
-    else if (st.caps & cap_eager != 0)
-        1
-    else
-        std.math.clamp(options.jit_threshold, 1, ref_bit - 1);
-}
-
-/// kw_host_reset: the host that compiled the slots is gone. Forget every
-/// slot without kw_host_jit_free and ask the new host. The caller then
-/// drops all blocks (resetCache), which finds no slot left to free.
-pub fn forgetHost(cpu: *Cpu) void {
-    const st = &cpu.priv.jit;
-    // Volatile stores: no memset import in the wasm object.
-    const owner: *volatile [npool]u32 = &st.owner;
-    const members: *volatile [npool][max_members]u16 = &st.members;
-    for (0..npool) |i| {
-        owner[i] = 0;
-        for (0..max_members) |j| members[i][j] = 0;
-    }
-    // No block may name a slot any more: re-decoding one would free it.
-    const bs: [*]volatile Block = &cpu.priv.blocks;
-    for (0..cpu.priv.blocks.len) |i| {
-        bs[i].jx.st = never;
-        bs[i].jx.hits = 0;
-    }
-    askHost(st);
-}
-
-/// Called by kw_cpu_init after the block has been zeroed.
-pub fn init(cpu: *Cpu) void {
-    const st = &cpu.priv.jit;
-    askHost(st);
-    st.region_max = max_members;
-    // 0: never (no member counts that many exits)
-    st.grow_threshold = if (options.jit_grow == 0) std.math.maxInt(u32) else options.jit_grow;
-    // Volatile stores: no memcpy import in the wasm object.
-    const t: *volatile AesTab = &st.aes;
-    const A = core.aes;
-    for (0..256) |i| {
-        t.te[i] = A.mixColumn(A.sbox[i]);
-        t.td[i] = A.invMixColumn(A.inv_sbox[i]);
-        t.im[i] = A.invMixColumn(@intCast(i));
-        t.s[i] = A.sbox[i];
-        t.is[i] = A.inv_sbox[i];
-    }
-}
-
-/// Initial JIT state of a newly decoded block.
-pub inline fn newBlock(cpu: *Cpu) BlockState {
-    return .{ .st = cpu.priv.jit.threshold };
-}
-
-/// Pool entry + 1 of b's code, 0 = not compiled.
-pub inline fn slotOf(b: *const Block) u32 {
-    return if (b.jx.st >= compiled) (b.jx.st & slot_mask) + 1 else 0;
-}
-
-/// Member index of a compiled block in its region.
-pub inline fn memberOf(b: *const Block) usize {
-    return (b.jx.st >> member_shift) & 0xff;
-}
-
-/// Give pool entry `i` back to the host and detach it from its blocks.
-fn freeSlot(cpu: *Cpu, i: usize) void {
-    const st = &cpu.priv.jit;
-    for (&st.members[i]) |*m| {
-        if (m.* == 0) continue;
-        const b = &cpu.priv.blocks[m.* - 1];
-        if (slotOf(b) == i + 1) b.jx.st = st.threshold; // recompiled when hot again
-        m.* = 0;
-    }
-    st.owner[i] = 0;
-    kw_host_jit_free(tableSlot(i));
-    st.frees += 1;
-}
-
-/// A block is about to be overwritten: drop its code. A region with other
-/// live members stays: its code checks a member's `st` before entering it,
-/// and the overwrite resets that.
-pub inline fn drop(cpu: *Cpu, b: *Block) void {
-    if (b.jx.st >= compiled) dropMember(cpu, b);
-}
-
-noinline fn dropMember(cpu: *Cpu, b: *Block) void {
-    const i = b.jx.st & slot_mask;
-    const me: u16 = @intCast(blockIndex(cpu, b) + 1);
-    b.jx.st = never;
-    for (cpu.priv.jit.members[i]) |m| {
-        if (m != 0 and m != me and slotOf(&cpu.priv.blocks[m - 1]) == i + 1) return;
-    }
-    freeSlot(cpu, i);
-}
-
-/// Free every slot in use (cache reset).
-pub fn releaseAll(cpu: *Cpu) void {
-    for (0..npool) |i| {
-        if (cpu.priv.jit.owner[i] != 0) freeSlot(cpu, i);
-    }
-}
-
-/// Clock: whether a live member of pool entry i was entered from `run`
-/// since the last sweep; clears the referenced bits.
-fn referenced(cpu: *Cpu, i: usize) bool {
-    var any = false;
-    for (cpu.priv.jit.members[i]) |m| {
-        if (m == 0) continue;
-        const b = &cpu.priv.blocks[m - 1];
-        if (slotOf(b) == i + 1 and b.jx.st & ref_bit != 0) {
-            b.jx.st &= ~ref_bit;
-            any = true;
-        }
-    }
-    return any;
-}
-
-/// A free pool entry, evicting one (clock, second chance) if none is free.
-fn allocSlot(cpu: *Cpu) usize {
-    const st = &cpu.priv.jit;
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
-        const i = st.hand;
-        st.hand = (i + 1) % npool;
-        const o = st.owner[i];
-        if (o == 0) return i;
-        if (referenced(cpu, i) and tries < 2 * npool) continue; // second chance
-        freeSlot(cpu, i);
-        st.evictions += 1;
-        return i;
-    }
-}
-
-/// Compile b (it got hot); true: `run` must look b up again before it runs
-/// anything (`windowClose`).
-noinline fn compile(cpu: *Cpu, b: *Block) bool {
-    @branchHint(.cold);
-    const st = &cpu.priv.jit;
-    if (!supported(cpu.priv.ops[b.op])) {
-        b.jx.st = never;
-        st.skips += 1;
-        return false;
-    }
-    windowOpen(cpu);
-    // An interrupt that is already pending (an IPI sent just before the
-    // window opened, whose sender may now be waiting) is taken first: the
-    // block runs interpreted this pass, and its next pass compiles it.
-    if (cpu.irq_pending) |p| {
-        if (p.* != 0) return windowClose(cpu);
-    }
-    var rg: Region = .{ .cpu = cpu };
-    gatherRegion(cpu, b, &rg);
-    install(cpu, &rg, b.pc >> 12, null);
-    return windowClose(cpu);
-}
-
-/// A compile (gathering a region, emitting its module, the host's compile
-/// and the slot bookkeeping) is a window in which other CPUs need not wait
-/// for this one's TLB flushes (kw_emu.h, "Flushes during a JIT compile"):
-/// nothing in it runs guest code or reads guest memory or a page table
-/// (only struct kw_cpu: decoded ops, exec-TLB generations, the emit
-/// buffer). Without atomics (one hart) nobody sets flush_all, and these
-/// are plain stores and loads.
-inline fn windowOpen(cpu: *Cpu) void {
-    @atomicStore(u32, &cpu.jit_busy, 1, .seq_cst);
-}
-
-/// End the window and do the flush another CPU asked for meanwhile, if
-/// any. True if it did: every block revalidates, and the one `run` was
-/// about to run may be gone, so `run` must look it up again before it runs
-/// anything. (An interrupt raised meanwhile is taken where the interpreter
-/// takes it, after that block.)
-fn windowClose(cpu: *Cpu) bool {
-    @atomicStore(u32, &cpu.jit_busy, 0, .seq_cst);
-    if (@atomicRmw(u32, &cpu.flush_all, .Xchg, 0, .seq_cst) == 0) return false;
-    cpu.flushAll();
-    return true;
-}
-
-/// Compile region `rg` (member 0 first) into a free pool entry for virtual
-/// page `page` and make it the home of every member that is not compiled
-/// elsewhere (the others are guests: their code is copied into this module,
-/// but `run` keeps entering them through their own region).
-/// `grow`: rg is the region in pool entry grow.? with a block added. If it
-/// does not fit the buffer, that region stays as it is (closed) instead of
-/// being cut: a cut would drop members, which then run interpreted until
-/// they get hot again. Otherwise member 0 is the block that got hot, which
-/// is never compiled again if this fails. Called inside the window
-/// (`windowOpen`).
-fn install(cpu: *Cpu, rg: *Region, page: u64, grow: ?u32) void {
-    const st = &cpu.priv.jit;
-    const b: *Block = &cpu.priv.blocks[rg.idx[0]];
-    const hot = grow == null;
-    // A module that does not fit the buffer is emitted again with less in
-    // it: a region drops the members found last, down to b alone, and then
-    // b is emitted for a shorter prefix (the rest is handed back), so a
-    // block of many large ops is still compiled. Either way no other block
-    // joins this region later (it would only push others out). Every retry
-    // emits strictly less, so this ends; a module that did not fit is never
-    // handed to the host. The code does not depend on the pool entry, so it
-    // is emitted before one is taken.
-    var closed = false;
-    var limit: usize = b.n;
-    const len = while (true) {
-        if (emitModule(cpu, b, if (rg.n > 1) rg else null, &limit)) |n| break n else |e| switch (e) {
-            error.Unsupported => {
-                if (hot) b.jx.st = never;
-                st.skips += 1;
-                return;
-            },
-            error.Overflow => {
-                closed = true;
-                if (grow) |g| {
-                    st.page[g] |= page_closed;
-                    return;
-                }
-                if (rg.n > 1) {
-                    rg.n = if (rg.n > 4) rg.n * 3 / 4 else rg.n - 1;
-                    st.shortened += 1;
-                } else if (limit > 1) {
-                    limit = limit * 3 / 4;
-                    st.shortened += 1;
-                } else {
-                    b.jx.st = never;
-                    st.fails += 1;
-                    return;
-                }
-            },
-        }
+/// Targets of side exits and terminators; return sites of calls.
+pub fn targets(o: Op, m: *const Block) [2]?u64 {
+    const call = o.rd != 0 and o.rd < 32;
+    return switch (o.h) {
+        .beq_x, .bne_x, .blt_x, .bge_x, .bltu_x, .bgeu_x, .goto => .{ o.imm, null },
+        .jal_c => .{ if (call) o.imm else null, null },
+        .beq, .bne, .blt, .bge, .bltu, .bgeu => .{ o.imm, m.end_pc },
+        .jal => .{ o.imm, if (call) m.end_pc else null },
+        .jalr => .{ if (call) m.end_pc else null, null },
+        else => .{ null, null },
     };
-    if (grow) |g| {
-        freeSlot(cpu, g);
-        st.exit_grows += 1;
+}
+
+pub fn memberTail(e: *Emit, rg: *Region, b: *const Block, last: Op) void {
+    switch (last.h) {
+        .jal, .goto => if (rg.memberAt(last.imm)) |t| e.toMember(rg, t),
+        .beq, .bne, .blt, .bge, .bltu, .bgeu => {
+            for ([_]u64{ last.imm, b.end_pc }) |pt| {
+                if (rg.memberAt(pt)) |t| e.targetIf(rg, t);
+            }
+        },
+        .jalr => for (0..rg.n) |t| e.targetIf(rg, t),
+        else => {},
     }
-    const i = allocSlot(cpu);
-    // A guest-only module would never be entered (cut down to its guests).
-    var home = false;
-    for (rg.idx[0..rg.n]) |x| home = home or cpu.priv.blocks[x].jx.st < compiled;
-    if (!home) return;
-    st.max_bytes = @max(st.max_bytes, @as(u32, @intCast(len)));
-    st.size[i] = @intCast(len);
-    if (kw_host_jit_compile(&st.buf, len, tableSlot(i), compile_warm) < 0) {
-        if (hot) b.jx.st = never;
-        st.fails += 1;
-        return;
+}
+
+pub fn indirect(last: Op) bool {
+    return last.h == .jalr;
+}
+
+pub fn poll(e: *Emit) void {
+    e.irqWord();
+}
+
+pub fn sync(e: *Emit) void {
+    _ = e;
+}
+
+/// Push guest register r (x0 reads as 0).
+fn reg(e: *Emit, r: u8) void {
+    if (r == 0) e.k64(0) else e.get(lreg(r));
+}
+/// Pop into guest register r (x0 / the redirected x0 slot: dropped).
+fn setReg(e: *Emit, r: u8) void {
+    if (r == 0 or r >= 32) e.op(W.drop) else e.set(lreg(r));
+}
+
+/// Inline data-TLB lookup for an access of `size` bytes at x[rs1] + imm:
+/// leaves the host address on the stack, or hands op k back on a miss.
+fn hostAddr(e: *Emit, o: Op, k: usize, pc: u64, tlb_off: u64, size: u64) void {
+    reg(e, o.rs1);
+    if (o.imm != 0) {
+        e.k64(o.imm);
+        e.op(W.i64_add);
     }
-    st.owner[i] = rg.idx[0] + 1;
-    // A self-loop's own module takes no members either: `findRegion` would
-    // otherwise pull it into the next region of its page (kbench fp's dgemm
-    // loop: 457 MIPS as a member, 540 on its own).
-    if (rg.n == 1 and selfLoop(cpu, b)) closed = true;
-    if (rg.n >= @min(st.region_max, max_members)) closed = true;
-    st.page[i] = page | (if (closed) page_closed else 0);
-    for (0..max_members) |m| {
-        st.members[i][m] = if (m < rg.n) @intCast(rg.idx[m] + 1) else 0;
-        if (m >= rg.n) continue;
-        const x = &cpu.priv.blocks[rg.idx[m]];
-        st.member_op[i][m] = @truncate(x.op);
-        if (x.jx.st < compiled) x.jx.st = memberSt(i, m) | ref_bit;
-    }
-    st.members_total += rg.n;
-    st.compiles += 1;
+    e.set(l_va);
+    e.tlbCheck(k, pc, tlb_off, size);
 }
 
-/// `run` is about to enter compiled block `b` right after compiled code of
-/// the region in pool entry `s` left (terminator or side exit) towards it.
-/// Cheap unless b is compiled in another region. True: a grow compiled, and
-/// `run` must look b up again (`windowClose`).
-pub inline fn noteExit(cpu: *Cpu, s: u32, b: *Block) bool {
-    if (b.jx.st < compiled or b.jx.st & slot_mask == s) return false;
-    return noteHot(cpu, s, b);
-}
-
-/// Region growth along hot exits: a block compiled in another region, on
-/// another page than the region's own, that `run` entered `grow_threshold`
-/// times per KiB of the region's module right after a region left towards
-/// it, joins the region that left last as a guest member (it keeps its own
-/// module, which `run` still enters). Calls, returns and jumps into other
-/// pages (libc, PLT stubs, functions that span pages) then stay inside one
-/// module. Targets on the region's own page are left to `findRegion`, and
-/// closed or full regions and self-loops (which keep their own module) are
-/// left alone: in measurements, growing towards those cost more in compiles
-/// than the exits it saved.
-noinline fn noteHot(cpu: *Cpu, s: u32, b: *Block) bool {
-    const st = &cpu.priv.jit;
-    // Called on every such exit: only the cheap tests before counting.
-    if (st.page[s] & page_closed != 0 or b.pc >> 12 == st.page[s]) return false;
-    b.jx.hits += 1;
-    // A grow recompiles the whole region: the bigger it is, the more exits
-    // it takes (grow_threshold per KiB of module).
-    if (b.jx.hits < st.grow_threshold *| @max(1, st.size[s] >> 10)) return false;
-    b.jx.hits = 0;
-    if (selfLoop(cpu, b)) return false;
-    // Already a member with this decode: the region stopped before it
-    // (budget, interrupt, a page revalidated since).
-    const me = blockIndex(cpu, b) + 1;
-    for (st.members[s], st.member_op[s]) |m, o| {
-        if (m == me and o == @as(u16, @truncate(b.op))) return false;
-    }
-    const limit = @min(st.region_max, max_members);
-    var rg: Region = .{ .cpu = cpu };
-    for (st.members[s]) |m| {
-        if (m != 0 and usable(cpu, &cpu.priv.blocks[m - 1])) addMember(&rg, m - 1);
-    }
-    if (rg.n == 0 or rg.n >= limit) {
-        st.page[s] |= page_closed; // full: stop counting its exits
-        return false;
-    }
-    addMember(&rg, blockIndex(cpu, b));
-    windowOpen(cpu);
-    install(cpu, &rg, st.page[s], s);
-    return windowClose(cpu);
-}
-
-/// A decoded block that may be a region member.
-fn usable(cpu: *Cpu, b: *const Block) bool {
-    return b.pc != std.math.maxInt(u64) and supported(cpu.priv.ops[b.op]) and !selfLoop(cpu, b);
-}
-
-/// What `ready` decided for a pass through a block: interpret it, run its
-/// compiled code, or neither: a compile asked `run` to look the block up
-/// again first (`windowClose`).
-pub const Go = enum { interp, compiled, again };
-
-/// A pass through `b` is about to run: whether it runs compiled. Counts the
-/// pass towards the threshold and compiles the block once it is hot. One
-/// load and no store for a block that is never compiled.
-pub inline fn ready(cpu: *Cpu, b: *Block) Go {
-    const s = b.jx.st;
-    if (s >= compiled) return .compiled;
-    if (s == never) return .interp;
-    if (s > b.ninsn) {
-        b.jx.st = s - b.ninsn;
-        return .interp;
-    }
-    if (compile(cpu, b)) return .again;
-    return if (b.jx.st >= compiled) .compiled else .interp;
-}
-
-/// The interpreter's self-loop over b continues while `left >= limit`
-/// (instead of `left >= b.ninsn`), so the JIT adds no work to that loop:
-/// a compiled block (the interpreter finished a handed-back pass) stops at
-/// once and re-enters through `enter`; a block counting towards its
-/// threshold stops when the countdown runs out (charged by `loopDone`), so
-/// the next pass is compiled; anything else keeps b.ninsn.
-pub inline fn loopLimit(b: *const Block, is_compiled: bool, left: u64) u64 {
-    if (is_compiled) return std.math.maxInt(u64);
-    const s = b.jx.st;
-    if (s == never) return b.ninsn;
-    return @max(@as(u64, b.ninsn) + 1, left -| s);
-}
-
-/// The interpreter leaves b after `n` more instructions in its self-loop.
-pub inline fn loopDone(b: *Block, n: u64) void {
-    const s = b.jx.st;
-    if (s != never and s < compiled) b.jx.st = @intCast(@max(1, s -| n));
-}
-
-/// Run `b`'s compiled code (`ready` returned true) with `jl` extra
-/// self-loop instructions allowed; returns (jl_left << 8) | code. Not
-/// inlined: keeps the indirect call out of the interpreter's hot loop.
-/// `run` has charged b in full; a region charges every further member it
-/// enters against `jl` the same way, and `code` refers to `lastBlock`.
-pub noinline fn enter(cpu: *Cpu, b: *Block, x: [*]u64, jl: u64) u64 {
-    const s = b.jx.st;
-    b.jx.st = s | ref_bit; // referenced (clock)
-    cpu.priv.jit.entries += 1;
-    cpu.priv.jit.cur = @intFromPtr(b);
-    const irqp: u64 = if (cpu.irq_pending) |p| @intFromPtr(p) else @intFromPtr(&cpu.priv.jit.zero);
-    return pool[s & slot_mask](@intFromPtr(x), @intFromPtr(cpu), irqp, jl);
-}
-
-/// `enter` returned "handed back" (the interpreter finishes the pass).
-pub inline fn handedBack(cpu: *Cpu) void {
-    cpu.priv.jit.handbacks += 1;
-}
-
-/// The block whose code returned from `enter`: the entered block, or the
-/// region member it left from. The result code refers to that block.
-pub inline fn lastBlock(cpu: *Cpu) *Block {
-    return @ptrFromInt(@as(usize, @intCast(cpu.priv.jit.cur)));
-}
-
-// ---- statistics (-Dkwemu-stats) ----------------------------------------------------
-
-/// Indices into Stats.jit.jx.
-pub const Jx = struct {
-    /// Calls from `run` into compiled code.
-    pub const entries = 0;
-    /// Compiled passes that handed an op back to the interpreter.
-    pub const handbacks = 1;
-    /// Compiled passes that left through a side exit (regions' included) /
-    /// the terminator (conditional branch, jal, goto) / a jalr terminator.
-    /// With exit_stop and handbacks these add up to entries.
-    pub const exit_side = 2;
-    pub const exit_direct = 3;
-    pub const exit_jalr = 4;
-    /// The block run next after a compiled pass that left through an exit
-    /// (not a stop): 5 + 4 * (left through a jalr terminator) + 2 * (same
-    /// page) + (compiled).
-    pub const next = 5;
-    /// ... of which the same block again / a block that is never compiled.
-    pub const next_self = 13;
-    pub const next_never = 14;
-    /// Region code: branches from one member into another (or itself) /
-    /// to a member that was not valid (stale tgen, re-decoded) / to a
-    /// member when the budget or a pending interrupt stopped it / to a pc
-    /// that is no member (these return to `run`).
-    pub const region_hops = 15;
-    pub const region_stale = 16;
-    pub const region_stop = 17;
-    pub const region_out = 18;
-    /// The compiled block run next after a compiled pass is a member of the
-    /// region that was entered / a self-loop's own module / in another
-    /// region (... of which the entered region was closed or full).
-    pub const next_same_region = 19;
-    pub const next_selfloop = 20;
-    pub const next_other_region = 21;
-    pub const next_other_full = 22;
-    /// Region code: branches from one member towards a member on another
-    /// page (counted at the branch site, before the checked entry).
-    pub const region_cross = 23;
-    /// Compiled passes stopped at a block's start: the budget did not
-    /// cover the next pass or member, an interrupt was pending, or a
-    /// member's checked entry failed (code_done_stop).
-    pub const exit_stop = 24;
-    /// ... of exit_side: side exits of a region member (code_done_side).
-    pub const exit_side_region = 25;
-    /// How a compiled pass left (Xr) by the block `run` looked up next
-    /// (Nx): next_by + n_nx * reason + class. Counted for every pass but
-    /// hand-backs, unless `run` returned first (budget used up, interrupt
-    /// pending), so a row adds up to at most its exit counter.
-    pub const next_by = 26;
-    pub const n_nx = 7;
-    pub const end = next_by + 4 * n_nx;
-};
-
-/// Exit reasons of Jx.next_by.
-pub const Xr = enum(u32) { side, direct, jalr, stop };
-
-/// Classes of the block run next, in Jx.next_by (the first that holds):
-/// the block left, again / never compiled / not compiled yet / compiled:
-/// a member of the region left / a self-loop's own module / in another
-/// region, and the region left could still grow / ... and the region left
-/// is closed or full.
-pub const Nx = enum(u32) { self, never, interp, same_region, selfloop, other, other_full };
-
-inline fn jx(cpu: *Cpu, i: usize, n: u64) void {
-    if (kwemu.stats_on) cpu.priv.stats.jit.jx[i] += n;
-}
-
-/// Statistics: how the compiled pass of `b` that returned `code` left it:
-/// 0 = handed back, else Jx.exit_*.
-pub fn countExit(cpu: *Cpu, b: *const Block, code: u32) u32 {
-    jx(cpu, Jx.entries, 1);
-    const kind: u32 = if (code < code_done)
-        Jx.handbacks
-    else if (code >= code_side or code == code_done_side)
-        Jx.exit_side
-    else if (code == code_done_stop)
-        Jx.exit_stop
-    else if (cpu.priv.ops[b.op + b.n - 1].h == .jalr)
-        Jx.exit_jalr
-    else
-        Jx.exit_direct;
-    jx(cpu, kind, 1);
-    if (code == code_done_side) jx(cpu, Jx.exit_side_region, 1);
-    return if (kind == Jx.handbacks) 0 else kind;
-}
-
-/// Statistics: block `b` runs after a compiled pass of `from` that left it
-/// the way `kind` (countExit) says.
-pub fn countNext(cpu: *Cpu, kind: u32, from: *const Block, b: *const Block, slot: u32) void {
-    const xr: Xr = switch (kind) {
-        Jx.exit_side => .side,
-        Jx.exit_jalr => .jalr,
-        Jx.exit_stop => .stop,
-        else => .direct,
-    };
-    var nx: Nx = if (b == from) .self else if (b.jx.st == never) .never else .interp;
-    if (kind != Jx.exit_stop) {
-        const same_page = (from.pc ^ b.pc) >> 12 == 0;
-        const i = Jx.next + 4 * @as(usize, @intFromBool(kind == Jx.exit_jalr)) + 2 * @as(usize, @intFromBool(same_page)) + @intFromBool(b.jx.st >= compiled);
-        jx(cpu, i, 1);
-        if (b == from) jx(cpu, Jx.next_self, 1);
-        if (b.jx.st == never) jx(cpu, Jx.next_never, 1);
-    }
-    if (b.jx.st >= compiled) {
-        const s = b.jx.st & slot_mask;
-        const st = &cpu.priv.jit;
-        const nc: Nx = if (s == slot)
-            .same_region
-        else if (st.members[s][1] == 0 and selfLoop(cpu, b))
-            .selfloop
-        else full: {
-            var n: usize = 0;
-            for (st.members[slot]) |m| n += @intFromBool(m != 0);
-            break :full if (st.page[slot] & page_closed != 0 or n >= st.region_max) .other_full else .other;
-        };
-        if (kind != Jx.exit_stop) switch (nc) {
-            .same_region => jx(cpu, Jx.next_same_region, 1),
-            .selfloop => jx(cpu, Jx.next_selfloop, 1),
-            .other => jx(cpu, Jx.next_other_region, 1),
-            .other_full => {
-                jx(cpu, Jx.next_other_region, 1);
-                jx(cpu, Jx.next_other_full, 1);
-            },
-            else => unreachable,
-        };
-        if (nx != .self) nx = nc;
-    }
-    jx(cpu, Jx.next_by + Jx.n_nx * @as(usize, @intFromEnum(xr)) + @intFromEnum(nx), 1);
-}
-
-/// The pool entry `enter` is about to run (for `noteExit`).
-pub inline fn slotIndex(b: *const Block) u32 {
-    return b.jx.st & slot_mask;
-}
+// ---- riscv emitter ---------------------------------------------------------------
 
 // ---- emitter ---------------------------------------------------------------------
 
@@ -753,7 +283,7 @@ pub inline fn slotIndex(b: *const Block) u32 {
 /// Optional extensions (core.Ext) need no gate here: the decoder emits
 /// their dedicated ops only while they are enabled, and `generic` ops that
 /// hold their encodings must stay handed back (core.exec gates them).
-fn supported(o: Op) bool {
+fn opSupported(o: Op) bool {
     return switch (o.h) {
         .addi, .addiw, .andi, .ori, .xori, .slti, .sltiu, .slli, .srli, .srai, .slliw, .srliw, .sraiw, .li => true,
         .add, .sub, .and_, .or_, .xor_, .sll, .srl, .sra, .slt, .sltu, .addw, .subw, .sllw, .srlw, .sraw => true,
@@ -809,7 +339,7 @@ fn fpGeneric(raw: u32) ?FpGen {
     };
 }
 
-const Use = struct {
+pub const Use = struct {
     read: u32 = 0,
     write: u32 = 0,
     fread: u32 = 0,
@@ -827,7 +357,7 @@ const Use = struct {
     bk: u8 = 0,
     nbk: u32 = 0,
 
-    fn add(u: *Use, x: Use) void {
+    pub fn add(u: *Use, x: Use) void {
         u.read |= x.read;
         u.write |= x.write;
         u.fread |= x.fread;
@@ -926,135 +456,14 @@ fn genUsage(raw: u32) Use {
     return u;
 }
 
-// wasm opcodes
-const W = struct {
-    const block = 0x02;
-    const loop = 0x03;
-    const @"if" = 0x04;
-    const @"else" = 0x05;
-    const end = 0x0b;
-    const br = 0x0c;
-    const drop = 0x1a;
-    const select = 0x1b;
-    const local_get = 0x20;
-    const local_set = 0x21;
-    const local_tee = 0x22;
-    const i32_load = 0x28;
-    const i64_load = 0x29;
-    const i64_store = 0x37;
-    const i32_const = 0x41;
-    const i64_const = 0x42;
-    const i32_eqz = 0x45;
-    const i32_eq = 0x46;
-    const i64_eqz = 0x50;
-    const i64_eq = 0x51;
-    const i64_ne = 0x52;
-    const i64_lt_s = 0x53;
-    const i64_lt_u = 0x54;
-    const i64_ge_s = 0x59;
-    const i64_ge_u = 0x5a;
-    const i32_and = 0x71;
-    const i32_or = 0x72;
-    const i32_shl = 0x74;
-    const i32_shr_s = 0x75;
-    const i32_shr_u = 0x76;
-    const i32_div_s = 0x6d;
-    const i32_div_u = 0x6e;
-    const i32_rem_s = 0x6f;
-    const i32_rem_u = 0x70;
-    const i64_add = 0x7c;
-    const i64_sub = 0x7d;
-    const i64_mul = 0x7e;
-    const i64_div_s = 0x7f;
-    const i64_div_u = 0x80;
-    const i64_rem_s = 0x81;
-    const i64_rem_u = 0x82;
-    const i64_and = 0x83;
-    const i64_or = 0x84;
-    const i64_xor = 0x85;
-    const i64_shl = 0x86;
-    const i64_shr_s = 0x87;
-    const i64_shr_u = 0x88;
-    const i32_wrap = 0xa7;
-    const i64_ext_s = 0xac;
-    const i64_ext_u = 0xad;
-    const void_t = 0x40;
-    const i64_t = 0x7e;
-    const i32_t = 0x7f;
-    const f64_t = 0x7c;
-    // FP and the rest (all MVP)
-    const @"return" = 0x0f;
-    const call = 0x10;
-    const global_get = 0x23;
-    const global_set = 0x24;
-    const i64_load32_u = 0x35;
-    const i64_store32 = 0x3e;
-    const f64_const = 0x44;
-    const i32_ne = 0x47;
-    const i64_gt_s = 0x55;
-    const i64_gt_u = 0x56;
-    const i64_le_u = 0x58;
-    const f32_eq = 0x5b;
-    const f32_lt = 0x5d;
-    const f32_le = 0x5f;
-    const f64_eq = 0x61;
-    const f64_ne = 0x62;
-    const f64_lt = 0x63;
-    const f64_gt = 0x64;
-    const f64_le = 0x65;
-    const f64_ge = 0x66;
-    const i32_xor = 0x73;
-    const i32_rotl = 0x77;
-    const i32_rotr = 0x78;
-    const i64_rotl = 0x89;
-    const i64_rotr = 0x8a;
-    const i64_load8_u = 0x31;
-    const i64_clz = 0x79;
-    const i64_ctz = 0x7a;
-    const i64_popcnt = 0x7b;
-    const i32_clz = 0x67;
-    const i32_ctz = 0x68;
-    const i32_popcnt = 0x69;
-    const f32_sqrt = 0x91;
-    const f64_ceil = 0x9b;
-    const f64_floor = 0x9c;
-    const f64_trunc = 0x9d;
-    const f64_nearest = 0x9e;
-    const f64_sqrt = 0x9f;
-    const f64_add = 0xa0;
-    const f64_sub = 0xa1;
-    const f64_mul = 0xa2;
-    const f64_div = 0xa3;
-    const i64_trunc_f64_s = 0xb0;
-    const i64_trunc_f64_u = 0xb1;
-    const f32_convert_i32_s = 0xb2;
-    const f32_convert_i32_u = 0xb3;
-    const f32_convert_i64_s = 0xb4;
-    const f32_convert_i64_u = 0xb5;
-    const f32_demote = 0xb6;
-    const f64_convert_i32_s = 0xb7;
-    const f64_convert_i32_u = 0xb8;
-    const f64_convert_i64_s = 0xb9;
-    const f64_convert_i64_u = 0xba;
-    const f64_promote = 0xbb;
-    const i32_reinterpret = 0xbc;
-    const i64_reinterpret = 0xbd;
-    const f32_reinterpret = 0xbe;
-    const f64_reinterpret = 0xbf;
-};
-
-// locals
-const l_x = 0;
-const l_cpu = 1;
-const l_irq = 2;
-const l_jl = 3;
+// locals (params l_x, l_cpu, l_irq, l_jl: jitcore.zig)
 inline fn lreg(r: u8) u32 {
     return 3 + @as(u32, r); // x1..x31 -> 4..34
 }
-const l_npc = 35;
-const l_va = 36;
-const l_e = 37;
-const l_code = 38;
+pub const l_npc = 35;
+pub const l_va = 36;
+pub const l_e = 37;
+pub const l_code = 38;
 const l_t0 = 39; // ..43
 /// f0..f31 (raw 64-bit register contents) -> 44..75
 inline fn lf(r: u32) u32 {
@@ -1105,388 +514,8 @@ const inf_s: u64 = 0x7f80_0000;
 const qnan_d: u64 = 0x7ff8_0000_0000_0000;
 const qnan_s: u64 = 0x7fc0_0000;
 
-const priv_off = @offsetOf(Cpu, "priv");
-const tlb_r_off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "tlb_r");
-const tlb_w_off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "tlb_w");
-/// Data-TLB index mask applied to va >> 8: (entries - 1) * 16-byte entries.
-const dtlb_mask: u64 = (@typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_r")).array.len - 1) << 4;
-
-const Emit = struct {
-    buf: *[buf_size]u8,
-    pos: usize = 0,
-    ok: bool = true,
-    mem32: bool,
-    /// The kernel's memory is shared (cap_shared): the import says so.
-    shared: bool = false,
-    /// Open blocks/loops/ifs; the exit block is the outermost.
-    nest: u32 = 0,
-    /// The frm == RNE test for dynamic rounding modes has been emitted (frm
-    /// cannot change inside compiled code, so the first test covers every
-    /// later op of the pass). Per region member: a member can be entered
-    /// without running the code of the members emitted before it.
-    frm_checked: bool = false,
-    /// Function indices of the FMA helpers (0 = not in this module).
-    fn_fmad: u32 = 0,
-    fn_fmas: u32 = 0,
-    /// FMA bodies are emitted inline (see fma_inline_max).
-    fma_inline: bool = false,
-    /// Function indices of the AES helpers per `AesK` (0 = not in this module).
-    fn_aes: [n_aes_k]u32 = @splat(0),
-    /// AES bodies are emitted inline (see aes_inline_max).
-    aes_inline: bool = false,
-    /// Function indices of the clmul/xperm helpers per `BkK` (0 = not in
-    /// this module).
-    fn_bk: [n_bk_k]u32 = @splat(0),
-    /// clmul/xperm bodies are emitted inline (see bk_inline_max).
-    bk_inline: bool = false,
-    /// While an inline FMA body is emitted: the nesting level of its
-    /// result block (its "return" is a br there).
-    fma_nest: u32 = 0,
-    /// Emitting the members of a region (see `emitMembers`).
-    rg: ?*Region = null,
-
-    fn op(e: *Emit, b: u8) void {
-        if (e.pos < buf_size) {
-            e.buf[e.pos] = b;
-            e.pos += 1;
-        } else e.ok = false;
-    }
-    fn ops(e: *Emit, bs: []const u8) void {
-        for (bs) |b| e.op(b);
-    }
-    fn uleb(e: *Emit, v0: u64) void {
-        var v = v0;
-        while (true) {
-            const b: u8 = @truncate(v & 0x7f);
-            v >>= 7;
-            if (v == 0) return e.op(b);
-            e.op(b | 0x80);
-        }
-    }
-    fn sleb(e: *Emit, v0: i64) void {
-        var v = v0;
-        while (true) {
-            const b: u8 = @truncate(@as(u64, @bitCast(v)) & 0x7f);
-            v >>= 7;
-            if ((v == 0 and b & 0x40 == 0) or (v == -1 and b & 0x40 != 0)) return e.op(b);
-            e.op(b | 0x80);
-        }
-    }
-    /// A 5-byte (padded) u32 LEB placeholder; returns its position.
-    fn reserve(e: *Emit) usize {
-        const at = e.pos;
-        e.ops(&.{ 0x80, 0x80, 0x80, 0x80, 0x00 });
-        return at;
-    }
-    /// Patch a placeholder with the byte count from after it to the end.
-    fn patch(e: *Emit, at: usize) void {
-        if (!e.ok) return;
-        var v: u32 = @intCast(e.pos - at - 5);
-        for (0..5) |i| {
-            e.buf[at + i] = @as(u8, @truncate(v & 0x7f)) | (if (i < 4) @as(u8, 0x80) else 0);
-            v >>= 7;
-        }
-    }
-    fn k64(e: *Emit, v: u64) void {
-        e.op(W.i64_const);
-        e.sleb(@bitCast(v));
-    }
-    fn k32(e: *Emit, v: i32) void {
-        e.op(W.i32_const);
-        e.sleb(v);
-    }
-    fn get(e: *Emit, l: u32) void {
-        e.op(W.local_get);
-        e.uleb(l);
-    }
-    fn set(e: *Emit, l: u32) void {
-        e.op(W.local_set);
-        e.uleb(l);
-    }
-    fn tee(e: *Emit, l: u32) void {
-        e.op(W.local_tee);
-        e.uleb(l);
-    }
-    fn kf(e: *Emit, v: f64) void {
-        e.op(W.f64_const);
-        const u: u64 = @bitCast(v);
-        for (0..8) |i| e.op(@truncate(u >> @intCast(8 * i)));
-    }
-    fn call(e: *Emit, f: u32) void {
-        e.op(W.call);
-        e.uleb(f);
-    }
-    fn gget(e: *Emit) void {
-        e.ops(&.{ W.global_get, 0 });
-    }
-    fn gset(e: *Emit) void {
-        e.ops(&.{ W.global_set, 0 });
-    }
-    /// local l (i64) as f64 / an f32 held in the low 32 bits, widened.
-    fn getD(e: *Emit, l: u32) void {
-        e.get(l);
-        e.op(W.f64_reinterpret);
-    }
-    fn getS(e: *Emit, l: u32) void {
-        e.get(l);
-        e.ops(&.{ W.i32_wrap, W.f32_reinterpret, W.f64_promote });
-    }
-    /// Push guest register r (x0 reads as 0).
-    fn reg(e: *Emit, r: u8) void {
-        if (r == 0) e.k64(0) else e.get(lreg(r));
-    }
-    /// Pop into guest register r (x0 / the redirected x0 slot: dropped).
-    fn setReg(e: *Emit, r: u8) void {
-        if (r == 0 or r >= 32) e.op(W.drop) else e.set(lreg(r));
-    }
-    /// The i64 address on the stack becomes a memory address operand.
-    fn addr(e: *Emit) void {
-        if (e.mem32) e.op(W.i32_wrap);
-    }
-    fn mem(e: *Emit, opc: u8, alignment: u8, off: u64) void {
-        e.op(opc);
-        e.uleb(alignment);
-        e.uleb(off);
-    }
-    /// Push *irqp (the CPU's word of pending interrupts). With a shared
-    /// memory another CPU sets it (an IPI: a TLB shootdown waits for the
-    /// answer), so the load is atomic (i32.atomic.load, a plain load on
-    /// x86-64 and arm64): an engine may hoist a plain load out of a loop
-    /// that stores nothing, which would leave a compiled self-loop deaf.
-    fn irqWord(e: *Emit) void {
-        e.get(l_irq);
-        e.addr();
-        if (e.shared) {
-            e.ops(&.{ 0xfe, 0x10 }); // i32.atomic.load
-            e.uleb(2);
-            e.uleb(0);
-        } else e.mem(W.i32_load, 2, 0);
-    }
-    fn open(e: *Emit, kind: u8, bt: u8) void {
-        e.op(kind);
-        e.op(bt);
-        e.nest += 1;
-    }
-    fn close(e: *Emit) void {
-        e.op(W.end);
-        e.nest -= 1;
-    }
-    fn brExit(e: *Emit) void {
-        e.op(W.br);
-        e.uleb(e.nest - 1);
-    }
-    fn exit(e: *Emit, npc: u64, code: u64) void {
-        e.k64(npc);
-        e.set(l_npc);
-        e.k64(code);
-        e.set(l_code);
-    }
-    /// Leave the function: hand op k (at pc) back to the interpreter.
-    fn handBack(e: *Emit, k: usize, pc: u64) void {
-        e.exit(pc, k);
-        e.brExit();
-    }
-};
-
-const Error = error{ Unsupported, Overflow };
-
-/// Translate block `b`, at most its first `limit.*` ops, or region `rg`
-/// (whose member 0 is b; members are emitted in full and `limit` only
-/// reports b's translated prefix), into a module in cpu.priv.jit.buf;
-/// returns its length. On error.Overflow, `limit.*` is the number of ops of
-/// b that were emitted.
-fn emitModule(cpu: *Cpu, b: *const Block, rg: ?*Region, limit: *usize) Error!usize {
-    const all = cpu.priv.ops[b.op..][0..b.n];
-    var u: usize = 0;
-    while (u < all.len and u < limit.* and supported(all[u])) u += 1;
-    if (u == 0) return error.Unsupported;
-    limit.* = u;
-    const full = u == all.len;
-    const last = all[all.len - 1];
-    const self_loop = rg == null and full and switch (last.h) {
-        .beq, .bne, .blt, .bge, .bltu, .bgeu, .jal, .goto => last.imm == b.pc,
-        else => false,
-    };
-    var use: Use = .{};
-    for (all[0..u]) |o| use.add(usage(o));
-    const fma_inline = use.nfma <= fma_inline_max;
-    const aes_inline = use.naes <= aes_inline_max;
-    const bk_inline = use.nbk <= bk_inline_max;
-    helpers(&use);
-    // A region's prologue and epilogue cover the union over its members
-    // (integer and FP registers, fcsr, FMA, AES and clmul/xperm helpers):
-    // one member may enter another without returning.
-    if (rg) |r| regionUse(cpu, r, &use);
-    // Load every register the block writes as well: a hand-back writes all
-    // of them back, including those the executed part did not reach.
-    const live = use.read | use.write;
-    const flive = use.fread | use.fwrite;
-
-    var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = cpu.priv.jit.caps & cap_mem32 != 0, .shared = cpu.priv.jit.caps & cap_shared != 0 };
-    e.rg = rg;
-    e.fma_inline = fma_inline; // a region's members set their own
-    e.aes_inline = aes_inline;
-    e.bk_inline = bk_inline;
-    var nfn: u32 = 1;
-    if (use.fmad) {
-        e.fn_fmad = nfn;
-        nfn += 1;
-    }
-    if (use.fmas) {
-        e.fn_fmas = nfn;
-        nfn += 1;
-    }
-    for (0..n_aes_k) |i| {
-        if (use.aes & (@as(u8, 1) << @intCast(i)) == 0) continue;
-        e.fn_aes[i] = nfn;
-        nfn += 1;
-    }
-    for (0..n_bk_k) |i| {
-        if (use.bk & (@as(u8, 1) << @intCast(i)) == 0) continue;
-        e.fn_bk[i] = nfn;
-        nfn += 1;
-    }
-    e.ops(&.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
-    // type 0: (i64 i64 i64 i64) -> i64 (f); type 1: (i64 i64 i64) -> i64 (the helpers)
-    e.ops(&.{ 0x01, 0x10, 0x02, 0x60, 0x04, W.i64_t, W.i64_t, W.i64_t, W.i64_t, 0x01, W.i64_t });
-    e.ops(&.{ 0x60, 0x03, W.i64_t, W.i64_t, W.i64_t, 0x01, W.i64_t });
-    // import env.memory: memory64 (flags 4) or memory32, min 0; a shared
-    // memory (flags | 3) needs a maximum, which an import matches when the
-    // memory's is not larger: 65536 pages (4 GiB) for memory32, 262144
-    // (16 GiB, the kernel's --max-memory) for memory64.
-    e.ops(&.{ 0x02, if (e.shared) 0x12 else 0x0f, 0x01, 0x03, 'e', 'n', 'v', 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02 });
-    if (e.shared)
-        e.ops(&.{ if (e.mem32) 0x03 else 0x07, 0x00, 0x80, 0x80, if (e.mem32) 0x04 else 0x10 })
-    else
-        e.ops(&.{ if (e.mem32) 0x00 else 0x04, 0x00 });
-    // functions: f (type 0), then the helpers (type 1)
-    e.ops(&.{ 0x03, @intCast(1 + nfn), @intCast(nfn), 0x00 });
-    for (1..nfn) |_| e.op(0x01);
-    // the helpers' status word: global 0, mutable i32 (not exported)
-    if (nfn > 1) e.ops(&.{ 0x06, 0x06, 0x01, 0x7f, 0x01, W.i32_const, 0x00, W.end });
-    // export "f"
-    e.ops(&.{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 });
-    e.op(0x0a);
-    const code_sec = e.reserve();
-    e.uleb(nfn);
-    const body = e.reserve();
-    // locals: i64 x n_i64, f64 x n_f64, and a region's i64 x n_region_locals
-    e.op(if (rg != null) 0x03 else 0x02);
-    e.uleb(n_i64);
-    e.op(W.i64_t);
-    e.uleb(n_f64);
-    e.op(W.f64_t);
-    if (rg != null) {
-        e.uleb(n_region_locals);
-        e.op(W.i64_t);
-    }
-
-    // cpu == 0 (never from `run`): return at once. The host calls f so
-    // inside kw_host_jit_compile, so that an engine that compiles a
-    // function only at its first call (V8) does it there, inside the
-    // jit_busy window, instead of in `run`'s first call (kw_emu.h).
-    e.get(l_cpu);
-    e.op(W.i64_eqz);
-    e.open(W.@"if", W.void_t);
-    e.k64(0);
-    e.op(W.@"return");
-    e.close();
-
-    // prologue
-    for (1..32) |r| {
-        if (live & (@as(u32, 1) << @intCast(r)) == 0) continue;
-        e.get(l_x);
-        e.addr();
-        e.mem(W.i64_load, 3, r * 8);
-        e.set(lreg(@intCast(r)));
-    }
-    for (0..32) |r| {
-        if (flive & (@as(u32, 1) << @intCast(r)) == 0) continue;
-        e.get(l_x);
-        e.addr();
-        e.mem(W.i64_load, 3, f_off + r * 8);
-        e.set(lf(@intCast(r)));
-    }
-    if (use.fcsr_r or use.fcsr_w) {
-        e.get(l_x);
-        e.addr();
-        e.mem(W.i64_load32_u, 2, fcsr_off);
-        e.set(l_fcsr);
-    }
-    e.open(W.block, W.void_t); // exit
-    if (rg) |r| emitMembers(&e, cpu, r) else {
-        if (self_loop) e.open(W.loop, W.void_t);
-        var pc = b.pc;
-        for (all[0..u], 0..) |o, k| {
-            emitOp(&e, o, k, pc, b, self_loop);
-            pc = kwemu.nextPc(o, pc);
-        }
-        if (!full) e.handBack(u, pc);
-        if (self_loop) e.close();
-    }
-    e.close();
-
-    // epilogue: write back, pc, return (jl << 8) | code
-    for (1..32) |r| {
-        if (use.write & (@as(u32, 1) << @intCast(r)) == 0) continue;
-        e.get(l_x);
-        e.addr();
-        e.get(lreg(@intCast(r)));
-        e.mem(W.i64_store, 3, r * 8);
-    }
-    for (0..32) |r| {
-        if (use.fwrite & (@as(u32, 1) << @intCast(r)) == 0) continue;
-        e.get(l_x);
-        e.addr();
-        e.get(lf(@intCast(r)));
-        e.mem(W.i64_store, 3, f_off + r * 8);
-    }
-    if (use.fcsr_w) {
-        e.get(l_x);
-        e.addr();
-        e.get(l_fcsr);
-        e.mem(W.i64_store32, 2, fcsr_off);
-    }
-    e.get(l_x);
-    e.addr();
-    e.get(l_npc);
-    e.mem(W.i64_store, 3, 32 * 8);
-    if (rg != null) regionExit(&e);
-    e.get(l_jl);
-    e.k64(8);
-    e.op(W.i64_shl);
-    e.get(l_code);
-    e.op(W.i64_or);
-    e.op(W.end);
-    e.patch(body);
-    if (e.fn_fmad != 0) fmaBody(&e, u64, false);
-    if (e.fn_fmas != 0) fmaBody(&e, u32, false);
-    for (0..n_aes_k) |i| if (e.fn_aes[i] != 0) aesHelper(&e, @enumFromInt(i));
-    for (0..n_bk_k) |i| if (e.fn_bk[i] != 0) bkHelper(&e, @enumFromInt(i));
-    e.patch(code_sec);
-    if (!e.ok) return error.Overflow;
-    return e.pos;
-}
-
-/// Self-loop back edge: stop (pc = block start, done) on a pending
-/// interrupt or when the budget does not cover another pass.
-fn backEdge(e: *Emit, b: *const Block) void {
-    e.irqWord();
-    e.get(l_jl);
-    e.k64(b.ninsn);
-    e.op(W.i64_lt_u);
-    e.op(W.i32_or);
-    e.open(W.@"if", W.void_t);
-    e.exit(b.pc, code_done_stop);
-    e.brExit();
-    e.close();
-    e.get(l_jl);
-    e.k64(b.ninsn);
-    e.op(W.i64_sub);
-    e.set(l_jl);
-    e.op(W.br);
-    e.uleb(e.nest - 2); // the loop
-}
+/// The core's region locals: a third group of i64 locals, after the f64 ones.
+pub const l_region = l_d0 + n_f64;
 
 fn cmpOp(h: exec.H) u8 {
     return switch (h) {
@@ -1508,19 +537,19 @@ fn mulhu(e: *Emit, o: Op) void {
     const t3 = l_t0 + 3;
     const t4 = l_t0 + 4;
     const lo: u64 = 0xffff_ffff;
-    e.reg(o.rs1);
+    reg(e, o.rs1);
     e.k64(lo);
     e.op(W.i64_and);
     e.set(t0);
-    e.reg(o.rs1);
+    reg(e, o.rs1);
     e.k64(32);
     e.op(W.i64_shr_u);
     e.set(t1);
-    e.reg(o.rs2);
+    reg(e, o.rs2);
     e.k64(lo);
     e.op(W.i64_and);
     e.set(t2);
-    e.reg(o.rs2);
+    reg(e, o.rs2);
     e.k64(32);
     e.op(W.i64_shr_u);
     e.set(t3);
@@ -1557,17 +586,17 @@ fn mulhu(e: *Emit, o: Op) void {
 
 /// Signed-operand correction: subtract ((s >> 63) & other).
 fn mulCorr(e: *Emit, s: u8, other: u8) void {
-    e.reg(s);
+    reg(e, s);
     e.k64(63);
     e.op(W.i64_shr_s);
-    e.reg(other);
+    reg(e, other);
     e.op(W.i64_and);
     e.op(W.i64_sub);
 }
 
 /// x[rs2] == 0 test for the M-extension divisions (`w`: low 32 bits).
 fn divZero(e: *Emit, o: Op, w: bool) void {
-    e.reg(o.rs2);
+    reg(e, o.rs2);
     if (w) {
         e.op(W.i32_wrap);
         e.op(W.i32_eqz);
@@ -1576,14 +605,14 @@ fn divZero(e: *Emit, o: Op, w: bool) void {
 }
 
 fn lo32(e: *Emit, r: u8) void {
-    e.reg(r);
+    reg(e, r);
     e.op(W.i32_wrap);
 }
 
-fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) void {
+pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) void {
     switch (o.h) {
         .addi, .andi, .ori, .xori, .addiw => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm);
             e.op(switch (o.h) {
                 .addi, .addiw => W.i64_add,
@@ -1592,23 +621,23 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 else => W.i64_xor,
             });
             if (o.h == .addiw) e.ops(&.{ W.i32_wrap, W.i64_ext_s });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .slti, .sltiu => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm);
             e.ops(&.{ if (o.h == .slti) W.i64_lt_s else W.i64_lt_u, W.i64_ext_u });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .slli, .srli, .srai => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm & 63);
             e.op(switch (o.h) {
                 .slli => W.i64_shl,
                 .srli => W.i64_shr_u,
                 else => W.i64_shr_s,
             });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .slliw, .srliw, .sraiw => {
             lo32(e, o.rs1);
@@ -1619,15 +648,15 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 else => W.i32_shr_s,
             });
             e.op(W.i64_ext_s);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .li => {
             e.k64(o.imm);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .add, .sub, .and_, .or_, .xor_, .sll, .srl, .sra, .mul, .addw, .subw, .mulw => {
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             e.op(switch (o.h) {
                 .add, .addw => W.i64_add,
                 .sub, .subw => W.i64_sub,
@@ -1640,13 +669,13 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 else => W.i64_mul,
             });
             if (o.h == .addw or o.h == .subw or o.h == .mulw) e.ops(&.{ W.i32_wrap, W.i64_ext_s });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .slt, .sltu => {
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             e.ops(&.{ if (o.h == .slt) W.i64_lt_s else W.i64_lt_u, W.i64_ext_u });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .sllw, .srlw, .sraw => {
             lo32(e, o.rs1);
@@ -1657,33 +686,33 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 else => W.i32_shr_s,
             });
             e.op(W.i64_ext_s);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .mulhu, .mulh, .mulhsu => {
             mulhu(e, o);
             if (o.h != .mulhu) mulCorr(e, o.rs1, o.rs2);
             if (o.h == .mulh) mulCorr(e, o.rs2, o.rs1);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .div, .divu, .rem, .remu => {
             // RV: x/0 = -1 (all ones), x%0 = x, MIN/-1 = MIN, MIN%-1 = 0
             // (wasm rem_s(MIN, -1) is 0; div_s would trap, so divide by 1).
             divZero(e, o, false);
-            if (o.h == .div or o.h == .divu) e.k64(std.math.maxInt(u64)) else e.reg(o.rs1);
+            if (o.h == .div or o.h == .divu) e.k64(std.math.maxInt(u64)) else reg(e, o.rs1);
             e.op(W.@"else");
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             if (o.h == .div) {
                 e.k64(1);
-                e.reg(o.rs2);
-                e.reg(o.rs1);
+                reg(e, o.rs2);
+                reg(e, o.rs1);
                 e.k64(1 << 63);
                 e.op(W.i64_eq);
-                e.reg(o.rs2);
+                reg(e, o.rs2);
                 e.k64(std.math.maxInt(u64));
                 e.op(W.i64_eq);
                 e.op(W.i32_and);
                 e.op(W.select);
-            } else e.reg(o.rs2);
+            } else reg(e, o.rs2);
             e.op(switch (o.h) {
                 .div => W.i64_div_s,
                 .divu => W.i64_div_u,
@@ -1691,7 +720,7 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 else => W.i64_rem_u,
             });
             e.close();
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .divw, .divuw, .remw, .remuw => {
             divZero(e, o, true);
@@ -1721,7 +750,7 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
             });
             e.op(W.i64_ext_s);
             e.close();
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .lb, .lh, .lw, .ld, .lbu, .lhu, .lwu => {
             const size: u64, const opc: u8 = switch (o.h) {
@@ -1733,9 +762,9 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 .lwu => .{ 4, 0x35 },
                 else => .{ 8, 0x29 },
             };
-            hostAddr(e, o, k, pc, tlb_r_off, size);
+            hostAddr(e, o, k, pc, jc.tlb_r_off, size);
             e.mem(opc, 0, 0);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .sb, .sh, .sw, .sd => {
             const size: u64, const opc: u8 = switch (o.h) {
@@ -1744,17 +773,17 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
                 .sw => .{ 4, 0x3e },
                 else => .{ 8, 0x37 },
             };
-            hostAddr(e, o, k, pc, tlb_w_off, size);
-            e.reg(o.rs2);
+            hostAddr(e, o, k, pc, jc.tlb_w_off, size);
+            reg(e, o.rs2);
             e.mem(opc, 0, 0);
         },
         .nop => {},
         .beq_x, .bne_x, .blt_x, .bge_x, .bltu_x, .bgeu_x => {
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             e.op(cmpOp(o.h));
             e.open(W.@"if", W.void_t);
-            if (e.rg) |r| regionSide(e, r, o.imm, k, b) else {
+            if (e.rg) |r| e.regionSide(r, o.imm, k, b) else {
                 e.exit(o.imm, code_side + k);
                 e.brExit();
             }
@@ -1762,22 +791,22 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
         },
         .jal_c => {
             e.k64(o.imm);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .beq, .bne, .blt, .bge, .bltu, .bgeu => {
             if (self_loop) {
-                e.reg(o.rs1);
-                e.reg(o.rs2);
+                reg(e, o.rs1);
+                reg(e, o.rs2);
                 e.op(cmpOp(o.h));
                 e.open(W.@"if", W.void_t);
-                backEdge(e, b);
+                e.backEdge(b);
                 e.close();
                 e.exit(b.end_pc, code_done);
             } else {
                 e.k64(o.imm);
                 e.k64(b.end_pc);
-                e.reg(o.rs1);
-                e.reg(o.rs2);
+                reg(e, o.rs1);
+                reg(e, o.rs2);
                 e.op(cmpOp(o.h));
                 e.op(W.select);
                 e.set(l_npc);
@@ -1787,27 +816,27 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
         },
         .jal => {
             e.k64(b.end_pc);
-            e.setReg(o.rd);
-            if (self_loop) backEdge(e, b) else e.exit(o.imm, code_done);
+            setReg(e, o.rd);
+            if (self_loop) e.backEdge(b) else e.exit(o.imm, code_done);
         },
         .jalr => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm);
             e.op(W.i64_add);
             e.k64(~@as(u64, 1));
             e.op(W.i64_and);
             e.set(l_npc);
             e.k64(b.end_pc);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
             e.k64(code_done);
             e.set(l_code);
         },
         .goto => {
-            if (self_loop) backEdge(e, b) else e.exit(o.imm, code_done);
+            if (self_loop) e.backEdge(b) else e.exit(o.imm, code_done);
         },
         .flw, .fld => {
             const size: u64 = if (o.h == .flw) 4 else 8;
-            hostAddr(e, o, k, pc, tlb_r_off, size);
+            hostAddr(e, o, k, pc, jc.tlb_r_off, size);
             if (o.h == .flw) {
                 e.mem(W.i64_load32_u, 0, 0);
                 e.k64(box_hi);
@@ -1816,24 +845,24 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
             e.set(lf(o.rd));
         },
         .fsw, .fsd => {
-            hostAddr(e, o, k, pc, tlb_w_off, if (o.h == .fsw) 4 else 8);
+            hostAddr(e, o, k, pc, jc.tlb_w_off, if (o.h == .fsw) 4 else 8);
             e.get(lf(o.rs2)); // fsw stores the low 32 bits as they are (no unboxing)
             e.mem(if (o.h == .fsw) W.i64_store32 else W.i64_store, 0, 0);
         },
         .fmv_x_w => {
             e.get(lf(o.rs1));
             e.ops(&.{ W.i32_wrap, W.i64_ext_s });
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .fmv_x_d => {
             e.get(lf(o.rs1));
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .fmv_w_x, .fmv_d_x => { // f[rd] = x[rs1] | imm (fli: rs1 = x0)
             if (o.rs1 == 0) {
                 e.k64((if (o.h == .fmv_w_x) box_hi else 0) | o.imm);
             } else {
-                e.reg(o.rs1);
+                reg(e, o.rs1);
                 if (o.h == .fmv_w_x or o.imm != 0) {
                     e.k64((if (o.h == .fmv_w_x) box_hi else 0) | o.imm);
                     e.op(W.i64_or);
@@ -1848,42 +877,42 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
         .generic => fGeneric(e, o.raw, k, pc),
         .aes64es, .aes64esm, .aes64ds, .aes64dsm, .aes64im => {
             const kind = aesKind(o.h);
-            if (e.aes_inline) {
+            if (e.x.aes_inline) {
                 aesBody(e, kind, .{ .reg = o.rs1 }, .{ .reg = o.rs2 }, .{ .local = l_cpu });
             } else {
-                e.reg(o.rs1);
-                e.reg(o.rs2);
+                reg(e, o.rs1);
+                reg(e, o.rs2);
                 e.get(l_cpu);
-                e.call(e.fn_aes[@intFromEnum(kind)]);
+                e.call(e.x.fn_aes[@intFromEnum(kind)]);
             }
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .aes64ks1i => aesKs1i(e, o),
         .andn, .orn, .xnor, .rol, .ror, .rolw, .rorw, .pack, .packh, .packw, .rori, .roriw, .rev8, .brev8 => bkSimple(e, o),
         .shadd, .clz, .ctz, .cpop, .minmax, .sext, .orc_b, .bitop, .bext, .czero => zbOp(e, o),
         .clmul, .clmulh, .clmulr, .xperm4, .xperm8 => {
             const kind = bkKind(o.h);
-            if (e.bk_inline) {
+            if (e.x.bk_inline) {
                 bkBody(e, kind, .{ .reg = o.rs1 }, .{ .reg = o.rs2 }, l_bk);
             } else {
-                e.reg(o.rs1);
-                e.reg(o.rs2);
+                reg(e, o.rs1);
+                reg(e, o.rs2);
                 e.k64(0);
-                e.call(e.fn_bk[@intFromEnum(kind)]);
+                e.call(e.x.fn_bk[@intFromEnum(kind)]);
             }
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         .aes64ks2 => {
             // w0 = hi(rs1) ^ lo(rs2); rd = (w0 ^ hi(rs2)) << 32 | w0
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(32);
             e.op(W.i64_shr_u);
-            e.reg(o.rs2);
+            reg(e, o.rs2);
             e.op(W.i64_xor);
             e.k64(0xffff_ffff);
             e.op(W.i64_and);
             e.tee(l_t0);
-            e.reg(o.rs2);
+            reg(e, o.rs2);
             e.k64(32);
             e.op(W.i64_shr_u);
             e.op(W.i64_xor);
@@ -1891,7 +920,7 @@ fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) 
             e.op(W.i64_shl);
             e.get(l_t0);
             e.op(W.i64_or);
-            e.setReg(o.rd);
+            setReg(e, o.rd);
         },
         else => unreachable,
     }
@@ -1928,7 +957,7 @@ const Src = union(enum) {
 
     fn push(s: Src, e: *Emit) void {
         switch (s) {
-            .reg => |r| e.reg(r),
+            .reg => |r| reg(e, r),
             .local => |l| e.get(l),
         }
     }
@@ -2018,7 +1047,7 @@ fn aesHelper(e: *Emit, kind: AesK) void {
 /// rd = w << 32 | w (t0 holds the word).
 fn aesKs1i(e: *Emit, o: Op) void {
     const rnum: u4 = @intCast(o.imm & 0xf);
-    e.reg(o.rs1);
+    reg(e, o.rs1);
     e.k64(32);
     e.op(W.i64_shr_u);
     if (rnum != 0xa) {
@@ -2048,7 +1077,7 @@ fn aesKs1i(e: *Emit, o: Op) void {
     e.op(W.i64_shl);
     e.get(l_t0);
     e.op(W.i64_or);
-    e.setReg(o.rd);
+    setReg(e, o.rd);
 }
 
 // ---- Zbkb / Zbc / Zbkc / Zbkx --------------------------------------------------------
@@ -2238,26 +1267,26 @@ fn bkSimple(e: *Emit, o: Op) void {
     const ones = std.math.maxInt(u64);
     switch (o.h) {
         .andn, .orn => {
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             e.k64(ones);
             e.op(W.i64_xor);
             e.op(if (o.h == .andn) W.i64_and else W.i64_or);
         },
         .xnor => {
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             e.op(W.i64_xor);
             e.k64(ones);
             e.op(W.i64_xor);
         },
         .rol, .ror => {
-            e.reg(o.rs1);
-            e.reg(o.rs2); // wasm takes the count mod 64, as RISC-V does
+            reg(e, o.rs1);
+            reg(e, o.rs2); // wasm takes the count mod 64, as RISC-V does
             e.op(if (o.h == .rol) W.i64_rotl else W.i64_rotr);
         },
         .rori => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm & 63);
             e.op(W.i64_rotr);
         },
@@ -2272,18 +1301,18 @@ fn bkSimple(e: *Emit, o: Op) void {
             e.ops(&.{ W.i32_rotr, W.i64_ext_s });
         },
         .pack => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.ops(&.{ W.i32_wrap, W.i64_ext_u });
-            e.reg(o.rs2);
+            reg(e, o.rs2);
             e.k64(32);
             e.op(W.i64_shl);
             e.op(W.i64_or);
         },
         .packh => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(0xff);
             e.op(W.i64_and);
-            e.reg(o.rs2);
+            reg(e, o.rs2);
             e.k64(0xff);
             e.op(W.i64_and);
             e.k64(8);
@@ -2300,16 +1329,16 @@ fn bkSimple(e: *Emit, o: Op) void {
             e.ops(&.{ W.i32_or, W.i64_ext_s });
         },
         .rev8 => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             rev8Seq(e, l_t0);
         },
         .brev8 => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             brev8Seq(e, l_t0);
         },
         else => unreachable,
     }
-    e.setReg(o.rd);
+    setReg(e, o.rd);
 }
 
 // ---- Zba / Zbb / Zbs / Zicond ------------------------------------------------------
@@ -2323,14 +1352,14 @@ fn zbOp(e: *Emit, o: Op) void {
     const ones = std.math.maxInt(u64);
     switch (o.h) {
         .shadd => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             if (o.imm & 64 != 0) e.ops(&.{ W.i32_wrap, W.i64_ext_u }); // .uw
             if (o.imm & 63 != 0) {
                 e.k64(o.imm & 63);
                 e.op(W.i64_shl);
             }
             if (o.rs2 != 0) {
-                e.reg(o.rs2);
+                reg(e, o.rs2);
                 e.op(W.i64_add);
             }
         },
@@ -2344,7 +1373,7 @@ fn zbOp(e: *Emit, o: Op) void {
                     else => W.i32_popcnt,
                 }, W.i64_ext_u });
             } else {
-                e.reg(o.rs1);
+                reg(e, o.rs1);
                 e.op(switch (o.h) {
                     .clz => W.i64_clz,
                     .ctz => W.i64_ctz,
@@ -2354,16 +1383,16 @@ fn zbOp(e: *Emit, o: Op) void {
         },
         .minmax => {
             // select(rs1, rs2, rs1 > rs2) (max) or rs1 < rs2 (min)
-            e.reg(o.rs1);
-            e.reg(o.rs2);
-            e.reg(o.rs1);
-            e.reg(o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
+            reg(e, o.rs1);
+            reg(e, o.rs2);
             const u = o.imm >> 63 != 0;
             e.op(if (o.imm & 1 != 0) (if (u) W.i64_gt_u else W.i64_gt_s) else (if (u) W.i64_lt_u else W.i64_lt_s));
             e.op(W.select);
         },
         .sext => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(o.imm & 63);
             e.op(W.i64_shl);
             e.k64(o.imm & 63);
@@ -2372,12 +1401,12 @@ fn zbOp(e: *Emit, o: Op) void {
         .orc_b => {
             // core.bitmanip.orcb: ((((a & 0x7f..) + 0x7f..) | a) >> 7 & 0x01..) * 0xff
             const lo7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(lo7);
             e.op(W.i64_and);
             e.k64(lo7);
             e.op(W.i64_add);
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.op(W.i64_or);
             e.k64(7);
             e.op(W.i64_shr_u);
@@ -2388,9 +1417,9 @@ fn zbOp(e: *Emit, o: Op) void {
         },
         .bitop => {
             // bclr (imm 1): a & ~m, bset (3): a | m, binv (2): a ^ m
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             e.k64(1);
-            e.reg(o.rs2); // wasm takes the count mod 64, as RISC-V does
+            reg(e, o.rs2); // wasm takes the count mod 64, as RISC-V does
             e.op(W.i64_shl);
             if (o.imm == 1) {
                 e.k64(ones);
@@ -2403,9 +1432,9 @@ fn zbOp(e: *Emit, o: Op) void {
             });
         },
         .bext => {
-            e.reg(o.rs1);
+            reg(e, o.rs1);
             if (o.rs2 == 0) e.k64(o.imm & 63) else {
-                e.reg(o.rs2);
+                reg(e, o.rs2);
                 if (o.imm != 0) {
                     e.k64(o.imm);
                     e.op(W.i64_add);
@@ -2419,18 +1448,18 @@ fn zbOp(e: *Emit, o: Op) void {
             // eqz: select(0, rs1, rs2 == 0); nez: select(rs1, 0, rs2 == 0)
             if (o.imm == 0) {
                 e.k64(0);
-                e.reg(o.rs1);
+                reg(e, o.rs1);
             } else {
-                e.reg(o.rs1);
+                reg(e, o.rs1);
                 e.k64(0);
             }
-            e.reg(o.rs2);
+            reg(e, o.rs2);
             e.op(W.i64_eqz);
             e.op(W.select);
         },
         else => unreachable,
     }
-    e.setReg(o.rd);
+    setReg(e, o.rd);
 }
 
 // ---- F/D -------------------------------------------------------------------------
@@ -2471,8 +1500,8 @@ fn fsrc(e: *Emit, r: u32, dbl: bool, tmp: u32) u32 {
 /// Hand op k back unless frm is RNE (only for a dynamic rounding mode, and
 /// only once per module: see Emit.frm_checked).
 fn frmCheck(e: *Emit, dyn: bool, k: usize, pc: u64) void {
-    if (!dyn or e.frm_checked) return;
-    e.frm_checked = true;
+    if (!dyn or e.x.frm_checked) return;
+    e.x.frm_checked = true;
     e.get(l_fcsr);
     e.k64(0xe0);
     e.op(W.i64_and);
@@ -2630,7 +1659,7 @@ fn fCmp(e: *Emit, o: Op) void {
         else => fCompare(e, a, b, dbl, .le),
     }
     e.op(W.i64_ext_u);
-    e.setReg(o.rd);
+    setReg(e, o.rd);
 }
 
 /// fmin / fmax, fminm / fmaxm (Zfa): fsgnj kind, imm = 4 | funct3.
@@ -2869,14 +1898,14 @@ fn fFma(e: *Emit, o: Op, k: usize, pc: u64) void {
             e.op(W.i64_xor);
         }
     }
-    if (e.fma_inline) {
+    if (e.x.fma_inline) {
         for (0..3) |i| e.set(l_fma_i + 2 - @as(u32, @intCast(i)));
         e.open(W.block, W.i64_t);
-        e.fma_nest = e.nest;
+        e.x.fma_nest = e.nest;
         if (dbl) fmaBody(e, u64, true) else fmaBody(e, u32, true);
         e.close();
-        e.fma_nest = 0;
-    } else e.call(if (dbl) e.fn_fmad else e.fn_fmas);
+        e.x.fma_nest = 0;
+    } else e.call(if (dbl) e.x.fn_fmad else e.x.fn_fmas);
     e.set(l_t5 + 3);
     // status: 0 exact, 1 inexact, 2 hand back
     fmaStatus(e);
@@ -2891,7 +1920,7 @@ fn fFma(e: *Emit, o: Op, k: usize, pc: u64) void {
 
 /// Push the last FMA body's status (i32).
 fn fmaStatus(e: *Emit) void {
-    if (e.fma_inline) {
+    if (e.x.fma_inline) {
         e.get(l_fma_st);
         e.op(W.i32_wrap);
     } else e.gget();
@@ -2905,7 +1934,7 @@ fn fmaStatus(e: *Emit) void {
 /// 1 (inexact) or 2 (the interpreter must do it: NaN/infinite operands,
 /// out-of-range operands or results). Emitted either as a helper function
 /// of type 1 (status in global 0) or inline in f inside a `block (result
-/// i64)` whose nesting level is e.fma_nest (operands in l_fma_i.., status
+/// i64)` whose nesting level is e.x.fma_nest (operands in l_fma_i.., status
 /// in l_fma_st).
 fn fmaBody(e: *Emit, comptime B: type, comptime inl: bool) void {
     const dbl = B == u64;
@@ -2966,7 +1995,7 @@ fn fmaBody(e: *Emit, comptime B: type, comptime inl: bool) void {
         fn ret(em: *Emit) void {
             if (inl) {
                 em.op(W.br);
-                em.uleb(em.nest - em.fma_nest);
+                em.uleb(em.nest - em.x.fma_nest);
             } else em.op(W.@"return");
         }
         fn handBack(em: *Emit) void {
@@ -3442,7 +2471,7 @@ fn fGeneric(e: *Emit, raw: u32, k: usize, pc: u64) void {
             // underflow is possible, inexact iff the magnitude spans more
             // than the significand's bits
             const mag = l_t5;
-            e.reg(@intCast(rs1));
+            reg(e, @intCast(rs1));
             switch (rs2) {
                 0 => e.ops(&.{ W.i32_wrap, W.i64_ext_s }),
                 1 => {
@@ -3522,7 +2551,7 @@ fn fGeneric(e: *Emit, raw: u32, k: usize, pc: u64) void {
             e.get(r);
             e.op(if (rs2 == 3) W.i64_trunc_f64_u else W.i64_trunc_f64_s);
             if (rs2 <= 1) e.ops(&.{ W.i32_wrap, W.i64_ext_s });
-            e.setReg(@intCast(rd));
+            setReg(e, @intCast(rd));
             e.get(r);
             e.get(x);
             e.op(W.f64_ne);
@@ -3577,526 +2606,7 @@ fn fGeneric(e: *Emit, raw: u32, k: usize, pc: u64) void {
             e.op(W.select);
             C.over(e, r, m, W.i64_gt_u, inf);
             e.get(r);
-            e.setReg(@intCast(rd));
+            setReg(e, @intCast(rd));
         },
     }
-}
-
-/// Inline data-TLB lookup for an access of `size` bytes at x[rs1] + imm:
-/// leaves the host address on the stack, or hands op k back on a miss
-/// (same test as Cpu.load/storeChk: tag == vpn of the last byte).
-fn hostAddr(e: *Emit, o: Op, k: usize, pc: u64, tlb_off: u64, size: u64) void {
-    e.reg(o.rs1);
-    if (o.imm != 0) {
-        e.k64(o.imm);
-        e.op(W.i64_add);
-    }
-    e.set(l_va);
-    e.get(l_cpu);
-    e.get(l_va);
-    e.k64(8);
-    e.op(W.i64_shr_u);
-    e.k64(dtlb_mask);
-    e.op(W.i64_and);
-    e.op(W.i64_add);
-    e.op(W.local_tee);
-    e.uleb(l_e);
-    e.addr();
-    e.mem(W.i64_load, 3, tlb_off); // tag
-    e.get(l_va);
-    if (size > 1) {
-        e.k64(size - 1);
-        e.op(W.i64_add);
-    }
-    e.k64(12);
-    e.op(W.i64_shr_u);
-    e.op(W.i64_ne);
-    e.open(W.@"if", W.void_t);
-    e.handBack(k, pc);
-    e.close();
-    e.get(l_e);
-    e.addr();
-    e.mem(W.i64_load, 3, tlb_off + 8); // add
-    e.get(l_va);
-    e.op(W.i64_add);
-    e.addr();
-}
-
-// ---- regions -------------------------------------------------------------------------
-//
-// A compiled module holds a region: up to `max_members` decoded blocks
-// (members), on any number of pages, not just one block. Guest registers
-// stay in wasm locals across the whole region: a member that leaves through
-// its terminator (a jalr compares its target against every member's pc) or
-// a side exit towards a member (itself included) continues there inside the
-// module, through a `loop` over a `br_table`. The table has two entries per
-// member: its checked entry (the checks below, then the member) and the
-// member itself (only for the member `run` entered; a jalr to the start of
-// the member being run continues in the member's own loop). A branch site only
-// sets the index and branches to the loop, so a module carries the checks
-// once per member, not once per branch site and target. Only exits to other
-// pcs, hand-backs and stops return to `run`.
-//
-// Home and guest members: a block's `st` names one region, its home, and
-// `run` enters the block only through that module. A region may also hold
-// copies of blocks whose home is another region (guests). A member's code
-// depends only on its decoded ops, so a copy is exact as long as the block
-// still holds the same decode; the checks below do not look at `st`.
-//
-// Entering a member: `run` looked the entered block up, so it is valid
-// under its page's current exec-TLB fill. A branch to a member m (from any
-// member, m itself included) goes through m's checked entry:
-//  - blocks[m].op is the op index m had when the module was emitted. A
-//    re-decode takes new ops (the arena only grows until a cache reset,
-//    which frees every module), so this is "still the same decode".
-//  - m is valid under the current fill of its own page: blocks[m].tgen
-//    equals l_g, the tgen of the member being run (a generation is unique
-//    to one fill of one page, and that fill is live), or else the
-//    generation of one of the two exec-TLB entries of m's page's set,
-//    exactly what `lookup` checks; l_g then becomes m's tgen. Nothing in
-//    compiled code changes the exec TLB (stores into code hand back), so a
-//    check made here holds until the module returns.
-//  - like `run`: the budget covers all of m (jl >= its instructions) and no
-//    interrupt is pending.
-// Then it charges m in full and enters it; a side exit first refunds the
-// rest of the member it leaves, so `jl` stays exact. Every member entry
-// polls *irqp, so the irq word is read at least every 64 instructions. If
-// a check fails, the module returns "done" with pc = the member's start,
-// and `run` takes over (looks it up, revalidates or re-decodes it).
-// `cpu.jit.cur` names the member a hand-back came from (`lastBlock`).
-// Nothing in compiled code frees or reuses a slot or rewrites a block
-// (only `run` does, between entries), so a region never outlives its
-// members while it runs.
-//
-// The emitted code depends on pc, the raw instruction bits, cpu-relative
-// layout offsets, the members' block-table positions and op indices, never
-// on host addresses, generations or the pool entry: a revalidated member
-// keeps its code. Regions are formed when a block gets hot (`compile`):
-// that block, the members of an open region of its page that has room
-// (which is then replaced, so a page tends to have one module), then
-// blocks reachable from those through branch, jal and call-return targets
-// that are already decoded, valid under their page's current fill and not
-// compiled elsewhere, on any page, in breadth-first order. They grow later
-// along hot exits (`noteHot`): a block compiled in another region, on
-// another page, that `run` often enters right after the region left joins
-// it as a guest. A member that is re-decoded only loses its own entry
-// (`dropMember`); copies of it in other regions fail the op check from then
-// on. A region is freed when no home member is left, when the clock evicts
-// it, when it is grown (replaced) or on a cache reset.
-
-/// Region locals: a third group of i64 locals, after the f64 ones.
-const n_region_locals = 4;
-/// `br_table` index of the code to run next: 2 m = member m's checked
-/// entry, 2 m + 1 = member m itself (see `emitMembers`).
-const l_next = l_d0 + n_f64;
-/// Address of the member being run (stored to cpu.jit.cur on exit).
-const l_cur = l_next + 1;
-/// tgen of a member while its checked entry tests it.
-const l_tg = l_next + 2;
-/// tgen of the member being run: the generation of the current exec-TLB
-/// fill of its page.
-const l_g = l_next + 3;
-
-const blocks_off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "blocks");
-const tlb_x_off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "tlb_x");
-const XTlb = @typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_x")).array.child;
-/// Exec-TLB sets (2 ways each).
-const xtlb_sets = @typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_x")).array.len / 2;
-const jit_off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "jit");
-const jst_off = @offsetOf(Block, "jx") + @offsetOf(BlockState, "st");
-
-/// Opcodes used only here.
-const WR = struct {
-    const br_table = 0x0e;
-};
-
-/// The blocks of a region being compiled (indices into cpu.priv.blocks;
-/// [0] is the block that got hot) and its emission state.
-pub const Region = struct {
-    cpu: *Cpu,
-    n: usize = 0,
-    idx: [max_members]u32 = undefined,
-    /// Member being emitted.
-    cur: usize = 0,
-    /// Nesting levels of the dispatch loop and of the current member's loop.
-    top: u32 = 0,
-    self: u32 = 0,
-
-    fn block(rg: *const Region, m: usize) *const Block {
-        return &rg.cpu.priv.blocks[rg.idx[m]];
-    }
-    /// Member whose block starts at pc.
-    fn memberAt(rg: *const Region, pc: u64) ?usize {
-        for (0..rg.n) |m| {
-            if (rg.block(m).pc == pc) return m;
-        }
-        return null;
-    }
-};
-
-/// State.page flag: the region takes no further members (it did not fit,
-/// or it is a self-loop's module of its own).
-const page_closed: u64 = 1 << 63;
-
-/// `st` of member m of the region in pool entry i (without ref_bit).
-inline fn memberSt(i: usize, m: usize) u32 {
-    return compiled | (@as(u32, @intCast(m)) << member_shift) | @as(u32, @intCast(i));
-}
-
-/// Pool entry of an open region of b's page with room for another member
-/// whose live (home) members on that page are on b's host page.
-fn findRegion(cpu: *Cpu, b: *const Block, limit: usize) ?usize {
-    const st = &cpu.priv.jit;
-    for (0..npool) |i| {
-        if (st.owner[i] == 0 or st.page[i] != b.pc >> 12) continue;
-        var n: usize = 0;
-        var live: usize = 0;
-        var same = true;
-        for (st.members[i]) |m| {
-            if (m == 0) continue;
-            n += 1;
-            const o = &cpu.priv.blocks[m - 1];
-            if (slotOf(o) != i + 1) continue;
-            live += 1;
-            if ((o.pc ^ b.pc) >> 12 == 0) same = same and o.host >> 12 == b.host >> 12;
-        }
-        if (same and live > 0 and n < limit) return i;
-    }
-    return null;
-}
-
-/// Whether block c is valid under the current exec-TLB fill of its page
-/// (what `lookup` checks).
-fn current(cpu: *Cpu, c: *const Block) bool {
-    return c.tgen != 0 and c.tgen == cpu.execGenOf(c.pc);
-}
-
-/// Index of the decoded block at pc t that may join b's region: valid under
-/// the current fill of its page (on b's page: also on b's host page), not
-/// compiled, compilable, no self-loop.
-fn candidate(cpu: *Cpu, b: *const Block, t: u64) ?u32 {
-    const set = kwemu.blockSet(t);
-    for (cpu.priv.blocks[set..][0..2], set..) |*c, i| {
-        if (c.pc != t) continue;
-        if ((t ^ b.pc) >> 12 == 0) {
-            if (c.tgen != b.tgen or c.host >> 12 != b.host >> 12) continue;
-        } else if (!current(cpu, c)) continue;
-        if (c.jx.st == never or c.jx.st >= compiled or !supported(cpu.priv.ops[c.op]) or selfLoop(cpu, c)) return null;
-        return @intCast(i);
-    }
-    return null;
-}
-
-/// A block that branches or jumps back to its own start keeps a module of
-/// its own: as a plain wasm loop that loads only its own registers it is
-/// faster than inside a region, and much cheaper to leave and re-enter
-/// (data-TLB misses hand back to `run` every few passes in loops over large
-/// arrays).
-fn selfLoop(cpu: *Cpu, b: *const Block) bool {
-    const last = cpu.priv.ops[b.op + b.n - 1];
-    return switch (last.h) {
-        .beq, .bne, .blt, .bge, .bltu, .bgeu, .jal, .goto => last.imm == b.pc,
-        else => false,
-    };
-}
-
-fn addMember(rg: *Region, i: u32) void {
-    for (rg.idx[0..rg.n]) |j| if (j == i) return;
-    rg.idx[rg.n] = i;
-    rg.n += 1;
-}
-
-/// Collect the region for b (see above).
-fn gatherRegion(cpu: *Cpu, b: *Block, rg: *Region) void {
-    const st = &cpu.priv.jit;
-    const limit = @min(st.region_max, max_members);
-    rg.idx[0] = blockIndex(cpu, b);
-    rg.n = 1;
-    if (limit <= 1 or selfLoop(cpu, b)) return;
-    if (findRegion(cpu, b, limit)) |i| {
-        for (st.members[i]) |m| {
-            if (m != 0 and usable(cpu, &cpu.priv.blocks[m - 1])) addMember(rg, m - 1);
-        }
-        freeSlot(cpu, i);
-        st.grows += 1;
-    }
-    var q: usize = 0;
-    while (q < rg.n and rg.n < limit) : (q += 1) {
-        const m = rg.block(q);
-        for (cpu.priv.ops[m.op..][0..m.n]) |o| {
-            // targets of side exits and terminators; return sites of calls
-            const call = o.rd != 0 and o.rd < 32;
-            const ts: [2]?u64 = switch (o.h) {
-                .beq_x, .bne_x, .blt_x, .bge_x, .bltu_x, .bgeu_x, .goto => .{ o.imm, null },
-                .jal_c => .{ if (call) o.imm else null, null },
-                .beq, .bne, .blt, .bge, .bltu, .bgeu => .{ o.imm, m.end_pc },
-                .jal => .{ o.imm, if (call) m.end_pc else null },
-                .jalr => .{ if (call) m.end_pc else null, null },
-                else => .{ null, null },
-            };
-            for (ts) |t| {
-                if (rg.n == limit) return;
-                if (t) |pc| if (candidate(cpu, b, pc)) |i| addMember(rg, i);
-            }
-        }
-    }
-}
-
-/// OR the register usage of members 1.. into `use` (member 0 is the block
-/// emitModule was called for).
-fn regionUse(cpu: *Cpu, rg: *const Region, use: *Use) void {
-    for (1..rg.n) |m| {
-        const b = rg.block(m);
-        var x: Use = .{};
-        for (cpu.priv.ops[b.op..][0..b.n]) |o| {
-            if (!supported(o)) break;
-            x.add(usage(o));
-        }
-        helpers(&x);
-        use.add(x);
-    }
-}
-
-/// The body of a region (inside the exit block): dispatch to the entered
-/// member, then every member, each after its checked entry. The `br_table`
-/// targets are, in order, checked entry 0, member 0, checked entry 1, ...:
-/// a checked entry falls through into its member, and a member never falls
-/// through (every path of it ends in a branch).
-fn emitMembers(e: *Emit, cpu: *Cpu, rg: *Region) void {
-    // l_cur = cpu.jit.cur (the entered member), l_g = its tgen,
-    // l_next = 2 * its index + 1
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i64_load, 3, jit_off + @offsetOf(State, "cur"));
-    e.set(l_cur);
-    e.get(l_cur);
-    e.addr();
-    e.mem(W.i64_load, 3, @offsetOf(Block, "tgen"));
-    e.set(l_g);
-    e.get(l_cur);
-    e.addr();
-    e.mem(W.i64_load32_u, 2, jst_off);
-    e.k64(member_shift - 1);
-    e.op(W.i64_shr_u);
-    e.k64(0x1fe);
-    e.op(W.i64_and);
-    e.k64(1);
-    e.op(W.i64_or);
-    e.set(l_next);
-    e.open(W.loop, W.void_t);
-    rg.top = e.nest;
-    for (0..2 * rg.n) |_| e.open(W.block, W.void_t);
-    e.get(l_next);
-    e.op(W.i32_wrap);
-    e.op(WR.br_table);
-    e.uleb(2 * rg.n);
-    for (0..2 * rg.n) |i| e.uleb(i);
-    e.uleb(2 * rg.n - 1);
-    for (0..rg.n) |m| {
-        e.close();
-        checkedEntry(e, rg, m);
-        e.close();
-        emitMember(e, cpu, rg, m);
-    }
-    e.close();
-}
-
-fn emitMember(e: *Emit, cpu: *Cpu, rg: *Region, m: usize) void {
-    const b = rg.block(m);
-    const all = cpu.priv.ops[b.op..][0..b.n];
-    var u: usize = 0;
-    while (u < all.len and supported(all[u])) u += 1;
-    rg.cur = m;
-    // A member may be entered first: its own code checks frm (frmCheck).
-    e.frm_checked = false;
-    var nfma: u32 = 0;
-    for (all[0..u]) |o| nfma += usage(o).nfma;
-    e.fma_inline = nfma <= fma_inline_max;
-    var naes: u32 = 0;
-    var nbk: u32 = 0;
-    for (all[0..u]) |o| {
-        naes += usage(o).naes;
-        nbk += usage(o).nbk;
-    }
-    e.aes_inline = naes <= aes_inline_max;
-    e.bk_inline = nbk <= bk_inline_max;
-    e.get(l_cpu);
-    e.k64(blocks_off + @as(u64, rg.idx[m]) * @sizeOf(Block));
-    e.op(W.i64_add);
-    e.set(l_cur);
-    e.open(W.loop, W.void_t);
-    rg.self = e.nest;
-    var pc = b.pc;
-    for (all[0..u], 0..) |o, k| {
-        emitOp(e, o, k, pc, b, false);
-        pc = kwemu.nextPc(o, pc);
-    }
-    if (u < all.len) {
-        e.handBack(u, pc);
-    } else {
-        // The terminator set l_npc (and l_code = done): continue at a member.
-        const last = all[all.len - 1];
-        switch (last.h) {
-            .jal, .goto => if (rg.memberAt(last.imm)) |t| toMember(e, rg, t),
-            .beq, .bne, .blt, .bge, .bltu, .bgeu => {
-                for ([_]u64{ last.imm, b.end_pc }) |pt| {
-                    if (rg.memberAt(pt)) |t| targetIf(e, rg, t);
-                }
-            },
-            .jalr => for (0..rg.n) |t| targetIf(e, rg, t),
-            else => {},
-        }
-        statInc(e, Jx.region_out);
-        e.brExit();
-    }
-    e.close();
-}
-
-/// if (l_npc == member t's pc) toMember(t)
-fn targetIf(e: *Emit, rg: *Region, t: usize) void {
-    e.get(l_npc);
-    e.k64(rg.block(t).pc);
-    e.op(W.i64_eq);
-    e.open(W.@"if", W.void_t);
-    toMember(e, rg, t);
-    e.close();
-}
-
-/// Branch to member t's checked entry. A branch to the start of the member
-/// being run (a jalr) needs no op or generation test, and continues in the
-/// member's own loop.
-fn toMember(e: *Emit, rg: *Region, t: usize) void {
-    if (t == rg.cur) {
-        const b = rg.block(t);
-        e.irqWord();
-        e.get(l_jl);
-        e.k64(b.ninsn);
-        e.op(W.i64_lt_u);
-        e.op(W.i32_or);
-        e.open(W.@"if", W.void_t);
-        statInc(e, Jx.region_stop);
-        e.exit(b.pc, code_done_stop);
-        e.brExit();
-        e.close();
-        e.get(l_jl);
-        e.k64(b.ninsn);
-        e.op(W.i64_sub);
-        e.set(l_jl);
-        statInc(e, Jx.region_hops);
-        e.op(W.br);
-        e.uleb(e.nest - rg.self);
-        return;
-    }
-    if ((rg.block(t).pc ^ rg.block(rg.cur).pc) >> 12 != 0) statInc(e, Jx.region_cross);
-    e.k64(2 * t);
-    e.set(l_next);
-    e.op(W.br);
-    e.uleb(e.nest - rg.top);
-}
-
-/// Member m's checked entry (see above): checks, charge, then fall through
-/// into m; or return to `run` with pc = m's start.
-fn checkedEntry(e: *Emit, rg: *Region, m: usize) void {
-    const b = rg.block(m);
-    const at = blocks_off + @as(u64, rg.idx[m]) * @sizeOf(Block);
-    e.irqWord();
-    e.get(l_jl);
-    e.k64(b.ninsn);
-    e.op(W.i64_lt_u);
-    e.op(W.i32_or);
-    // The same decoded block: its ops start where they did when this
-    // module was emitted (a re-decode takes new ops until a cache reset,
-    // which frees every module).
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i32_load, 2, at + @offsetOf(Block, "op"));
-    e.k32(@bitCast(b.op));
-    e.op(W.i32_ne);
-    e.op(W.i32_or);
-    // Valid under the current fill of its page: the generation the member
-    // being run was validated under (l_g), else the generation of one of
-    // the two exec-TLB entries of its page's set (like `lookup`).
-    const set: u64 = tlb_x_off + 2 * ((b.pc >> 12) % xtlb_sets) * @sizeOf(XTlb) + @offsetOf(XTlb, "gen");
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i64_load, 3, at + @offsetOf(Block, "tgen"));
-    e.tee(l_tg);
-    e.get(l_g);
-    e.op(W.i64_ne);
-    e.open(W.@"if", W.i32_t);
-    e.get(l_tg);
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i64_load, 3, set);
-    e.op(W.i64_ne);
-    e.get(l_tg);
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i64_load, 3, set + @sizeOf(XTlb));
-    e.op(W.i64_ne);
-    e.op(W.i32_and);
-    e.op(W.@"else");
-    e.k32(0);
-    e.close();
-    e.op(W.i32_or);
-    e.open(W.@"if", W.void_t);
-    statInc(e, Jx.region_stop);
-    e.exit(b.pc, code_done_stop);
-    e.brExit();
-    e.close();
-    e.get(l_jl);
-    e.k64(b.ninsn);
-    e.op(W.i64_sub);
-    e.set(l_jl);
-    e.get(l_tg);
-    e.set(l_g);
-    statInc(e, Jx.region_hops);
-}
-
-/// Side exit at op k of member b towards pc: refund the rest of b, then
-/// continue at a member or leave ("done": `run` refunds nothing).
-fn regionSide(e: *Emit, rg: *Region, pc: u64, k: usize, b: *const Block) void {
-    const refund = b.ninsn - (k + 1);
-    if (refund > 0) {
-        e.get(l_jl);
-        e.k64(refund);
-        e.op(W.i64_add);
-        e.set(l_jl);
-    }
-    if (rg.memberAt(pc)) |t| toMember(e, rg, t);
-    statInc(e, Jx.region_out);
-    e.exit(pc, code_done_side);
-    e.brExit();
-}
-
-/// Epilogue part: name the member the code leaves from.
-fn regionExit(e: *Emit) void {
-    e.get(l_cpu);
-    e.addr();
-    e.get(l_cur);
-    e.mem(W.i64_store, 3, jit_off + @offsetOf(State, "cur"));
-}
-
-/// -Dkwemu-stats: count Stats.jx[i] in the generated code.
-fn statInc(e: *Emit, i: usize) void {
-    if (!kwemu.stats_on) return;
-    const off = priv_off + @offsetOf(@FieldType(Cpu, "priv"), "stats") + @offsetOf(kwemu.Stats, "jit") + @offsetOf(kwemu.JitStats, "jx") + 8 * i;
-    e.get(l_cpu);
-    e.addr();
-    e.get(l_cpu);
-    e.addr();
-    e.mem(W.i64_load, 3, off);
-    e.k64(1);
-    e.op(W.i64_add);
-    e.mem(W.i64_store, 3, off);
-}
-
-comptime {
-    std.debug.assert(@sizeOf(Op) == 16);
-    // TLB index (va >> 8) & dtlb_mask assumes 16-byte entries, a power-of-two
-    // count, and read and write TLBs of the same length.
-    std.debug.assert(@sizeOf(@typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_r")).array.child) == 16);
-    std.debug.assert(std.math.isPowerOfTwo(@typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_r")).array.len));
-    std.debug.assert(@typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_r")).array.len ==
-        @typeInfo(@FieldType(@FieldType(Cpu, "priv"), "tlb_w")).array.len);
 }

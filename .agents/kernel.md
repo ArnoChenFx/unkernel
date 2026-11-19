@@ -153,9 +153,8 @@ patch re-export.
   `compile`, from a kwemu before ABI 8, as 0), and the kernel never calls
   them. Only a kwemu built with `-Dkwemu-jit=true` imports them (it then
   owns 1024 stub functions in the kernel's exported
-  `__indirect_function_table`; kwemu.md); that JIT compiles riscv blocks
-  only, which the A64 `kw_run` never enters, so build.sh leaves it out
-  unless `KWEMU_JIT=1`, and the kernel then has no JIT imports at all.
+  `__indirect_function_table`; kwemu.md, a64.md JIT), which build.sh
+  does unless `KWEMU_JIT=0`; the kernel then has no JIT imports at all.
 
 ## Memory model
 

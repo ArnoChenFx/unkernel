@@ -81,9 +81,9 @@
 #                  (default: vendor/build/kwemu-smp/lib/libkwemu.a, rebuilt on every run).
 #                  Libraries given here count as built from this checkout with the
 #                  default options (the build id hashes the sources, not the library)
-#   KWEMU_JIT=1    build those libraries with the JIT tier (-Dkwemu-jit=true; the kernel
-#                  then imports unkernel.kw_host_jit_*; ignored with KWEMU=). Default 0:
-#                  the JIT compiles riscv blocks only and the A64 kw_run never enters it
+#   KWEMU_JIT=0    build those libraries without the JIT tier (-Dkwemu-jit=false; the
+#                  kernel then imports no unkernel.kw_host_jit_*; ignored with KWEMU=).
+#                  Default 1
 #   KWEMU_STATS=1  build the UP library with -Dkwemu-stats into vendor/build/kwemu-stats
 #                  (what `stats` sets; ignored with KWEMU=)
 #   JOBS=n         parallelism (default: nproc)
@@ -205,12 +205,11 @@ prepare_kernel_tree() {
 	fi
 }
 
-# The zig build option for the kwemu JIT tier (src/emu/jit.zig), off unless
-# KWEMU_JIT=1: it compiles riscv blocks only, which the A64 guest CPU never
-# runs (.agents/a64.md). Hosts without the JIT simply answer
-# kw_host_jit_caps() with 0.
+# The zig build option for the kwemu JIT tier (src/emu/jitcore.zig, A64:
+# src/a64/jit/; .agents/a64.md, JIT), on unless KWEMU_JIT=0. Hosts without
+# the JIT simply answer kw_host_jit_caps() with 0.
 kwemu_jit_flag() {
-	if [ "${KWEMU_JIT:-0}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi
+	if [ "${KWEMU_JIT:-1}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi
 }
 
 # kwemu_obj up|smp: the kwemu library to link into that kernel (empty for
@@ -272,7 +271,7 @@ kernel_stamps() {
 			git -C "$ksrc" --no-optional-locks diff --binary HEAD
 			(cd "$ksrc" && git --no-optional-locks ls-files -z -o --exclude-standard | xargs -0r sha256sum)
 			digest_files "$root" src include build.zig build.zig.zon kernel/patches/llvm kernel/tools/fake-llvm
-			echo "zig $("${zig:-zig}" version 2>/dev/null) jit ${KWEMU_JIT:-0} stats ${KWEMU_STATS:-0}"
+			echo "zig $("${zig:-zig}" version 2>/dev/null) jit ${KWEMU_JIT:-1} stats ${KWEMU_STATS:-0}"
 		} | sha256sum | cut -c1-12
 	)"
 	when="$({

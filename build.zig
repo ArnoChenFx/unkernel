@@ -148,6 +148,29 @@ pub fn build(b: *std.Build) void {
     harness_wasm.rdynamic = true;
     harness_wasm.root_module.linkLibrary(lib_wasm);
     b.installArtifact(harness_wasm); // zig-out/bin/kwemu-harness.wasm
+    // The wasm64 harness with the JIT tier (test/a64-test.mjs runs it with the
+    // JS host of test/kwemu-jit-host.mjs): imports unkernel.kw_host_jit_* and
+    // exports its function table.
+    const lib_wasm_jit = if (jit) lib_wasm else b.addLibrary(.{
+        .name = "kwemu-jit",
+        .linkage = .static,
+        .root_module = kwemuModule(b, wasm64, lib_optimize, kw_h_wasm, kw_opts_jit_mod),
+    });
+    const harness_jit = b.addExecutable(.{
+        .name = "kwemu-harness-jit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/emu/harness_wasm.zig"),
+            .target = wasm64,
+            .optimize = lib_optimize,
+            .strip = lib_optimize != .Debug,
+            .imports = &.{ .{ .name = "kw_h", .module = kw_h_wasm }, .{ .name = "kwemu_options", .module = kw_opts_jit_mod } },
+        }),
+    });
+    harness_jit.entry = .disabled;
+    harness_jit.rdynamic = true;
+    harness_jit.export_table = true;
+    harness_jit.root_module.linkLibrary(lib_wasm_jit);
+    b.installArtifact(harness_jit); // zig-out/bin/kwemu-harness-jit.wasm
 
     // Hard-float guests: riscv64-linux-musl, default CPU = rv64gc (lp64d).
     if (riscv_legacy) for (gc_guests) |name| {
@@ -232,8 +255,34 @@ pub fn build(b: *std.Build) void {
             .imports = &.{ .{ .name = "kw_h", .module = kw_h_native }, .{ .name = "kwemu_options", .module = kw_opts_mod } },
         }),
     });
-    const test_step = b.step("test", "Run the A64 unit tests and the A64 guests (native and wasm64 harness) against qemu-aarch64");
+    // The A64 unit tests that run code (the tier's and the JIT's) again as
+    // wasm64 with the JIT tier, against an eager JS JIT host
+    // (test/kwemu-unit-wasm.mjs): every block compiles on its first entry.
+    const unit_a64_wasm = b.addTest(.{
+        .name = "a64-unit-jit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_a64_wasm.zig"),
+            .target = wasm64,
+            .optimize = .ReleaseSafe,
+            .single_threaded = true,
+            .imports = &.{ .{ .name = "kw_h", .module = kw_h_wasm }, .{ .name = "kwemu_options", .module = kw_opts_jit_mod } },
+        }),
+        .test_runner = .{ .path = b.path("src/test_runner_wasm.zig"), .mode = .simple },
+        // Only these: the rest (softfloat, AdvSIMD primitives) is pulled in
+        // through imports and does not depend on the JIT.
+        .filters = &.{ "a64 tier", "a64 jit" },
+    });
+    unit_a64_wasm.entry = .disabled;
+    unit_a64_wasm.rdynamic = true;
+    unit_a64_wasm.export_table = true;
+    const unit_a64_wasm_run = b.addSystemCommand(&.{"node"});
+    unit_a64_wasm_run.addFileArg(b.path("test/kwemu-unit-wasm.mjs"));
+    unit_a64_wasm_run.addFileArg(unit_a64_wasm.getEmittedBin());
+    unit_a64_wasm_run.addArgs(&.{ "--name", "a64" });
+    unit_a64_wasm_run.has_side_effects = true;
+    const test_step = b.step("test", "Run the A64 unit tests (native, and wasm64 with the JIT) and the A64 guests (native, wasm64, wasm64 with the JIT) against qemu-aarch64");
     test_step.dependOn(&b.addRunArtifact(unit_a64).step);
+    test_step.dependOn(&unit_a64_wasm_run.step);
     test_step.dependOn(&a64_e2e.step);
     if (riscv_legacy) {
         const test_riscv = b.step("test-riscv", "Run the riscv unit tests (native, and wasm64 with the JIT tier); reference code only");

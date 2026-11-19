@@ -112,6 +112,9 @@ const mark_wild = std.math.maxInt(u64);
 const exec = @import("exec.zig");
 const a64_state = @import("../a64/state.zig");
 const Op = exec.Op;
+/// The ISA-neutral JIT core (block state, slots, cache hooks) and riscv's
+/// emitter (its `run` below).
+const jc = @import("jitcore.zig");
 const jit = @import("jit.zig");
 
 pub const Block = extern struct {
@@ -130,7 +133,7 @@ pub const Block = extern struct {
     mask: u64,
     /// JIT tier (-Dkwemu-jit): compile countdown / compiled slot (see
     /// jit.zig); empty otherwise.
-    jx: jit.BlockState = .{},
+    jx: jc.BlockState = .{},
 };
 
 const Mark = extern struct { key: u64, mask: u64 };
@@ -212,7 +215,7 @@ const Priv = extern struct {
     victim: [nsets]u8,
     ops: [nops]Op,
     /// JIT tier bookkeeping (-Dkwemu-jit); empty otherwise.
-    jit: jit.State,
+    jit: jc.State,
     /// A64 (src/a64): exclusive-monitor extras, enabled features.
     a64: a64_state.Priv,
 };
@@ -252,7 +255,7 @@ pub const Cpu = extern struct {
     budget: u64,
     icount: u64,
     ev: Event,
-    /// 1 while kwemu compiles (jit.windowOpen): another CPU may then set
+    /// 1 while kwemu compiles (jitcore.zig windowOpen): another CPU may then set
     /// `flush_all` instead of waiting for this one's flush.
     jit_busy: u32,
     flush_all: u32,
@@ -537,7 +540,7 @@ pub const Cpu = extern struct {
 
     pub fn resetCache(self: *Cpu) void {
         count(self, "resets", 1);
-        if (jit.enabled) jit.releaseAll(self);
+        if (jc.enabled) jc.releaseAll(self);
         // Volatile stores: no memset import in the wasm object.
         const bs: [*]volatile Block = &self.priv.blocks;
         for (0..nblocks) |i| {
@@ -697,10 +700,10 @@ pub const Cpu = extern struct {
         };
         const b = &self.priv.blocks[set + way];
         if (self.priv.ops_used + D.max_slots > nops) self.resetCache();
-        if (jit.enabled) jit.drop(self, b); // its code belongs to the old contents
+        if (jc.enabled) jc.drop(self, b); // its code belongs to the old contents
         D.decode(self, b, pc, host);
         b.tgen = gen;
-        b.jx = if (jit.enabled) jit.newBlock(self) else .{};
+        b.jx = if (jc.enabled) jc.newBlock(self) else .{};
         self.markCode(host & ~page_mask, b.mask);
         return b;
     }
@@ -829,7 +832,7 @@ comptime {
     std.debug.assert(@sizeOf(Cpu) <= cpu_size);
     // harness.zig reads this layout
     std.debug.assert(@sizeOf(Stats) == (11 + 192 + (if (stats_on) 2 + 192 + 40 + 64 else 0)) * 8);
-    if (stats_on) std.debug.assert(jit.Jx.end <= 64);
+    if (stats_on) std.debug.assert(jc.Jx.end <= 64);
     std.debug.assert(cpu_size == c.KW_CPU_SIZE);
     std.debug.assert(abi_version == c.KW_ABI_VERSION);
     std.debug.assert(@alignOf(Cpu) == 8);
@@ -860,7 +863,7 @@ pub fn cpuInit(cpu: *Cpu) void {
     cpu.priv.gen = 1;
     cpu.flushAll();
     cpu.resetCache();
-    if (jit.enabled) jit.init(cpu);
+    if (jc.enabled) jc.init(cpu);
 }
 
 fn event(cpu: *Cpu, kind: core.Kind, access: u32, addr: u64, insn: u64) u32 {
@@ -1090,7 +1093,7 @@ pub fn setIsa(cpu: *Cpu, isa: u64) u64 {
 /// table holds the stubs again. Forget compiled code without freeing it,
 /// ask the new host for its JIT, then drop every decoded block.
 pub fn hostReset(cpu: *Cpu) void {
-    if (jit.enabled) jit.forgetHost(cpu);
+    if (jc.enabled) jc.forgetHost(cpu);
     cpu.resetCache();
 }
 
@@ -1108,7 +1111,7 @@ pub fn exportAbi() void {
     @export(&kw_set_isa, .{ .name = "kw_set_isa" });
     @export(&kw_host_reset, .{ .name = "kw_host_reset" });
     if (stats_on) @export(&kw_debug_stats, .{ .name = "kw_debug_stats" });
-    if (stats_on and jit.enabled) @export(&kw_debug_cpu_of_jit_buf, .{ .name = "kw_debug_cpu_of_jit_buf" });
+    if (stats_on and jc.enabled) @export(&kw_debug_cpu_of_jit_buf, .{ .name = "kw_debug_cpu_of_jit_buf" });
 }
 
 fn kw_cpu_init(cpu: *Cpu) callconv(.c) void {
@@ -1142,7 +1145,7 @@ fn kw_debug_stats(cpu: *Cpu, out: *Stats) callconv(.c) void {
 /// whose emit buffer is `buf` (the pointer kw_host_jit_compile receives),
 /// so a host can find the cpu to pass to kw_debug_stats.
 fn kw_debug_cpu_of_jit_buf(buf: usize) callconv(.c) usize {
-    return buf - (@offsetOf(Cpu, "priv") + @offsetOf(Priv, "jit") + @offsetOf(jit.State, "buf"));
+    return buf - (@offsetOf(Cpu, "priv") + @offsetOf(Priv, "jit") + @offsetOf(jc.State, "buf"));
 }
 fn kw_abi_version() callconv(.c) u32 {
     return abi_version;

@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const kwemu = @import("../emu/kwemu.zig");
+const jc = @import("../emu/jitcore.zig");
 const run_mod = @import("run.zig");
 pub const Regs = run_mod.Regs;
 const Cpu = kwemu.Cpu;
@@ -61,6 +62,7 @@ pub const Machine = struct {
         return m;
     }
     pub fn deinit(m: *Machine) void {
+        m.cpu.resetCache(); // gives compiled code back to the JIT host
         m.gpa.free(m.mem);
         const p: [*]align(8) u8 = @ptrCast(m.cpu);
         const sl: []align(8) u8 = p[0..kwemu.cpu_size];
@@ -125,15 +127,20 @@ pub const Machine = struct {
         return run_mod.runRef(m.cpu, &m.regs);
     }
     /// Another CPU on the same memory and page table (free with freeCpu).
+    /// It never compiles (-Dkwemu-jit): kwemu's slot pool is per wasm
+    /// instance (its stubs in the one function table), and in a kernel each
+    /// CPU is an instance of its own, while here both share this one.
     pub fn newCpu(m: *Machine) !*Cpu {
         const cpu_mem = try m.gpa.alignedAlloc(u8, .fromByteUnits(8), kwemu.cpu_size);
         const cpu: *Cpu = @ptrCast(cpu_mem.ptr);
         run_mod.cpuInit(cpu);
+        if (jc.enabled) cpu.priv.jit.threshold = jc.never;
         cpu.phys_base = m.cpu.phys_base;
         kwemu.setPgd(cpu, m.root);
         return cpu;
     }
     pub fn freeCpu(m: *Machine, cpu: *Cpu) void {
+        cpu.resetCache();
         const p: [*]align(8) u8 = @ptrCast(cpu);
         const sl: []align(8) u8 = p[0..kwemu.cpu_size];
         m.gpa.free(sl);

@@ -42,13 +42,13 @@ path runs at wasm speed.
   native).
 - **fork at native speed**: fork + exit + wait takes about 60 µs, against
   about 70 µs natively and 1.2 ms under qemu-system.
-- **A JIT for user code** (riscv64 guest; the aarch64 CPU is an
-  interpreter so far): hot riscv64 code is compiled to wasm while it runs. A
+- **A JIT for user code** (riscv64 guest; the aarch64 JIT compiles only
+  a few instruction kinds so far): hot riscv64 code is compiled to wasm while it runs. A
   tight loop takes 2.5 ns per iteration (1.8 native, 28 without the JIT),
   and https downloads in the guest reach 30 MB/s.
 
 These numbers were measured with the riscv64 guest. The aarch64 guest has
-a decoded-op interpreter and no JIT yet, so CPU-bound work in it runs
+a decoded-op interpreter and an early JIT, so CPU-bound work in it runs
 slower than riscv64 with its JIT (`apk search` over the main index: 1.1 s
 against 0.75 s, 2026-11-17). CPU-heavy programs are well behind native.
 [Benchmarks](#-benchmarks) has the full numbers.
@@ -210,9 +210,10 @@ gets real stacks that it can suspend and resume.
 
 For the riscv64 guest, hot user code goes through a second tier: a JIT that
 compiles riscv64 to wasm modules at run time, with output that matches the
-interpreter bit for bit. The aarch64 CPU has the interpreter only so far:
-blocks of guest code are decoded once into compact ops, and what has no op
-runs through a reference interpreter.
+interpreter bit for bit. The aarch64 CPU runs blocks of guest code
+decoded once into compact ops (what has no op runs through a reference
+interpreter); its JIT shares the riscv64 JIT's core and compiles only a
+few instruction kinds so far.
 [Benchmarks](#-benchmarks) shows what each tier costs.
 
 Devices are small paravirtual drivers that talk to the JavaScript host:
@@ -243,8 +244,9 @@ faster than without it, which is still well behind native.
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
 - No ptrace register sets, so `strace` and `gdb` don't work. No seccomp.
-- No JIT for the aarch64 CPU yet (its decoded-op interpreter runs integer
-  code at about 250-300 MIPS under Node).
+- The aarch64 JIT compiles only a few instruction kinds so far (the
+  decoded-op interpreter runs integer code at about 250-300 MIPS under
+  Node).
 - A wasm trap in the kernel ends the session.
 
 ## 🧩 Use it from JavaScript

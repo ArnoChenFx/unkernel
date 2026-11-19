@@ -6,7 +6,8 @@
 // every compile goes into a free slot, every free into an installed one,
 // no module fails to compile, and nothing is left installed at the end
 // (each test's Machine.deinit resets the block cache).
-// usage: node test/kwemu-unit-wasm.mjs <kwemu-unit-jit.wasm> [--fuzz N] [--seed S]
+// usage: node test/kwemu-unit-wasm.mjs <unit-test.wasm> [--name NAME] [--fuzz N] [--seed S]
+//   --name: the label in the output (default kwemu; the A64 tests: a64)
 //   --fuzz N: the randomized interpreter-vs-JIT test ("kwemu jit fuzz") runs
 //   N seeds from S (default 0) instead of its default count (`zig build fuzz -- N [S]`)
 import { readFile } from "node:fs/promises";
@@ -19,6 +20,7 @@ const arg = (name) => {
   return i > 0 ? BigInt(process.argv[i + 1]) : 0n;
 };
 const fuzz = [arg("--fuzz"), arg("--seed")];
+const name = process.argv.includes("--name") ? process.argv[process.argv.indexOf("--name") + 1] : "kwemu";
 let mem, out = "";
 const { instance } = await WebAssembly.instantiate(await readFile(process.argv[2]), {
   env: {
@@ -38,14 +40,14 @@ try {
   failed = instance.exports.run_tests();
 } catch (e) {
   const last = out.split("\n").pop().split("\t")[0];
-  console.log(`FAIL kwemu unit (wasm64+jit): trapped in "${last}": ${e.message}`);
+  console.log(`FAIL ${name} unit (wasm64+jit): trapped in "${last}": ${e.message}`);
   process.exit(1);
 }
 const lines = out.trim().split("\n").map((l) => l.split("\t"));
-for (const [name, st] of lines) console.log(`${(st.startsWith("FAIL") ? st : st.padEnd(4))} wasm64+jit ${name}`);
+for (const [test, st] of lines) console.log(`${(st.startsWith("FAIL") ? st : st.padEnd(4))} wasm64+jit ${test}`);
 const n = (p) => lines.filter(([, st]) => st?.startsWith(p)).length;
 const s = jit.stats;
-console.log(`kwemu unit (wasm64+jit): ${n("ok")} passed, ${n("skip")} skipped, ${failed} failed; ` +
+console.log(`${name} unit (wasm64+jit): ${n("ok")} passed, ${n("skip")} skipped, ${failed} failed; ` +
   `host: ${s.compiles} compiles, ${s.frees} frees, ${s.failures} compile failures, ${jit.installed()} left installed, ` +
   `${(Number(s.compileNs) / 1e6).toFixed(0)} ms compiling ${(s.bytes / 1024).toFixed(0)} KiB`);
 for (const e of s.errors) console.log(`FAIL jit host: ${e}`);

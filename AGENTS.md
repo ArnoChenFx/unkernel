@@ -9,7 +9,8 @@ guest image.
 
 This branch (`aarch64`) switches the guest CPU to AArch64: `include/kw_emu.h`
 (ABI 10) and the kwemu library are A64 only (src/a64, .agents/a64.md: a
-decoded-op tier over a reference interpreter, no JIT yet).
+decoded-op tier over a reference interpreter, and a JIT that compiles a
+few op kinds so far).
 The kernel presents the arm64 user ABI (kernel.md, arm64 user ABI), and
 the guest image is Alpine's aarch64 minirootfs (kernel/README.md, alpine).
 The riscv CPU is kept in src/cpu and src/emu for reference
@@ -20,8 +21,8 @@ The riscv CPU is kept in src/cpu and src/emu for reference
 | File | Covers |
 | --- | --- |
 | [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, config |
-| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, the decoded-op tier and its op set, coherence on SMP, tests, coverage tool, numbers, the JIT plan |
-| [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs (riscv; MMU and TLBs still shared) |
+| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, the decoded-op tier and its op set, coherence on SMP, tests, coverage tool, numbers, the JIT (family API, flags contract, tests) |
+| [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs (riscv; MMU, TLBs and the JIT core still shared) |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
@@ -72,8 +73,8 @@ The parts that `ls` does not make obvious:
 
 ```sh
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
-zig build test              # A64 unit tests, A64 guests (native and wasm64 harness) against qemu-aarch64
-kernel/build.sh kernel      # the UP kernel: kwemu (no JIT tier on A64), vmlinux, lower, refresh the bundle
+zig build test              # A64 unit tests (native, wasm64 + JIT), A64 guests (native, wasm64, + JIT) against qemu-aarch64
+kernel/build.sh kernel      # the UP kernel: kwemu with the JIT, vmlinux, lower, refresh the bundle
 kernel/build.sh smp         # the SMP kernel (kwemu with atomics); the bundle then gets the SMP patch
 pnpm install                # SDK and page dev dependencies
 node js/cli.ts              # boot Alpine from the bundle; --help lists options

@@ -15,6 +15,8 @@ const c = @import("common.zig");
 const ops = @import("ops.zig");
 const tier = @import("tier.zig");
 const kwemu = @import("../emu/kwemu.zig");
+const jc = @import("../emu/jitcore.zig");
+const jit_tests = @import("jit/tests.zig");
 const mach = @import("machine.zig");
 const Machine = mach.Machine;
 const Cpu = kwemu.Cpu;
@@ -226,6 +228,11 @@ test "a64 tier: IC IVAU on another CPU makes this CPU's decoded code stale (code
 }
 
 test "a64 tier: IC IVAU on another CPU reaches a CPU inside kw_run at its next block boundary" {
+    // Needs host threads (not in the wasm64 unit tests).
+    if (@import("builtin").single_threaded) return error.SkipZigTest else return crossCpuInsideRun();
+}
+
+fn crossCpuInsideRun() !void {
     // CPU A spins in one kw_run: `loop: add x5, x5, #1; str x5, [x6];
     // bl f; cbz x0, loop; svc` where f is `mov x0, #0; ret`. CPU B (another
     // thread), once A is looping, rewrites f to return 1 and executes
@@ -565,12 +572,40 @@ fn fuzzSetup(gpa: std.mem.Allocator, seed: u64) !Fz {
     return f;
 }
 
+/// Totals of the JIT fuzz (wasm64 unit tests).
+var jit_totals: struct { compiles: u64 = 0, entries: u64 = 0, handbacks: u64 = 0, grows: u64 = 0, flushes: u64 = 0 } = .{};
+
 fn fuzzOne(gpa: std.mem.Allocator, seed: u64, max_insns: u64) !void {
     var f = try fuzzSetup(gpa, seed);
     defer for (&f.m) |*m| m.deinit();
     const r = f.rng.random();
     const T = &f.m[0];
     const Rm = &f.m[1];
+    if (jc.enabled) {
+        // The JIT machine: a random compile threshold (eager or after a few
+        // passes), region size and growth threshold, and a flush asked for
+        // during every other compile (another CPU; jitcore.zig windowClose).
+        // A separate random stream: the programs stay those of the native run.
+        var jr = Rng.init(seed ^ 0x6a09_e667_f3bc_c908);
+        const st = &T.cpu.priv.jit;
+        st.threshold = if (jr.random().boolean()) 1 else 1 + jr.random().uintLessThan(u32, 200);
+        st.region_max = 1 + jr.random().uintLessThan(u32, jc.max_members);
+        st.grow_threshold = switch (jr.random().uintLessThan(u32, 3)) {
+            0 => 1,
+            1 => 16,
+            else => 1 << 20,
+        };
+        jit_tests.hook = .{ .cpu = T.cpu, .flush_every = 2 };
+    }
+    defer if (jc.enabled) {
+        const st = &T.cpu.priv.jit;
+        jit_totals.compiles += st.compiles;
+        jit_totals.entries += st.entries;
+        jit_totals.handbacks += st.handbacks;
+        jit_totals.grows += st.grows + st.exit_grows;
+        jit_totals.flushes += jit_tests.hook.flushes;
+        jit_tests.hook = .{};
+    };
     while (T.cpu.icount < max_insns and f.events < 4000) {
         const slice: u64 = switch (r.uintLessThan(u32, 4)) {
             0 => 1 + r.uintLessThan(u64, 8),
@@ -672,11 +707,14 @@ fn fuzzOne(gpa: std.mem.Allocator, seed: u64, max_insns: u64) !void {
     }
 }
 
-test "a64 tier fuzz: random instruction soups, tier vs reference in lockstep (budgets, faults, irq, SMC, flushes, COW)" {
+test "a64 tier fuzz: random instruction soups, tier (wasm64 unit tests: the JIT) vs reference in lockstep (budgets, faults, irq, SMC, flushes, COW)" {
     const n: u64 = if (options.a64_fuzz != 0) options.a64_fuzz else 300;
     for (0..n) |k| {
         // A long run names its programs: a panic does not say the seed.
         if (options.a64_fuzz != 0 and (n <= 64 or k % 64 == 0)) std.debug.print("a64 fuzz: seeds from {d}\n", .{options.a64_fuzz_seed + k});
         try fuzzOne(t.allocator, options.a64_fuzz_seed + k, 30_000);
     }
+    if (jc.enabled) std.debug.print("a64 jit fuzz: {d} programs: {d} compiles ({d} regions grown), {d} entries, {d} hand-backs, {d} flushes during a compile\n", .{
+        n, jit_totals.compiles, jit_totals.grows, jit_totals.entries, jit_totals.handbacks, jit_totals.flushes,
+    });
 }

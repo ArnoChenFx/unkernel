@@ -24,6 +24,8 @@ const decode = @import("decode.zig");
 const branch = @import("branch.zig");
 const core = @import("../cpu/core.zig");
 const kwemu = @import("../emu/kwemu.zig");
+const jc = @import("../emu/jitcore.zig");
+const jit = @import("jit/emit.zig");
 const Op = ops.Op;
 const Cpu = kwemu.Cpu;
 const Block = kwemu.Block;
@@ -164,9 +166,12 @@ inline fn epochNow() u64 {
     return @atomicLoad(u64, &code_epoch, .seq_cst);
 }
 
-/// Called by kw_cpu_init: this CPU has seen every change so far.
+/// Called by kw_cpu_init and kw_host_reset: this CPU has seen every change
+/// so far; compiled code finds the epoch through a64.epoch_ptr.
 pub fn epochInit(cpu: *Cpu) void {
-    if (multi_cpu) cpu.priv.a64.seen_epoch = epochNow();
+    if (!multi_cpu) return;
+    cpu.priv.a64.seen_epoch = epochNow();
+    cpu.priv.a64.epoch_ptr = @intFromPtr(&code_epoch);
 }
 
 /// Retire everything if another CPU invalidated code since this one last
@@ -223,6 +228,16 @@ pub fn trapEvent(cpu: *Cpu, regs: *Regs) u32 {
     };
 }
 
+/// kw_run: blocks run compiled (`-Dkwemu-jit`, once hot: jit.C.ready) or
+/// through `runOps`. Compiled code returns "done" (pc set; a side exit
+/// refunds the rest of its block here, a region's own side exits did it
+/// themselves) or hands op k of `lastBlock` back: `runOps` then finishes
+/// that pass from op k of the same decode, with slot 32 set back to 0 first
+/// (compiled code stores pc there at its exit, and the ops read the slot as
+/// XZR). A compiled block's further self-loop passes enter its code again,
+/// so after a hand-back runOps runs no further pass; a block counting
+/// towards its compile threshold runs at most the countdown's worth of
+/// passes in runOps, so its next pass compiles it.
 pub fn run(cpu: *Cpu, regs: *Regs) u32 {
     const start = cpu.budget;
     var left = start;
@@ -237,12 +252,22 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
     const h = &cpu.priv.hart;
     const s: c.St = .{ .r = regs, .h = h, .m = cpu };
     const arena = cpu.opArena(Op);
+    // JIT: pool entry of the region entered last, and whether its code left
+    // through an exit (not a hand-back) towards the block looked up next.
+    var xs: u32 = 0;
+    var left_region = false;
     while (true) {
         if (left == 0) return event(cpu, .budget, 0, 0, 0);
         const b = cpu.lookupIn(Blocks, regs.pc) catch |e| return switch (e) {
             error.Misaligned => event(cpu, .misaligned, 0, regs.pc, 0),
             error.PageFault => event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0),
         };
+        if (jc.enabled and left_region) {
+            left_region = false;
+            // A grow compiled, and a flush came during the compile: look b
+            // up again (jitcore.zig, windowClose).
+            if (jit.C.noteExit(cpu, xs, b)) continue;
+        }
         if (b.ninsn > left) {
             // Single-step: the budget ends inside this block.
             kwemu.count(cpu, "single_steps", 1);
@@ -272,16 +297,55 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         kwemu.count(cpu, "blocks", 1);
         kwemu.count(cpu, "block_insns", b.ninsn);
         left -= b.ninsn;
-        const first: [*]const Op = arena + b.op;
-        x[ops.zr] = 0; // XZR while the ops run
-        // Self-loop passes that fit the budget run inside runOps.
-        const r = opexec.runOps(first, x, cpu, b.end_pc, b.pc, b.ninsn, left);
-        left = r.left;
+        var blk = b;
+        var first: [*]const Op = arena + blk.op;
+        var o = first;
+        // Budget runOps may spend on further self-loop passes.
+        var cap = left;
+        if (jc.enabled) {
+            const go = jit.C.ready(cpu, blk);
+            if (go == .again) {
+                // It compiled, and a flush came during the compile: blk may
+                // be gone. Nothing of it ran; take it back and look it up
+                // again (jitcore.zig, windowClose).
+                left += blk.ninsn;
+                continue;
+            }
+            if (go == .compiled) {
+                const jl = @min(left, jc.max_jl);
+                xs = jc.slotIndex(blk);
+                const ret = jc.enter(cpu, blk, x, jl);
+                left = left - jl + (ret >> 8);
+                // A region charges every further member in full before it
+                // runs (like blk above); `code` refers to the last one.
+                blk = jc.lastBlock(cpu);
+                first = arena + blk.op;
+                const code: u32 = @intCast(ret & 0xff);
+                if (kwemu.stats_on) jitStats(cpu, b, blk, jl -% (ret >> 8), code);
+                if (code >= jc.code_done) {
+                    if (code >= jc.code_side) left += blk.ninsn - (code - jc.code_side + 1);
+                    left_region = true;
+                    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+                    _ = epochCheck(cpu);
+                    continue;
+                }
+                // Handed back before op `code`: the ops finish the pass.
+                jc.handedBack(cpu);
+                o = first + code;
+                cap = 0;
+            } else if (blk.jx.st != jc.never) cap = @min(left, blk.jx.st);
+        }
+        x[ops.zr] = 0; // XZR while the ops run (compiled code left pc there)
+        // Self-loop passes that fit `cap` run inside runOps.
+        const r = opexec.runOps(o, x, cpu, blk.end_pc, blk.pc, blk.ninsn, cap);
+        const passes = cap - r.left;
+        left -= passes;
+        if (jc.enabled and passes != 0) jc.loopDone(blk, passes);
         if (r.next == .done or r.next == .side) {
             if (r.next == .side) {
                 // Side exit after k + 1 instructions: refund the rest.
                 const k = (@intFromPtr(r.op) - @intFromPtr(first)) / @sizeOf(Op);
-                left += b.ninsn - (k + 1);
+                left += blk.ninsn - (k + 1);
             }
             if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
             _ = epochCheck(cpu);
@@ -289,31 +353,50 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         }
         // Left the block early: k instructions before r.op retired.
         const k: usize = (@intFromPtr(r.op) - @intFromPtr(first)) / @sizeOf(Op);
-        left += b.ninsn - k;
+        left += blk.ninsn - k;
         cpu.priv.smc = 0;
         switch (r.next) {
             .done, .cont, .side => unreachable,
             .fault => {
-                regs.pc = pcAt(cpu, b, k);
+                regs.pc = pcAt(cpu, blk, k);
                 return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
             },
             .trap => {
-                regs.pc = pcAt(cpu, b, k);
+                regs.pc = pcAt(cpu, blk, k);
                 if (h.trap == .syscall) left -= 1; // SVC retires
                 return trapEvent(cpu, regs);
             },
             .counter => {
                 // MRS CNTVCT_EL0: retires with the instructions retired before it.
-                regs.pc = pcAt(cpu, b, k);
+                regs.pc = pcAt(cpu, blk, k);
                 branch.finishCounter(s, cpu.icount +% (start - left));
                 left -= 1;
             },
             .stop => {
                 left -= 1;
-                regs.pc = pcAt(cpu, b, k + 1);
+                regs.pc = pcAt(cpu, blk, k + 1);
             },
         }
         if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
         _ = epochCheck(cpu);
     }
+}
+
+/// -Dkwemu-stats: account one call into compiled code that entered block
+/// `entry` (charged by `run`) and left from `b` (`lastBlock`), `extra` =
+/// what it charged against its budget beyond `entry` (wraps when a side
+/// exit of `entry` refunded into it), `code` its exit code.
+noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64, code: u32) void {
+    const st = &cpu.priv.stats.jit;
+    const charged = entry.ninsn +% extra;
+    if (code >= jc.code_side) {
+        st.insns += charged - (b.ninsn - (code - jc.code_side + 1));
+    } else if (code >= jc.code_done) {
+        st.insns += charged;
+    } else {
+        st.insns += charged - (b.ninsn - code);
+        st.handbacks += 1;
+        st.hb[@intFromEnum(cpu.opArena(Op)[b.op + code].h)] += 1;
+    }
+    _ = jit.C.countExit(cpu, b, code);
 }

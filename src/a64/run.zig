@@ -183,4 +183,5 @@ fn kw_set_isa(cpu: *Cpu, isa: u64) callconv(.c) u64 {
 }
 fn kw_host_reset(cpu: *Cpu) callconv(.c) void {
     kwemu.hostReset(cpu);
+    tier.epochInit(cpu);
 }

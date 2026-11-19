@@ -9,14 +9,17 @@ reference. What A64 shares with it: `kwemu.Cpu` in `src/emu/kwemu.zig`
 exclusive monitor, and the block cache: `lookupIn` takes the ISA's block
 hooks, riscv's `Rv` or A64's `tier.Blocks`, so the Interpreter section's
 lookup, generations, revalidation, code tracking and arena resets hold
-for both) and `src/cpu/fpu.zig`. The riscv guests and unit tests build only
+for both), the JIT core in `src/emu/jitcore.zig` (the JIT tier section
+below, except what it names as riscv's: `Jit(I)` takes the ISA's hooks,
+riscv's `jit.zig` or A64's `src/a64/jit/emit.zig`) and
+`src/cpu/fpu.zig`. The riscv guests and unit tests build only
 with `-Driscv-legacy` (`zig build test-riscv`: the native and the
 wasm64+JIT unit tests); the harness is A64-only, so `test/kwemu-test.mjs`
 and the riscv guests' harness runs do not work, and `kwemu-bench.mjs` runs
 the A64 benchmark guests (a64.md, Numbers). The rest of this file has the
 design, the invariants that tests guarded, the numbers that drove
 decisions, and the designs that were tried and rejected; a64.md has the
-A64 tier's own and the plan for its JIT.
+A64 tier's own and its JIT's (a64.md, JIT).
 
 ## Sources and outputs
 
@@ -25,21 +28,24 @@ A64 tier's own and the plan for its JIT.
 | `src/libkwemu.zig` | library root: exports the A64 C ABI (`src/a64/run.zig`) |
 | `src/emu/kwemu.zig` | Sv39 walker and TLBs, the block cache (lookup, validation, SMC tracking; generic over the ISA's block hooks, shared with A64), the riscv block hooks (`Rv`) and `run` |
 | `src/emu/exec.zig` | decoder (RV64GC to ops), op semantics, dispatch |
-| `src/emu/jit.zig` | JIT tier: block and region emitter, slot pool, compile policy, host imports |
+| `src/emu/jitcore.zig` | JIT tier, ISA-neutral: slot pool, host imports, compile policy, `install` and its emit retries, module skeleton, regions, the `Emit` helpers, statistics; `Jit(I)` takes an ISA's hooks (riscv: `jit.zig`, A64: `src/a64/jit/emit.zig`) |
+| `src/emu/jit.zig` | riscv's JIT: the hooks of `jitcore.Jit` (register file in locals, prologue and epilogue, region targets) and the emitter of every translated op |
 | `src/cpu/core.zig` | reference interpreter; kwemu runs its `generic` ops through it |
 | `src/cpu/fpu.zig` | exact softfloat for all rounding modes and flags, host-float fast paths for RNE |
 | `src/emu/kwemu_test.zig` | unit tests; roots `src/tests.zig` (native) and `src/tests_wasm.zig` (wasm64 with the JIT) |
 | `src/emu/harness*.zig` | test "kernel" using only the C ABI (native and wasm64; A64 ELFs) |
 | `guest/` | test guests: `isatest`, `fptest`, `atomics`, `kbench`, `aestest` (+zkne,+zknd), `bktest` (+zbc,+zbkb,+zbkc,+zbkx), `zbtest` (+zba,+zbb,+zbs,+zicond), `rvatest` (+zcb,+zimop,+zcmop,+zicbom,+zicboz,+zawrs), `zfatest` (+zfa), `zfhtest` (+zfhmin), `jalrtest` (C, static musl); `hello`, `bench` (Zig, `rt.zig`) |
-| `test/kwemu-test.mjs`, `kwemu-unit-wasm.mjs` | run by `zig build test` |
+| `test/kwemu-test.mjs` | the riscv guests in every harness mode (needs a riscv harness, which is not built any more) |
+| `test/kwemu-unit-wasm.mjs` | runs a wasm64 unit-test module against an eager JIT host: riscv's (`zig build test-riscv`) and A64's (`zig build test`, `--name a64`) |
 | `test/kwemu-jit-host.mjs` | JS host of the JIT imports, for tests and benchmarks |
 | `test/kwemu-bench.mjs` | A64 benchmark table (`--ref`, `--median --reps N`, `--wasm-only`; a64.md, Numbers) |
 | `test/jit-proto.mjs` | the standalone feasibility prototype of the JIT |
 
 `zig build` writes `zig-out/lib/{kwemu.o,libkwemu.a}` (wasm64, cpu `mvp` +
 memory64 only, undefined `__stack_pointer`), `zig-out/lib/native/libkwemu.a`,
-`zig-out/bin/kwemu-harness{,.wasm}` (A64) and the A64 tools and guests
-(a64.md). The JIT harness `kwemu-harness-jit.wasm` is no longer built.
+`zig-out/bin/kwemu-harness{,.wasm}` and `kwemu-harness-jit.wasm` (A64,
+the latter with the JIT tier; `test/a64-test.mjs` runs it) and the A64
+tools and guests (a64.md).
 
 Build options: `-Dkwemu-jit` (off for plain `zig build`; kernel/build.sh
 turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (8192

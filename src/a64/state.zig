@@ -49,4 +49,8 @@ pub const Priv = extern struct {
     /// The cross-CPU code epoch this CPU has caught up with (tier.zig, code
     /// coherence).
     seen_epoch: u64 = 0,
+    /// Address of the global code epoch for compiled code, which addresses
+    /// memory only cpu-relative (jit/emit.zig `poll`). Set by kw_cpu_init
+    /// and kw_host_reset (tier.epochInit).
+    epoch_ptr: u64 = 0,
 };

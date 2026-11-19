@@ -1549,7 +1549,18 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		vm.write("kwvsock connect 5005 </dev/null >/tmp/vs.out 2>&1 & echo vs-started\n");
 		await a.waitFor(/vs-started/);
 		const conn = (await l.accept())!;
-		const snap = sdk.decodeSnapshot(sdk.encodeSnapshot(await vm.snapshot({ stop: true })));
+		// snapshot() refuses while vsock packets are in flight (the accept's and kwtty's last ones may still be), and the guest goes on.
+		const quiet = async () => {
+			for (let i = 0; ; i++) {
+				try {
+					return await vm.snapshot({ stop: true });
+				} catch (e) {
+					if (i >= 40 || !/in flight/.test(String((e as Error)?.message))) throw e;
+					await new Promise((done) => setTimeout(done, 50));
+				}
+			}
+		};
+		const snap = sdk.decodeSnapshot(sdk.encodeSnapshot(await quiet()));
 		assert.deepEqual(snap.devices.network?.mac, [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
 		assert.ok(snap.devices.vsock?.guestCid === 3, JSON.stringify(snap.devices));
 		void conn.closed;

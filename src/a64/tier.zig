@@ -258,6 +258,10 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
     // through an exit (not a hand-back) towards the block looked up next.
     var xs: u32 = 0;
     var left_region = false;
+    // -Dkwemu-stats: how the last compiled pass left (jit.C.countExit), and
+    // from which block, for jit.C.countNext.
+    var xk: u32 = 0;
+    var xb: *const Block = undefined;
     while (true) {
         if (left == 0) return event(cpu, .budget, 0, 0, 0);
         const b = cpu.lookupIn(Blocks, regs.pc) catch |e| return switch (e) {
@@ -265,6 +269,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
             error.PageFault => event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0),
         };
         if (jc.enabled and left_region) {
+            if (kwemu.stats_on) jit.C.countNext(cpu, xk, xb, b, xs);
             left_region = false;
             // A grow compiled, and a flush came during the compile: look b
             // up again (jitcore.zig, windowClose).
@@ -324,7 +329,10 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 blk = jc.lastBlock(cpu);
                 first = arena + cpu.opIndex(blk.op);
                 const code: u32 = @intCast(ret & 0xff);
-                if (kwemu.stats_on) jitStats(cpu, b, blk, jl -% (ret >> 8), code);
+                if (kwemu.stats_on) {
+                    xk = jitStats(cpu, b, blk, jl -% (ret >> 8), code);
+                    xb = blk;
+                }
                 if (code >= jc.code_done) {
                     if (code >= jc.code_side) left += blk.ninsn - (code - jc.code_side + 1);
                     left_region = true;
@@ -609,8 +617,9 @@ pub fn axCore(cpu: *Cpu) void {
 /// -Dkwemu-stats: account one call into compiled code that entered block
 /// `entry` (charged by `run`) and left from `b` (`lastBlock`), `extra` =
 /// what it charged against its budget beyond `entry` (wraps when a side
-/// exit of `entry` refunded into it), `code` its exit code.
-noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64, code: u32) void {
+/// exit of `entry` refunded into it), `code` its exit code. Returns how
+/// it left (jit.C.countExit), for countNext.
+noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64, code: u32) u32 {
     const st = &cpu.priv.stats.jit;
     const charged = entry.ninsn +% extra;
     if (code >= jc.code_side) {
@@ -622,5 +631,5 @@ noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64
         st.handbacks += 1;
         st.hb[@intFromEnum(cpu.opArena(Op)[cpu.opIndex(b.op + code)].h)] += 1;
     }
-    _ = jit.C.countExit(cpu, b, code);
+    return jit.C.countExit(cpu, b, code);
 }

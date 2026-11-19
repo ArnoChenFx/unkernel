@@ -16,6 +16,7 @@ import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
 import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
 import { connectOn, execOn, spawnOn, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess } from "./tty.ts";
 import { fetchOver } from "./http.ts";
+import { CommandTable, parseCommands, type CommandsOption, type HostCommand } from "./commands.ts";
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
 import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
@@ -190,6 +191,18 @@ export interface CreateKernelOptions {
 	 * reject with its MountError (it is logged too). Needs vsock (the default).
 	 */
 	mounts?: MountsOption;
+	/**
+	 * Host commands (commands.ts): names to functions of the host that the
+	 * guest runs as programs. Each gets a link /run/kw/bin/NAME to the
+	 * guest's kwcmd (first on PATH), made through kwtty once it answers; a
+	 * guest process that runs NAME is a normal process, and the function is
+	 * called with its arguments, environment, stdin, stdout and stderr, and
+	 * what it returns ends that process. spawn() and exec() wait for the
+	 * links; if making them failed, the calls that waited reject with the
+	 * CommandError (it is logged too). Needs vsock (the default). With
+	 * `restore`, the snapshot's links are replaced by these.
+	 */
+	commands?: CommandsOption;
 	/** Initial console size (cols x rows); resize() changes it later. */
 	consoleSize?: { cols: number; rows: number };
 	/** Console output, from the first byte. */
@@ -365,8 +378,9 @@ export interface KernelHandle {
 	 * (the zigpty / node-pty shape), or with `pty: false` on stdin, stdout
 	 * and stderr pipes, a Subprocess. Rejects with a PtyError ENODEV when
 	 * the instance was created with `vsock: false`. Waits until
-	 * createKernel's `mounts` are mounted, as exec() does, and rejects with
-	 * the MountError if one of them failed.
+	 * createKernel's `mounts` are mounted and its `commands` linked, as
+	 * exec() does, and rejects with the MountError or CommandError if one
+	 * of them failed.
 	 */
 	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
@@ -400,6 +414,18 @@ export interface KernelHandle {
 	mount(path: string, fs: FsSource, opts?: MountOptions): Promise<Mount>;
 	/** The mounts the guest has now, by guest path. */
 	readonly mounts: ReadonlyMap<string, Mount>;
+	/**
+	 * Add a host command (commands.ts): from now on a guest process that
+	 * runs `name` calls `handler` here. Resolves once the guest has the link
+	 * /run/kw/bin/NAME (at once when `name` is replaced); rejects with a
+	 * CommandError (EINVAL for a bad name, ENODEV without vsock, ENOENT
+	 * without kwcmd in the image, ETIMEDOUT, ...).
+	 */
+	addCommand(name: string, handler: HostCommand, opts?: { timeout?: number }): Promise<void>;
+	/** Remove a host command and its link in the guest. A guest process running it goes on. */
+	removeCommand(name: string, opts?: { timeout?: number }): Promise<void>;
+	/** The host commands the guest has now, by name. */
+	readonly commands: ReadonlyMap<string, HostCommand>;
 	/**
 	 * With the shm option: guest shmem files read and written in place
 	 * (open(), create(), openId(); ShmFile.read()/write()). In worker mode the
@@ -440,6 +466,7 @@ export class KernelInstance implements KernelHandle {
 	#vsock: VsockHost | undefined;
 	#shm: ShmClient<InlineShmFile> | undefined;
 	#mounts = new MountTable(undefined, () => {});
+	#commands = new CommandTable(undefined, () => {});
 
 	/** @internal Use createKernel(). */
 	constructor(kernel: Kernel, module: WebAssembly.Module, cmdline: string, net: NetDevice | undefined, compileMs: number) {
@@ -451,6 +478,7 @@ export class KernelInstance implements KernelHandle {
 		this.#out = new ConsoleOutput(() => !!kernel.result);
 		if (kernel.shm.enabled) this.#shm = inlineShm(kernel.shm);
 		this.exited = kernel.exited.then((res) => {
+			this.#commands.shutdown();
 			this.#mounts.shutdown();
 			this.#vsock?.shutdown();
 			this.#shm?.shutdown();
@@ -465,6 +493,7 @@ export class KernelInstance implements KernelHandle {
 	attachVsock(host: VsockHost): void {
 		this.#vsock = host;
 		const mounts = this.#mounts = new MountTable(host, host.log);
+		this.#commands = new CommandTable(host, host.log);
 		// The 9p server runs here, on the kernel's thread: its sessions are
 		// saved at the snapshot point, with the vsock device.
 		this.kernel.vsock.onSave = () => mounts.save();
@@ -487,6 +516,16 @@ export class KernelInstance implements KernelHandle {
 		this.#mounts.mountAll(list);
 	}
 
+	/** @internal createKernel's `commands`, once the kernel runs. */
+	startCommands(list: ReturnType<typeof parseCommands>): void {
+		this.#commands.addAll(list);
+	}
+
+	/** createKernel's `mounts` and `commands` first (see KernelHandle.spawn()). */
+	#gate<T>(fn: () => Promise<T>): Promise<T> {
+		return this.#mounts.gate(() => this.#commands.gate(fn));
+	}
+
 	/**
 	 * With the vsock option: listen() for guest connections to the host
 	 * (CID 2, any port) and connect() to guest listeners (CID 3), each a
@@ -503,18 +542,18 @@ export class KernelInstance implements KernelHandle {
 	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions | PipeOptions): Promise<Pty | Subprocess> {
-		return this.#mounts.gate(() => spawnOn(this.#vsock, file, args, opts));
+		return this.#gate(() => spawnOn(this.#vsock, file, args, opts));
 	}
 
 	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
 	exec(file: string, args: readonly string[] | undefined, opts: ExecOptions & { encoding: "buffer" }): Promise<ExecResult<Uint8Array>>;
 	exec(file: string, args?: readonly string[], opts?: ExecOptions): Promise<ExecResult<string | Uint8Array>> {
-		return this.#mounts.gate(() => execOn(this.#vsock, file, args, opts));
+		return this.#gate(() => execOn(this.#vsock, file, args, opts));
 	}
 
 	/** A raw byte stream to a TCP server on the guest's loopback (see KernelHandle.connect()). */
 	connect(port: number, opts?: ConnectOptions): Promise<GuestSocket> {
-		return this.#mounts.gate(() => connectOn(this.#vsock, port, opts));
+		return this.#gate(() => connectOn(this.#vsock, port, opts));
 	}
 
 	/** HTTP/1.1 to a server on the guest's loopback (see KernelHandle.fetch()). */
@@ -531,6 +570,18 @@ export class KernelInstance implements KernelHandle {
 		return this.#mounts.mounts;
 	}
 
+	/** Add a host command (commands.ts; see KernelHandle.addCommand()). */
+	addCommand(name: string, handler: HostCommand, opts?: { timeout?: number }): Promise<void> {
+		return this.#commands.add(name, handler, opts);
+	}
+
+	removeCommand(name: string, opts?: { timeout?: number }): Promise<void> {
+		return this.#commands.remove(name, opts);
+	}
+
+	get commands(): ReadonlyMap<string, HostCommand> {
+		return this.#commands.commands;
+	}
 
 	/**
 	 * With the shm option: open guest shmem files by name or by a guest
@@ -738,6 +789,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	const vopt = opts.vsock ?? true;
 	const raw = typeof vopt === "object" ? vopt.raw : undefined;
 	const mounts = parseMounts(opts.mounts, !!vopt && !raw);
+	const commands = parseCommands(opts.commands, !!vopt && !raw);
 	const savedMounts = opts.restore?.devices?.vsock?.mounts;
 	if (savedMounts?.mounts.length && (opts.worker || raw))
 		throw new BootError("boot", `snapshot: it has host file systems (${savedMounts.mounts.map((m) => m.path).join(", ")}), which resume inline only (not in worker mode or with vsock.raw)`);
@@ -747,6 +799,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		checkWorkerOptions(platform, opts);
 		const vm = await createKernelInWorker(platform, opts, progress);
 		vm.startMounts(mounts);
+		vm.startCommands(commands);
 		return vm;
 	}
 	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
@@ -858,6 +911,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	}
 	booting.catch(() => {});
 	instance.startMounts(rest);
+	instance.startCommands(commands);
 	if (signal) {
 		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
 		if (signal.aborted) onAbort();

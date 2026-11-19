@@ -47,7 +47,7 @@ RAM-resident: keep it small). Everything in it is `kw-*` or under
 `/usr/lib/kw/`, so it never shadows a distro's file; its scripts run the
 base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 
-- `/usr/bin/kwtty`, `kw9p`, `kwvsock`, `kwshm`, `kwwasi` (Guest tools,
+- `/usr/bin/kwtty`, `kw9p`, `kwvsock`, `kwshm`, `kwwasi`, `kwcmd` (Guest tools,
   below). The image must not carry them: kwtty's protocol belongs to the
   SDK shipped with the kernel. `glimmer` is not in the layer: every distro
   build compiles it into its image (`install_common`, guest/lib/stage.sh),
@@ -65,7 +65,7 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/lib/kw/shim` and `/usr/lib/kw/bin/{fx,claude,opencode,node,npm,npx,bun,bunx}`
   (Shims, below).
 - `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`
-  (`~/.local/bin` first on PATH, `/usr/lib/kw/bin` last, below), `/etc/profile.d/kw-term.sh`
+  (`/run/kw/bin`, then `~/.local/bin` first on PATH, `/usr/lib/kw/bin` last, below), `/etc/profile.d/kw-term.sh`
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
   `/usr/share/licenses/unkernel` (the GPL notice for these files).
@@ -80,7 +80,7 @@ network).
 
 - PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for login shells, kwtty
   for programs it starts), and the install goes to `~/.local/bin`, which
-  comes first, so later calls start the program directly and anything
+  comes before the distro's, so later calls start the program directly and anything
   else of those names (a user's own install) wins. A shell that ran the
   shim keeps it hashed until `hash -r`, which costs one busybox `sh`
   start per call (the shim execs the installed program).
@@ -263,9 +263,10 @@ The files are in `guest/distro/alpine/rootfs/`.
   (`APKINDEX.<8 hex digits of sha1(index URL)>.tar.gz`, unless the page has
   pushed it), and on a hit the repository is enabled and apk reuses that
   file.
-- **`~/.local/bin` first on PATH** (`/etc/profile.d/kw-path.sh`, from the
+- **`~/.local/bin` ahead of the distro's on PATH** (`/etc/profile.d/kw-path.sh`, from the
   kw layer): Alpine's
-  `/etc/profile` sets a fixed PATH; this prepends `$HOME/.local/bin` and
+  `/etc/profile` sets a fixed PATH; this prepends `/run/kw/bin` (the
+  host's commands, kwcmd) and `$HOME/.local/bin` and
   appends `/usr/lib/kw/bin` (the shims) for every login shell, and
   kwtty gives programs it starts directly the same PATH. Per-user installs
   go there (`pip install --user`, the fx and claude installers, the
@@ -352,6 +353,11 @@ within what kwemu implements: check it with the coverage classifier
   `pause()` instead of exiting, so init does not respawn it every second.
 - `kw9p NAME DIR [ro]` mounts a host file system (devices.md, 9p); the SDK
   runs it through kwtty.
+- `kwcmd` runs a command the host provides (`createKernel({ commands })`,
+  `js/core/commands.ts`; the protocol is at the top of `kwcmd.c` and
+  there): through a link `/run/kw/bin/NAME`, or `kwcmd run NAME`, it
+  connects to vsock port 1020 and is that command's process. `kwcmd sync
+  NAME...` makes the links; the SDK runs it through kwtty.
 - `kwshm memfd SIZE [SEED]` and `kwshm export FILE` export a patterned
   memfd or a file and print its id.
 - `glimmer` is a small game for the display, keyboard and mouse at any

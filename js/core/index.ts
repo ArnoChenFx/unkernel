@@ -42,6 +42,8 @@ export { MemoryFs } from "./memfs.ts";
 export type { FsTree, FsTreeFile, MemoryFsChange } from "./memfs.ts";
 export { MountError } from "./mounts.ts";
 export type { FsSource, Mount, MountErrorCode, MountOptions, MountSpec, MountStats, MountsOption } from "./mounts.ts";
+export { CMD_PORT, CommandError } from "./commands.ts";
+export type { CommandErrorCode, CommandsOption, HostCommand, HostCommandContext, HostCommandResult } from "./commands.ts";
 export { SHM_PAGE_SIZE, ShmClient, ShmDevice, ShmError, inlineShm } from "./shm.ts";
 export type { InlineShmFile, Shm, ShmBackend, ShmCall, ShmCallResult, ShmCloseReason, ShmDeviceOptions, ShmDeviceStats, ShmFile, ShmInfo, ShmStats } from "./shm.ts";
 export { WorkerKernel } from "./worker-host.ts";

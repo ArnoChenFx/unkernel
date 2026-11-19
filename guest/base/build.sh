@@ -17,7 +17,7 @@
 #   /kw/layer/              rootfs/: the top lower layer of the root, so
 #                           every distro has it (RAM-resident: keep it
 #                           small): usr/bin/{kwtty,kw9p,kwvsock,kwshm,
-#                           kwwasi} (guest/src/), usr/sbin/kw-overlay,
+#                           kwwasi,kwcmd} (guest/src/), usr/sbin/kw-overlay,
 #                           usr/lib/kw/ (rc, welcome, net, udhcpc, shutdown,
 #                           data-stop: the runtime a distro's init calls;
 #                           shim and bin/: fx, claude, opencode, node,
@@ -94,7 +94,7 @@ echo hvc0 > "$stage/etc/securetty"
 # the same ones (the top lower layer wins), so they are all 755.
 layer="$stage/kw/layer"
 mkdir -p "$layer"/{data,etc/profile.d,usr/bin,usr/sbin,usr/lib/kw}
-for t in kwvsock kwshm kwtty kw9p kwwasi; do
+for t in kwvsock kwshm kwtty kw9p kwwasi kwcmd; do
 	"${cc_guest[@]}" -o "$layer/usr/bin/$t" "$guest/src/$t.c"
 	ln -s "/kw/layer/usr/bin/$t" "$stage/usr/bin/$t"   # for the base shell
 done

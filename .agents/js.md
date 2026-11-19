@@ -77,7 +77,8 @@ parts that are easy to get wrong.
   themselves, host file systems mounted over 9p (`mounts`, `vm.mount()`;
   below), and guest shmem files (`shm` option). kwtty is the only guest
   service; there is no other guest agent (kw9p is a one-shot program that
-  kwtty runs). A one-shot program can be the init (`rdinit=`).
+  kwtty runs, and kwcmd, the process of a host command, `commands.ts`,
+  connects to the host by itself). A one-shot program can be the init (`rdinit=`).
 - `stop()` parks the kernel at its next suspension point (kernel.md,
   Tasks). The guest gets no shutdown, so prefer typing `poweroff`.
 - `sync()` (`Kernel.requestSync()`) raises IRQ 4 and resolves true once

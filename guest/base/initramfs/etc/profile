@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # /etc/profile of the base shell.
 
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/run/kw/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 case $TERM in linux | vt102 | "") export TERM=xterm-256color ;; esac
 [ "$PWD" = / ] && cd /root

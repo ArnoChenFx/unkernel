@@ -21,6 +21,7 @@ import { VsockHost, type VsockStats } from "./vsock.ts";
 import { ShmClient, ShmError, type ShmCallResult } from "./shm.ts";
 import { connectOn, execOn, spawnOn, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess } from "./tty.ts";
 import { fetchOver } from "./http.ts";
+import { CommandTable, type HostCommand, type parseCommands } from "./commands.ts";
 import { MountTable, type FsSource, type Mount, type MountOptions, type parseMounts } from "./mounts.ts";
 import { FrameClient, RemoteEvdev, SoundBridge } from "./worker-devices.ts";
 import { SharedOwner, newSharedControl, sharedMemoryAvailable, type KernelTransport } from "./worker-shared.ts";
@@ -199,6 +200,7 @@ export class WorkerKernel implements KernelHandle {
 	#vsock: VsockHost | undefined;
 	#vsockOut: Uint8Array[] = [];
 	#mounts: MountTable;
+	#commands: CommandTable;
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
@@ -247,6 +249,7 @@ export class WorkerKernel implements KernelHandle {
 			});
 		}
 		this.#mounts = new MountTable(this.#vsock, opts.log);
+		this.#commands = new CommandTable(this.#vsock, opts.log);
 		if (opts.shm) {
 			// Each call is a round trip: the worker runs it on its ShmDevice (where the kernel's
 			// memory is) when the kernel next suspends, and a read's bytes come back transferred.
@@ -416,6 +419,7 @@ export class WorkerKernel implements KernelHandle {
 		this.#evdev?.close();
 		this.#frames?.close();
 		this.#shared?.close();
+		this.#commands.shutdown();
 		this.#mounts.shutdown();
 		this.#vsock?.shutdown();
 		for (const c of this.#shmCalls.values()) c.reject(new ShmError("ECONNABORTED", "the kernel exited"));
@@ -555,18 +559,18 @@ export class WorkerKernel implements KernelHandle {
 	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions | PipeOptions): Promise<Pty | Subprocess> {
-		return this.#mounts.gate(() => spawnOn(this.#vsock, file, args, opts));
+		return this.#mounts.gate(() => this.#commands.gate(() => spawnOn(this.#vsock, file, args, opts)));
 	}
 
 	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
 	exec(file: string, args: readonly string[] | undefined, opts: ExecOptions & { encoding: "buffer" }): Promise<ExecResult<Uint8Array>>;
 	exec(file: string, args?: readonly string[], opts?: ExecOptions): Promise<ExecResult<string | Uint8Array>> {
-		return this.#mounts.gate(() => execOn(this.#vsock, file, args, opts));
+		return this.#mounts.gate(() => this.#commands.gate(() => execOn(this.#vsock, file, args, opts)));
 	}
 
 	/** A raw byte stream to a TCP server on the guest's loopback, as inline (kwtty's CONNECT; the protocol runs on this thread). */
 	connect(port: number, opts?: ConnectOptions): Promise<GuestSocket> {
-		return this.#mounts.gate(() => connectOn(this.#vsock, port, opts));
+		return this.#mounts.gate(() => this.#commands.gate(() => connectOn(this.#vsock, port, opts)));
 	}
 
 	/** HTTP/1.1 to a server on the guest's loopback, as inline (http.ts over connect()). */
@@ -586,6 +590,24 @@ export class WorkerKernel implements KernelHandle {
 	/** @internal createKernel's `mounts`, once the kernel runs. */
 	startMounts(list: ReturnType<typeof parseMounts>): void {
 		this.#mounts.mountAll(list);
+	}
+
+	/** Host commands, as inline (commands.ts): the handlers run on this thread. */
+	addCommand(name: string, handler: HostCommand, opts?: { timeout?: number }): Promise<void> {
+		return this.#commands.add(name, handler, opts);
+	}
+
+	removeCommand(name: string, opts?: { timeout?: number }): Promise<void> {
+		return this.#commands.remove(name, opts);
+	}
+
+	get commands(): ReadonlyMap<string, HostCommand> {
+		return this.#commands.commands;
+	}
+
+	/** @internal createKernel's `commands`, once the kernel runs. */
+	startCommands(list: ReturnType<typeof parseCommands>): void {
+		this.#commands.addAll(list);
 	}
 
 	/**

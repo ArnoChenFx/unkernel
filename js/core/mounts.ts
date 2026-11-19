@@ -205,8 +205,8 @@ class MountHandle implements Mount {
 	}
 }
 
-/** Run `cmd` in the guest with a deadline over the whole run (exec()'s own covers only reaching kwtty); it is killed when it runs out. */
-async function guestRun(vsock: Vsock, file: string, args: string[], timeout: number): Promise<ExecResult<string>> {
+/** @internal Run `cmd` in the guest with a deadline over the whole run (exec()'s own covers only reaching kwtty); it is killed when it runs out. */
+export async function guestRun(vsock: Vsock, file: string, args: string[], timeout: number): Promise<ExecResult<string>> {
 	const ac = new AbortController();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {

@@ -1447,6 +1447,113 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		});
 	});
 
+	// Host commands (js/core/commands.ts; guest/src/kwcmd.c): guest processes that run functions of the host.
+	for (const { worker, name } of MODES) describe(`host commands (kwcmd), one kernel (${name})`,
+		{ concurrency: 1, skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, () => {
+		const seen: Array<Record<string, unknown> | string> = [];
+		const k = sharedKernel(() => ({
+			worker, log: () => {},
+			commands: {
+				hello: (c) => {
+					seen.push({ args: c.args, cwd: c.cwd, uid: c.uid, tty: c.isTTY, foo: c.env.FOO, pid: c.pid });
+					return `hello ${c.args.join(",")}\n`;
+				},
+				upper: async (c) => {
+					const dec = new TextDecoder();
+					await c.stdin.pipeThrough(new TransformStream<Uint8Array, string>({ transform: (b, tc) => tc.enqueue(dec.decode(b, { stream: true }).toUpperCase()) })).pipeTo(c.stdout);
+					return 3;
+				},
+				boom: () => { throw new Error("it broke"); },
+				noawait: (c) => {
+					const out = c.stdout.getWriter(), err = c.stderr.getWriter();
+					for (let i = 0; i < 5; i++) void out.write(`line ${i}\n`);
+					void err.write("err\n");
+				},
+				big: async (c) => {
+					const w = c.stdout.getWriter();
+					for (let i = 0; i < 4; i++) await w.write(new Uint8Array(1 << 20).fill(120));
+				},
+				first: async (c) => `first:${new TextDecoder().decode((await c.stdin.getReader().read()).value)}`,
+				die: (c) => ({ signal: c.args[0] }),
+				hang: (c) => new Promise<number>((r) => c.signal.addEventListener("abort", () => { seen.push("aborted"); r(0); })),
+				ask: async (c) => {
+					const w = c.stdout.getWriter();
+					await w.write(`${c.cols}x${c.rows} ${c.isTTY.stdin} name? `);
+					const { value } = await c.stdin.getReader().read();
+					await w.write(`hi ${new TextDecoder().decode(value).trim()}\n`);
+				},
+			},
+		}));
+		const sh = (script: string) => k.vm.exec("sh", ["-c", script]);
+
+		test("exec() waits for createKernel's commands: arguments, environment, cwd, stdout and the exit status; a link per command, first on PATH", async () => {
+			const r = await sh("cd /tmp && FOO=bar hello a 'b c'; echo rc=$?; command -v hello; readlink /run/kw/bin/hello; ls /run/kw/bin | tr '\\n' ' '");
+			assert.equal(r.stdout, "hello a,b c\nrc=0\n/run/kw/bin/hello\n/usr/bin/kwcmd\nask big boom die first hang hello noawait upper ");
+			const call = seen.pop() as Record<string, unknown>;
+			assert.ok((call.pid as number) > 1);
+			assert.deepEqual({ ...call, pid: 0 }, { args: ["a", "b c"], cwd: "/tmp", uid: 0, tty: { stdin: false, stdout: false, stderr: false }, foo: "bar", pid: 0 });
+			assert.deepEqual([...k.vm.commands.keys()], ["hello", "upper", "boom", "noawait", "big", "first", "die", "hang", "ask"]);
+		});
+
+		test("stdin to the handler and back, a returned status, a throw (stderr, exit 1), writes not awaited, 4 MiB through a pipe, a reader that leaves early", async () => {
+			assert.deepEqual(await sh("echo abc | upper; echo rc=$?"), { stdout: "ABC\nrc=3\n", stderr: "", exitCode: 0, signal: null });
+			assert.deepEqual(await sh("boom; echo rc=$?"), { stdout: "rc=1\n", stderr: "boom: it broke\n", exitCode: 0, signal: null });
+			assert.deepEqual(await sh("noawait; echo rc=$?"), { stdout: "line 0\nline 1\nline 2\nline 3\nline 4\nrc=0\n", stderr: "err\n", exitCode: 0, signal: null });
+			assert.equal((await sh("big | wc -c; big | head -c 5; echo; echo rc=$?")).stdout, "4194304\nxxxxx\nrc=0\n");
+		});
+
+		test("stdin is read only as the handler reads it: one read takes one line of a slow pipe and the rest stays; { signal } ends the process by that signal", async () => {
+			assert.equal((await sh("{ echo one; sleep 0.3; echo two; } | { first; cat; }")).stdout, "first:one\ntwo\n");
+			assert.equal((await sh("first </dev/null; echo; die TERM; echo rc=$?; die SIGUSR1; echo rc=$?; die NOPE 2>&1; echo rc=$?")).stdout,
+				'first:\nrc=143\nrc=138\ndie: unknown signal "NOPE"\nrc=1\n');
+			assert.deepEqual(await k.vm.exec("die", ["KILL"]), { stdout: "", stderr: "", exitCode: null, signal: 9 });
+		});
+
+		test("a normal process: ps and /proc show it by its name and arguments; killing it aborts the handler's signal", async () => {
+			const r = await sh("hang x y & sleep 0.3; cat /proc/$!/comm; tr '\\0' ' ' < /proc/$!/cmdline; echo; kill $!; wait $!; echo rc=$?");
+			assert.equal(r.stdout, "hang\nhang x y \nrc=143\n");
+			for (let i = 0; i < 100 && !seen.includes("aborted"); i++) await new Promise((done) => setTimeout(done, 20));
+			assert.ok(seen.includes("aborted"));
+		});
+
+		test("on a terminal: its size, stdin read only when the handler reads it (typeahead stays), Ctrl-C ends the process", async () => {
+			const p = await k.vm.spawn(undefined, [], { cols: 90, rows: 20 });
+			const sc = termScreen(p);
+			await p.write("hello; echo typeahead-$((1+1))\n");
+			await sc.waitFor(/typeahead-2/);
+			await p.write("ask\n");
+			await sc.waitFor(/90x20 true name\? /);
+			await p.write("bob\n");
+			await sc.waitFor(/hi bob\r?\n[^]*# /); // the next prompt: busybox ash drops what is typed before it
+			const at = sc.st.text.length;
+			await p.write("ask\n");
+			await sc.waitFor(/name\? /, at);
+			await p.write("\x03");
+			await p.write("echo rc=$?\n");
+			await sc.waitFor(/^rc=130\r?$/m, at);
+			await p.close();
+		});
+
+		test("a name the host does not have (127), kwcmd run, addCommand() and removeCommand(), bad names", async () => {
+			const r = await sh("ln -s /usr/bin/kwcmd /tmp/nope; /tmp/nope; echo rc=$?; kwcmd run hello via-run");
+			assert.deepEqual(r, { stdout: "rc=127\nhello via-run\n", stderr: "nope: the host does not provide this command\n", exitCode: 0, signal: null });
+			await k.vm.addCommand("late", () => 7);
+			assert.equal((await sh("late; echo rc=$?")).stdout, "rc=7\n");
+			await k.vm.addCommand("late", () => 8); // replaced: the link is there already
+			assert.equal((await sh("late; echo rc=$?")).stdout, "rc=8\n");
+			await k.vm.removeCommand("late");
+			assert.equal((await sh("late 2>/dev/null; echo rc=$?; ls /run/kw/bin | wc -l")).stdout, "rc=127\n9\n");
+			assert.ok(!k.vm.commands.has("late"));
+			for (const bad of ["", "a/b", ".x", "-x", "kwcmd", "a b"])
+				await assert.rejects(k.vm.addCommand(bad, () => 0), (e: Error) => e instanceof sdk.CommandError && e.code === "EINVAL", bad);
+		});
+	});
+
+	test("host commands: the option without vsock is refused before boot", async () => {
+		await assert.rejects(createKernel({ kernel: testKernel, vsock: false, commands: { x: () => 0 } }),
+			(e: Error) => e instanceof sdk.CommandError && e.code === "ENODEV");
+	});
+
 	// A distro root (guest/distro/alpine, the kw layer of guest/base/rootfs on top): what only a full userland has.
 	describe("Alpine, one kernel", { concurrency: 1, skip: noAlpine || (!kernelHasVsock && "the kernel under test has no kwvsock") }, () => {
 		const alp = sharedKernel(() => ({ distro: alpine!, log: () => {} }));
@@ -1460,8 +1567,8 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.equal(alp.vm.distro?.label, "kwroot");
 		});
 
-		test("PATH: ~/.local/bin, then /etc/profile's, then the shims, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
-			const want = "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin\n";
+		test("PATH: the host's commands, ~/.local/bin, then /etc/profile's, then the shims, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
+			const want = "/run/kw/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin\n";
 			assert.equal((await alp.vm.exec("sh", ["-c", 'echo "$PATH"'])).stdout, want);
 			assert.equal((await alp.vm.exec("sh", ["-lc", 'echo "$PATH"'])).stdout, want);
 		});

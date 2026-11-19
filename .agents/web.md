@@ -689,12 +689,11 @@ Ctrl-C). Typing the command into a fresh shell lost the start of the line,
 because the login discards input typed ahead of its prompt. The preview opens once the
 guest answers http on the first of its `ports`. The distros' nginx default
 site also listens on `[::]:80`, which fails in the guest (no IPv6), so the
-nginx demo replaces it. A demo may carry repository sources as text (Vite `?raw` or
-`import.meta.glob`; the file needs an extension, doom/files.ts says why): Doom brings `web/src/demos/doom/fbdoom.sh` (fbDOOM built in
+nginx demo replaces it. A demo's files are text in its own file: Doom (`web/src/demos/doom.ts`) carries the `fbdoom` script (fbDOOM built in
 the guest with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound; the
 first run took 22 s to the first frame, a later one 0.2 s, 2026-11-18) and
-its `patches/` this way, loaded at launch (`doom/files.ts`), and these GPL-2.0-or-later texts keep their license
-(their SPDX headers) inside the MIT bundle. Files with absolute paths land outside the demo directory, and
+its patches to fbDOOM as template literals, and these GPL-2.0-or-later texts keep their license
+(the script's SPDX header) inside the MIT bundle. Files with absolute paths land outside the demo directory, and
 files from an earlier launch are never removed. A demo's `downloads`
 (url, SHA-256, size, guest path, an optional `unless` shell test) are
 fetched by the page before its window opens (`download.ts`, described at

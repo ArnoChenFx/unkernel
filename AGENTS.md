@@ -2,7 +2,8 @@
 
 unkernel runs Linux 7.3, compiled to a single wasm module (`arch/wasm` with an
 MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
-Linux ELF (ARMv8.0-A with FP, AdvSIMD, AES, PMULL, SHA1, SHA2, CRC32), run
+Linux ELF (ARMv8.0-A with FP, AdvSIMD, AES, PMULL, SHA1, SHA2, CRC32, LSE,
+SHA512, SHA3), run
 by kwemu: a Zig interpreter linked into the kernel. README.md is the
 overview, and kernel/README.md covers the kernel side, the devices and the
 guest image.
@@ -112,7 +113,7 @@ Details are in the area files.
 - Guest C programs in the image (`kernel/guest/*.c`) are built for the
   generic ARMv8.0 CPU. Check new code with the coverage classifier
   (a64.md, Coverage tool): it lists what kwemu rejects (later architecture
-  features: LSE, SVE, SHA512, ...).
+  features: SVE, SM3, SM4, ...).
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
 

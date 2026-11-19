@@ -160,10 +160,10 @@ static int failures;
  * FP and AdvSIMD), 1 = one of kwemu's optional features (KW_ISA_*), listed
  * unless kw.isa= masks it or kwemu does not implement it yet (either),
  * 0 = cpuid, listed once kwemu answers the ID registers (either). probe: an
- * instruction only this feature defines, on x0, x1, d0/v0 and v1; it must
- * raise SIGILL exactly when the feature is not listed. Any other HWCAP bit
- * (LSE atomics, SVE, SHA3, SHA512, PAC, ...) must never be set, and
- * AT_HWCAP2 and AT_HWCAP3 are 0.
+ * instruction only this feature defines, on x0, x1, d0/v0, v1 and the
+ * stack; it must raise SIGILL exactly when the feature is not listed. Any
+ * other HWCAP bit (SVE, PAC, ...) must never be set, and AT_HWCAP2 and
+ * AT_HWCAP3 are 0. kw.isa= also takes "lse" for "atomics".
  */
 static const struct a64_feat {
 	const char *name;
@@ -178,13 +178,18 @@ static const struct a64_feat {
 	{ "sha1",  1UL << 5,  1, 0x5e280820 },	/* sha1h s0, s1 */
 	{ "sha2",  1UL << 6,  1, 0x5e282820 },	/* sha256su0 v0.4s, v1.4s */
 	{ "crc32", 1UL << 7,  1, 0x1ac14000 },	/* crc32b w0, w0, w1 */
+	{ "atomics", 1UL << 8, 1, 0xf8ff03e0 },	/* ldaddal xzr, x0, [sp] */
 	{ "cpuid", 1UL << 11, 0, 0xd5380600 },	/* mrs x0, id_aa64isar0_el1 */
+	{ "sha3",  1UL << 17, 1, 0xce618c00 },	/* rax1 v0.2d, v0.2d, v1.2d */
+	{ "sha512", 1UL << 21, 1, 0xcec08020 },	/* sha512su0 v0.2d, v1.2d */
 };
 #define NFEAT (int)(sizeof(a64_feats) / sizeof(a64_feats[0]))
 #define A64_RET 0xd65f03c0u
 
 static int feat_find(const char *name, size_t len)
 {
+	if (len == 3 && !strncmp(name, "lse", 3))
+		name = "atomics", len = 7;
 	for (int i = 0; i < NFEAT; i++)
 		if (strlen(a64_feats[i].name) == len && !strncmp(a64_feats[i].name, name, len))
 			return i;
@@ -387,6 +392,29 @@ static void isa_checks(void)
 	}
 	CHECK(!unknown && ordered && !bad && hwcap == hw_want && !(hwcap & ~allowed),
 	      "cpuinfo Features: %s (kw.isa=%s); AT_HWCAP %#lx (want %#lx)", feats, mask, hwcap, hw_want);
+	/*
+	 * ID_AA64ISAR0_EL1 (kwemu's answer) says what AT_HWCAP says: AES (2 with
+	 * PMULL), SHA1, SHA2 (2 with SHA512), CRC32, Atomic (2), SHA3; SHA512
+	 * only together with SHA2 (kw.isa=-sha2 drops both).
+	 */
+	if (hwcap & (1UL << 11)) {
+		unsigned long isar0 = MRS(id_aa64isar0_el1), want_isar0 = 0;
+
+		if (hwcap & (1UL << 3))
+			want_isar0 |= (hwcap & (1UL << 4) ? 2UL : 1UL) << 4;
+		if (hwcap & (1UL << 5))
+			want_isar0 |= 1UL << 8;
+		if (hwcap & (1UL << 6))
+			want_isar0 |= (hwcap & (1UL << 21) ? 2UL : 1UL) << 12;
+		if (hwcap & (1UL << 7))
+			want_isar0 |= 1UL << 16;
+		if (hwcap & (1UL << 8))
+			want_isar0 |= 2UL << 20;
+		if (hwcap & (1UL << 17))
+			want_isar0 |= 1UL << 32;
+		CHECK(isar0 == want_isar0 && (!(hwcap & (1UL << 21)) || (hwcap & (1UL << 6))),
+		      "ID_AA64ISAR0_EL1 %#lx matches AT_HWCAP (want %#lx); SHA512 only with SHA2", isar0, want_isar0);
+	}
 	CHECK(getauxval(AT_HWCAP2) == 0 && getauxval(29 /* AT_HWCAP3 */) == 0 && !getauxval(AT_SYSINFO_EHDR) &&
 	      getauxval(AT_PLATFORM) && !strcmp((char *)getauxval(AT_PLATFORM), "aarch64") &&
 	      getauxval(51 /* AT_MINSIGSTKSZ */) == 4720,
@@ -557,7 +585,7 @@ static void isa_checks(void)
  * the exec check (qemu-user cannot exec a foreign binary). Everything here
  * is integer or scalar FP: kwemu has no AdvSIMD FP yet.
  */
-#define CX_EXT ".arch_extension aes\n\t.arch_extension sha2\n\t.arch_extension crc\n\t"
+#define CX_EXT ".arch_extension aes\n\t.arch_extension sha2\n\t.arch_extension sha3\n\t.arch_extension crc\n\t"
 /* d = insn(d, n, m) on whole q registers: v0 = d, v1 = n, v2 = m */
 #define CX3(fn, insn) static void fn(uint8_t *d, const uint8_t *n, const uint8_t *m) { \
 	__asm__ volatile(CX_EXT "ldr q0, [%0]\n\tldr q1, [%1]\n\tldr q2, [%2]\n\t" insn "\n\tstr q0, [%0]" \
@@ -580,6 +608,10 @@ CX3(cx_sha256h, "sha256h q0, q1, v2.4s")
 CX3(cx_sha256h2, "sha256h2 q0, q1, v2.4s")
 CX3(cx_sha256su1, "sha256su1 v0.4s, v1.4s, v2.4s")
 CX2(cx_sha256su0, "sha256su0 v0.4s, v1.4s")
+CX3(cx_sha512h, "sha512h q0, q1, v2.2d")
+CX3(cx_sha512h2, "sha512h2 q0, q1, v2.2d")
+CX3(cx_sha512su1, "sha512su1 v0.2d, v1.2d, v2.2d")
+CX2(cx_sha512su0, "sha512su0 v0.2d, v1.2d")
 #define CXCRC(fn, insn, reg) static uint32_t fn(uint32_t a, uint64_t v) { uint32_t r; \
 	__asm__ volatile(CX_EXT insn " %w0, %w1, %" reg "2" : "=r"(r) : "r"(a), "r"(v)); return r; }
 CXCRC(cx_crc32b, "crc32b", "w")
@@ -891,6 +923,198 @@ static int kat_sha2(void)
 	return ok;
 }
 
+/*
+ * SHA-512 of one 128-byte block, the way OpenSSL's sha512_block_armv8
+ * drives the instructions: the state in four 2D registers (ab, cd, ef, gh)
+ * and a fifth that rotates through the roles, two rounds per step.
+ */
+static const uint64_t k512[80] = {
+	0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538, 0x59f111f1b605d019,
+	0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+	0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3,
+	0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65, 0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+	0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725,
+	0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+	0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b, 0xa2bfe8a14cf10364, 0xa81a664bbc423001,
+	0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+	0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb,
+	0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+	0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b, 0xca273eceea26619c, 0xd186b8c721c0c207,
+	0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+	0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a,
+	0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+};
+struct q128 { uint64_t v[2]; } __attribute__((aligned(16)));
+static struct q128 q_pair(uint64_t lo, uint64_t hi) { struct q128 r = { { lo, hi } }; return r; }
+static struct q128 q_add(struct q128 a, struct q128 b) { return q_pair(a.v[0] + b.v[0], a.v[1] + b.v[1]); }
+static struct q128 q_ext8(struct q128 n, struct q128 m) { return q_pair(n.v[1], m.v[0]); }
+
+static void sha512_block(uint64_t st[8], const uint8_t *blk)
+{
+	struct q128 msg[8], h[5], saved[4];
+	int hi[5] = { 0, 1, 2, 3, 4 };
+
+	for (int i = 0; i < 16; i++) {
+		uint64_t v = 0;
+
+		for (int k = 0; k < 8; k++)
+			v = v << 8 | blk[8 * i + k];
+		msg[i / 2].v[i % 2] = v;
+	}
+	for (int i = 0; i < 4; i++)
+		saved[i] = h[i] = q_pair(st[2 * i], st[2 * i + 1]);
+	for (int i = 0; i < 40; i++) {
+		struct q128 *m0 = &msg[i % 8], kw, v5, v6, v7, t3;
+		int n[5] = { hi[3], hi[0], hi[4], hi[2], hi[1] };
+
+		kw = q_add(*m0, q_pair(k512[2 * i], k512[2 * i + 1]));
+		kw = q_ext8(kw, kw);
+		v5 = q_ext8(h[hi[2]], h[hi[3]]);
+		v6 = q_ext8(h[hi[1]], h[hi[2]]);
+		t3 = q_add(h[hi[3]], kw);
+		if (i < 32)
+			cx_sha512su0((uint8_t *)m0, (uint8_t *)&msg[(i + 1) % 8]);
+		v7 = q_ext8(msg[(i + 4) % 8], msg[(i + 5) % 8]);
+		cx_sha512h((uint8_t *)&t3, (uint8_t *)&v5, (uint8_t *)&v6);
+		if (i < 32)
+			cx_sha512su1((uint8_t *)m0, (uint8_t *)&msg[(i + 7) % 8], (uint8_t *)&v7);
+		h[hi[4]] = q_add(h[hi[1]], t3);
+		cx_sha512h2((uint8_t *)&t3, (uint8_t *)&h[hi[1]], (uint8_t *)&h[hi[0]]);
+		h[hi[3]] = t3;
+		memcpy(hi, n, sizeof(n));
+	}
+	for (int i = 0; i < 4; i++) {
+		struct q128 r = q_add(h[hi[i]], saved[i]);
+
+		st[2 * i] = r.v[0];
+		st[2 * i + 1] = r.v[1];
+	}
+}
+
+/* SHA-512 of FIPS 180 "abc" (one block) and its 896-bit message (two). */
+static int kat_sha512(void)
+{
+	static const char *msgs[2] = { "abc", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+					     "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu" };
+	static const uint64_t want[2][8] = {
+		{ 0xddaf35a193617aba, 0xcc417349ae204131, 0x12e6fa4e89a97ea2, 0x0a9eeee64b55d39a,
+		  0x2192992a274fc1a8, 0x36ba3c23a3feebbd, 0x454d4423643ce80e, 0x2a9ac94fa54ca49f },
+		{ 0x8e959b75dae313da, 0x8cf4f72814fc143f, 0x8f7779c6eb9f7fa1, 0x7299aeadb6889018,
+		  0x501d289e4900f7e4, 0x331b99dec4b5433a, 0xc7d329eeb6dd2654, 0x5e96e55b874be909 },
+	};
+	int ok = 1;
+
+	for (int m = 0; m < 2; m++) {
+		uint8_t buf[256] = { 0 };
+		size_t n = strlen(msgs[m]);
+		int blocks = n < 112 ? 1 : 2;
+		uint64_t st[8] = { 0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+				   0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179 };
+
+		memcpy(buf, msgs[m], n);
+		buf[n] = 0x80;
+		for (int i = 0; i < 8; i++)
+			buf[128 * blocks - 1 - i] = (uint8_t)((uint64_t)n * 8 >> (8 * i));
+		for (int b = 0; b < blocks; b++)
+			sha512_block(st, buf + 128 * b);
+		ok &= !memcmp(st, want[m], sizeof(st));
+	}
+	return ok;
+}
+
+/*
+ * Keccak-f[1600] on the SHA3 instructions, the way OpenSSL's ARMv8.2 path
+ * (KeccakF1600_ce) uses them: theta's column sums by EOR3, D by RAX1, rho
+ * by XAR, chi by BCAX. Each of the 25 lanes is a 2D register, so lane 0
+ * and lane 1 of the vectors are two independent states.
+ */
+typedef struct { uint64_t v[2]; } __attribute__((aligned(16))) kq;
+#define K_EXT ".arch_extension sha3\n\t"
+static void k_eor3(kq *d, const kq *n, const kq *m, const kq *a) {
+	__asm__ volatile(K_EXT "ldr q1, [%1]\n\tldr q2, [%2]\n\tldr q3, [%3]\n\teor3 v0.16b, v1.16b, v2.16b, v3.16b\n\tstr q0, [%0]"
+		: : "r"(d), "r"(n), "r"(m), "r"(a) : "v0", "v1", "v2", "v3", "memory");
+}
+static void k_bcax(kq *d, const kq *n, const kq *m, const kq *a) {
+	__asm__ volatile(K_EXT "ldr q1, [%1]\n\tldr q2, [%2]\n\tldr q3, [%3]\n\tbcax v0.16b, v1.16b, v2.16b, v3.16b\n\tstr q0, [%0]"
+		: : "r"(d), "r"(n), "r"(m), "r"(a) : "v0", "v1", "v2", "v3", "memory");
+}
+static void k_rax1(kq *d, const kq *n, const kq *m) {
+	__asm__ volatile(K_EXT "ldr q1, [%1]\n\tldr q2, [%2]\n\trax1 v0.2d, v1.2d, v2.2d\n\tstr q0, [%0]"
+		: : "r"(d), "r"(n), "r"(m) : "v0", "v1", "v2", "memory");
+}
+#define K_XAR1(k) case k: __asm__ volatile(K_EXT "ldr q1, [%1]\n\tldr q2, [%2]\n\txar v0.2d, v1.2d, v2.2d, %3\n\tstr q0, [%0]" \
+		: : "r"(d), "r"(n), "r"(m), "i"(k) : "v0", "v1", "v2", "memory"); break;
+#define K_XAR8(k) K_XAR1(k) K_XAR1(k + 1) K_XAR1(k + 2) K_XAR1(k + 3) K_XAR1(k + 4) K_XAR1(k + 5) K_XAR1(k + 6) K_XAR1(k + 7)
+static void k_xar(kq *d, const kq *n, const kq *m, int imm) {
+	switch (imm) { K_XAR8(0) K_XAR8(8) K_XAR8(16) K_XAR8(24) K_XAR8(32) K_XAR8(40) K_XAR8(48) K_XAR8(56) }
+}
+
+static const uint64_t keccak_rc[24] = {
+	0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000, 0x000000000000808b, 0x0000000080000001,
+	0x8000000080008081, 0x8000000000008009, 0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
+	0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003, 0x8000000000008002, 0x8000000000000080,
+	0x000000000000800a, 0x800000008000000a, 0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+};
+/* rotation of lane x + 5y */
+static const int keccak_rho[25] = { 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
+
+static void keccak_f(kq a[25]) {
+	kq c[5], d[5], b[25];
+	for (int r = 0; r < 24; r++) {
+		for (int x = 0; x < 5; x++) {
+			k_eor3(&c[x], &a[x], &a[x + 5], &a[x + 10]);
+			k_eor3(&c[x], &c[x], &a[x + 15], &a[x + 20]);
+		}
+		for (int x = 0; x < 5; x++) k_rax1(&d[x], &c[(x + 4) % 5], &c[(x + 1) % 5]);
+		/* theta and rho by XAR (rotate right by 64 - r), pi by where it goes */
+		for (int x = 0; x < 5; x++)
+			for (int y = 0; y < 5; y++)
+				k_xar(&b[y + 5 * ((2 * x + 3 * y) % 5)], &a[x + 5 * y], &d[x], (64 - keccak_rho[x + 5 * y]) & 63);
+		for (int y = 0; y < 5; y++)
+			for (int x = 0; x < 5; x++)
+				k_bcax(&a[x + 5 * y], &b[x + 5 * y], &b[(x + 2) % 5 + 5 * y], &b[(x + 1) % 5 + 5 * y]);
+		a[0].v[0] ^= keccak_rc[r];
+		a[0].v[1] ^= keccak_rc[r];
+	}
+}
+
+/* One-block sponge (message < rate) in both lanes: msg0 in lane 0, msg1 in lane 1. */
+static void keccak_one(uint8_t *out0, uint8_t *out1, int outlen, int rate, uint8_t pad, const char *msg0, const char *msg1)
+{
+	kq a[25];
+	uint8_t blk[2][200];
+	const char *msg[2] = { msg0, msg1 };
+	memset(a, 0, sizeof a);
+	for (int l = 0; l < 2; l++) {
+		size_t n = strlen(msg[l]);
+		memset(blk[l], 0, sizeof blk[l]);
+		memcpy(blk[l], msg[l], n);
+		blk[l][n] ^= pad;
+		blk[l][rate - 1] ^= 0x80;
+		for (int i = 0; i < rate / 8; i++) { uint64_t w; memcpy(&w, blk[l] + 8 * i, 8); a[i].v[l] ^= w; }
+	}
+	keccak_f(a);
+	for (int i = 0; i < outlen / 8; i++) { memcpy(out0 + 8 * i, &a[i].v[0], 8); memcpy(out1 + 8 * i, &a[i].v[1], 8); }
+}
+
+/* SHA3-256 of "" and "abc" (one permutation, one per lane), SHAKE128 of "". */
+static int kat_sha3(void)
+{
+	static const uint8_t want_e[32] = { 0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66, 0x51, 0xc1, 0x47, 0x56, 0xa0, 0x61, 0xd6, 0x62,
+					    0xf5, 0x80, 0xff, 0x4d, 0xe4, 0x3b, 0x49, 0xfa, 0x82, 0xd8, 0x0a, 0x4b, 0x80, 0xf8, 0x43, 0x4a };
+	static const uint8_t want_abc[32] = { 0x3a, 0x98, 0x5d, 0xa7, 0x4f, 0xe2, 0x25, 0xb2, 0x04, 0x5c, 0x17, 0x2d, 0x6b, 0xd3, 0x90, 0xbd,
+					      0x85, 0x5f, 0x08, 0x6e, 0x3e, 0x9d, 0x52, 0x5b, 0x46, 0xbf, 0xe2, 0x45, 0x11, 0x43, 0x15, 0x32 };
+	static const uint8_t want_shake[32] = { 0x7f, 0x9c, 0x2b, 0xa4, 0xe8, 0x8f, 0x82, 0x7d, 0x61, 0x60, 0x45, 0x50, 0x76, 0x05, 0x85, 0x3e,
+						0xd7, 0x3b, 0x80, 0x93, 0xf6, 0xef, 0xbc, 0x88, 0xeb, 0x1a, 0x6e, 0xac, 0xfa, 0x66, 0xef, 0x26 };
+	uint8_t a[32], b[32];
+	int ok;
+
+	keccak_one(a, b, 32, 136, 0x06, "", "abc");
+	ok = !memcmp(a, want_e, 32) && !memcmp(b, want_abc, 32);
+	keccak_one(a, b, 32, 168, 0x1f, "", "");
+	return ok && !memcmp(a, want_shake, 32);
+}
+
 /* CRC-32 and CRC-32C of "123456789": by bytes, by X then B, by W, H, B, H. */
 static int kat_crc32(void)
 {
@@ -911,6 +1135,88 @@ static int kat_crc32(void)
 	a = cx_crc32h(cx_crc32b(cx_crc32h(cx_crc32w(~0u, w4), h56), (uint8_t)s[6]), h89);
 	c = cx_crc32ch(cx_crc32cb(cx_crc32ch(cx_crc32cw(~0u, w4), h56), (uint8_t)s[6]), h89);
 	return ok && ~a == 0xcbf43926 && ~c == 0xe3069283;
+}
+
+/*
+ * LSE atomics: each atomic memory operation, SWP, CAS and CASP once (or
+ * twice) with a known answer, on B, H, W and X.
+ */
+#define LSE_EXT ".arch_extension lse\n\t"
+#define LSEOP(fn, insn, T, r) static T fn(T *p, T v) { T old; \
+	__asm__ volatile(LSE_EXT insn " %" r "1, %" r "0, [%2]" : "=&r"(old) : "r"(v), "r"(p) : "memory"); return old; }
+LSEOP(lse_ldaddal_x, "ldaddal", uint64_t, "x")
+LSEOP(lse_ldclrl_w, "ldclrl", uint32_t, "w")
+LSEOP(lse_ldeorah, "ldeorah", uint16_t, "w")
+LSEOP(lse_ldsetb, "ldsetb", uint8_t, "w")
+LSEOP(lse_ldsmax_w, "ldsmax", uint32_t, "w")
+LSEOP(lse_ldsmin_x, "ldsmin", uint64_t, "x")
+LSEOP(lse_ldumaxb, "ldumaxb", uint8_t, "w")
+LSEOP(lse_lduminh, "lduminh", uint16_t, "w")
+LSEOP(lse_swpal_x, "swpal", uint64_t, "x")
+LSEOP(lse_swpb, "swpb", uint8_t, "w")
+/* CAS: returns the old value (what Rs holds after) */
+#define LSECAS(fn, insn, T, r) static T fn(T *p, T cmp, T v) { \
+	__asm__ volatile(LSE_EXT insn " %" r "0, %" r "2, [%1]" : "+&r"(cmp) : "r"(p), "r"(v) : "memory"); return cmp; }
+LSECAS(lse_casal_x, "casal", uint64_t, "x")
+LSECAS(lse_casa_w, "casa", uint32_t, "w")
+LSECAS(lse_casb, "casb", uint8_t, "w")
+LSECAS(lse_caslh, "caslh", uint16_t, "w")
+/* CASPAL on a 16-byte pair: Rs:Rs+1 = x4:x5 (in: compare, out: old), Rt:Rt+1 = x6:x7 */
+static void lse_caspal(uint64_t *p, uint64_t *c0, uint64_t *c1, uint64_t n0, uint64_t n1)
+{
+	register uint64_t s0 __asm__("x4") = *c0, s1 __asm__("x5") = *c1;
+	register uint64_t t0 __asm__("x6") = n0, t1 __asm__("x7") = n1;
+
+	__asm__ volatile(LSE_EXT "caspal x4, x5, x6, x7, [%2]" : "+r"(s0), "+r"(s1) : "r"(p), "r"(t0), "r"(t1) : "memory");
+	*c0 = s0;
+	*c1 = s1;
+}
+/* STADD (LDADD with Rt = XZR) */
+static void lse_staddl_x(uint64_t *p, uint64_t v)
+{
+	__asm__ volatile(LSE_EXT "staddl %0, [%1]" : : "r"(v), "r"(p) : "memory");
+}
+
+static int kat_lse(void)
+{
+	static uint64_t q[2] __attribute__((aligned(16)));
+	uint64_t x = 40, c0, c1;
+	uint32_t w = 0xff00ff00;
+	uint16_t h = 0x1234;
+	uint8_t b = 0x80;
+	int ok = 1;
+
+	ok &= lse_ldaddal_x(&x, 2) == 40 && x == 42;
+	lse_staddl_x(&x, 8);
+	ok &= x == 50;
+	ok &= lse_ldclrl_w(&w, 0x0f0f0f0f) == 0xff00ff00 && w == 0xf000f000;
+	ok &= lse_ldeorah(&h, 0xffff) == 0x1234 && h == 0xedcb;
+	ok &= lse_ldsetb(&b, 1) == 0x80 && b == 0x81;
+	w = 0x80000000;
+	ok &= lse_ldsmax_w(&w, 1) == 0x80000000 && w == 1;
+	x = 5;
+	ok &= lse_ldsmin_x(&x, (uint64_t)-3) == 5 && x == (uint64_t)-3;
+	b = 0xff;
+	ok &= lse_ldumaxb(&b, 1) == 0xff && b == 0xff;
+	h = 0x8000;
+	ok &= lse_lduminh(&h, 0x7fff) == 0x8000 && h == 0x7fff;
+	x = 5;
+	ok &= lse_swpal_x(&x, 77) == 5 && x == 77;
+	ok &= lse_swpb(&b, 3) == 0xff && b == 3;
+	ok &= lse_casal_x(&x, 77, 9) == 77 && x == 9;	/* passes */
+	ok &= lse_casal_x(&x, 77, 1) == 9 && x == 9;	/* fails */
+	w = 0x80000000;
+	ok &= lse_casa_w(&w, 0x80000000, 7) == 0x80000000 && w == 7;
+	ok &= lse_casb(&b, 3, 0xfe) == 3 && b == 0xfe;
+	ok &= lse_caslh(&h, 0x7ffe, 1) == 0x7fff && h == 0x7fff;
+	q[0] = 1;
+	q[1] = 2;
+	c0 = 1, c1 = 3;
+	lse_caspal(q, &c0, &c1, 7, 8);	/* the high half differs: fails */
+	ok &= c0 == 1 && c1 == 2 && q[0] == 1 && q[1] == 2;
+	lse_caspal(q, &c0, &c1, 7, 8);
+	ok &= c0 == 1 && c1 == 2 && q[0] == 7 && q[1] == 8;
+	return ok;
 }
 
 /* fn() (1 = right, 0 = wrong), or minus the signal it raised. */
@@ -943,6 +1249,9 @@ static void crypto_checks(void)
 		{ "sha1", "SHA-1 of FIPS 180 \"abc\" and the 2-block message", 1UL << 5, kat_sha1 },
 		{ "sha2", "SHA-256 of FIPS 180 \"abc\" and the 2-block message", 1UL << 6, kat_sha2 },
 		{ "crc32", "CRC-32 and CRC-32C of \"123456789\" by B, H, W, X", 1UL << 7, kat_crc32 },
+		{ "atomics", "LSE: LD<op> of each kind, STADD, SWP, CAS and CASP known answers", 1UL << 8, kat_lse },
+		{ "sha3", "SHA3-256 of \"\" and \"abc\", SHAKE128 of \"\" (Keccak-f[1600] on EOR3, RAX1, XAR, BCAX)", 1UL << 17, kat_sha3 },
+		{ "sha512", "SHA-512 of FIPS 180 \"abc\" and the 2-block message", 1UL << 21, kat_sha512 },
 	};
 	unsigned long hwcap = getauxval(AT_HWCAP);
 
@@ -2358,6 +2667,101 @@ static void smp_checks(void)
 }
 
 /*
+ * LSE atomics on several CPUs (also run on one, where preemption
+ * interleaves the threads): one thread per CPU (2 to 4) hammers shared
+ * counters with LDADDAL, STADD, a CASAL loop, SWPAL (every value put in
+ * comes out exactly once), LDUMAXAL, a 128-bit CASPAL counter and a lock
+ * taken by CASA and released by SWPL around a plain increment; every
+ * total must be exact. Skipped when AT_HWCAP has no HWCAP_ATOMICS.
+ */
+#define LSE_ITERS 60000
+static struct {
+	uint64_t add, stadd, cas, swp, swp_sum, max, locked;
+	uint32_t lock;
+	uint64_t pair[2] __attribute__((aligned(16)));
+	volatile int go;
+} lse_sh;
+
+static void *lse_worker(void *arg)
+{
+	uint64_t id = (uint64_t)(uintptr_t)arg, sum = 0, cpus = 0;
+	unsigned cpu;
+
+	while (!lse_sh.go)
+		;
+	for (uint64_t i = 0; i < LSE_ITERS; i++) {
+		uint64_t old = __atomic_load_n(&lse_sh.cas, __ATOMIC_RELAXED), got;
+
+		lse_ldaddal_x(&lse_sh.add, 1);
+		lse_staddl_x(&lse_sh.stadd, 3);
+		while ((got = lse_casal_x(&lse_sh.cas, old, old + 1)) != old)
+			old = got;
+		sum += lse_swpal_x(&lse_sh.swp, i * 4 + id + 1);
+		__asm__ volatile(LSE_EXT "ldumaxal %1, %0, [%2]" : "=&r"(got) : "r"(i * 4 + id), "r"(&lse_sh.max) : "memory");
+		while (lse_casa_w(&lse_sh.lock, 0, 1) != 0)
+			;
+		lse_sh.locked++;
+		__asm__ volatile(LSE_EXT "swpl wzr, %w0, [%1]" : "=&r"(got) : "r"(&lse_sh.lock) : "memory");
+		if (!(i & 7)) {
+			uint64_t c0 = __atomic_load_n(&lse_sh.pair[0], __ATOMIC_RELAXED), c1 = lse_sh.pair[1], w0, w1;
+
+			for (;;) {
+				w0 = c0;
+				w1 = c1;
+				lse_caspal(lse_sh.pair, &c0, &c1, w0 + 1, w1 + (w0 + 1 == 0));
+				if (c0 == w0 && c1 == w1)
+					break;
+			}
+		}
+		if (!(i & 4095) && !syscall(SYS_getcpu, &cpu, NULL, NULL) && cpu < 64)
+			cpus |= 1UL << cpu;
+	}
+	lse_ldaddal_x(&lse_sh.swp_sum, sum);
+	return (void *)(uintptr_t)cpus;
+}
+
+static void lse_smp_checks(void)
+{
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	int n = online < 2 ? 2 : online > 4 ? 4 : (int)online, made = 1;
+	unsigned long cpus = 0;
+	pthread_t th[4];
+	void *r;
+
+	if (!(getauxval(AT_HWCAP) & (1UL << 8))) {
+		printf("ok   lse smp: no HWCAP_ATOMICS (skipped)\n");
+		return;
+	}
+	memset((void *)&lse_sh, 0, sizeof(lse_sh));
+	lse_sh.pair[0] = ~0UL - LSE_ITERS / 16;
+	for (int i = 1; i < n; i++)
+		made += !pthread_create(&th[i], NULL, lse_worker, (void *)(uintptr_t)i);
+	lse_sh.go = 1;
+	cpus = (unsigned long)lse_worker((void *)0);
+	for (int i = 1; i < n; i++)
+		if (!pthread_join(th[i], &r))
+			cpus |= (unsigned long)r;
+	uint64_t total = (uint64_t)n * LSE_ITERS, steps = (uint64_t)n * (LSE_ITERS / 8);
+	/* SWP: values 1..4 * LSE_ITERS of the threads that ran, each once */
+	uint64_t want_swp = 0;
+	for (uint64_t i = 0; i < LSE_ITERS; i++)
+		for (int k = 0; k < n; k++)
+			want_swp += i * 4 + k + 1;
+	CHECK(made == n && lse_sh.add == total && lse_sh.stadd == 3 * total && lse_sh.cas == total &&
+	      lse_sh.swp_sum + lse_sh.swp == want_swp && lse_sh.max == (LSE_ITERS - 1) * 4 + n - 1 &&
+	      lse_sh.locked == total && lse_sh.lock == 0 &&
+	      lse_sh.pair[0] == steps - LSE_ITERS / 16 - 1 && lse_sh.pair[1] == 1 &&
+	      (online < 2 || __builtin_popcountl(cpus) >= 2),
+	      "lse smp: %d threads on %ld CPUs (%#lx): ldaddal %lu, staddl %lu, casal loop %lu, swpal %s, ldumaxal %#lx, "
+	      "casa/swpl lock %lu, caspal 128-bit %#lx:%lx (want %lu each, x3, %#lx, %#lx:1)",
+	      made, online, cpus, (unsigned long)lse_sh.add, (unsigned long)lse_sh.stadd, (unsigned long)lse_sh.cas,
+	      lse_sh.swp_sum + lse_sh.swp == want_swp ? "exact" : "WRONG", (unsigned long)lse_sh.max,
+	      (unsigned long)lse_sh.locked, (unsigned long)lse_sh.pair[1], (unsigned long)lse_sh.pair[0],
+	      (unsigned long)total, (unsigned long)((LSE_ITERS - 1) * 4 + n - 1),
+	      (unsigned long)(steps - LSE_ITERS / 16 - 1));
+}
+
+/*
  * Moving tasks (SMP, more than one CPU online): a user task moves to
  * another CPU where it is switched out on its way to user mode, and starts
  * there on a fresh kernel stack (kernel.md, SMP). Its registers, FP state
@@ -3392,6 +3796,7 @@ int main(int argc, char **argv)
 		mount("proc", "/proc", "proc", 0, NULL);
 		uaccess_checks();
 		smp_checks();
+		lse_smp_checks();
 		move_checks();
 		jit_smp_checks();
 		goto done;
@@ -3514,6 +3919,7 @@ int main(int argc, char **argv)
 	fb_checks();
 	park_checks();
 	smp_checks();
+	lse_smp_checks();
 	move_checks();
 	jit_smp_checks();
 #endif

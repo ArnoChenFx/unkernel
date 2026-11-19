@@ -504,7 +504,19 @@ fn gen(r: std.Random, out: []u32, i: usize) usize {
             else => 0xc8df_fc00 | (20 << 5) | dst(r), // ldar
         },
         91 => w = 0xb900_0000 | (@as(u32, @intCast(bell_off / 4)) << 10) | (20 << 5) | 27, // str w27, [x20, #bell]: doorbell
-        92...93 => w = A.nop,
+        92 => { // LSE atomics on a base: LD<op>/SWP (some reserved o3/opc), CAS, CASP
+            const size = r.uintLessThan(u32, 4);
+            const ar = r.uintLessThan(u32, 4) << 22; // A, R
+            const lo0 = (r.uintLessThan(u32, 2) << 22) | (r.uintLessThan(u32, 2) << 15); // CAS(P): L, o0
+            const bn = base(r);
+            const even = [_]u32{ 0, 2, 4, 6, 8, 10, 12, 14, 16, 26, 28, 30 }; // pairs that leave the bases alone
+            w = switch (r.uintLessThan(u32, 5)) {
+                0, 1 => 0x3820_0000 | (size << 30) | ar | (anyReg(r) << 16) | (r.uintLessThan(u32, if (r.uintLessThan(u32, 8) == 0) 16 else 9) << 12) | (bn << 5) | (if (r.uintLessThan(u32, 4) == 0) 31 else dst(r)),
+                2, 3 => (size << 30) | 0x08a0_7c00 | lo0 | ((if (r.uintLessThan(u32, 6) == 0) 31 else dst(r)) << 16) | (bn << 5) | anyReg(r), // cas
+                else => (r.uintLessThan(u32, 2) << 30) | 0x0820_7c00 | lo0 | (even[r.uintLessThan(usize, even.len)] << 16) | (bn << 5) | (2 * r.uintLessThan(u32, 16)), // casp
+            };
+        },
+        93 => w = A.nop,
         else => w = 0x9100_0000 | (r.uintLessThan(u32, 64) << 10) | (rn << 5) | rd,
     }
     out[i] = w;

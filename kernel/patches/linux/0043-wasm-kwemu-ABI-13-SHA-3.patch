@@ -1,0 +1,88 @@
+From db4c076f477148ab0d37ec682aa966e85cb75934 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Wed, 18 Nov 2026 02:42:59 +0000
+Subject: [PATCH] wasm: kwemu ABI 13: SHA-3
+
+kwemu implements EOR3, BCAX, RAX1 and XAR behind the new KW_ISA_SHA3
+bit. When kw_set_isa() leaves it on, AT_HWCAP has HWCAP_SHA3, the
+Features line lists "sha3" (in HWCAP order, before sha512) and
+ID_AA64ISAR0_EL1.SHA3 reads 1; kw.isa=-sha3 turns it off.
+---
+ arch/wasm/include/asm/kw_emu.h | 9 +++++----
+ arch/wasm/kernel/cpu.c         | 5 +++--
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
+index 4737a256fb2..39004b6bf02 100644
+--- a/arch/wasm/include/asm/kw_emu.h
++++ b/arch/wasm/include/asm/kw_emu.h
+@@ -10,8 +10,8 @@
+  * Guest ISA (ABI 9 and later): AArch64, A64 instruction set, ARMv8.0-A user mode
+  * (EL0), little-endian, with FP and AdvSIMD. No SVE, pointer authentication
+  * or MTE; the PAC and BTI encodings in the hint space run as NOPs. The
+- * crypto extensions, LSE atomics (ABI 11) and SHA-512 (ABI 12) are
+- * optional features (KW_ISA_*, below), enabled only when this build
++ * crypto extensions, LSE atomics (ABI 11), SHA-512 (ABI 12) and SHA-3
++ * (ABI 13) are optional features (KW_ISA_*, below), enabled only when this build
+  * implements them. .agents/a64.md lists which instructions are
+  * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
+  * riscv64; that code is kept in src/cpu and src/emu for reference only.)
+@@ -77,7 +77,7 @@
+ extern "C" {
+ #endif
+ 
+-#define KW_ABI_VERSION 12
++#define KW_ABI_VERSION 13
+ 
+ /*
+  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
+@@ -190,7 +190,7 @@ uint32_t kw_abi_version(void);
+ 
+ /*
+  * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
+- * (they map to the AT_HWCAP bits the kernel reports). Bits 7..63 are
++ * (they map to the AT_HWCAP bits the kernel reports). Bits 8..63 are
+  * reserved. An instruction of a feature that is not implemented, or not
+  * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
+  * kw_isa_supported() says which ones this build implements.
+@@ -204,6 +204,7 @@ uint32_t kw_abi_version(void);
+ 					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
+ #define KW_ISA_SHA512	(1ULL << 6)	/* ABI 12: SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
+ 					   needs KW_ISA_SHA2: kw_set_isa drops it without */
++#define KW_ISA_SHA3	(1ULL << 7)	/* ABI 13: EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
+ 
+ /* The KW_ISA_* features this kwemu build implements. */
+ uint64_t kw_isa_supported(void);
+diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
+index 62ca85f58dd..c570edd4be4 100644
+--- a/arch/wasm/kernel/cpu.c
++++ b/arch/wasm/kernel/cpu.c
+@@ -17,7 +17,7 @@
+  * ASIMD are part of what every kwemu runs (ARMv8.0-A with FP and AdvSIMD).
+  * The optional ones are kwemu's KW_ISA_* features: listed only if kwemu
+  * implements them (kw_set_isa) and kw.isa= leaves them on. Never listed:
+- * SVE, SHA3, RNG, PAC, BTI and the rest of v8.1+ that kwemu does
++ * SVE, SM3/SM4, RNG, PAC, BTI and the rest of v8.1+ that kwemu does
+  * not run (OpenSSL and gcc's outline atomics pick code paths from these
+  * bits).
+  *
+@@ -49,6 +49,7 @@ static const struct kw_isa_ext kw_isa_exts[] = {
+ 	{ "crc32",	HWCAP_CRC32,	KW_ISA_CRC32 },
+ 	{ "atomics",	HWCAP_ATOMICS,	KW_ISA_LSE,	"lse" },
+ 	{ "cpuid",	HWCAP_CPUID,	0 },	/* only if KW_HWCAP_CPUID */
++	{ "sha3",	HWCAP_SHA3,	KW_ISA_SHA3 },
+ 	{ "sha512",	HWCAP_SHA512,	KW_ISA_SHA512 },
+ };
+ 
+@@ -75,7 +76,7 @@ u64 kw_isa_enabled(void)
+  * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
+  * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
+  * implements it; the names are those of the Features line (aes, pmull,
+- * sha1, sha2, crc32, atomics, sha512; "lse" is atomics too). For example
++ * sha1, sha2, crc32, atomics, sha3, sha512; "lse" is atomics too). For example
+  * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
+  * sha512 starts off (KW_ISA_DEFAULT_OFF): kw.isa=+sha512 turns it on.
+  * kwemu runs SHA512 only together with SHA2 (kw_set_isa drops it
+-- 
+2.56.0
+

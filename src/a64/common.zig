@@ -55,12 +55,19 @@ pub const St = struct {
 // `has(s, .x)` (else `ill`), test it, then add it to `implemented`; the
 // kernel then advertises it (AT_HWCAP) through kw_set_isa.
 
-pub const Feature = enum(u6) { aes = 0, pmull = 1, sha1 = 2, sha2 = 3, crc32 = 4 };
+pub const Feature = enum(u6) { aes = 0, pmull = 1, sha1 = 2, sha2 = 3, crc32 = 4, lse = 5, sha512 = 6, sha3 = 7 };
 pub inline fn featureBit(f: Feature) u64 {
     return @as(u64, 1) << @intFromEnum(f);
 }
 /// The features this build implements (kw_isa_supported()).
-pub const implemented: u64 = featureBit(.aes) | featureBit(.pmull) | featureBit(.sha1) | featureBit(.sha2) | featureBit(.crc32);
+pub const implemented: u64 = featureBit(.aes) | featureBit(.pmull) | featureBit(.sha1) | featureBit(.sha2) | featureBit(.crc32) | featureBit(.lse) | featureBit(.sha512) | featureBit(.sha3);
+/// The features of `isa` that can be on together: SHA512 needs SHA2 (the
+/// architecture has no SHA-512 without SHA-256, and ID_AA64ISAR0_EL1.SHA2
+/// = 2 means both), so a set without SHA2 loses SHA512.
+pub fn consistentIsa(isa: u64) u64 {
+    if (isa & featureBit(.sha2) == 0) return isa & ~featureBit(.sha512);
+    return isa;
+}
 /// Whether feature `f` is implemented and enabled (folds to false at
 /// compile time while it is not implemented).
 pub inline fn has(s: St, comptime f: Feature) bool {

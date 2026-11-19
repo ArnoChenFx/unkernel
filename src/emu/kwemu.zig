@@ -23,7 +23,7 @@ const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
 pub const Regs = core.Regs;
-pub const abi_version: u32 = 10;
+pub const abi_version: u32 = 13;
 pub const cpu_size: usize = 8 << 20;
 
 pub const Event = extern struct {

@@ -2,7 +2,7 @@
 
 On this branch the library exports the AArch64 CPU (a64.md): `kw_run` is
 the A64 decoded-op tier over the A64 reference interpreter, and `struct
-kw_regs` the A64 register file (ABI 10). This file describes the RV64GC
+kw_regs` the A64 register file (ABI 13). This file describes the RV64GC
 CPU that kwemu was until ABI 8 (plus optional extensions, below), kept for
 reference. What A64 shares with it: `kwemu.Cpu` in `src/emu/kwemu.zig`
 (struct kw_cpu, the Sv39 walker, the TLBs and flushes, `Hart.resv` as the

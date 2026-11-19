@@ -41,9 +41,9 @@ comptime {
     // common.zig's register views rely on sp following x30.
     std.debug.assert(@offsetOf(Regs, "sp") == 31 * 8);
     // Optional features: common.Feature matches the KW_ISA_* bits.
-    for (.{ "aes", "pmull", "sha1", "sha2", "crc32" }, .{ kw_h.KW_ISA_AES, kw_h.KW_ISA_PMULL, kw_h.KW_ISA_SHA1, kw_h.KW_ISA_SHA2, kw_h.KW_ISA_CRC32 }) |name, v|
+    for (.{ "aes", "pmull", "sha1", "sha2", "crc32", "lse", "sha512", "sha3" }, .{ kw_h.KW_ISA_AES, kw_h.KW_ISA_PMULL, kw_h.KW_ISA_SHA1, kw_h.KW_ISA_SHA2, kw_h.KW_ISA_CRC32, kw_h.KW_ISA_LSE, kw_h.KW_ISA_SHA512, kw_h.KW_ISA_SHA3 }) |name, v|
         std.debug.assert(c.featureBit(@field(c.Feature, name)) == v);
-    std.debug.assert(@typeInfo(c.Feature).@"enum".fields.len == 5);
+    std.debug.assert(@typeInfo(c.Feature).@"enum".fields.len == 8);
 }
 
 fn event(cpu: *Cpu, kind: core.Kind, access: u32, addr: u64, insn: u64) u32 {
@@ -116,7 +116,7 @@ pub fn cpuInit(cpu: *Cpu) void {
 }
 
 pub fn setIsa(cpu: *Cpu, isa: u64) u64 {
-    cpu.priv.a64.isa = isa & c.implemented;
+    cpu.priv.a64.isa = c.consistentIsa(isa & c.implemented);
     // Decoded blocks need not depend on it (feature instructions are
     // generic ops, which check it when they run), but drop them anyway.
     cpu.resetCache();

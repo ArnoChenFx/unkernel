@@ -9,10 +9,10 @@ paths for kwemu's CPU, but on aarch64 it is off unless `KW_ALPINE_OPT=1`:
   shortened what the JIT ran. The A64 kwemu is an interpreter so far, and
   nothing has been measured on it.
 - Alpine's aarch64 builds run as they are: their code is ARMv8.0 (gcc's
-  default `-march=armv8-a`), and the instructions beyond it (LSE atomics
-  through gcc's outline atomics, SVE, SHA3/SHA512 in libcrypto) are
-  chosen at run time from AT_HWCAP, which never lists them (a64.md, The
-  image). A rebuild would not avoid the one gap either: the AdvSIMD FP
+  default `-march=armv8-a`), and the instructions beyond it (SVE,
+  SM3/SM4 in libcrypto) are chosen at run time from AT_HWCAP, which
+  never lists them; gcc's outline LSE atomics stay on their exclusive
+  path on musl (a64.md, The image). A rebuild would not avoid the one gap either: the AdvSIMD FP
   conversions (`fcvtzs d, d` and kin) are plain gcc code for any
   `-march`.
 - The script is ported to aarch64 (Bootlin's aarch64 musl gcc, the

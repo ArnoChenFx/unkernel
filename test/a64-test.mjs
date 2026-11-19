@@ -37,6 +37,7 @@ const cases = [
   { guest: "simdmovetest", args: [], status: 0 },
   { guest: "cryptotest", args: [], status: 0 },
   { guest: "atomictest", args: [], status: 0 },
+  { guest: "lsetest", args: [], status: 0 },
   { guest: "simdtest", args: [], status: 0 },
   { guest: "fptest", args: [], status: 0 },
   { guest: "simdfptest", args: [], status: 0 },

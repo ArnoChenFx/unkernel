@@ -566,8 +566,16 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   shared with riscv, is in the kernel build and translates every ALU,
   memory and branch op; on the image it is 1.6-2.3x the tier alone (an
   ash loop 2.5 s against 4.0 s, sort 3.1 s against 7.1 s, 2026-11-18).
-  AdvSIMD, FP, system, exclusive and crypto instructions stay generic
-  ops (the reference interpreter). Next: LSE atomics, SHA-512, SHA-3.
+  AdvSIMD, FP, system, exclusive, LSE and crypto instructions stay
+  generic ops (the reference interpreter).
+- **aarch64: SHA512 is off by default (`kw.isa=+sha512` turns it on),
+  because OpenSSL's SHA-512 is 12.5x slower with HWCAP_SHA512.** Its
+  ARMv8.2 path (SHA512H and AdvSIMD) is all generic ops, its integer path
+  is compiled: `openssl speed -evp sha512` 10 MB/s against 128 MB/s with
+  `kw.isa=-sha512` (2026-11-18, a64.md, Crypto). The fix is JIT
+  translation of the AdvSIMD integer ops and SHA512H/H2/SU0/SU1; SHA-256
+  is already faster on its hardware path (26 against 3 MB/s, its fallback
+  is NEON).
 - **One timing-sensitive case in `pnpm test:api`** failed now and then
   on the decoded-op tier bundle (2026-11-17; not seen in 4 runs on the
   JIT bundle, 2026-11-18): the inline `display, evdev and sound` case

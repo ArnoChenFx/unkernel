@@ -187,14 +187,16 @@ pub const id_aa64mmfr0: u64 = 0x0000_0111_ff00_0000;
 /// ID_AA64ISAR0_EL1 for the enabled optional features (`c.has`, so it
 /// follows common.implemented and kw_set_isa like AT_HWCAP does): AES 1
 /// (2 with PMULL; PMULL without AES cannot be expressed and shows 0), SHA1
-/// 1, SHA2 1 (no SHA512), CRC32 1. Atomic (LSE), RDM, SHA3, SM3/SM4,
-/// DotProd, FHM, TS, RNDR are 0.
+/// 1, SHA2 1 (2 with SHA512, which needs SHA2), CRC32 1, Atomic 2 (LSE),
+/// SHA3 1. RDM, SM3/SM4, DotProd, FHM, TS, RNDR are 0.
 pub fn idAa64isar0(s: c.St) u64 {
     var v: u64 = 0;
     if (c.has(s, .aes)) v |= @as(u64, if (c.has(s, .pmull)) 2 else 1) << 4;
     if (c.has(s, .sha1)) v |= 1 << 8;
-    if (c.has(s, .sha2)) v |= 1 << 12;
+    if (c.has(s, .sha2)) v |= @as(u64, if (c.has(s, .sha512)) 2 else 1) << 12;
     if (c.has(s, .crc32)) v |= 1 << 16;
+    if (c.has(s, .lse)) v |= 2 << 20;
+    if (c.has(s, .sha3)) v |= 1 << 32;
     return v;
 }
 

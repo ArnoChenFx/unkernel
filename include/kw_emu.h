@@ -8,10 +8,11 @@
  * task's pt_regs).
  *
  * Guest ISA (ABI 9 and later): AArch64, A64 instruction set, ARMv8.0-A user mode
- * (EL0), little-endian, with FP and AdvSIMD. No LSE, SVE, pointer
- * authentication or MTE; the PAC and BTI encodings in the hint space run as
- * NOPs. Optional features (KW_ISA_*, below) are enabled only when this
- * build implements them. .agents/a64.md lists which instructions are
+ * (EL0), little-endian, with FP and AdvSIMD. No SVE, pointer authentication
+ * or MTE; the PAC and BTI encodings in the hint space run as NOPs. The
+ * crypto extensions, LSE atomics (ABI 11), SHA-512 (ABI 12) and SHA-3
+ * (ABI 13) are optional features (KW_ISA_*, below), enabled only when this build
+ * implements them. .agents/a64.md lists which instructions are
  * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
  * riscv64; that code is kept in src/cpu and src/emu for reference only.)
  *
@@ -56,8 +57,8 @@
  * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
  * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
- * DSB) full barriers, exclusives atomic, and IC IVAU visible to every CPU
- * (above); without atomics everything assumes one CPU.
+ * DSB) full barriers, exclusives and LSE atomics atomic, and IC IVAU
+ * visible to every CPU (above); without atomics everything assumes one CPU.
  *
  * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
  * and another CPU may skip waiting for its TLB flush. The A64 build has no
@@ -76,7 +77,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 10
+#define KW_ABI_VERSION 13
 
 /*
  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -189,7 +190,7 @@ uint32_t kw_abi_version(void);
 
 /*
  * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
- * (they map to the AT_HWCAP bits the kernel reports). Bits 5..63 are
+ * (they map to the AT_HWCAP bits the kernel reports). Bits 8..63 are
  * reserved. An instruction of a feature that is not implemented, or not
  * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
  * kw_isa_supported() says which ones this build implements.
@@ -199,6 +200,11 @@ uint32_t kw_abi_version(void);
 #define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
 #define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
 #define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
+#define KW_ISA_LSE	(1ULL << 5)	/* ABI 11: LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
+					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
+#define KW_ISA_SHA512	(1ULL << 6)	/* ABI 12: SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
+					   needs KW_ISA_SHA2: kw_set_isa drops it without */
+#define KW_ISA_SHA3	(1ULL << 7)	/* ABI 13: EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
 
 /* The KW_ISA_* features this kwemu build implements. */
 uint64_t kw_isa_supported(void);

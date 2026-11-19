@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-//! Cryptographic extensions (FEAT_AES, FEAT_SHA1, FEAT_SHA256) and CRC32
-//! (FEAT_CRC32):
+//! Cryptographic extensions (FEAT_AES, FEAT_SHA1, FEAT_SHA256,
+//! FEAT_SHA512, FEAT_SHA3) and CRC32 (FEAT_CRC32):
 //!
 //!   AES (KW_ISA_AES):     AESE, AESD, AESMC, AESIMC
 //!   SHA1 (KW_ISA_SHA1):   SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0, SHA1SU1
 //!   SHA2 (KW_ISA_SHA2):   SHA256H, SHA256H2, SHA256SU0, SHA256SU1
+//!   SHA512 (KW_ISA_SHA512): SHA512H, SHA512H2, SHA512SU0, SHA512SU1 (op0 =
+//!                         1100; kw_set_isa keeps it only with SHA2)
+//!   SHA3 (KW_ISA_SHA3):   EOR3, BCAX, RAX1, XAR (op0 = 1100)
 //!   CRC32 (KW_ISA_CRC32): CRC32B/H/W/X, CRC32CB/CH/CW/CX (encoded in
 //!                         data-processing 2-source; dp_reg.zig calls `crc32`)
 //!   PMULL (KW_ISA_PMULL): `pmull64`, the 64x64 -> 128 carry-less multiply of
 //!                         PMULL/PMULL2 .1Q, whose decode (AdvSIMD three
 //!                         different) is in simd_arith.zig
 //!
-//! The ARMv8.2 classes decode.zig also routes here (op0 = 1100: SHA512,
-//! SHA3, SM3, SM4) are ILLEGAL: struct kw_cpu has no feature bit for them,
-//! so the kernel never advertises them.
+//! The other ARMv8.2 classes decode.zig routes here (op0 = 1100: SM3,
+//! SM4) are ILLEGAL: struct kw_cpu has no feature bit for them, so the
+//! kernel never advertises them.
 //!
 //! None of this branches on or indexes memory by data, so the time these
 //! take does not depend on keys or messages (as far as integer
@@ -33,7 +36,59 @@ pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     if (inst & 0xff3e_0c00 == 0x4e28_0800) return aes(s, inst);
     if (inst & 0xff20_8c00 == 0x5e00_0000) return sha3reg(s, inst);
     if (inst & 0xff3e_0c00 == 0x5e28_0800) return sha2reg(s, inst);
-    return c.ill(s, inst); // op0 = 1100: SHA512, SHA3, SM3, SM4 (ARMv8.2)
+    if (inst & 0xffe0_b000 == 0xce60_8000) return sha512three(s, inst);
+    if (inst & 0xffff_f000 == 0xcec0_8000) return sha512two(s, inst);
+    if (inst & 0xff80_8000 == 0xce00_0000) return fourReg(s, inst);
+    if (inst & 0xffe0_0000 == 0xce80_0000) return xarInst(s, inst);
+    return c.ill(s, inst); // the rest of op0 = 1100: SM3, SM4 (ARMv8.2)
+}
+
+/// Four-register (`11001110 0 Op0 Rm 0 Ra Rn Rd`): Op0 00 EOR3, 01 BCAX
+/// (SHA3); 10 is SM3SS1, 11 unallocated.
+fn fourReg(s: c.St, inst: u32) c.Exit {
+    const op0 = c.bits(inst, 22, 21);
+    if (op0 >= 2 or !c.has(s, .sha3)) return c.ill(s, inst);
+    const n = c.vq(s, c.rn(inst));
+    const m = c.vq(s, c.rm(inst));
+    const a = c.vq(s, c.ra(inst));
+    c.setVq(s, c.rd(inst), if (op0 == 0) eor3(n, m, a) else bcax(n, m, a));
+    return .next;
+}
+
+/// XAR (`11001110 100 Rm imm6 Rn Rd`, SHA3).
+fn xarInst(s: c.St, inst: u32) c.Exit {
+    if (!c.has(s, .sha3)) return c.ill(s, inst);
+    c.setVq(s, c.rd(inst), xar(c.vq(s, c.rn(inst)), c.vq(s, c.rm(inst)), @intCast(c.bits(inst, 15, 10))));
+    return .next;
+}
+
+/// Three-register SHA512 (`11001110 011 Rm 1 O 00 opcode Rn Rd`): O = 0,
+/// opcode 00 SHA512H, 01 SHA512H2, 10 SHA512SU1, 11 RAX1 (SHA3); O = 1 is
+/// SM3PARTW1/2, SM4EKEY.
+fn sha512three(s: c.St, inst: u32) c.Exit {
+    const op = c.bits(inst, 11, 10);
+    if (c.bit(inst, 14) or !(if (op == 3) c.has(s, .sha3) else c.has(s, .sha512))) return c.ill(s, inst);
+    const d = c.rd(inst);
+    const vd = c.vq(s, d);
+    const vn = c.vq(s, c.rn(inst));
+    const vm = c.vq(s, c.rm(inst));
+    c.setVq(s, d, switch (op) {
+        0 => sha512h(vd, vn, vm),
+        1 => sha512h2(vd, vn, vm),
+        2 => sha512su1(vd, vn, vm),
+        3 => rax1(vn, vm),
+        else => unreachable,
+    });
+    return .next;
+}
+
+/// Two-register SHA512 (`11001110 11000000 1000 opcode Rn Rd`): opcode 00
+/// SHA512SU0 (01 is SM4E).
+fn sha512two(s: c.St, inst: u32) c.Exit {
+    if (c.bits(inst, 11, 10) != 0 or !c.has(s, .sha512)) return c.ill(s, inst);
+    const d = c.rd(inst);
+    c.setVq(s, d, sha512su0(c.vq(s, d), c.vq(s, c.rn(inst))));
+    return .next;
 }
 
 /// AES (`01001110 size 10100 opcode 10 Rn Rd`).
@@ -508,4 +563,94 @@ pub fn sha256su1(d: u128, n: u128, m: u128) u128 {
     r[2] = sigma1(r[0]) +% a[2] +% t0[2];
     r[3] = sigma1(r[1]) +% a[3] +% t0[3];
     return c.fromLanes(u32, r);
+}
+
+// ---- SHA-512 (FEAT_SHA512) -------------------------------------------------------
+//
+// The Arm ARM's pseudocode on the two 64-bit halves (lo = <63:0>, hi =
+// <127:64>); Ch, Maj and the sigma functions of FIPS 180-4.
+
+inline fn ror64(x: u64, comptime k: u6) u64 {
+    return std.math.rotr(u64, x, k);
+}
+inline fn bigSigma0(x: u64) u64 {
+    return ror64(x, 28) ^ ror64(x, 34) ^ ror64(x, 39);
+}
+inline fn bigSigma1(x: u64) u64 {
+    return ror64(x, 14) ^ ror64(x, 18) ^ ror64(x, 41);
+}
+inline fn smallSigma0(x: u64) u64 {
+    return ror64(x, 1) ^ ror64(x, 8) ^ (x >> 7);
+}
+inline fn smallSigma1(x: u64) u64 {
+    return ror64(x, 19) ^ ror64(x, 61) ^ (x >> 6);
+}
+inline fn ch64(x: u64, y: u64, z: u64) u64 {
+    return (x & y) ^ (~x & z);
+}
+inline fn maj64(x: u64, y: u64, z: u64) u64 {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+/// SHA512H Qd, Qn, Vm.2D: two rounds' worth of the T1 sums (d = W, n = X,
+/// m = Y in the pseudocode).
+pub fn sha512h(d: u128, n: u128, m: u128) u128 {
+    const w = c.lanes(u64, d);
+    const x = c.lanes(u64, n);
+    const y = c.lanes(u64, m);
+    const hi = ch64(y[1], x[0], x[1]) +% bigSigma1(y[1]) +% w[1];
+    const tmp = hi +% y[0];
+    const lo = ch64(tmp, y[1], x[0]) +% bigSigma1(tmp) +% w[0];
+    return c.v128(lo, hi);
+}
+
+/// SHA512H2 Qd, Qn, Vm.2D: the T2 sums (d = W, n = X, m = Y).
+pub fn sha512h2(d: u128, n: u128, m: u128) u128 {
+    const w = c.lanes(u64, d);
+    const x = c.lanes(u64, n);
+    const y = c.lanes(u64, m);
+    const hi = maj64(x[0], y[1], y[0]) +% bigSigma0(y[0]) +% w[1];
+    const lo = maj64(hi, y[0], y[1]) +% bigSigma0(hi) +% w[0];
+    return c.v128(lo, hi);
+}
+
+/// SHA512SU0 Vd.2D, Vn.2D: message schedule, sigma0 part.
+pub fn sha512su0(d: u128, n: u128) u128 {
+    const w = c.lanes(u64, d);
+    const x = c.lanes(u64, n);
+    return c.v128(w[0] +% smallSigma0(w[1]), w[1] +% smallSigma0(x[0]));
+}
+
+/// SHA512SU1 Vd.2D, Vn.2D, Vm.2D: message schedule, sigma1 part.
+pub fn sha512su1(d: u128, n: u128, m: u128) u128 {
+    const w = c.lanes(u64, d);
+    const x = c.lanes(u64, n);
+    const y = c.lanes(u64, m);
+    return c.v128(w[0] +% smallSigma1(x[0]) +% y[0], w[1] +% smallSigma1(x[1]) +% y[1]);
+}
+
+// ---- SHA-3 (FEAT_SHA3) -------------------------------------------------------------
+
+/// EOR3 Vd.16B, Vn.16B, Vm.16B, Va.16B: n ^ m ^ a.
+pub fn eor3(n: u128, m: u128, a: u128) u128 {
+    return n ^ m ^ a;
+}
+
+/// BCAX Vd.16B, Vn.16B, Vm.16B, Va.16B: n ^ (m & ~a).
+pub fn bcax(n: u128, m: u128, a: u128) u128 {
+    return n ^ (m & ~a);
+}
+
+/// RAX1 Vd.2D, Vn.2D, Vm.2D: n ^ rol(m, 1) in each 64-bit lane.
+pub fn rax1(n: u128, m: u128) u128 {
+    const x = c.lanes(u64, n);
+    const y = c.lanes(u64, m);
+    return c.v128(x[0] ^ std.math.rotl(u64, y[0], 1), x[1] ^ std.math.rotl(u64, y[1], 1));
+}
+
+/// XAR Vd.2D, Vn.2D, Vm.2D, #imm6: ror(n ^ m, imm6) in each 64-bit lane.
+pub fn xar(n: u128, m: u128, imm6: u6) u128 {
+    const x = c.lanes(u64, n);
+    const y = c.lanes(u64, m);
+    return c.v128(std.math.rotr(u64, x[0] ^ y[0], imm6), std.math.rotr(u64, x[1] ^ y[1], imm6));
 }

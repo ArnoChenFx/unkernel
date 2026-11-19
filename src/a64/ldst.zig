@@ -11,13 +11,15 @@
 //! extensions, B/H/S/D/Q registers, PRFM/PRFUM (no effect).
 //!
 //! Load/store exclusive and ordered (LDXR, STXR, LDAXR, STLXR, LDXP, STXP,
-//! LDAXP, STLXP, LDAR, STLR and the B/H forms) are excl.zig. Not in
-//! ARMv8.0 (stay ILLEGAL): LSE (CAS*, LDADD and other atomics, SWP),
-//! LDAPR/RCpc, MTE tag loads/stores, LDRAA/LDRAB, LDLAR/STLLR.
+//! LDAXP, STLXP, LDAR, STLR and the B/H forms) are excl.zig; the LSE
+//! atomics (LDADD and the other atomic memory operations, SWP; CAS and
+//! CASP through excl.zig) are lse.zig. ILLEGAL: LDAPR/RCpc, MTE tag
+//! loads/stores, LDRAA/LDRAB, LDLAR/STLLR.
 
 const std = @import("std");
 const c = @import("common.zig");
 const excl = @import("excl.zig");
+const lse = @import("lse.zig");
 
 pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     if (inst & 0x3f00_0000 == 0x0800_0000) return exclusive(s, inst);
@@ -146,13 +148,15 @@ inline fn writeback(s: c.St, idx: u32, n: u32, base: u64, off: u64) void {
 const Mode = enum { uimm, unscaled, post, unpriv, pre, regoff };
 
 fn single(s: c.St, inst: u32) c.Error!c.Exit {
+    // Atomic memory operations (FEAT_LSE): bit 24 = 0, bit 21 = 1, bits 11..10 = 00.
+    if (inst & 0x0120_0c00 == 0x0020_0000) return lse.atomicOp(s, inst);
     const mode: Mode = if (c.bit(inst, 24)) .uimm else if (!c.bit(inst, 21)) switch (c.bits(inst, 11, 10)) {
         0 => .unscaled,
         1 => .post,
         2 => .unpriv,
         3 => .pre,
         else => unreachable,
-    } else if (c.bits(inst, 11, 10) == 2) .regoff else return c.ill(s, inst); // LSE atomics, LDRAA/LDRAB
+    } else if (c.bits(inst, 11, 10) == 2) .regoff else return c.ill(s, inst); // LDRAA/LDRAB
     if (c.bit(inst, 25)) return c.ill(s, inst);
     const size = c.bits(inst, 31, 30);
     const opc = c.bits(inst, 23, 22);

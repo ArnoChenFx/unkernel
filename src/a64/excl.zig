@@ -5,10 +5,11 @@
 //!
 //! Implemented (ARMv8.0): LDXR, LDAXR, STXR, STLXR (B, H, W, X), LDXP,
 //! LDAXP, STXP, STLXP (two W or two X registers), LDAR, STLR (B, H, W, X).
-//! ILLEGAL: LDLAR/STLLR (FEAT_LOR), CAS/CASP (FEAT_LSE), and every
-//! encoding whose should-be-one fields (Rs, Rt2 where the instruction has
-//! none) are not 11111: the Arm ARM makes those CONSTRAINED UNPREDICTABLE
-//! and UNDEFINED is one of the permitted behaviours.
+//! CAS and CASP (FEAT_LSE) are lse.zig. ILLEGAL: LDLAR/STLLR (FEAT_LOR),
+//! and every encoding whose should-be-one fields (Rs, Rt2 where the
+//! instruction has none) are not 11111: the Arm ARM makes those
+//! CONSTRAINED UNPREDICTABLE and UNDEFINED is one of the permitted
+//! behaviours.
 //!
 //! Every access must be naturally aligned (to the whole pair for LDXP/STXP),
 //! else KW_EV_MISALIGNED with the address, before anything else happens.
@@ -38,6 +39,7 @@
 const std = @import("std");
 const c = @import("common.zig");
 const core = @import("../cpu/core.zig");
+const lse = @import("lse.zig");
 
 pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     const size: u2 = @intCast(c.bits(inst, 31, 30));
@@ -50,14 +52,15 @@ pub fn exec(s: c.St, inst: u32) c.Error!c.Exit {
     const n = c.rn(inst);
     const t = c.rd(inst);
     if (o2) {
-        // Ordered: LDAR/STLR (o0 = 1). LDLAR/STLLR (o0 = 0, FEAT_LOR) and
-        // CAS (o1 = 1, FEAT_LSE) are not ARMv8.0.
-        if (o1 or !o0 or rs != 31 or t2 != 31) return c.ill(s, inst);
+        // Ordered: LDAR/STLR (o0 = 1); CAS (o1 = 1, FEAT_LSE). LDLAR/STLLR
+        // (o0 = 0, FEAT_LOR) are not implemented.
+        if (o1) return lse.compareSwap(s, inst);
+        if (!o0 or rs != 31 or t2 != 31) return c.ill(s, inst);
         return if (load) loadAcquire(s, size, n, t) else storeRelease(s, size, n, t);
     }
     if (o1) {
         // Pairs of W (size 10) or X (size 11); size 0x is CASP (FEAT_LSE).
-        if (size < 2) return c.ill(s, inst);
+        if (size < 2) return lse.compareSwap(s, inst);
         if (load) {
             if (rs != 31) return c.ill(s, inst);
             return loadExclusivePair(s, size == 3, n, t, t2);
@@ -247,17 +250,26 @@ fn storePair128(s: c.St, va: u64, old1: u64, old2: u64, v1: u64, v2: u64) c.Erro
     return storePair128Shared(host([2]u64, try s.m.rmwPtr([2]u64, va)), old1, old2, v1, v2);
 }
 
-/// Serialises every 128-bit STXP of every CPU (SMP builds only). It lives
-/// in the module's linear memory, which all CPU threads share, and is never
-/// held across instructions, so a parked CPU or a snapshot never sees it
-/// taken. The one piece of global state in kwemu.
+/// Serialises every 128-bit write by an exclusive or atomic instruction of
+/// every CPU (SMP builds only): STXP and CASP (lse.zig) of two X registers.
+/// It lives in the module's linear memory, which all CPU threads share, and
+/// is never held across instructions, so a parked CPU or a snapshot never
+/// sees it taken. The one piece of global state in kwemu besides the code
+/// epoch (tier.zig).
 var pair_lock: u32 = 0;
+
+pub fn pairLock() void {
+    while (@cmpxchgWeak(u32, &pair_lock, 0, 1, .seq_cst, .monotonic) != null) std.atomic.spinLoopHint();
+}
+pub fn pairUnlock() void {
+    @atomicStore(u32, &pair_lock, 0, .seq_cst);
+}
 
 /// The 128-bit STXP on shared memory. wasm has no 128-bit compare-and-swap,
 /// so: under `pair_lock`, compare-and-swap the low half, then the high half
 /// (undoing the low half if the high one changed).
 ///
-/// Guarantee: 128-bit STXPs of all CPUs are serialised and each passes only
+/// Guarantee: 128-bit STXPs and CASPs of all CPUs are serialised and each STXP passes only
 /// if both halves still hold what its LDXP read (modulo ABA, as for STXR).
 /// A torn LDXP (two loads around another CPU's STXP) cannot pass its STXP.
 /// Plain loads may see a half-done STXP; the architecture allows that,
@@ -267,8 +279,8 @@ var pair_lock: u32 = 0;
 /// either may then win, and a failed STXP can briefly expose its low half.
 /// QEMU instead stops all other CPUs (or uses a host 128-bit cmpxchg).
 pub fn storePair128Shared(p: *[2]u64, old1: u64, old2: u64, v1: u64, v2: u64) bool {
-    while (@cmpxchgWeak(u32, &pair_lock, 0, 1, .seq_cst, .monotonic) != null) std.atomic.spinLoopHint();
-    defer @atomicStore(u32, &pair_lock, 0, .seq_cst);
+    pairLock();
+    defer pairUnlock();
     if (@cmpxchgStrong(u64, &p[0], old1, v1, .seq_cst, .seq_cst) != null) return false;
     if (@cmpxchgStrong(u64, &p[1], old2, v2, .seq_cst, .seq_cst) != null) {
         _ = @cmpxchgStrong(u64, &p[0], v1, old1, .seq_cst, .seq_cst);

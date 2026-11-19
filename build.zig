@@ -18,6 +18,7 @@ const a64_guests = [_][]const u8{
     "simdmovetest",
     "cryptotest",
     "atomictest",
+    "lsetest",
     "simdtest",
     "fptest",
     "simdfptest",

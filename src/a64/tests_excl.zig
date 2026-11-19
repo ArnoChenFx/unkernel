@@ -281,12 +281,8 @@ test "a64 excl: reserved neighbours and non-v8.0 forms are ILLEGAL" {
         0x484f565d, // "ldxrh w29, [x18]" with Rs, Rt2 != 11111 (static corpus)
         ex(2, 1, 1, 0, 31, 0, 31, 1, 0), // ldlar (FEAT_LOR)
         ex(2, 1, 0, 0, 31, 0, 31, 1, 0), // stllr (FEAT_LOR)
-        ex(2, 1, 0, 1, 2, 0, 31, 1, 0), // cas
-        ex(3, 1, 1, 1, 2, 1, 31, 1, 0), // casal
-        ex(0, 0, 0, 1, 2, 0, 31, 1, 4), // casp
-        ex(1, 0, 1, 1, 2, 1, 31, 1, 4), // caspal
-        0xf8200020, // ldadd (LSE)
-        0xf8e08020, // swpal (LSE)
+        ex(2, 1, 0, 1, 2, 0, 0, 1, 0), // cas with Rt2 != 11111
+        ex(0, 0, 0, 1, 3, 0, 31, 1, 4), // casp with an odd Rs
     };
     for (words) |w| {
         m.code(0x10000, &.{w});
@@ -397,8 +393,10 @@ test "a64 system: ID registers, read-only registers, FPCR/FPSR masks" {
     const fb = c.featureBit;
     if (isa & fb(.aes) != 0) isar0 |= @as(u64, if (isa & fb(.pmull) != 0) 2 else 1) << 4;
     if (isa & fb(.sha1) != 0) isar0 |= 1 << 8;
-    if (isa & fb(.sha2) != 0) isar0 |= 1 << 12;
+    if (isa & fb(.sha2) != 0) isar0 |= @as(u64, if (isa & fb(.sha512) != 0) 2 else 1) << 12;
     if (isa & fb(.crc32) != 0) isar0 |= 1 << 16;
+    if (isa & fb(.lse) != 0) isar0 |= 2 << 20;
+    if (isa & fb(.sha3) != 0) isar0 |= 1 << 32;
     try t.expectEqual(isar0, m.regs.x[4]);
     try t.expectEqual(@as(u64, 0x0000_0111_ff00_0000), m.regs.x[5]);
     try t.expectEqual(@as(u64, 6), m.regs.x[6]);

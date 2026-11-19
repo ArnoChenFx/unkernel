@@ -76,7 +76,8 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   [AF_VSOCK](#talk-over-vsock), and [shared memory](#share-memory) with the
   host.
 - **aarch64 user space**: ARMv8.0-A with FP and AdvSIMD plus the AES,
-  PMULL, SHA1, SHA2 and CRC32 extensions, so distribution binaries and
+  PMULL, SHA1, SHA2, SHA3, CRC32 and LSE atomics extensions (SHA512 with
+  `kw.isa=+sha512`), so distribution binaries and
   OpenSSL's hardware AES, GHASH and SHA paths run unchanged; AdvSIMD
   floating point is still being finished. aarch64 is a first-class port of
   every distribution, so their full, current package archives are

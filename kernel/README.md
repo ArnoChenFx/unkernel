@@ -941,10 +941,10 @@ from source). Everything is self-hosted except the Wisp fallback.
     `fpsimd_context` record), with `SA_RESTORER`.
   * ELF loading uses binfmt_elf with `EM_AARCH64`, `AT_PLATFORM` aarch64,
     `AT_HWCAP` = FP, ASIMD, CPUID and the optional features kwemu
-    implements (AES, PMULL, SHA1, SHA2, CRC32), `AT_MINSIGSTKSZ` 4720.
+    implements (AES, PMULL, SHA1, SHA2, CRC32, ATOMICS, SHA3, SHA512), `AT_MINSIGSTKSZ` 4720.
   * `uname -m` reports `aarch64`. The `Features` line of `/proc/cpuinfo`
     lists the AT_HWCAP names. Nothing beyond what kwemu runs is listed (no
-    LSE atomics, SVE, SHA3/SHA512, RNG, PAC or BTI), and user space picks
+    SVE, SM3/SM4, RNG, PAC or BTI), and user space picks
     its code paths from that (OpenSSL reads AT_HWCAP).
   * **`kw.isa=`** masks optional features, for A/B measurements and
     bisecting: a comma list applied from left to right, where `armv8`

@@ -1,0 +1,152 @@
+From c1df32de7d832140d27548576b29bc5e6ffc75d1 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Wed, 18 Nov 2026 01:44:09 +0000
+Subject: [PATCH] wasm: kwemu ABI 11: LSE atomics
+
+kwemu implements the LSE atomics (CAS, CASP, SWP and the atomic memory
+operations LDADD, LDCLR, LDEOR, LDSET, LD{S,U}{MAX,MIN}) behind the new
+KW_ISA_LSE bit. When kw_set_isa() leaves it on, AT_HWCAP has
+HWCAP_ATOMICS and the Features line lists "atomics" (ID_AA64ISAR0_EL1
+.Atomic is 2, answered by kwemu); kw.isa=-atomics (or -lse) turns it
+off, after which the instructions raise SIGILL.
+
+The feature table now lists cpuid in its HWCAP position, so the Features
+line stays in HWCAP bit order as more features are added.
+---
+ arch/wasm/include/asm/kw_emu.h | 17 ++++++++++-------
+ arch/wasm/kernel/cpu.c         | 22 +++++++++++++---------
+ 2 files changed, 23 insertions(+), 16 deletions(-)
+
+diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
+index dba5424701c..cd5124d668b 100644
+--- a/arch/wasm/include/asm/kw_emu.h
++++ b/arch/wasm/include/asm/kw_emu.h
+@@ -8,9 +8,10 @@
+  * task's pt_regs).
+  *
+  * Guest ISA (ABI 9 and later): AArch64, A64 instruction set, ARMv8.0-A user mode
+- * (EL0), little-endian, with FP and AdvSIMD. No LSE, SVE, pointer
+- * authentication or MTE; the PAC and BTI encodings in the hint space run as
+- * NOPs. Optional features (KW_ISA_*, below) are enabled only when this
++ * (EL0), little-endian, with FP and AdvSIMD. No SVE, pointer authentication
++ * or MTE; the PAC and BTI encodings in the hint space run as NOPs. LSE
++ * atomics (ABI 11) and the crypto extensions are optional features
++ * (KW_ISA_*, below), enabled only when this
+  * build implements them. .agents/a64.md lists which instructions are
+  * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
+  * riscv64; that code is kept in src/cpu and src/emu for reference only.)
+@@ -56,8 +57,8 @@
+  * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
+  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
+  * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
+- * DSB) full barriers, exclusives atomic, and IC IVAU visible to every CPU
+- * (above); without atomics everything assumes one CPU.
++ * DSB) full barriers, exclusives and LSE atomics atomic, and IC IVAU
++ * visible to every CPU (above); without atomics everything assumes one CPU.
+  *
+  * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
+  * and another CPU may skip waiting for its TLB flush. The A64 build has no
+@@ -76,7 +77,7 @@
+ extern "C" {
+ #endif
+ 
+-#define KW_ABI_VERSION 10
++#define KW_ABI_VERSION 11
+ 
+ /*
+  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
+@@ -189,7 +190,7 @@ uint32_t kw_abi_version(void);
+ 
+ /*
+  * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
+- * (they map to the AT_HWCAP bits the kernel reports). Bits 5..63 are
++ * (they map to the AT_HWCAP bits the kernel reports). Bits 6..63 are
+  * reserved. An instruction of a feature that is not implemented, or not
+  * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
+  * kw_isa_supported() says which ones this build implements.
+@@ -199,6 +200,8 @@ uint32_t kw_abi_version(void);
+ #define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
+ #define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
+ #define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
++#define KW_ISA_LSE	(1ULL << 5)	/* ABI 11: LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
++					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
+ 
+ /* The KW_ISA_* features this kwemu build implements. */
+ uint64_t kw_isa_supported(void);
+diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
+index 3c41d9060e7..b31a38b8f41 100644
+--- a/arch/wasm/kernel/cpu.c
++++ b/arch/wasm/kernel/cpu.c
+@@ -17,8 +17,9 @@
+  * ASIMD are part of what every kwemu runs (ARMv8.0-A with FP and AdvSIMD).
+  * The optional ones are kwemu's KW_ISA_* features: listed only if kwemu
+  * implements them (kw_set_isa) and kw.isa= leaves them on. Never listed:
+- * LSE atomics, SVE, SHA3/SHA512, RNG, PAC, BTI and the rest of v8.1+,
+- * which kwemu does not run (OpenSSL picks code paths from these bits).
++ * SVE, SHA3/SHA512, RNG, PAC, BTI and the rest of v8.1+ that kwemu does
++ * not run (OpenSSL and gcc's outline atomics pick code paths from these
++ * bits).
+  *
+  * CPUID (HWCAP bit 11) says that EL0 may read the ID registers
+  * (MIDR_EL1, MPIDR_EL1, REVIDR_EL1 and the ID_AA64* space, which Linux
+@@ -34,8 +35,10 @@ struct kw_isa_ext {
+ 	const char *name;
+ 	unsigned long hwcap;
+ 	u64 kw;		/* KW_ISA_* bit; 0 for one that is always there */
++	const char *alias;	/* another name kw.isa= takes */
+ };
+ 
++/* In HWCAP bit order, as the Features line lists them. */
+ static const struct kw_isa_ext kw_isa_exts[] = {
+ 	{ "fp",		HWCAP_FP,	0 },
+ 	{ "asimd",	HWCAP_ASIMD,	0 },
+@@ -44,6 +47,8 @@ static const struct kw_isa_ext kw_isa_exts[] = {
+ 	{ "sha1",	HWCAP_SHA1,	KW_ISA_SHA1 },
+ 	{ "sha2",	HWCAP_SHA2,	KW_ISA_SHA2 },
+ 	{ "crc32",	HWCAP_CRC32,	KW_ISA_CRC32 },
++	{ "atomics",	HWCAP_ATOMICS,	KW_ISA_LSE,	"lse" },
++	{ "cpuid",	HWCAP_CPUID,	0 },	/* only if KW_HWCAP_CPUID */
+ };
+ 
+ /* The KW_ISA_* features the command line leaves on. */
+@@ -63,8 +68,8 @@ u64 kw_isa_enabled(void)
+  * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
+  * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
+  * implements it; the names are those of the Features line (aes, pmull,
+- * sha1, sha2, crc32). For example kw.isa=armv8, kw.isa=-pmull or
+- * kw.isa=armv8,+crc32.
++ * sha1, sha2, crc32, atomics; "lse" is atomics too). For example
++ * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
+  */
+ static int __init kw_isa_param(char *arg)
+ {
+@@ -85,7 +90,8 @@ static int __init kw_isa_param(char *arg)
+ 		if (*tok == '-' || *tok == '+')
+ 			on = *tok++ == '+';
+ 		for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++)
+-			if (!strcmp(tok, kw_isa_exts[i].name))
++			if (!strcmp(tok, kw_isa_exts[i].name) ||
++			    (kw_isa_exts[i].alias && !strcmp(tok, kw_isa_exts[i].alias)))
+ 				break;
+ 		if (i == ARRAY_SIZE(kw_isa_exts) || !kw_isa_exts[i].kw) {
+ 			pr_warn("kw.isa: ignoring '%s'\n", tok);
+@@ -117,14 +123,12 @@ void __init kw_isa_init(struct kw_cpu *cpu)
+ 
+ 		if (e->kw & ~got)
+ 			continue;
++		if (e->hwcap == HWCAP_CPUID && !KW_HWCAP_CPUID)
++			continue;
+ 		hwcap |= e->hwcap;
+ 		p += scnprintf(p, end - p, "%s%s", p == kw_isa_str ? "" : " ",
+ 			       e->name);
+ 	}
+-	if (KW_HWCAP_CPUID) {
+-		hwcap |= HWCAP_CPUID;
+-		scnprintf(p, end - p, " cpuid");
+-	}
+ 	kw_elf_hwcap = hwcap;
+ 	pr_info("kwemu: features %s (kwemu implements %#llx, enabled %#llx)\n",
+ 		kw_isa_str, kw_isa_supported(), got);
+-- 
+2.56.0
+

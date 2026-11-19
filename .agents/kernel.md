@@ -53,7 +53,11 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   of the riscv series (whose arch and ISA patches it rewrites: registers,
   syscalls, uapi, ELF, signals, cpuinfo), followed by the arm64 fixes
   made since (`wasm: clear the exclusive monitor on every return to user
-  mode`); fold them into the arch and ISA patches once the port settles.
+  mode`) and the kwemu ABI steps (`wasm: kwemu ABI 10: the A64
+  decoded-op tier`, `wasm: kwemu ABI 11: LSE atomics`, `wasm: kwemu ABI
+  12: SHA-512`, `wasm: kwemu ABI 13: SHA-3`, each with the
+  header and what the kernel advertises); fold them into the arch and
+  ISA patches once the port settles.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
   built with `KSRC=/path/x KOUT=vendor/build/kernel-x kernel/build.sh kernel`.
@@ -98,7 +102,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 9 (A64 registers; 1 to 8 were riscv64). `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 13 (A64 since 9; 1 to 8 were riscv64). `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it, in both copies, on any change to
   the layout or the semantics. A new `KW_ISA_*` bit is an ABI change;
   implementing an extension that already has a bit is not. Host imports
@@ -118,8 +122,8 @@ patch re-export.
   (kwemu.md, Sizes).
 - kwemu has no allocator and no globals. All state lives in `struct kw_cpu`
   and `struct kw_regs`, which the kernel owns. One exception: the atomics
-  build (SMP kernels) has one static word, `pair_lock` (128-bit STXP), in
-  kwemu's data section, which the shared memory makes common to every CPU
+  build (SMP kernels) has one static word, `pair_lock` (128-bit STXP and
+  CASP), in kwemu's data section, which the shared memory makes common to every CPU
   as it must be; parking and snapshots, UP only, never see it.
 - Sv39 tables are read at `phys_base + pa`, and kwemu never writes a PTE.
   If A is 0, or D is 0 on a store, it raises `KW_EV_FAULT`. The kernel then
@@ -964,15 +968,21 @@ MTE, PAC, BTI, GCS or POE.
   non-EL0t mode, and masks FPCR and FPSR to the bits kwemu keeps.
 - Features (cpu.c): AT_HWCAP is FP | ASIMD | the KW_ISA_* features
   `kw_set_isa()` enabled (AES, PMULL, SHA1, SHA2, CRC32: HWCAP bits 3 to
-  7) | CPUID (kwemu answers the ID registers; `KW_HWCAP_CPUID`). The
+  7; LSE: HWCAP_ATOMICS, bit 8, listed as `atomics`; SHA3: bit 17;
+  SHA512: bit 21) |
+  CPUID (kwemu answers the ID registers; `KW_HWCAP_CPUID`). The
   `/proc/cpuinfo` `Features` line lists the same names in HWCAP order,
   with arm64's other fields for kwemu's MIDR_EL1 (implementer 0x00,
   architecture 8, variant 0x0, part 0x000, revision 0) and BogoMIPS from
   `loops_per_jiffy` (2000.00). `kw.isa=` is a comma list from left to
   right: `armv8` turns every optional feature off, `-aes` one off, `+aes`
-  (or `aes`) one back on. User space picks code paths from these (OpenSSL
+  (or `aes`) one back on; the names are the Features line's (`lse` also
+  names `atomics`). kwemu keeps SHA512 only with SHA2, so `-sha2` turns
+  both off. SHA512 starts off and needs `+sha512` (OpenSSL's ARMv8.2
+  SHA-512 path is interpreted and far slower than its compiled integer
+  path; a64.md). User space picks code paths from these (OpenSSL
   reads AT_HWCAP), so nothing beyond what kwemu runs is ever listed: no
-  LSE atomics, SVE, SHA3/SHA512, RNG, PAC or BTI.
+  SVE, SM3/SM4, RNG, PAC or BTI.
 - Address space: user page tables keep the Sv39 format kwemu walks, and
   TASK_SIZE is 1 << 38 (256 GiB), half of arm64's 39-bit VA user space:
   mmap hints and MAP_FIXED at or above 1 << 38 do not get there. kwemu has
@@ -1089,7 +1099,8 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     ZVA, misaligned LDR/STR of X, W, D and LDP/STP in a page and across
     pages, UDF (SIGILL, ILL_ILLOPC) and BRK (SIGTRAP, TRAP_BRKPT), one probe
     instruction per feature (`a64_feats`: fcmp, orr, aese, pmull, sha1h,
-    sha256su0, crc32b, an ID register MRS) that must raise SIGILL exactly
+    sha256su0, crc32b, ldaddal, an ID register MRS, rax1, sha512su0) that must
+    raise SIGILL exactly
     when the feature is not listed, the signal frame (the fpsimd record
     and terminator, V8 and FPCR as at the SVC, sigreturn loading V9 and
     FPCR from the frame), the return to `sa_restorer` and, without
@@ -1102,7 +1113,13 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     FIPS-197 C.1 encrypt and decrypt with the key expanded by AESE;
     PMULL/PMULL2 .1Q against a C carry-less multiply and GHASH of GCM test
     case 2; SHA-1 and SHA-256 of FIPS 180 "abc" and the two-block message;
-    CRC-32 and CRC-32C of "123456789" by B, H, W and X). `fp:` each
+    CRC-32 and CRC-32C of "123456789" by B, H, W and X; SHA-512 of
+    "abc" and the two-block message, driven as OpenSSL's ARMv8.2 code
+    does; SHA3-256 of "" and "abc" and SHAKE128 of "" by Keccak-f[1600]
+    on EOR3, RAX1, XAR and BCAX; the ID_AA64ISAR0_EL1 fields against
+    AT_HWCAP; LSE: each
+    LD<op>, STADD, SWP, CAS and CASP once with a known answer, on B, H,
+    W and X). `fp:` each
     FPCR.RMode for FDIV (double and single), FSQRT, FRINTI and SCVTF; each
     FPSR flag (IOC, DZC, OFC, UFC, IXC, IDC) and their accumulation, FZ on
     a denormal input and output, DN with NaN payloads; FPCR and FPSR read
@@ -1144,6 +1161,12 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   - `smp:` (more than one CPU online; skipped otherwise): three threads,
     the main one among them, count to 900000 through atomic adds, a
     compare-and-swap loop and a pthread mutex, and must have run on at least two CPUs.
+  - `lse smp:` (skipped without HWCAP_ATOMICS; on one CPU too, where
+    preemption interleaves): one thread per CPU (2 to 4) hammers shared
+    counters with LDADDAL, STADDL, a CASAL loop, SWPAL (every value put
+    in comes out exactly once), LDUMAXAL, a CASA/SWPL lock around a plain
+    increment and a 128-bit CASPAL counter; every total must be exact,
+    and on several CPUs the threads must have run on two at least.
   - `move:` (more than one CPU online; skipped otherwise; SMP above):
     2 threads per CPU (at most 8) started on CPU 0 and then allowed
     everywhere run `fphot()` for 2 s and must sit evenly on every CPU at
@@ -1178,7 +1201,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     the code while it is not executable (it must fault), and never
     crash.
     `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only
-    `uaccess:`, `smp:`, `move:` and `jit:`.
+    `uaccess:`, `smp:`, `lse smp:`, `move:` and `jit:`.
 - abitest (`kernel/guest/abitest.c`): a freestanding arm64 ABI test (no
   libc, no exclusives, no TLS), so it runs before a libc does and is the
   only test that sees the registers exec leaves (all of x0..x30, V0..V31,

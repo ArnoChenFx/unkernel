@@ -751,6 +751,11 @@ asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
 chroot), Doom 22 (tcc install, downloads and a 6 s build; 0.2 later).
 The REPL and toolchain demos (Claude Code, fx, Bun, Node.js, Python, Go,
 Rust) came after that run and have not been through it.
+Docker (Debian only: `docker run --rm hello-world` through the image's
+docker shim, kernel/guest.md) came later too: with Docker installed, its
+command pulled and ran hello-world in 6 s (Node SDK, 1 GiB, data disk, the
+host's network, 2026-11-19); the first run adds the shim's install
+(about 1 min).
 
 `?showcase` runs `src/showcase.ts` once the guest is up: a
 fast, hands-off tour of the demos, leaving out the web servers (described at its top).

@@ -5,6 +5,7 @@
 import type { Demo } from "../launcher.ts";
 import bun from "./bun.ts";
 import claude from "./claude.ts";
+import docker from "./docker.ts";
 import doom from "./doom.ts";
 import dos from "./dos.ts";
 import fx from "./fx.ts";
@@ -28,4 +29,4 @@ import tmux from "./tmux.ts";
 import ubuntu from "./ubuntu.ts";
 import valkey from "./valkey.ts";
 
-export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, claude, fx, sshfs, nginx, node, bun, nitro, python, go, rust, postgres, sqlite, valkey, radio, speak, dos, doom];
+export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, docker, claude, fx, sshfs, nginx, node, bun, nitro, python, go, rust, postgres, sqlite, valkey, radio, speak, dos, doom];

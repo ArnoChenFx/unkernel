@@ -9,7 +9,8 @@
 <!-- Added to the home screen, iOS opens the page without Safari's bars (it has no element full screen on iPhone). -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Not black-translucent: iOS 26+ then gives the page a viewport short of the screen by the status bar and leaves a black band at the bottom (WebKit bug 301108). The page is black, so the status bar matches. -->
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="unkernel">
 <meta name="color-scheme" content="dark">
 <title>unkernel</title>

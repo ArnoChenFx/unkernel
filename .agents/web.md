@@ -242,12 +242,20 @@ deploying the page needs no kernel toolchain.
   `#bar-errors`, `#status` (its CSS `color` turns red on an error) and
   `#status-label`, `#panel` (class `open`), `#confirm`. Keep them working.
 - Safe areas are the CSS variables `--st`, `--sr`, `--sb`, `--sl` (style.css). On iOS,
-  `--sb` is 0: the page keeps the top inset but takes the whole height below it, and the
-  status line moves its ends in by `--sc` (half the bottom inset) for the round corners.
+  `--sb` is three quarters of the bottom inset: the status line's background reaches the
+  bottom edge, its contents sit that far above it, and it moves its ends in by `--sc`
+  (half the bottom inset) for the round corners. While the on-screen keyboard is up
+  (`App.tsx` sets `kb` on the root when the visual viewport is well below the layout
+  viewport, so on iOS) both are 0 and the status line is hidden. In an iOS home screen
+  app `--st` is 24 px more than the top inset: iOS fades the page's top 20 px or so
+  there.
   On macOS outside fullscreen, `main.tsx` sets `mac-window` on the root and `--sc` is
   8 px, for the window's round bottom corners.
-  In a home screen app (standalone) `App.tsx` sizes `#app` to the screen's height,
-  rounded down, unless the keyboard is up, because iOS can report a shorter viewport there.
+  In a home screen app (standalone) `App.tsx` sizes `#app` to the layout viewport's height
+  unless the keyboard is up (the visual viewport can stay short after it closed). The
+  status bar style is `black`, not `black-translucent`: with that, iOS 26+ makes the
+  viewport shorter than the screen by the status bar and shows nothing below it (WebKit
+  bug 301108). iOS reads the style when the app is added to the home screen.
 - An unknown or failed boot step must end in `ui.fail(...)`, so the
   indicator turns red and the panel opens. The page must never stay blank.
   `index.html` installs `error`/`unhandledrejection` handlers first and

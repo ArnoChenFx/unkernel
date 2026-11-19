@@ -82,6 +82,8 @@ function useViewport(app: RefObject<HTMLDivElement | null>) {
 	useEffect(() => {
 		const el = app.current!, bottom = trackBottom(document.getElementById("term")!), vv = visualViewport;
 		const apply = () => {
+			// The on-screen keyboard is up (not a pinch zoom, which also shrinks the visual viewport): style.css hides the status line.
+			document.documentElement.classList.toggle("kb", !!vv && Math.abs(vv.scale - 1) <= 0.01 && vv.height < document.documentElement.clientHeight - 120);
 			if (!vv || Math.abs(vv.scale - 1) > 0.01) { el.style.height = ""; el.style.top = ""; }
 			else {
 				// Whole px, rounded down, so the page never runs past the screen's bottom edge.
@@ -145,19 +147,16 @@ function useKeyBar(mobile: boolean) {
 }
 
 /**
- * The page's height in an iOS home screen app (standalone, which covers the
- * whole screen: viewport-fit=cover, black-translucent): the screen's height,
- * whole px, unless the on-screen keyboard is up. iOS can report a viewport
- * that is shorter than the screen there (by the status bar, or a band left
- * after the keyboard closed), which would leave a dead strip at the bottom.
- * Undefined elsewhere, and when the window is not the whole screen's width
- * (iPad Split View).
+ * The page's height in an iOS home screen app (standalone): the layout
+ * viewport's (what a fixed element with inset 0 fills), unless the on-screen
+ * keyboard is up. The visual viewport can stay short after the keyboard
+ * closed, which would leave a dead strip at the bottom. Not the screen's
+ * height: the viewport can be shorter (index.html's status bar style), and
+ * what is past it is not shown. Undefined elsewhere.
  */
 function standaloneHeight(vvHeight: number): number | undefined {
 	if ((navigator as Navigator & { standalone?: boolean }).standalone !== true) return;
-	const long = Math.max(screen.width, screen.height), short = Math.min(screen.width, screen.height);
-	const [w, full] = innerWidth <= innerHeight ? [short, long] : [long, short];
-	if (Math.abs(innerWidth - w) > 1) return;
+	const full = document.documentElement.clientHeight;
 	// Only a focused field can have the keyboard up, and it takes well over 120 px.
 	const el = document.activeElement as HTMLElement | null;
 	const editable = !!el && (el.isContentEditable || el.tagName === "INPUT" || el.tagName === "TEXTAREA");

@@ -40,13 +40,30 @@
 /* A macOS window outside fullscreen (main.tsx): its bottom corners are round. */
 :root.mac-window { --sc: 8px; }
 /* iOS (only its WebKit knows -webkit-touch-callout): the page keeps the top
-   safe area (status bar, notch, Dynamic Island) but takes the whole height
-   below it. The status line goes down to the bottom edge, over the home
-   indicator, and its round corners may cut into it, so it moves its ends in
-   by half the bottom inset (17 px on a Face ID iPhone in portrait). */
+   safe area (status bar, notch, Dynamic Island) and three quarters of the
+   bottom one (25 px on a Face ID iPhone in portrait). The status line's
+   background goes down to the bottom edge, over the home indicator, with its
+   contents that far above it, clear of the round corners, which it also
+   keeps its ends away from by half the bottom inset. Not while the
+   on-screen keyboard is up (App.tsx sets kb): nothing is at the screen's
+   bottom edge then. */
 @supports (-webkit-touch-callout: none) {
-	:root { --sb: 0px; --sc: calc(env(safe-area-inset-bottom, 0px) / 2); }
+	:root { --sb: calc(env(safe-area-inset-bottom, 0px) * 0.75); --sc: calc(env(safe-area-inset-bottom, 0px) / 2); }
+	:root.kb { --sb: 0px; --sc: 0px; }
+	/* A home screen app (iOS 26+): iOS fades the page's top 20 px or so under
+	   the status bar, and a page cannot turn that off, so what is at the top
+	   starts below it. */
+	@media (display-mode: standalone) {
+		:root { --st: calc(env(safe-area-inset-top, 0px) + 24px); }
+	}
+	/* Below the status line's contents: a line like the one on its top, and the page's black down to the edge. */
+	#bar::after {
+		content: ""; position: absolute; inset: auto 0 0 0; height: var(--sb); pointer-events: none;
+		border-top: 1px solid var(--color-line); background: var(--color-bg);
+	}
 }
+/* The on-screen keyboard is up (App.tsx): the terminal gets the status line's height (the key bar stays). */
+:root.kb #bar { display: none; }
 /* Touch (config.ts: a coarse pointer or a mobile user agent): a taller status line with wider targets. */
 @media (pointer: coarse) { :root { --bar-h: 38px; } }
 :root:has(#app.mobile) { --bar-h: 38px; }

@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 00:53:46 +0000
+Subject: [PATCH 2/6] fbdev: 32 bpp fast path with 4:3 scaling
+
+---
+ fbdoom/i_video_fbdev.c | 90 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 89 insertions(+), 1 deletion(-)
+
+diff --git a/fbdoom/i_video_fbdev.c b/fbdoom/i_video_fbdev.c
+index c6e5925..df62519 100644
+--- a/fbdoom/i_video_fbdev.c
++++ b/fbdoom/i_video_fbdev.c
+@@ -37,7 +37,9 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
+ #include "doomkeys.h"
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+ 
+@@ -54,6 +56,19 @@ struct fb_var_screeninfo fb = {};
+ int fb_scaling = 1;
+ int usemouse = 0;
+ 
++/*
++ * 32 bpp fast path: the palette is kept in the framebuffer's pixel format,
++ * columns are scaled by fb32_sx and rows stretched to fb32_h, which is
++ * 240 * fb32_sx (the 4:3 picture that 320x200 was drawn for; 640x480 on a
++ * 640x480 screen) or 200 * fb32_sx with -noaspect. Each frame is one
++ * pwrite() of the rows in use, so a reader never sees half a frame drawn.
++ */
++static int fb32;
++static int fb32_sx, fb32_w, fb32_h, fb32_x0, fb32_y0;
++static unsigned int fb32_stride;
++static uint32_t fb32_palette[256];
++static unsigned char *fb32_buf;
++
+ struct color {
+     uint32_t b:8;
+     uint32_t g:8;
+@@ -166,7 +181,7 @@ void I_InitGraphics (void)
+     fd_fb = open("/dev/fb0", O_RDWR);
+     if (fd_fb < 0)
+     {
+-        printf("Could not open /dev/fb0");
++        perror("Could not open /dev/fb0");
+         exit(-1);
+     }
+ 
+@@ -196,6 +211,36 @@ void I_InitGraphics (void)
+     }
+ 
+ 
++    {
++        struct fb_fix_screeninfo fix;
++        int sx, h;
++
++        if (fb.bits_per_pixel == 32 && !M_CheckParm("-scaling")
++         && ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) == 0)
++        {
++            sx = fb.xres / SCREENWIDTH;
++            h = M_CheckParm("-noaspect") ? SCREENHEIGHT : 240;
++            if ((int) fb.yres / h < sx)
++                sx = fb.yres / h;
++            if (sx >= 1)
++            {
++                fb32 = 1;
++                fb32_sx = sx;
++                fb32_w = SCREENWIDTH * sx;
++                fb32_h = h * sx;
++                fb32_x0 = (fb.xres - fb32_w) / 2;
++                fb32_y0 = (fb.yres - fb32_h) / 2;
++                fb32_stride = fix.line_length;
++                fb32_buf = calloc(fb32_h, fb32_stride);
++                if (!fb32_buf)
++                    fb32 = 0;
++            }
++        }
++        if (fb32)
++            printf("I_InitGraphics: 32 bpp, %dx%d at %d,%d\n",
++                   fb32_w, fb32_h, fb32_x0, fb32_y0);
++    }
++
+     /* Allocate screen to draw to */
+ 	I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);  // For DOOM to draw on
+ 	I_VideoBuffer_FB = (byte*)malloc(fb.xres * fb.yres * (fb.bits_per_pixel/8));     // For a single write() syscall to fbdev
+@@ -400,12 +445,51 @@ void I_UpdateNoBlit (void)
+ // I_FinishUpdate
+ //
+ 
++static void I_FinishUpdate32 (void)
++{
++    int x, y, k, src, prev = -1;
++    unsigned char *line, *last = NULL;
++
++    for (y = 0; y < fb32_h; y++)
++    {
++        line = fb32_buf + (size_t) y * fb32_stride;
++        src = y * SCREENHEIGHT / fb32_h;
++        if (src == prev)
++        {
++            memcpy(line + fb32_x0 * 4, last + fb32_x0 * 4, fb32_w * 4);
++        }
++        else
++        {
++            const byte *in = I_VideoBuffer + src * SCREENWIDTH;
++            uint32_t *out = (uint32_t *) line + fb32_x0;
++
++            for (x = 0; x < SCREENWIDTH; x++)
++            {
++                uint32_t pix = fb32_palette[in[x]];
++
++                for (k = 0; k < fb32_sx; k++)
++                    *out++ = pix;
++            }
++        }
++        prev = src;
++        last = line;
++    }
++    pwrite(fd_fb, fb32_buf, (size_t) fb32_h * fb32_stride,
++           (off_t) fb32_y0 * fb32_stride);
++}
++
+ void I_FinishUpdate (void)
+ {
+     int y;
+     int x_offset, y_offset, x_offset_end;
+     unsigned char *line_in, *line_out;
+ 
++    if (fb32)
++    {
++        I_FinishUpdate32();
++        return;
++    }
++
+     /* Offsets in case FB is bigger than DOOM */
+     /* 600 = fb heigt, 200 screenheight */
+     /* 600 = fb heigt, 200 screenheight */
+@@ -487,6 +571,10 @@ void I_SetPalette (byte* palette)
+         colors[i].r = gammatable[usegamma][*palette++];
+         colors[i].g = gammatable[usegamma][*palette++];
+         colors[i].b = gammatable[usegamma][*palette++];
++        fb32_palette[i] =
++            ((uint32_t) (colors[i].r >> (8 - fb.red.length)) << fb.red.offset)
++          | ((uint32_t) (colors[i].g >> (8 - fb.green.length)) << fb.green.offset)
++          | ((uint32_t) (colors[i].b >> (8 - fb.blue.length)) << fb.blue.offset);
+     }
+ 
+     /* Set new color map in kernel framebuffer driver */

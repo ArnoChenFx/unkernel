@@ -1,230 +1,548 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The page's kernel: web/kernel/unkernel-alpine.wasm (gitignored).
-// vite.config.ts calls fetchKernel() when the dev server starts and when
-// the page is built.
-//   - The dev server runs the file that is there, whatever wrote it (the
-//     local pipeline: kernel/build.sh bundle copies its output there), and
-//     fetches only when there is none.
-//   - A page build always takes the bundle attached to the newest GitHub
-//     release of this repository, so a deploy never ships a local kernel.
-//     It downloads unless the file is that release's, by sha256.
-// The download happens here, at build time, because GitHub sends release
-// assets without CORS, so a browser cannot fetch them. The file is a Vite
-// asset (src/sdk.ts), so it gets a hashed /assets/ name. web/kernel/release.json records the release
-// that was downloaded last; a file that does not match it is "local".
+// What the page runs: the base bundle unkernel.wasm (the kernel and the
+// base initramfs, with an SMP patch section) and the read-only distro
+// images it boots (NAME.erofs), which the page attaches by URL and reads
+// lazily with Range requests (the SDK's createKernel({ distro })).
+// vite.config.ts calls pageSource() when the dev server starts and when the
+// page is built, before anything is served or built. In this order:
+//   1. KW_KERNEL=<file> and/or KW_DISTROS=<dir>: that base bundle and the
+//      images in that directory (the other from the local build), whatever
+//      KW_LOCAL says.
+//   2. A local build, when one may be used (localPolicy(): KW_LOCAL=1
+//      forces it, KW_LOCAL=0 forbids it, and by default it is off when CI
+//      or VERCEL is set, whose builds have no vendor/ and must ship a
+//      release): vendor/build/bundle/unkernel.wasm and at least one image
+//      in vendor/build/distro/ (kernel/build.sh base and distro, or all).
+//   3. Else the newest GitHub release of this repository (KW_KERNEL_RELEASE=
+//      <tag>: that one), which must carry unkernel.wasm, distros.json and
+//      every image distros.json names; a release from before this layout
+//      (unkernel-alpine.wasm only) is refused with what to do instead.
+// It logs which it picked and why (a page build between two lines of =).
+// The About dialog says "local build" for 1 and 2 and names the release
+// for 3.
+//
+// A release is downloaded here, at build time (and by the dev server when
+// it has no copy yet), because GitHub sends release assets without CORS, so
+// a browser cannot fetch them. Everything is checked before it replaces
+// web/kernel/release/ (a temporary directory, then a rename), so a refused
+// or broken release leaves the copy there as it was: distros.json first
+// (its kwemu ABI must be include/kw_emu.h's KW_ABI_VERSION, its entries
+// well formed), then unkernel.wasm (the API's sha256 digest where there is
+// one, wasm magic, its own ABI, its base id against distros.json's), then
+// each image (size and sha256 from distros.json, and the API's digest);
+// an image the copy already has with that sha256 is reused, not downloaded.
+// web/kernel/release/release.json records the release (tag, date, the
+// files and their sha256). The dev server uses that copy as it is, without
+// a network check; a page build checks for a newer release.
+//
+// The kernel's URLs: the dev server serves the base's UP and SMP bundles
+// from web/kernel/page/<hash>/ (splitBase(), written again when the bundle
+// changes); a build emits them as hashed assets from memory (baseSplit()),
+// so it never touches the dev server's files. splitBundle() takes the SMP
+// patch section off the bundle (kernel/tools/bundle.mjs --smp): the UP
+// bundle is the bundle without it, the SMP one the kernel the patch makes
+// with the same initramfs, command line and data disk template
+// (js/core/kpatch.ts); without the section there is no SMP bundle.
+//
+// The images' URLs: the dev server answers /distros/<name>.erofs itself
+// (vite.config.ts, server/range.ts; revalidated, since a local image is
+// rebuilt in place). A build names each by its content,
+// /distros/<name>-<first 16 hex digits of its sha256>.erofs, immutable and
+// cached for a year by browsers and CDNs, and copies it there into the
+// output (vite.config.ts unkernel:distro-images; server/distros.ts on Node,
+// static files on Vercel).
 //
 // Environment:
-//   KW_KERNEL=<path>          use this bundle instead (copied in), in a build too, e.g.
-//                             KW_KERNEL=../vendor/build/bundle/unkernel-alpine.wasm pnpm build:web
-//   KW_KERNEL_RELEASE=<tag>   this release instead of the newest (e.g. v0.2.0);
-//                             the dev server then fetches it too
+//   KW_KERNEL=<file>          the base bundle (relative to web/), e.g.
+//                             KW_KERNEL=../vendor/build/bundle/unkernel.wasm
+//   KW_DISTROS=<dir>          the images (<name>.erofs; distros.json there
+//                             gives their image ids)
+//   KW_KERNEL_RELEASE=<tag>   this release instead of the newest (e.g. v0.2.0)
+//   KW_LOCAL=1 | 0            use a local build when there is one (default,
+//                             except when CI or VERCEL is set) | never
 //   GITHUB_TOKEN, GH_TOKEN    for the GitHub API (60 requests an hour without
 //                             one; past that, the release feed is used)
-// If GitHub cannot be reached and the file is a release's (the tag asked
-// for, if one was), a build keeps it. A release whose kernel was built for
-// another kwemu ABI than include/kw_emu.h's is refused (checkAbi): after a
-// guest or contract change, cut a release before the page is deployed.
-//
-// splitKernel() then makes what the page serves, in web/kernel/page/: the
-// UP bundle unkernel-alpine.wasm, which is the file above without its SMP
-// patch section (kernel/tools/bundle.mjs --smp; byte for byte the file when
-// it has none), and, only when the file has that section,
-// unkernel-alpine-smp.wasm: the SMP kernel the patch makes with the same
-// root file system, command line and data disk template
-// (js/core/kpatch.ts). So UP visitors download what they would without the
-// patch, and an SMP page would download one SMP bundle without patching in
-// the browser. vite.config.ts serves the second file as its own hashed
-// asset (virtual:unkernel-smp-kernel).
+//   KW_GITHUB_API, KW_GITHUB  the API and web origins (default
+//                             https://api.github.com, https://github.com):
+//                             a stand-in server for testing
+// If GitHub cannot be reached, a build keeps the copy in web/kernel/release/
+// (when it is the tag asked for, if one was). A local build whose ABI is
+// not this checkout's only gets a warning.
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { copyFile, link, mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { smpKernelFromBundle, withoutSmpPatch } from "../../js/core/kpatch.ts";
 
 const REPO = "pithings/unkernel";
-const ASSET = "unkernel-alpine.wasm";
+const GITHUB_API = (process.env.KW_GITHUB_API || "https://api.github.com").replace(/\/+$/, "");
+const GITHUB = (process.env.KW_GITHUB || "https://github.com").replace(/\/+$/, "");
+const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const DIR = fileURLToPath(new URL("../kernel/", import.meta.url));
-/** Where the kernel goes; src/sdk.ts imports it from here. */
-export const KERNEL_FILE = `${DIR}${ASSET}`;
-const META_FILE = `${DIR}release.json`;
+/** The downloaded release (gitignored): unkernel.wasm, distros.json, the images, release.json. */
+export const RELEASE_DIR = `${DIR}release/`;
+const META = "release.json";
+/** The dev server's split of the base bundle (splitBase()). */
 const PAGE_DIR = `${DIR}page/`;
-/** The UP bundle the page serves (src/sdk.ts kernelUrl). */
-export const PAGE_KERNEL_FILE = `${PAGE_DIR}${ASSET}`;
-/** The SMP bundle the page serves, present only when KERNEL_FILE carries an SMP patch. */
-export const PAGE_SMP_FILE = `${PAGE_DIR}unkernel-alpine-smp.wasm`;
+/** A local build's base bundle and images. */
+const LOCAL_BASE = `${ROOT}vendor/build/bundle/unkernel.wasm`;
+const LOCAL_DISTROS = `${ROOT}vendor/build/distro/`;
+const BASE_ASSET = "unkernel.wasm";
+const INDEX_ASSET = "distros.json";
+/** An image file: NAME.erofs or NAME.ext4 (distros.json's `file`). */
+const IMAGE_RE = /^([a-z0-9]+)\.(erofs|ext4)$/;
 
+/** Which kernel the page runs, for the About dialog (__KW_BUILD__). */
 export interface KernelRelease {
-	/** The release's tag, or "local" for KW_KERNEL. */
+	/** The release's tag, or "local" for a local build. */
 	tag: string;
 	/** When it was published (ISO 8601), or the local file's time; "" if unknown. */
 	date: string;
+	/** The base bundle's sha256. */
 	sha256: string;
 }
 
-interface Resolved { tag: string; date: string; url: string; sha256?: string }
+/** One distro image the page offers, as the page gets it (virtual:unkernel-kernel). */
+export interface PageDistro {
+	/** The distro's name (`?distro=`), as its /usr/lib/kw-distro says. */
+	name: string;
+	/** Its URL on the page's origin: /distros/<name>.erofs in dev, /distros/<name>-<sha256 prefix>.erofs in a build. */
+	url: string;
+	size: number;
+	/** Its /usr/lib/kw-image, where distros.json gives it (else the page reads it from the guest). */
+	imageId?: string;
+}
+
+/** A PageDistro and the file behind it (not given to the page). */
+export interface PageImage extends PageDistro {
+	file: string;
+	sha256: string;
+}
+
+export interface PageSource {
+	/** Why this source (logged; a build's log and the dev server's first line). */
+	why: string;
+	kernel: KernelRelease;
+	/** The base bundle's Linux release, from its banner. */
+	linux: string;
+	/** The base bundle. */
+	base: string;
+	/** The images, debian first. */
+	distros: PageImage[];
+}
+
+/** One entry of distros.json (guest/tools/distros-json.mjs). */
+interface IndexEntry { name: string; file: string; size: number; sha256: string; image?: string | null }
+interface DistrosIndex { abi: number | null; base: string | null; distros: IndexEntry[] }
+/** web/kernel/release/release.json. */
+interface ReleaseMeta extends KernelRelease { abi: number; baseId: string | null; distros: IndexEntry[] }
 
 const UA = { "user-agent": "unkernel-web-build" };
 const sha256 = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
 const log = (msg: string) => console.log(`[kernel] ${msg}`);
+const mib = (n: number) => `${(n / 1048576).toFixed(1)} MiB`;
+/** `f` relative to the repository (absolute outside it), for messages. */
+const rel = (f: string) => { const r = path.relative(ROOT, f); return r.startsWith("..") ? f : r || "."; };
+const isFile = async (f: string) => { try { return (await stat(f)).isFile(); } catch { return false; } };
+const banner = (bytes: Uint8Array) => /Linux version (\S+)/.exec(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1"))?.[1] ?? "";
+/** Debian first (the default), then by name. */
+const byName = (a: { name: string }, b: { name: string }) => (a.name === "debian" ? -1 : b.name === "debian" ? 1 : a.name.localeCompare(b.name));
 
-/** The release to use: from the API (with the asset's digest), else from the feed. */
+/** sha256 of a file, streamed; cached per path, size and mtime (a dev server hashes again after a rebuild). */
+const hashes = new Map<string, { key: string; sum: Promise<string> }>();
+async function fileSha256(file: string): Promise<string> {
+	const st = await stat(file);
+	const key = `${st.size}:${st.mtimeMs}:${st.ino}`;
+	const hit = hashes.get(file);
+	if (hit?.key === key) return hit.sum;
+	const sum = new Promise<string>((resolve, reject) => {
+		const h = createHash("sha256");
+		createReadStream(file).on("data", (d) => h.update(d)).on("error", reject).on("end", () => resolve(h.digest("hex")));
+	});
+	hashes.set(file, { key, sum });
+	return sum;
+}
+
+/** This checkout's include/kw_emu.h KW_ABI_VERSION. */
+async function wantAbi(): Promise<number> {
+	const h = await readFile(`${ROOT}include/kw_emu.h`, "utf8");
+	const want = Number(/^#define KW_ABI_VERSION (\d+)$/m.exec(h)?.[1]);
+	if (!Number.isInteger(want)) throw new Error("include/kw_emu.h: no KW_ABI_VERSION");
+	return want;
+}
+
+/** A base bundle's kwemu ABI and base id (kernel/tools/bundle.mjs, guest/tools/distros-json.mjs). */
+async function bundleInfo(bytes: Uint8Array): Promise<{ abi: number | null; base: string | null }> {
+	const { bundleInfo } = (await import(new URL("../../guest/tools/distros-json.mjs", import.meta.url).href)) as {
+		bundleInfo(wasm: Uint8Array): { abi: number | null; base: string | null };
+	};
+	return bundleInfo(bytes);
+}
+
+function checkWasm(bytes: Uint8Array, what: string): void {
+	if (bytes[0] !== 0 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) throw new Error(`${what}: not a wasm module`);
+}
+
+/**
+ * Write `bytes` to `file` unless it holds them already (a temporary file,
+ * then a rename). The temporary name is per call: the dev server may split
+ * the same bundle twice at once (its watcher and a page load).
+ */
+let tmpSeq = 0;
+async function writeIfChanged(file: string, bytes: Uint8Array): Promise<void> {
+	try {
+		if (Buffer.compare(await readFile(file), bytes) === 0) return;
+	} catch {}
+	const tmp = `${file}.${process.pid}-${++tmpSeq}.tmp`;
+	try {
+		await writeFile(tmp, bytes);
+		await rename(tmp, file);
+	} catch (e) {
+		await rm(tmp, { force: true });
+		throw e;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local builds.
+
+/**
+ * Whether a local build may be used: KW_LOCAL=1 or 0 says so; by default
+ * yes, except where CI or VERCEL is set (a deploy or CI build, which has no
+ * vendor/ and ships a release).
+ */
+function localPolicy(): { ok: boolean; why: string } {
+	const v = process.env.KW_LOCAL;
+	if (v === "1") return { ok: true, why: "KW_LOCAL=1" };
+	if (v === "0") return { ok: false, why: "KW_LOCAL=0" };
+	const on = (k: string) => !!process.env[k] && process.env[k] !== "0" && process.env[k] !== "false";
+	const ci = on("VERCEL") ? "VERCEL" : on("CI") ? "CI" : "";
+	if (ci) return { ok: false, why: `${ci} is set; KW_LOCAL=1 would use a local build` };
+	return { ok: true, why: "auto-detected; KW_LOCAL=0 takes the newest release" };
+}
+
+/** distros.json in `dir`, if there is a readable one. */
+async function readIndex(dir: string): Promise<DistrosIndex | undefined> {
+	try {
+		const j = JSON.parse(await readFile(path.join(dir, INDEX_ASSET), "utf8")) as DistrosIndex;
+		return Array.isArray(j.distros) ? j : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The images in `dir`: NAME.erofs (NAME.ext4 where there is no .erofs),
+ * hashed; the image id from distros.json when its entry has the same sha256.
+ */
+async function scanImages(dir: string): Promise<PageImage[]> {
+	let files: string[] = [];
+	try { files = await readdir(dir); } catch {}
+	const names = new Set(files.filter((f) => IMAGE_RE.test(f)).map((f) => IMAGE_RE.exec(f)![1]!));
+	const index = await readIndex(dir);
+	const out: PageImage[] = [];
+	for (const name of names) {
+		const file = path.join(dir, files.includes(`${name}.erofs`) ? `${name}.erofs` : `${name}.ext4`);
+		let st;
+		try { st = await stat(file); } catch { continue; }
+		if (!st.isFile() || st.size === 0) continue;
+		const sum = await fileSha256(file);
+		const e = index?.distros.find((d) => d.name === name && d.sha256 === sum);
+		out.push({ name, url: "", size: st.size, file, sha256: sum, ...(e?.image ? { imageId: e.image } : {}) });
+	}
+	return out.sort(byName);
+}
+
+/** The local build (or KW_KERNEL / KW_DISTROS) as the page's source. */
+async function localSource(base: string, images: PageImage[], why: string): Promise<PageSource> {
+	const bytes = new Uint8Array(await readFile(base));
+	checkWasm(bytes, rel(base));
+	const want = await wantAbi();
+	const { abi } = await bundleInfo(bytes);
+	if (abi !== want) log(`warning: ${rel(base)} has kwemu ABI ${abi ?? "unknown"}, this checkout's include/kw_emu.h has ${want} (a stale local build?)`);
+	return { why, kernel: { tag: "local", date: (await stat(base)).mtime.toISOString(), sha256: sha256(bytes) }, linux: banner(bytes), base, distros: images };
+}
+
+// ---------------------------------------------------------------------------
+// Releases.
+
+interface Asset { url: string; sha256?: string }
+interface Resolved { tag: string; date: string; assets: Map<string, Asset> | null }
+
+/** The release to use: from the API (with the assets' digests), else from the feed (assets unknown). */
 async function resolve(want?: string): Promise<Resolved> {
 	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-	const res = await fetch(`https://api.github.com/repos/${REPO}/releases${want ? `/tags/${want}` : "?per_page=20"}`, {
+	const res = await fetch(`${GITHUB_API}/repos/${REPO}/releases${want ? `/tags/${want}` : "?per_page=10"}`, {
 		headers: { ...UA, accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
 	});
 	if (res.ok) {
 		type R = { tag_name: string; draft: boolean; published_at: string; assets: { name: string; browser_download_url: string; digest?: string | null }[] };
-		for (const r of ([] as R[]).concat(await res.json())) {
-			const a = r.draft ? undefined : r.assets.find((a) => a.name === ASSET);
-			if (a) return { tag: r.tag_name, date: r.published_at, url: a.browser_download_url, sha256: a.digest?.replace(/^sha256:/, "") };
-		}
-		throw new Error(`no release of ${REPO}${want ? ` tagged ${want}` : ""} has ${ASSET}`);
+		const r = ([] as R[]).concat(await res.json()).find((r) => !r.draft);
+		if (!r) throw new Error(`${REPO} has no releases`);
+		const assets = new Map(r.assets.map((a) => [a.name, { url: a.browser_download_url, sha256: a.digest?.replace(/^sha256:/, "") || undefined }]));
+		return { tag: r.tag_name, date: r.published_at, assets };
 	}
 	if (res.status === 404 && want) throw new Error(`${REPO} has no release ${want}`);
-	// Rate limited (or the API is down): the release feed has no limit, but no digests.
+	// Rate limited (or the API is down): the release feed has no limit, but no assets.
 	log(`GitHub API: ${res.status} ${res.statusText}; using the release feed`);
 	let tag = want, date = "";
 	if (!tag) {
-		const feed = await fetch(`https://github.com/${REPO}/releases.atom`, { headers: UA });
+		const feed = await fetch(`${GITHUB}/${REPO}/releases.atom`, { headers: UA });
 		if (!feed.ok) throw new Error(`release feed: ${feed.status} ${feed.statusText}`);
 		const entry = /<entry>([\s\S]*?)<\/entry>/.exec(await feed.text())?.[1] ?? "";
 		tag = /\/releases\/tag\/([^"]+)"/.exec(entry)?.[1];
 		date = /<updated>([^<]+)<\/updated>/.exec(entry)?.[1] ?? "";
 		if (!tag) throw new Error(`${REPO} has no releases`);
 	}
-	return { tag, date, url: `https://github.com/${REPO}/releases/download/${tag}/${ASSET}` };
+	return { tag, date, assets: null };
 }
 
-/** The file there now: its release if it is the one release.json names, else "local"; undefined if none. */
-async function current(): Promise<KernelRelease | undefined> {
-	let bytes: Uint8Array;
-	try { bytes = await readFile(KERNEL_FILE); }
-	catch { return undefined; }
-	const sum = sha256(bytes);
-	try {
-		const meta = JSON.parse(await readFile(META_FILE, "utf8")) as KernelRelease;
-		if (meta.sha256 === sum) return meta;
-	} catch {}
-	return { tag: "local", date: (await stat(KERNEL_FILE)).mtime.toISOString(), sha256: sum };
+/** The error for a release that does not have this layout. */
+const notThisLayout = (tag: string, missing: string, why: string) => new Error(
+	`release ${tag} of ${REPO} has no ${missing}: it predates the base bundle and distro images this page runs ` +
+	`(unkernel.wasm, distros.json and the images), or is incomplete. Build locally (kernel/build.sh all; ` +
+	`a page build then uses vendor/build, or point KW_KERNEL and KW_DISTROS at a build) or cut a release ` +
+	`(.github/workflows/release.yml), or pick a release that has them (KW_KERNEL_RELEASE=<tag>). ` +
+	`No local build was used (${why}). web/kernel/ was left as it was`);
+
+/** Download `name` of release `r` (its API URL, else the usual download URL); check the API's digest. */
+async function download(r: Resolved, name: string, why: string): Promise<Uint8Array> {
+	const a = r.assets?.get(name);
+	if (r.assets && !a) throw notThisLayout(r.tag, name, why);
+	const url = a?.url ?? `${GITHUB}/${REPO}/releases/download/${r.tag}/${name}`;
+	const res = await fetch(url, { headers: UA });
+	if (res.status === 404 && !r.assets) throw notThisLayout(r.tag, name, why);
+	if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
+	const bytes = new Uint8Array(await res.arrayBuffer());
+	if (a?.sha256 && sha256(bytes) !== a.sha256) throw new Error(`${url}: sha256 ${sha256(bytes)}, the release says ${a.sha256}`);
+	return bytes;
 }
 
-async function store(bytes: Uint8Array, rel: KernelRelease): Promise<KernelRelease> {
-	if (bytes[0] !== 0 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) throw new Error(`${rel.tag}: ${ASSET} is not a wasm module`);
-	await mkdir(DIR, { recursive: true });
-	await writeFile(`${KERNEL_FILE}.tmp`, bytes);
-	await rename(`${KERNEL_FILE}.tmp`, KERNEL_FILE);
-	await writeFile(META_FILE, `${JSON.stringify(rel, null, "\t")}\n`);
-	return rel;
-}
-
-async function fetchOnce(dev: boolean): Promise<KernelRelease> {
-	const local = process.env.KW_KERNEL;
-	if (local) {
-		const bytes = await readFile(local);
-		log(`${local} (KW_KERNEL), ${(bytes.length / 1048576).toFixed(1)} MiB`);
-		await mkdir(DIR, { recursive: true });
-		await writeFile(KERNEL_FILE, bytes);
-		return { tag: "local", date: (await stat(local)).mtime.toISOString(), sha256: sha256(bytes) };
+/** distros.json's content, checked: this checkout's ABI, well-formed entries, at least one image. */
+function checkIndex(j: DistrosIndex, tag: string, want: number): IndexEntry[] {
+	if (j.abi !== want) {
+		throw new Error(`release ${tag}: distros.json says kwemu ABI ${j.abi ?? "unknown"}, this checkout's include/kw_emu.h has ${want}: ` +
+			`the release was built for another guest CPU or kernel contract. Cut a release from this checkout first (.github/workflows/release.yml), ` +
+			`build from a local build (KW_LOCAL=1, or KW_KERNEL and KW_DISTROS) or pick a matching release (KW_KERNEL_RELEASE=<tag>). web/kernel/ was left as it was`);
 	}
+	if (!Array.isArray(j.distros) || !j.distros.length) throw new Error(`release ${tag}: distros.json lists no images`);
+	for (const d of j.distros) {
+		const m = IMAGE_RE.exec(String(d.file));
+		if (!m || m[1] !== d.name || !Number.isSafeInteger(d.size) || d.size <= 0 || !/^[0-9a-f]{64}$/.test(String(d.sha256)))
+			throw new Error(`release ${tag}: distros.json: a bad entry ${JSON.stringify(d)}`);
+	}
+	return j.distros;
+}
+
+/** web/kernel/release/release.json, if the copy there is complete (every file at its size). */
+async function cached(): Promise<ReleaseMeta | undefined> {
+	let meta: ReleaseMeta;
+	try { meta = JSON.parse(await readFile(path.join(RELEASE_DIR, META), "utf8")) as ReleaseMeta; } catch { return undefined; }
+	try {
+		if (!(await isFile(path.join(RELEASE_DIR, BASE_ASSET)))) return undefined;
+		for (const d of meta.distros) if ((await stat(path.join(RELEASE_DIR, d.file))).size !== d.size) return undefined;
+	} catch {
+		return undefined;
+	}
+	return meta;
+}
+
+/**
+ * Put the release in web/kernel/release/ (see the top) and return what is
+ * there. `dev`: the dev server, which uses a copy that is there as it is.
+ */
+async function fetchRelease(dev: boolean, why: string): Promise<ReleaseMeta> {
 	const want = process.env.KW_KERNEL_RELEASE || undefined;
-	const now = await current();
-	if (dev && now && (!want || now.tag === want)) {
-		log(`${now.tag === "local" ? "a local build" : now.tag} (web/kernel/unkernel-alpine.wasm)`);
-		return now;
-	}
-	const have = now?.tag === "local" ? undefined : now;
-	let rel: Resolved;
+	const have = await cached();
+	if (dev && have && (!want || have.tag === want)) return have;
+	let r: Resolved;
 	try {
-		rel = await resolve(want);
+		r = await resolve(want);
 	} catch (e) {
-		if (!have || (want && have.tag !== want)) throw new Error(`cannot fetch the page's kernel from ${REPO}'s GitHub releases: ${(e as Error).message}`);
-		log(`${(e as Error).message}; keeping ${have.tag}`);
+		if (!have || (want && have.tag !== want)) {
+			throw new Error(`cannot fetch the page's kernel and distro images from ${REPO}'s GitHub releases: ${(e as Error).message}. ` +
+				`No local build was used (${why}): build locally (kernel/build.sh all) or give KW_KERNEL and KW_DISTROS`);
+		}
+		log(`${(e as Error).message}; keeping ${have.tag} (web/kernel/release/)`);
 		return have;
 	}
-	if (have?.tag === rel.tag && (!rel.sha256 || rel.sha256 === have.sha256)) return have;
-	log(`downloading ${rel.tag} (was ${now?.tag ?? "none"})`);
-	const res = await fetch(rel.url, { headers: UA });
-	if (!res.ok) throw new Error(`${rel.url}: ${res.status} ${res.statusText}`);
-	const bytes = new Uint8Array(await res.arrayBuffer());
-	const sum = sha256(bytes);
-	if (rel.sha256 && sum !== rel.sha256) throw new Error(`${rel.url}: sha256 ${sum}, the release says ${rel.sha256}`);
-	log(`${rel.tag}: ${(bytes.length / 1048576).toFixed(1)} MiB, sha256 ${sum.slice(0, 16)}`);
-	return store(bytes, { tag: rel.tag, date: rel.date, sha256: sum });
-}
-
-/**
- * The kernel at KERNEL_FILE must have been built for this checkout's guest
- * CPU and kernel contract: its kwemu's kw_abi_version() (kernelInfo() in
- * kernel/tools/bundle.mjs) must be include/kw_emu.h's KW_ABI_VERSION. The
- * page (its texts, demos and the data disk's guest architecture) is written
- * for that guest, so a release from before an ABI change (for example a
- * release of another guest architecture, the newest one until a release is
- * cut from this checkout) is refused. A local file only gets a warning.
- */
-async function checkAbi(rel: KernelRelease): Promise<KernelRelease> {
-	const h = await readFile(new URL("../../include/kw_emu.h", import.meta.url), "utf8");
-	const want = Number(/^#define KW_ABI_VERSION (\d+)$/m.exec(h)?.[1]);
-	if (!Number.isInteger(want)) throw new Error("include/kw_emu.h: no KW_ABI_VERSION");
-	const { kernelInfo } = (await import(new URL("../../kernel/tools/bundle.mjs", import.meta.url).href)) as {
-		kernelInfo(wasm: Uint8Array): { abi: number | null };
-	};
-	const { abi } = kernelInfo(new Uint8Array(await readFile(KERNEL_FILE)));
-	if (abi === want) return rel;
-	const what = `${ASSET} (${rel.tag}) has kwemu ABI ${abi ?? "unknown"}, this checkout's include/kw_emu.h has ${want}`;
-	if (rel.tag === "local") {
-		log(`warning: ${what}`);
-		return rel;
-	}
-	throw new Error(`${what}: the release was built for another guest CPU or kernel contract. ` +
-		`Cut a release from this checkout first (.github/workflows/release.yml), or give a bundle built here ` +
-		`(KW_KERNEL=../vendor/build/bundle/${ASSET}) or a matching release (KW_KERNEL_RELEASE=<tag>)`);
-}
-
-let once: Promise<KernelRelease> | undefined;
-
-/**
- * Puts the kernel at KERNEL_FILE (once per process) and says which it is.
- * `dev`: the dev server, which keeps a file that is there. Refuses a
- * release built for another guest (checkAbi).
- */
-export function fetchKernel(dev = false): Promise<KernelRelease> {
-	return (once ??= fetchOnce(dev).then(checkAbi));
-}
-
-/** Write `bytes` to `file` unless it holds them already (atomically). */
-async function writeIfChanged(file: string, bytes: Uint8Array): Promise<void> {
+	const sameDigest = (name: string, sum: string) => !r.assets?.get(name)?.sha256 || r.assets.get(name)!.sha256 === sum;
+	if (have?.tag === r.tag && sameDigest(BASE_ASSET, have.sha256) && have.distros.every((d) => sameDigest(d.file, d.sha256))) return have;
+	log(`downloading ${r.tag} (was ${have?.tag ?? "none"})`);
+	const abi = await wantAbi();
+	// distros.json first: it is small, and an old or foreign release fails here.
+	const indexBytes = await download(r, INDEX_ASSET, why);
+	let index: DistrosIndex;
+	try { index = JSON.parse(Buffer.from(indexBytes).toString("utf8")) as DistrosIndex; }
+	catch { throw new Error(`release ${r.tag}: distros.json is not JSON`); }
+	const entries = checkIndex(index, r.tag, abi);
+	const base = await download(r, BASE_ASSET, why);
+	checkWasm(base, `${r.tag}: ${BASE_ASSET}`);
+	const info = await bundleInfo(base);
+	if (info.abi !== abi) throw new Error(`release ${r.tag}: ${BASE_ASSET} has kwemu ABI ${info.abi ?? "unknown"}, distros.json and include/kw_emu.h say ${abi}. web/kernel/ was left as it was`);
+	if (index.base && info.base && index.base !== info.base) throw new Error(`release ${r.tag}: ${BASE_ASSET} is base ${info.base}, distros.json was made for ${index.base}. web/kernel/ was left as it was`);
+	log(`${r.tag}: ${BASE_ASSET} ${mib(base.length)}, ABI ${abi}, base ${info.base ?? "?"}`);
+	// Everything goes to a temporary directory first; only a complete, checked copy replaces web/kernel/release/.
+	const tmp = `${DIR}release.tmp-${process.pid}/`;
+	await rm(tmp, { recursive: true, force: true });
+	await mkdir(tmp, { recursive: true });
 	try {
-		if (Buffer.compare(await readFile(file), bytes) === 0) return;
-	} catch {}
-	await writeFile(`${file}.tmp`, bytes);
-	await rename(`${file}.tmp`, file);
+		await writeFile(path.join(tmp, BASE_ASSET), base);
+		await writeFile(path.join(tmp, INDEX_ASSET), indexBytes);
+		for (const d of entries) {
+			const to = path.join(tmp, d.file);
+			const old = have?.distros.find((o) => o.file === d.file && o.sha256 === d.sha256);
+			if (old && (await fileSha256(path.join(RELEASE_DIR, d.file))) === d.sha256) {
+				await link(path.join(RELEASE_DIR, d.file), to).catch(() => copyFile(path.join(RELEASE_DIR, d.file), to));
+				log(`${r.tag}: ${d.file} ${mib(d.size)}, the same as the copy's`);
+				continue;
+			}
+			const bytes = await download(r, d.file, why);
+			const sum = sha256(bytes);
+			if (bytes.length !== d.size || sum !== d.sha256) throw new Error(`release ${r.tag}: ${d.file} is ${bytes.length} bytes, sha256 ${sum}; distros.json says ${d.size} bytes, ${d.sha256}`);
+			await writeFile(to, bytes);
+			log(`${r.tag}: ${d.file} ${mib(d.size)}, sha256 ${sum.slice(0, 16)} (${d.image ?? "no image id"})`);
+		}
+		const meta: ReleaseMeta = { tag: r.tag, date: r.date, sha256: sha256(base), abi, baseId: info.base, distros: entries };
+		await writeFile(path.join(tmp, META), `${JSON.stringify(meta, null, "\t")}\n`);
+		// Swap: the old copy aside, the new one in, the old one gone.
+		const old = `${DIR}release.old-${process.pid}/`;
+		await rm(old, { recursive: true, force: true });
+		await rename(RELEASE_DIR, old).catch((e: NodeJS.ErrnoException) => { if (e.code !== "ENOENT") throw e; });
+		await rename(tmp, RELEASE_DIR);
+		await rm(old, { recursive: true, force: true });
+		return meta;
+	} finally {
+		await rm(tmp, { recursive: true, force: true });
+	}
 }
 
-let split: Promise<{ smp: boolean }> | undefined;
+/** The release in web/kernel/release/ as the page's source; `why`: why no local build. */
+async function releaseSource(dev: boolean, why: string): Promise<PageSource> {
+	const meta = await fetchRelease(dev, why);
+	const base = path.join(RELEASE_DIR, BASE_ASSET);
+	const bytes = new Uint8Array(await readFile(base));
+	const distros = meta.distros.map((d) => ({
+		name: d.name, url: "", size: d.size, file: path.join(RELEASE_DIR, d.file), sha256: d.sha256, ...(d.image ? { imageId: d.image } : {}),
+	})).sort(byName);
+	return { why: `release ${meta.tag} (${why})`, kernel: { tag: meta.tag, date: meta.date, sha256: meta.sha256 }, linux: banner(bytes), base, distros };
+}
+
+// ---------------------------------------------------------------------------
+// The choice (see the top).
+
+async function choose(dev: boolean): Promise<PageSource> {
+	const kk = process.env.KW_KERNEL, kd = process.env.KW_DISTROS;
+	if (kd === "0") throw new Error("KW_DISTROS=0 is gone: the page always boots a distro image (?distro=none is the base shell)");
+	if (kk || kd) {
+		const base = kk ? path.resolve(kk) : LOCAL_BASE, dir = kd ? path.resolve(kd) : LOCAL_DISTROS;
+		if (!(await isFile(base))) throw new Error(`no base bundle ${base}${kk ? " (KW_KERNEL)" : " (kernel/build.sh base, or KW_KERNEL)"}`);
+		const images = await scanImages(dir);
+		if (!images.length) throw new Error(`no distro images (<name>.erofs) in ${dir}${kd ? " (KW_DISTROS)" : " (kernel/build.sh distro, or KW_DISTROS)"}`);
+		return localSource(base, images, `${[kk && "KW_KERNEL", kd && "KW_DISTROS"].filter(Boolean).join(" and ")} (a local build)`);
+	}
+	const tag = process.env.KW_KERNEL_RELEASE;
+	if (tag) return releaseSource(dev, `KW_KERNEL_RELEASE=${tag}`);
+	const policy = localPolicy();
+	let why = policy.why;
+	if (policy.ok) {
+		const images = (await isFile(LOCAL_BASE)) ? await scanImages(LOCAL_DISTROS) : [];
+		if (images.length) return localSource(LOCAL_BASE, images, `a local build in vendor/build, ${policy.why}`);
+		why = !(await isFile(LOCAL_BASE)) ? `no ${rel(LOCAL_BASE)} (kernel/build.sh base)` : `no images in ${rel(LOCAL_DISTROS)} (kernel/build.sh distro)`;
+	}
+	return releaseSource(dev, why);
+}
+
+const describe = (s: PageSource) => `${s.kernel.tag === "local" ? "a local build" : `release ${s.kernel.tag}`}, Linux ${s.linux || "?"}; ` +
+	s.distros.map((d) => `${d.name} ${mib(d.size)}`).join(", ");
+
+let once: Promise<PageSource> | undefined;
 
 /**
- * Make web/kernel/page/ from KERNEL_FILE (once per process unless `again`,
- * which the dev server passes when the file changes; after fetchKernel()):
- * the UP bundle without the SMP patch section and, if there is a patch,
- * the SMP bundle. A bundle without the section gives the same UP file
- * and no SMP file.
+ * The base bundle and the images the page runs, with their URLs (`dev`: the
+ * dev server's; once per process; see the top). It logs the choice.
  */
-export function splitKernel(again = false): Promise<{ smp: boolean }> {
-	if (again) split = undefined;
-	return (split ??= (async () => {
-		const bytes = new Uint8Array(await readFile(KERNEL_FILE));
-		await mkdir(PAGE_DIR, { recursive: true });
-		const up = withoutSmpPatch(bytes);
-		await writeIfChanged(PAGE_KERNEL_FILE, up);
-		if (up === bytes) {
-			await rm(PAGE_SMP_FILE, { force: true });
-			return { smp: false };
+export function pageSource(dev: boolean): Promise<PageSource> {
+	return (once ??= choose(dev).then((s) => {
+		for (const d of s.distros) d.url = `/distros/${dev ? path.basename(d.file) : servedName(d)}`;
+		if (dev) log(`${describe(s)} (${s.why})`);
+		else {
+			const line = "=".repeat(72);
+			log(line);
+			log(`PAGE BUILD: ${describe(s)}`);
+			log(`  why: ${s.why}`);
+			log(`  base: ${rel(s.base)}`);
+			for (const d of s.distros) log(`  ${d.url} <- ${rel(d.file)}${d.imageId ? ` (${d.imageId})` : ""}`);
+			log(line);
 		}
+		return s;
+	}));
+}
+
+/** A build's file name for an image: NAME-<16 hex digits of its sha256>.erofs (or .ext4). */
+export const servedName = (d: PageImage) => `${d.name}-${d.sha256.slice(0, 16)}${path.extname(d.file)}`;
+
+/** The dev server's images again (sizes, ids and hashes as the files are now: an image may have been rebuilt). */
+export async function rescanImages(s: PageSource): Promise<PageImage[]> {
+	const out: PageImage[] = [];
+	for (const d of s.distros) {
+		try {
+			const st = await stat(d.file);
+			const sum = await fileSha256(d.file);
+			out.push({ ...d, size: st.size, sha256: sum, ...(sum === d.sha256 ? {} : { imageId: undefined }) });
+		} catch {
+			out.push(d);
+		}
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------------
+// The base bundle's UP and SMP kernels.
+
+const splits = new Map<string, Promise<{ up: Uint8Array; smp: Uint8Array | null }>>();
+
+/**
+ * The base bundle `src` without its SMP patch section (byte for byte `src`
+ * when it has none) and the SMP bundle the patch makes (null without one);
+ * once per process and file unless `again`.
+ */
+export function baseSplit(src: string, again = false): Promise<{ up: Uint8Array; smp: Uint8Array | null }> {
+	if (again) splits.delete(src);
+	let p = splits.get(src);
+	if (!p) splits.set(src, p = (async () => {
+		const bytes = new Uint8Array(await readFile(src));
+		const up = withoutSmpPatch(bytes);
+		if (up === bytes) return { up, smp: null };
 		const smp = await smpKernelFromBundle(bytes);
-		if (!smp) throw new Error(`${ASSET}: an SMP patch section that makes no kernel`);
-		await writeIfChanged(PAGE_SMP_FILE, smp);
-		log(`SMP patch: UP ${(up.length / 1048576).toFixed(1)} MiB and SMP ${(smp.length / 1048576).toFixed(1)} MiB bundles in web/kernel/page/`);
-		return { smp: true };
+		if (!smp) throw new Error(`${src}: an SMP patch section that makes no kernel`);
+		log(`SMP patch of ${rel(src)}: UP ${mib(up.length)} and SMP ${mib(smp.length)} bundles`);
+		return { up, smp };
 	})());
+	return p;
+}
+
+/**
+ * The dev server: baseSplit() written to web/kernel/page/<16 hex digits of
+ * the bundle's sha256>/ (unkernel.wasm, unkernel-smp.wasm), so dev servers
+ * of different bundles never overwrite each other's files. The four
+ * directories used last are kept.
+ */
+export async function splitBase(src: string, again = false): Promise<{ up: string; smp: string | null }> {
+	const { up, smp } = await baseSplit(src, again);
+	const dir = path.join(PAGE_DIR, sha256(new Uint8Array(await readFile(src))).slice(0, 16));
+	await mkdir(dir, { recursive: true });
+	const files = { up: path.join(dir, BASE_ASSET), smp: smp ? path.join(dir, "unkernel-smp.wasm") : null };
+	await writeIfChanged(files.up, up);
+	if (files.smp) await writeIfChanged(files.smp, smp!);
+	const now = new Date();
+	await utimes(dir, now, now);
+	const dirs: { d: string; t: number }[] = [];
+	for (const e of await readdir(PAGE_DIR, { withFileTypes: true })) {
+		if (e.isDirectory() && /^[0-9a-f]{16}$/.test(e.name)) dirs.push({ d: path.join(PAGE_DIR, e.name), t: (await stat(path.join(PAGE_DIR, e.name))).mtimeMs });
+	}
+	for (const { d } of dirs.sort((a, b) => b.t - a.t).slice(4)) await rm(d, { recursive: true, force: true });
+	return files;
 }

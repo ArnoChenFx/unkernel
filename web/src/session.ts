@@ -38,6 +38,14 @@ export interface SessionMeta {
 	screen?: string;
 	/** Saved in worker mode (either mode can resume it). */
 	worker: boolean;
+	/**
+	 * The distro image it ran on (its name and URL; a build's URL names the
+	 * image's content), or null (?distro=none). A session resumes only on
+	 * the same one; inline the image's content is checked too
+	 * (snapshotDiskMismatch(), the snapshot's first disk), in worker mode the
+	 * worker checks it.
+	 */
+	distro?: { name: string; url: string } | null;
 }
 
 export interface SessionDevices {
@@ -107,9 +115,14 @@ export async function clearSession(): Promise<void> {
 	await run("readwrite", (s) => { s.clear(); });
 }
 
-/** Why `m` cannot be resumed with these options and this kernel, or null if it can. */
-export function sessionMismatch(m: SessionMeta, kernelUrl: string, devices: SessionDevices): string | null {
+/** Why `m` cannot be resumed with these options, this kernel and this distro image, or null if it can. */
+export function sessionMismatch(m: SessionMeta, kernelUrl: string, devices: SessionDevices, distro: { name: string; url: string } | null): string | null {
 	if (m.kernelUrl !== kernelUrl) return "it was saved by another kernel release";
+	const was = m.distro ?? null;
+	if ((was?.url ?? null) !== (distro?.url ?? null)) {
+		if (was && distro && was.name === distro.name) return `it was saved on another build of the ${was.name} image (${was.url}; now ${distro.url})`;
+		return `it was saved on ${was ? `the ${was.name} image` : "no distro image"}, this boot runs ${distro ? `the ${distro.name} image` : "none"} (Options, Distro)`;
+	}
 	const names: Record<keyof SessionDevices, string> = { display: "Display", sound: "Sound", net: "Network", data: "Data disk" };
 	for (const k of Object.keys(names) as Array<keyof SessionDevices>)
 		if (m.devices[k] !== devices[k]) return `it was saved with ${names[k]} ${m.devices[k] ? "on" : "off"} (Options)`;

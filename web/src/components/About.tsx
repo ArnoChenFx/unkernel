@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The About dialog: credits and the build (vite.config.ts's __KW_BUILD__),
+// The About dialog: credits and the build (vite.config.ts's __KW_BUILD__:
+// the base bundle's Linux release and where it came from; the distro image,
+// the store's distro),
 // opened by the triangle in the status line (the ⋯ menu's About on narrow
 // screens) or the prefix, a (shortcuts.ts). A native
 // modal <dialog> like Confirm (Overlays.tsx): Esc closes it, the page under
@@ -8,6 +10,7 @@
 import { useRef, type ReactNode } from "react";
 import { REPO } from "../config.ts";
 import { KW } from "../kw.ts";
+import { useStore } from "../store.ts";
 import { PREFIX } from "../shortcuts.ts";
 
 const B = __KW_BUILD__;
@@ -45,6 +48,7 @@ export function About({ hint, className = "" }: { hint?: ReactNode; className?: 
 	const ref = useRef<HTMLDialogElement>(null);
 	const close = () => ref.current?.close();
 	const commit = B.commit.slice(0, 7);
+	const distro = useStore((s) => s.distro);
 	return (
 		<>
 			<button id="bar-about" type="button" title={`About unkernel (${PREFIX} a)`} aria-label="About unkernel" aria-haspopup="dialog"
@@ -61,6 +65,7 @@ export function About({ hint, className = "" }: { hint?: ReactNode; className?: 
 					<dl className="mt-4 grid grid-cols-[8ch_1fr] gap-x-4 gap-y-1 tabular-nums">
 						<Row k="source"><A href={REPO}>github.com/pithings/unkernel</A></Row>
 						<Row k="kernel">Linux {B.linux || "?"}{B.kernel && <span className="text-faint">, {B.kernel === "local" ? "local build" : <A href={`${REPO}/releases/tag/${B.kernel}`}>{B.kernel}</A>}</span>}</Row>
+						<Row k="distro">{distro ? <>{distro.image || distro.name}<span className="text-faint">, {distro.url}</span></> : "none (base shell)"}</Row>
 						<Row k="commit">{commit ? <A href={`${REPO}/commit/${B.commit}`}>{commit}</A> : "dev"}{B.date && <span className="text-faint">, {day(B.date)}</span>}</Row>
 					</dl>
 					<footer className="mt-4 border-t border-line pt-3">

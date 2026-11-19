@@ -10,13 +10,16 @@
 //   copy. So a README the user edited stays as it is, and one they deleted
 //   stays deleted.
 // - On the overlay root both live in the upper layer, so this happens once
-//   per data disk; with ?data=0 (or in safe mode) once per boot.
+//   per data disk and distro; with ?data=0 (or in safe mode) once per boot.
 // - Failures are logged and otherwise ignored.
+// - Written for Alpine (apk, kw-apk-install, qemu-user): boot.ts calls it only
+//   on the alpine image; `upper` is where the root's changes live
+//   (/data/distros/alpine/upper).
 
 import { REPO } from "./config.ts";
 import type { KernelHandle } from "./sdk.ts";
 
-const TEXT = `Welcome to unkernel
+const text = (upper: string) => `Welcome to unkernel
 ===================
 
 This is a Linux 7.3 kernel compiled to WebAssembly, running in your
@@ -65,11 +68,11 @@ Your changes persist
 
 The root file system is an overlay on a disk kept in your browser
 (IndexedDB), so everything you change survives a reload. If a change
-stops the system from booting, it starts in safe mode instead: your
-changes stay in /data/overlay/upper, where you can fix them, and
-"kw-overlay restore" boots with them again ("kw-overlay status" says
-more, "kw-overlay discard" starts over from the image). Open the page
-with ?data=0 for a fresh system every time.
+stops the system from booting, that boot runs in safe mode instead:
+your changes stay in ${upper}, where you can fix
+them, and every boot tries them again ("kw-overlay status" says more,
+"kw-overlay discard" sets them aside and starts over from the image).
+Open the page with ?data=0 for a fresh system every time.
 
 Limits
 ------
@@ -103,9 +106,9 @@ mkdir -p "\${s%/*}"
 echo "$new" > "$s"
 echo written`;
 
-export async function writeReadme(vm: KernelHandle, log: (m: string) => void): Promise<void> {
+export async function writeReadme(vm: KernelHandle, log: (m: string) => void, { upper = "/data/distros/alpine/upper" }: { upper?: string } = {}): Promise<void> {
 	try {
-		const r = await vm.exec("/bin/sh", ["-c", WRITE_SH], { input: TEXT });
+		const r = await vm.exec("/bin/sh", ["-c", WRITE_SH], { input: text(upper) });
 		if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `exit ${r.exitCode}`);
 		if (r.stdout.trim() === "written") log("[readme] wrote /root/README");
 	} catch (e) {

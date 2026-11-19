@@ -6,7 +6,7 @@
 // React components (components/) render. Also the actions those components
 // run: Copy diagnostics, the data disk buttons, the key bar, paste, font size.
 import { flushSync } from "react-dom";
-import { DEFAULT_CMDLINE, type Config } from "./config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, type Config } from "./config.ts";
 import { KW, type KWError } from "./kw.ts";
 import { initStore, type Ask, type PadLayout, type CheckResult, type Options, type State, type Tab, type UiState } from "./store.ts";
 
@@ -110,18 +110,22 @@ export function createUi(cfg: Config) {
 		root: cfg.root === "initramfs" ? "safe" : "overlay",
 		worker: cfg.workerParam ? "on" : "off",
 		cpus: String(cfg.smpParam),
+		distro: cfg.distroParam,
 		fx: cfg.fx ? "on" : "off",
 	};
+	// Where the root's changes live on the data disk: per distro (guest/base/initramfs/init).
+	const upperDir = `/data/distros/${cfg.guest}/upper`;
+	const imageName = `${cfg.guest} image`;
 	const $ = initStore({
 		state: "checking", label: LABEL.checking, suspended: false,
 		splash: { title: "Starting", msg: "Loading the page scripts…", hidden: false, error: false, details: false },
 		checks: [], errors: [], fatal: null,
 		panelOpen: false, tab: "status", toast: null,
 		dataStatus: "Not attached yet.", disk: null,
-		safeNote: cfg.root === "initramfs"
-			? "Safe mode: the root is the plain image (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in /data/overlay/upper. kw-overlay status explains, kw-overlay discard starts over from the image."
+		safeNote: cfg.root === "initramfs" && cfg.distro
+			? `Safe mode: the root is the plain ${imageName} (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in ${upperDir}. kw-overlay status explains, kw-overlay discard starts over from the image.`
 			: null,
-		resetNote: null,
+		distro: cfg.distro ? { name: cfg.distro.name, image: cfg.distro.imageId ?? "", url: cfg.distro.url } : null,
 		ctrl: false, keysOn: false, pasteOpen: false, ask: null, prefix: false,
 		fontPref, fontSize: cfg.fontSize, copyText: null,
 		display: { attached: false, shown: true, width: 0, height: 0, keyboard: false, mouse: false, tablet: false,
@@ -300,24 +304,33 @@ export function createUi(cfg: Config) {
 			const d = $.get().disk;
 			if (d?.used !== used || d.size !== size || d.saved !== saved) $.set({ disk: { used, size, saved } });
 		},
-		/** The guest fell back to safe mode by itself (boot.ts saw "kw-overlay: SAFE MODE: <reason>"). */
+		/**
+		 * The base fell back to safe mode for this boot (boot.ts saw "kw-overlay: SAFE MODE: <reason>"):
+		 * the root with the changes failed its check, so this boot runs the plain image. Each boot checks again.
+		 */
 		safeMode(reason: string) {
 			$.set({
-				safeNote: `Safe mode: ${reason}. This boot runs the plain image; your changes to the root are kept, unused, in /data/overlay/upper. ` +
-					"Fix them there, then run kw-overlay restore and reboot (kw-overlay status explains, kw-overlay discard starts over).",
+				safeNote: `Safe mode: ${reason}. This boot runs the plain ${imageName}; your changes to the root are kept, unused, in ${upperDir}. ` +
+					"Fix them there and reboot: each boot tries them again (kw-overlay status explains, kw-overlay discard sets them aside and starts over from the image).",
 			});
 			ui.check("overlay", "Root", "warn", "safe mode", reason);
-			ui.toast(`Safe mode: ${reason}. Root changes are paused; kw-overlay restore brings them back.`);
+			ui.toast(`Safe mode: ${reason}. Your root changes are kept but unused this boot; fix them and reboot.`);
 		},
 
 		/**
-		 * The guest reset the data disk, written by a guest of another architecture, keeping only /root
-		 * (boot.ts saw "kw-data: RESET: <note>").
+		 * The base found no distro to boot and started its base shell (boot.ts
+		 * saw "unkernel base shell (...): <reason>").
 		 */
-		archReset(note: string) {
-			$.set({ resetNote: note });
-			ui.check("arch-reset","Data disk reset", "warn", /\/root was kept/.test(note) ? "at this boot, /root kept" : "at this boot", note);
-			ui.toast(note);
+		baseShell(reason: string) {
+			if (cfg.distro) {
+				ui.check("overlay", "Root", "warn", "base shell", `the ${cfg.distro.name} image did not boot: ${reason}`);
+				KW.report("distro", `The ${cfg.distro.name} image did not boot (${reason}): this is the base shell. Reboot, or pick another distro under Options.`, "", false);
+			} else ui.check("overlay", "Root", "info", "base shell", `no distro (?distro=none): ${reason}`);
+		},
+		/** What the guest says it booted (/run/kw-base; boot.ts). */
+		distroBooted(image: string) {
+			const d = $.get().distro;
+			if (d && image && d.image !== image) $.set({ distro: { ...d, image } });
 		},
 
 		diagText,
@@ -393,7 +406,7 @@ export function createUi(cfg: Config) {
 		L.push(`unkernel diagnostics, ${new Date().toISOString()}`);
 		L.push(`url: ${location.href}`);
 		L.push(`state: ${s.state} (${s.label}) after ${fmtT(now())}`);
-		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.cpus > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}${cfg.smpParam > 1 ? ` cpus=${cfg.cpus}${cfg.smpWhy ? ` (asked ${cfg.smpParam}: ${cfg.smpWhy})` : ""}` : ""}`);
+		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.cpus > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl} distro=${cfg.guest}${s.distro ? ` image=${s.distro.image || "?"} (${s.distro.url})` : ""} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}${cfg.smpParam > 1 ? ` cpus=${cfg.cpus}${cfg.smpWhy ? ` (asked ${cfg.smpParam}: ${cfg.smpWhy})` : ""}` : ""}`);
 		L.push("", "== stages");
 		for (const [id] of STAGES) {
 			const st = stages[id]!;
@@ -449,6 +462,7 @@ export function createUi(cfg: Config) {
 		set("root", o.root === "safe" ? "initramfs" : null);
 		set("worker", o.worker === "on" ? "1" : null);
 		set("smp", o.cpus === "1" ? null : o.cpus);
+		set("distro", o.distro === DEFAULT_DISTRO ? null : o.distro);
 		if (o.fx === "off") set("fx", null);
 		else if (!cfg.fx) set("fx", "1"); // an existing ?fx (any value but 0) stays as written
 		// URLSearchParams writes a bare ?fx as fx=: keep it bare, so the URL stays as given.
@@ -456,6 +470,8 @@ export function createUi(cfg: Config) {
 		return location.pathname + (q ? `?${q}` : "");
 	}
 	let rebooting = false;
+	/** A data disk reset or import is running (dataAction); it ends in a reload. */
+	let dataBusy = false;
 	function reboot() {
 		const url = rebootUrl();
 		const go = () => {
@@ -463,6 +479,8 @@ export function createUi(cfg: Config) {
 			else location.assign(url);
 		};
 		if (rebooting) return;
+		// A reset or import in progress reloads the page itself; a reload now would cut it off.
+		if (dataBusy) { ui.toast("The data disk is being replaced; the page reloads when it is done"); return; }
 		rebooting = true;
 		// Let the guest write its file systems back to the saved disks first
 		// (boot.ts: KW.sync, at most 3 s).
@@ -476,7 +494,9 @@ export function createUi(cfg: Config) {
 	// The actions live in boot.ts (KW.exportData / importData / resetData).
 	function dataAction(name: "exportData" | "importData" | "resetData", run: () => Promise<unknown>) {
 		if (!KW[name]) { ui.toast("The data disk is not ready yet"); return; }
-		run().catch((e: Error) => KW.report("data", `Data disk: ${e?.message ?? String(e)}`, e?.stack ?? "", false));
+		if (dataBusy) { ui.toast("The data disk is busy; wait for it to finish"); return; }
+		dataBusy = name !== "exportData";
+		run().finally(() => { dataBusy = false; }).catch((e: Error) => KW.report("data", `Data disk: ${e?.message ?? String(e)}`, e?.stack ?? "", false));
 	}
 	function dataExport() {
 		dataAction("exportData", async () => {
@@ -494,14 +514,14 @@ export function createUi(cfg: Config) {
 	}
 	async function dataReset() {
 		if (!await ui.ask({ title: "reset data disk", msg: "Everything in /data is deleted, and the page reloads.", ok: "Reset", danger: true })) return;
-		dataAction("resetData", () => KW.resetData!());
+		dataAction("resetData", () => { ui.toast("Resetting the data disk… the page reloads when it is done"); return KW.resetData!(); });
 	}
 	// Safe mode: one boot on the plain image root (kw.root=initramfs), with
 	// /data still mounted, to repair or turn off an overlay root (kw-overlay).
 	async function safeModeToggle() {
 		const state = $.get().state;
 		if (cfg.root !== "initramfs" && (state === "running" || state === "booting") &&
-			!await ui.ask({ title: "safe mode", msg: "Reboot on the plain image root: your root changes on /data are not used. /data stays mounted.", ok: "Reboot" })) return;
+			!await ui.ask({ title: "safe mode", msg: `Reboot on the plain ${imageName} as the root: your root changes on /data are not used. /data stays mounted.`, ok: "Reboot" })) return;
 		ui.setOption("root", cfg.root === "initramfs" ? "overlay" : "safe");
 		reboot();
 	}

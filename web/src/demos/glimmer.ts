@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// glimmer: the image's framebuffer game (kernel/guest/glimmer.c).
+// glimmer: the framebuffer game every distro image has (guest/src/glimmer.c).
 import type { Demo } from "../launcher.ts";
 
 export default {
@@ -12,7 +12,7 @@ export default {
 	colors: ["#7c3aed", "#ec4899"],
 	needs: { display: true },
 	files: {
-		"README": "glimmer: a small game in the image (/usr/bin/glimmer, kernel/guest/glimmer.c).\n" +
+		"README": "glimmer: a small game in every distro image (/usr/bin/glimmer, guest/src/glimmer.c).\n" +
 			"It draws on /dev/fb0 (kwfb), reads the keyboard and mouse through evdev (kwinput)\n" +
 			"and plays sound through ALSA when there is a sound card.\n\n" +
 			"M or Tab mutes. The status line's fb item switches between the picture and this shell.\n" +

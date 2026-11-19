@@ -220,5 +220,5 @@ async function attachTarget(target, name, { shots } = {}) {
 	return page;
 }
 
-/** The Alpine prompt is "~ ⇒ " (kw-prompt.sh in kernel/guest/alpine.sh). */
+/** The prompt is "~ ⇒ " (each distro's rootfs/etc/profile.d/kw-prompt.sh under guest/distro/), or a plain one ending in :~# or :~$. */
 export const PROMPT = /(:~[#$]|⇒)\s*$/m;

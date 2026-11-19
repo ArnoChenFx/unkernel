@@ -15,6 +15,6 @@ export default {
 	colors: ["#3f3f46", "#09090b"],
 	// Left out of the launcher: the status line's fx button runs fx in the page (fx.ts). ?demo=fx still runs this.
 	hidden: true,
-	needs: { net: true },
+	needs: { net: true, alpine: true },
 	commands: ["fx"],
 } satisfies Demo;

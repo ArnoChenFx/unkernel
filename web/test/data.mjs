@@ -8,21 +8,24 @@
 //
 // Runs against the built output (web/.output, `pnpm build:web` first), or
 // with --dev against the Vite dev server. One fresh browser profile, page
-// loads of the default page (the bundle, which carries the data disk
-// template):
+// loads of the page with ?distro=alpine (the base bundle, which carries the
+// data disk template, with the alpine image; the default is debian):
 //   1. first boot: the data disk is created from the template; mount it by
 //      label (mount LABEL=kwdata), write a marker and an N MiB file, sync.
 //      Also the guest's own /data mount and the overlay root (its changes
-//      live on /data), and that KW.sync() (IRQ 4) alone saves a file
-//      written with the guest's writeback slowed down.
+//      live on /data/distros/alpine/upper), and that KW.sync() (IRQ 4)
+//      alone saves a file written with the guest's writeback slowed down.
 //   2. reload: the files are still there, the disk opened lazily (no block
 //      data in memory at boot), and a file written under /etc survives
-//      another reload. Safe mode (?root=initramfs) boots the plain root
-//      with /data mounted, and the reload after it the overlay again.
-//   2b. a broken root: /etc/profile ends in `exit`, so the console shell
-//      keeps exiting; the guest says so, the reload after it boots safe
-//      mode by itself (the plain image, changes kept; the page explains),
-//      and `kw-overlay restore` after a repair brings the overlay root back.
+//      another reload. Safe mode (?root=initramfs) boots the plain image
+//      (a tmpfs upper) with /data mounted, and the reload after it the
+//      overlay on the data disk again.
+//   2b. a broken root: /sbin/init deleted, so the base's check of the root
+//      with the changes fails and the reload boots safe mode by itself for
+//      that boot (the plain image, changes kept; the page explains); after
+//      the repair on /data the next boot uses the changes again.
+//   2c. ?distro=debian (when the page has the image): its changes live in
+//      /data/distros/debian/, apart from Alpine's, and survive a reload.
 //   3. a second tab while the first is open: it gets an in-memory snapshot
 //      (and says so), with the saved files; its writes are not saved.
 //   4. export (KW.exportData, a download) and reset (KW.resetData): the
@@ -46,6 +49,8 @@ const check = (name, ok, detail = "") => {
 
 const MOUNT = "mkdir -p /mnt/kwdata; mountpoint -q /mnt/kwdata || mount LABEL=kwdata /mnt/kwdata";
 const ROOT = "awk '$2 == \"/\" { t = $3 } END { print t }' /proc/mounts";
+/** The upper layer this boot uses (data, tmpfs or none) and why, from the base (guest/base/initramfs/init). */
+const BASE = "sed -n 's/^upper=//p; s/^why=//p' /run/kw-base";
 const diskInfo = (p) => p.evaluate(`JSON.stringify(KW.dataDisk && { persistent: KW.dataDisk.persistent, seeded: !!KW.dataDisk.seeded,
 	stored: KW.dataDisk.stored.size, mem: KW.dataDisk.mem.size, memBytes: KW.dataDisk.memBytes, notice: KW.dataDisk.notice ?? null,
 	stats: KW.dataDisk.stats, size: KW.dataDisk.size })`).then((s) => (s ? JSON.parse(s) : null));
@@ -53,6 +58,8 @@ const panelText = (p) => p.evaluate("document.getElementById('data-status').text
 
 const port = 23000 + Math.floor(Math.random() * 1000);
 const base = `http://127.0.0.1:${port}/`;
+/** The page on the alpine image (the default is debian): these checks name Alpine's upper layer. */
+const home = `${base}?distro=alpine`;
 const downloads = mkdtempSync(path.join(tmpdir(), "kw-data-dl-"));
 const server = await startServer({ port, host: "127.0.0.1" });
 console.log(`server: ${server.kind}, ${base}`);
@@ -65,14 +72,10 @@ try {
 		await p.goto(url);
 		await sleep(500);
 		await shell(p);
-		// bootwatch confirms the idle prompt (two samples 0.25 s apart) and
-		// clears the boot attempt count; two boots in a row reloaded before
-		// that count as failed and the next one is safe mode.
-		await sleep(1000);
 	};
 
 	console.log("== 1. first boot: the data disk is created from the template");
-	await load(a, base);
+	await load(a, home);
 	let info = await diskInfo(a);
 	check("data disk attached persistently, created from the template", info?.persistent && info.seeded && info.size === 4 * 1024 ** 3,
 		JSON.stringify(info && { stored: info.stored, size: info.size }));
@@ -98,7 +101,7 @@ try {
 	check("KW.sync() (the SDK's sync()) is confirmed by the kernel", r.rc === 0 && synced === true, String(synced));
 
 	console.log("== 2. reload: the files persist, the disk opens lazily");
-	await load(a, base);
+	await load(a, home);
 	info = await diskInfo(a);
 	check("reattached without seeding, nothing loaded at boot", info.persistent && !info.seeded && info.stored > TEMPLATE_BLOCKS + mb * 256,
 		`${info.stored} stored, ${info.mem} in memory, ${info.stats.storeBlocksRead} blocks read so far`);
@@ -106,48 +109,58 @@ try {
 	check("marker and file survive the reload", r.out.includes(marker) && r.out.includes(md5), r.out.replace(/\n/g, " | "));
 	r = await a.run("cat /root/unsynced.txt");
 	check("a file written without a guest sync survives (KW.sync)", r.out.includes(marker), r.out);
-	r = await a.run(`${ROOT}; echo ${marker} > /etc/kw-overlay-test; sync`);
-	check("overlay: / is the overlay, write /etc/kw-overlay-test", r.rc === 0 && /^overlay$/m.test(r.out), r.out.replace(/\n/g, " | "));
+	r = await a.run(`${ROOT}; echo ${marker} > /etc/kw-overlay-test; sync; cat /data/distros/alpine/upper/etc/kw-overlay-test`);
+	check("overlay: / is the overlay, /etc/kw-overlay-test lands in /data/distros/alpine/upper", r.rc === 0 && /^overlay$/m.test(r.out) && r.out.includes(marker),
+		r.out.replace(/\n/g, " | "));
 	await a.evaluate("KW.sync({ timeout: 2000 })");
-	await load(a, base);
+	await load(a, home);
 	r = await a.run(`${ROOT}; cat /etc/kw-overlay-test`);
 	check("overlay: /etc/kw-overlay-test survives a reload", /^overlay$/m.test(r.out) && r.out.includes(marker), r.out.replace(/\n/g, " | "));
 
-	await load(a, `${base}?root=initramfs`);
-	r = await a.run(`${ROOT}; grep ' /data ' /proc/mounts | cut -d' ' -f3; cat /etc/kw-overlay-test 2>&1 | head -1`);
+	await load(a, `${home}&root=initramfs`);
+	r = await a.run(`${BASE}; grep ' /data ' /proc/mounts | cut -d' ' -f3; cat /etc/kw-overlay-test 2>&1 | head -1`);
 	const safeBtn = await a.evaluate("document.getElementById('data-safe').textContent");
-	check("safe mode (?root=initramfs): the plain root, /data mounted", /^(rootfs|tmpfs|ramfs)$/m.test(r.out) && /^ext4$/m.test(r.out) &&
-		!r.out.includes(marker) && safeBtn === "Leave safe mode", `${r.out.replace(/\n/g, " | ")}; button "${safeBtn}"`);
-	await load(a, base);
-	r = await a.run(`${ROOT}`);
-	check("after safe mode: the overlay root again", /^overlay$/m.test(r.out), r.out.replace(/\n/g, " | "));
+	check("safe mode (?root=initramfs): the plain image (tmpfs upper), /data mounted", /^tmpfs$/m.test(r.out) && /^kw\.root=initramfs$/m.test(r.out) &&
+		/^ext4$/m.test(r.out) && !r.out.includes(marker) && safeBtn === "Leave safe mode", `${r.out.replace(/\n/g, " | ")}; button "${safeBtn}"`);
+	await load(a, home);
+	r = await a.run(`${BASE}; cat /etc/kw-overlay-test`);
+	check("after safe mode: the changes on the data disk again", /^data$/m.test(r.out) && r.out.includes(marker), r.out.replace(/\n/g, " | "));
 
-	console.log("== 2b. a broken root recovers through safe mode");
-	r = await a.run("echo exit >> /etc/profile; sync");
+	console.log("== 2b. a broken root: safe mode for that boot, the changes back once repaired");
+	r = await a.run("rm /sbin/init; sync");
 	await a.evaluate("KW.sync({ timeout: 2000 })");
-	await a.goto(base);
-	await sleep(500);
-	await a.waitScreen(/console shell keeps exiting/, "the respawn-loop report", 90000);
-	check("broken /etc/profile: the guest reports the respawn loop", true);
-	await sleep(1500); // /data/overlay/safe reaches IndexedDB (sync -f)
-	await load(a, base);
+	await load(a, home);
 	const scr = await a.screen();
-	check("the reload boots safe mode, with the reason", /SAFE MODE/.test(scr) && /kept exiting before its prompt/.test(scr),
+	check("the reload boots safe mode, with the reason", /SAFE MODE/.test(scr) && /\/sbin\/init is missing/.test(scr),
 		scr.split("\n").filter((l) => /kw-overlay|SAFE/.test(l)).join(" | "));
 	const note = await a.evaluate("(() => { const n = document.getElementById('data-safe-note'); return n.hidden ? '' : n.textContent; })()");
-	check("the page explains safe mode and kw-overlay restore", /kept exiting/.test(note) && /kw-overlay restore/.test(note), note);
-	r = await a.run(`${ROOT}; cat /data/overlay/upper/etc/kw-overlay-test; rm /data/overlay/upper/etc/profile; kw-overlay restore`);
-	check("safe mode: plain root, changes kept, kw-overlay restore", /^(rootfs|tmpfs|ramfs)$/m.test(r.out) && r.out.includes(marker) && /uses your changes/.test(r.out),
+	check("the page explains safe mode", /\/sbin\/init is missing/.test(note) && note.includes("/data/distros/alpine/upper") && /each boot tries them again/.test(note), note);
+	r = await a.run(`${BASE}; cat /data/distros/alpine/upper/etc/kw-overlay-test; rm /data/distros/alpine/upper/sbin/init; sync`);
+	check("safe mode: a tmpfs upper, the changes kept on /data", /^tmpfs$/m.test(r.out) && /^safe mode: /m.test(r.out) && r.out.includes(marker),
 		r.out.replace(/\n/g, " | "));
 	await a.evaluate("KW.sync({ timeout: 2000 })");
-	await load(a, base);
-	r = await a.run(`${MOUNT}; ${ROOT}; cat /etc/kw-overlay-test`); // step 3 uses the mount
-	check("after the repair: the overlay root again, with the changes", /^overlay$/m.test(r.out) && r.out.includes(marker), r.out.replace(/\n/g, " | "));
+	await load(a, home);
+	r = await a.run(`${MOUNT}; ${BASE}; cat /etc/kw-overlay-test`); // step 3 uses the mount
+	check("after the repair: the changes on the data disk again", /^data$/m.test(r.out) && r.out.includes(marker), r.out.replace(/\n/g, " | "));
+
+	if (await a.evaluate("!!document.getElementById('opt-distro-debian')")) {
+		console.log("== 2c. another distro keeps its own changes");
+		await load(a, `${base}?distro=debian`);
+		r = await a.run(`cat /usr/lib/kw-distro; ${BASE}; cat /etc/kw-overlay-test 2>&1 | head -1; echo deb-${marker} > /etc/kw-overlay-test-debian; sync`);
+		check("debian: its own upper, Alpine's change not there", /^debian$/m.test(r.out) && /^data$/m.test(r.out) && !r.out.includes(`\n${marker}`), r.out.replace(/\n/g, " | "));
+		await a.evaluate("KW.sync({ timeout: 2000 })");
+		await load(a, `${base}?distro=debian`);
+		r = await a.run("cat /etc/kw-overlay-test-debian; ls /data/distros | tr '\\n' ' '");
+		check("debian: its change survives a reload, /data/distros has both", r.out.includes(`deb-${marker}`) && /alpine debian/.test(r.out), r.out.replace(/\n/g, " | "));
+		await load(a, home);
+		r = await a.run(`${MOUNT}; cat /etc/kw-overlay-test; cat /etc/kw-overlay-test-debian 2>&1 | head -1`);
+		check("alpine again: its change, not Debian's", r.out.includes(marker) && !r.out.includes(`deb-${marker}`), r.out.replace(/\n/g, " | "));
+	}
 
 	console.log("== 3. a second tab gets an unsaved snapshot");
 	const b = await a.newTab("data-tab2");
 	try {
-		await load(b, base);
+		await load(b, home);
 		info = await diskInfo(b);
 		check("second tab: not persistent, with a notice", info && !info.persistent && /another tab/.test(await b.screen()), info?.notice);
 		const chk = await panelText(b);
@@ -190,7 +203,7 @@ try {
 	}
 
 	console.log("== 5. ?data=0");
-	await load(a, `${base}?data=0`);
+	await load(a, `${home}&data=0`);
 	info = await diskInfo(a);
 	r = await a.run("findfs LABEL=kwdata || echo none");
 	check("?data=0: no data disk", info === null && /none/.test(r.out), r.out);

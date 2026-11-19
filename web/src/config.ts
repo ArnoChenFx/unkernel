@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The page's configuration, from its URL. The kernel is always the page's
-// own unkernel-alpine.wasm (sdk.ts), with Alpine bundled. Each parameter
+// The page's configuration, from its URL. The kernel is the page's own
+// (sdk.ts): the base bundle unkernel.wasm, with the distro image ?distro=
+// picks (virtual:unkernel-kernel's list) attached read-only. Each parameter
 // except ?simulate, ?demo and ?showcase has a control under Options in the status panel
 // (ui.ts), which rebuilds the URL on Reboot (keeping the others).
 //
@@ -34,6 +35,10 @@
 //                                      /dev/dsp (kwsnd, playback), played with Web Audio
 //                                      (audio.ts; try `glimmer`). Nothing runs until a program
 //                                      plays; the first tap or key press after that unmutes.
+//   ?distro=<name> | ?distro=none     the distro image to boot (default debian, else the first;
+//                                      an unknown name boots the default and says so; none: no
+//                                      image, the base shell). Its changes to the root
+//                                      live in /data/distros/<name>/ on the data disk.
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
 //                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
@@ -54,7 +59,7 @@
 //                                      of its own on one shared memory; implies ?worker=1 (CPU 0
 //                                      blocks while it waits for another CPU, which a page's main
 //                                      thread may not). Needs the page's SMP kernel (sdk.ts
-//                                      kernelSmpUrl: a release bundle with an SMP patch) and
+//                                      kernelSmpUrl: a base bundle with an SMP patch) and
 //                                      cross-origin isolation (https or localhost); otherwise, or
 //                                      when the SMP kernel fails to load or start, the page boots
 //                                      on one CPU as usual (smpBlocker(), boot.ts). No Suspend.
@@ -71,6 +76,22 @@
 //                                      read in launcher.ts
 //   ?simulate=nojspi,oom,lowmem        fake a failure (for tests)
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
+import { distros as DISTROS } from "virtual:unkernel-kernel";
+
+/** A distro image the page offers (virtual:unkernel-kernel). */
+export interface DistroEntry {
+	name: string;
+	/** On the page's origin, read with Range requests (in a build, a name with its sha256: immutable). */
+	url: string;
+	size: number;
+	/** Its /usr/lib/kw-image where the list knows it (else boot.ts reads it from the guest). */
+	imageId?: string;
+}
+
+/** The images offered, debian first. */
+export const DISTROS_OFFERED: readonly DistroEntry[] = DISTROS;
+/** The ?distro= default. */
+export const DEFAULT_DISTRO = DISTROS_OFFERED.find((d) => d.name === "debian")?.name ?? DISTROS_OFFERED[0]?.name ?? "none";
 
 /** The project's source, linked from About and the boot notes. */
 export const REPO = "https://github.com/pithings/unkernel";
@@ -79,7 +100,18 @@ export const REPO = "https://github.com/pithings/unkernel";
 export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 
 export interface Config {
+	/** The kernel this page boots on one CPU: the base bundle unkernel.wasm (its UP kernel). */
 	kernelUrl: string;
+	/** The image this load boots, or null (?distro=none). */
+	distro: DistroEntry | null;
+	/** The Distro option: an image's name or "none". */
+	distroParam: string;
+	/** Why this load does not boot what ?distro= asked for, or null. */
+	distroWhy: string | null;
+	/** The user space this load runs: the image's name ("alpine", "debian", ...), or "none" (the base shell). */
+	guest: string;
+	/** ?append= as given, or null (the kernel bundle's own command line then, boot.ts). */
+	append: string | null;
 	memMiB: number;
 	memWhy: string;
 	/** What auto would pick on this device, even when ?mem= is given. */
@@ -148,7 +180,7 @@ export const MAX_CPUS = 8;
  * that cannot start CPUs boots the SMP kernel on one CPU (boot.ts says so).
  */
 export function smpBlocker(): string | null {
-	if (!kernelSmpUrl) return "this page's kernel has no SMP build (its release bundle carries no SMP patch)";
+	if (!kernelSmpUrl) return "this page's kernel has no SMP build (its base bundle carries no SMP patch: kernel/build.sh smp, then base)";
 	const why = webCpuBlocker({ worker: true });
 	if (why) return why;
 	if ((navigator.hardwareConcurrency || 1) < 2) return "this device reports a single CPU thread";
@@ -192,8 +224,21 @@ export function readConfig(search: string = location.search): Config {
 	const smpWhy = smpParam < 2 ? null : smpBlocked ?? upOnce;
 	const cpus = smpWhy ? 1 : Math.min(smpParam, cpuMax);
 	const workerParam = params.get("worker") === "1";
+	// The distro: one of the images ("none": the base shell).
+	const distroAsked = params.get("distro");
+	let distroParam = DEFAULT_DISTRO, distroWhy: string | null = null;
+	const names = DISTROS_OFFERED.map((d) => d.name);
+	if (distroAsked === "none") distroParam = "none";
+	else if (distroAsked && names.includes(distroAsked)) distroParam = distroAsked;
+	else if (distroAsked) distroWhy = `?distro=${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
+	const distro = DISTROS_OFFERED.find((d) => d.name === distroParam) ?? null;
 	return {
 		kernelUrl: kernelUrl.pathname,
+		distro,
+		distroParam,
+		distroWhy,
+		guest: distro?.name ?? "none",
+		append: append || null,
 		memMiB: fixed ? Number(memParam) : auto.mib,
 		memWhy: fixed ? `?mem=${memParam}` : auto.why,
 		memAutoMiB: auto.mib,

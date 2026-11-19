@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa
 // Stand-ins for fx, claude and opencode in ~/.local/bin, written by the page
 // through vm.exec() once user space runs (boot.ts passes the texts: kw-shim.sh
-// and kernel/guest/kw-path.sh). A stand-in (kw-shim.sh, described at its top)
+// and guest/base/rootfs/etc/profile.d/kw-path.sh). A stand-in (kw-shim.sh, described at its top)
 // installs the real program on its first call, in its place, so later calls
 // start the program directly. No Vite imports here: test/api.test.ts runs
 // this file's shell text through the SDK.
@@ -15,10 +15,10 @@
 // - Each write holds the stand-in's own lock (/tmp/.kw-shim-NAME.lock), so it
 //   cannot replace a program that a first call installs at the same moment.
 // - ~/.local/bin must be on PATH: Alpine's /etc/profile sets a fixed one, and
-//   the image adds it in /etc/profile.d/kw-path.sh (kernel/guest/kw-path.sh).
-//   The page writes that file too when it is missing, for a bundle from
-//   before it; the console's shell, started before this runs, then lacks it
-//   on that boot.
+//   the base's kw layer adds it in /etc/profile.d/kw-path.sh
+//   (guest/base/rootfs/etc/profile.d/kw-path.sh). The page writes that file
+//   too when it is missing (a root whose changes hide the layer's copy); the
+//   console's shell, started before this runs, then lacks it on that boot.
 // - On the overlay root these land in the upper layer, so this happens once
 //   per data disk (and for a newer stand-in); with ?data=0 (or in safe mode)
 //   once per boot.

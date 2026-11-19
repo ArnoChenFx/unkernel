@@ -1,32 +1,31 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The SDK from source (the page is built with it, not with the published
-// dist/), with the page's own kernel: web/kernel/page/unkernel-alpine.wasm, the
-// bundle of the newest GitHub release (web/scripts/kernel.ts fetches it when
-// the dev server starts or the page is built), a Vite asset. js/web.ts is not imported, so the SDK's own bundled kernel (the
+// dist/), with the page's own kernel (virtual:unkernel-kernel, vite.config.ts;
+// web/scripts/kernel.ts pageSource() picks it when the dev server starts or
+// the page is built): the base bundle unkernel.wasm, which boot.ts starts
+// with a distro image (createKernel({ distro })), a hashed Vite asset in a
+// build. js/web.ts is not imported, so the SDK's own bundled kernel (the
 // symlink into vendor/) is not part of the page.
 import { createKernelOn, type CreateKernelOptions, type KernelHandle, type KernelInstance, type WorkerOption } from "../../js/core/instance.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
 import { webPlatform } from "../../js/web/platform.ts";
+import { kernelSmpUrl, kernelUrl } from "virtual:unkernel-kernel";
 
 export * from "../../js/core/index.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
-export { DATA_DISK_NAME, importDataDisk, openDataDisk, resetDataDisk } from "../../js/web/disk.ts";
+export { DATA_DISK_NAME, importDataDisk, openDataDisk, openDistroDisk, resetDataDisk } from "../../js/web/disk.ts";
 export { webCpuBlocker } from "../../js/web/cpu.ts";
 
 /**
- * The kernel with Alpine bundled (vmlinux32.wasm + the initramfs,
- * kernel/tools/bundle.mjs): web/kernel/page/'s copy, without an SMP patch
- * (web/scripts/kernel.ts splitKernel()).
+ * The kernel the page runs on one CPU: the base bundle (vmlinux32.wasm +
+ * the base initramfs, kernel/tools/bundle.mjs) without its SMP patch
+ * (web/scripts/kernel.ts baseSplit()). And the SMP kernel of the same
+ * bundle, its own hashed asset, or null when the bundle has no SMP patch:
+ * fetched only when the page boots on more than one CPU (?smp=N, config.ts;
+ * boot.ts).
  */
-export const kernelUrl: URL = new URL("../kernel/page/unkernel-alpine.wasm", import.meta.url);
-
-/**
- * The SMP kernel with the same Alpine, its own hashed asset, or null when
- * the release bundle has no SMP patch. Fetched only when the page boots on
- * more than one CPU (?smp=N, config.ts; boot.ts).
- */
-export { kernelSmpUrl } from "virtual:unkernel-smp-kernel";
+export { kernelSmpUrl, kernelUrl };
 
 const platform = webPlatform(kernelUrl);
 

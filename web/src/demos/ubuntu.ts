@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Ubuntu: Ubuntu Base 26.10 arm64 (glibc 2.44, dpkg, apt 3.3, bash, uutils
-// coreutils; no init system), fetched at run time from cdimage.ubuntu.com,
-// the tarball kernel/build.sh ubuntu builds its disk from (same SHA-256 as
-// kernel/tools/env.sh), and run in a chroot on the Alpine guest. Nothing from
-// Ubuntu is in the page.
+// coreutils; no init system), fetched at run time from cdimage.ubuntu.com
+// (the URL and SHA-256 below are this demo's own pin), and run in a chroot
+// on the Alpine guest. Nothing from Ubuntu is in the page.
 //
 // The page fetches the tarball (35 MB; `downloads`, download.ts) and pushes
 // it into the demo's directory, unless the tree is there already. ubuntu.sh
@@ -14,9 +13,9 @@
 // extracted. The tree (about 110 MB)
 // goes to /data/ubuntu with the data disk (kept: later runs start at once),
 // else /var/lib/ubuntu, on the root in memory (gone at power off). A tree
-// whose bash is not an aarch64 program (one a riscv64 guest extracted, on a
-// data disk that the guest's architecture reset adopted) is deleted and
-// extracted again, and its download is not skipped. The release directory
+// whose bash is not an aarch64 program (one another guest architecture
+// extracted on the same data disk) is deleted and extracted again, and its
+// download is not skipped. The release directory
 // is versioned (releases/26.10/release/), so the URL does not move on.
 //
 // Each run enters a private mount namespace (unshare -m, all mounts private),
@@ -135,7 +134,7 @@ export default {
 	// Crafted: a ring with three dots, after Ubuntu's Circle of Friends.
 	icon: { svg: '<circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="2.4"/><g stroke="#c34113" stroke-width="1.6"><circle cx="20.6" cy="12" r="2.6"/><circle cx="7.7" cy="19.45" r="2.6"/><circle cx="7.7" cy="4.55" r="2.6"/></g>' },
 	colors: ["#e95420", "#5e2750"],
-	needs: { net: true },
+	needs: { net: true, alpine: true },
 	files: { "ubuntu.sh": { content: UBUNTU_SH, mode: 0o755 } },
 	downloads: [{ url: TARBALL_URL, sha256: SHA256, size: SIZE, path: NAME, unless: `${ROOT_SH}; ${OURS_SH}` }],
 	commands: ["./ubuntu.sh"],

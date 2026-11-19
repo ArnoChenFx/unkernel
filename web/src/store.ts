@@ -71,8 +71,12 @@ export interface UiState {
 	disk: { used: number; size: number; saved: boolean } | null;
 	/** The safe-mode explanation in the Data disk section, or null. */
 	safeNote: string | null;
-	/** The guest reset the data disk at this boot (a guest of another architecture wrote it): why, or null. */
-	resetNote: string | null;
+	/**
+	 * The distro this load boots, as the About dialog shows it (its name,
+	 * then its image id once the guest said it, from /run/kw-base); null with
+	 * ?distro=none.
+	 */
+	distro: { name: string; image: string; url: string } | null;
 	/** The key bar's Ctrl is armed. */
 	ctrl: boolean;
 	/** The key bar is showing (phones, on-screen keyboard up). */
@@ -116,6 +120,8 @@ export interface Options {
 	worker: "on" | "off";
 	/** CPUs, "1" to "8" (?smp=). */
 	cpus: string;
+	/** The distro image (?distro=): a name, or "none". */
+	distro: string;
 	fx: "on" | "off";
 }
 

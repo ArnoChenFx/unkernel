@@ -9,7 +9,8 @@
 //
 // Runs against the built output (web/.output, `pnpm build:web` first), or
 // with --dev against the Vite dev server. The page is opened from
-// http://127.0.0.1, an origin the default Wisp server accepts.
+// http://127.0.0.1, an origin the default Wisp server accepts, with
+// ?distro=alpine (apk and wget are Alpine's; the default image is debian).
 //   wisp      the default Wisp server (wss://wisp.pi0.io:6680/): DHCP, DNS,
 //             apk update + apk add, http and https wget, a large download
 //             (throughput), and an unresolvable name failing.
@@ -29,7 +30,7 @@ async function withPage(env, fn, query = "") {
 		page.on((msg) => {
 			if (msg.method === "Runtime.exceptionThrown") console.error("  [exception]", msg.params.exceptionDetails.exception?.description);
 		});
-		await page.goto(`http://127.0.0.1:${port}/${query ? `?${query}` : ""}`);
+		await page.goto(`http://127.0.0.1:${port}/?distro=alpine${query ? `&${query}` : ""}`);
 		await page.waitScreen(PROMPT, "shell prompt", 180000);
 		await fn({ run: page.run, hostLog: async () => page.consoleLines.join("\n") });
 	} finally {

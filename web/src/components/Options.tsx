@@ -6,7 +6,7 @@
 // options are [x] check boxes, Network and CPUs are (•) radio choices,
 // Memory and Font size are sliders over their sizes. CPUs are disabled,
 // with the reason, where the page cannot boot more than one (config.ts
-// smpBlocker()).
+// smpBlocker()). Distro (?distro=) lists the page's images and none.
 //
 // The fields are controlled by the store. Besides onChange, native listeners
 // on the form (capture phase, so non-bubbling events count too) read every
@@ -14,7 +14,7 @@
 // the browser tests), and the store would miss it. A check box stores its
 // data-on or data-off value, so the options keep the values rebootUrl() reads.
 import { useEffect, useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
-import { DEFAULT_CMDLINE } from "../config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED } from "../config.ts";
 import { KW } from "../kw.ts";
 import { useStore, type Options as Opts } from "../store.ts";
 import { autoFont } from "../ui.ts";
@@ -150,6 +150,13 @@ export function Options() {
 		: cfg.smpWhy ? `This boot runs on one CPU: ${cfg.smpWhy}.`
 		: "Experimental. More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); no Suspend.";
 
+	// Distro: the images (debian first) and none, the base shell.
+	const mib1 = (n: number) => `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MiB`;
+	const distros = [...DISTROS_OFFERED.map((d) => ({ value: d.name, label: `${d.name[0]!.toUpperCase()}${d.name.slice(1)}`, title: `${d.url}, ${mib1(d.size)}, streamed` })),
+		{ value: "none", label: "None (base shell)", title: "no distro image: the base initramfs's busybox shell" }];
+	const distroNote = cfg.distroWhy ? `${cfg.distroWhy}.`
+		: `A read-only image under the root overlay; its changes are kept per distro on the data disk. Default ${DEFAULT_DISTRO}.`;
+
 	// Enter in a text field reboots, like the button.
 	const enter = (e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); ui.reboot(); } };
 
@@ -178,6 +185,18 @@ export function Options() {
 				<input id="opt-wisp" name="wisp" type="text" inputMode="url" placeholder="wss://wisp.example.com/" autoCapitalize="off" autoComplete="off" spellCheck={false}
 					value={o.wisp} onChange={onField} onKeyDown={enter} className="field h-8 px-2.5 text-[12.5px]" />
 			</Field>
+
+			<fieldset className="col-span-full flex flex-col gap-1.5">
+				<legend className="mb-1.5 text-[11.5px] text-faint">Distro</legend>
+				<div className="flex flex-wrap gap-x-5 gap-y-1" role="radiogroup" id="opt-distro">
+					{distros.map((d) => (
+						<span key={d.value} title={d.title || undefined}>
+							<Radio id={`opt-distro-${d.value}`} name="distro" value={d.value} current={o.distro} label={d.label} />
+						</span>
+					))}
+				</div>
+				<small id="opt-distro-note" className="text-[11.5px] text-faint">{distroNote}</small>
+			</fieldset>
 
 			<fieldset className="col-span-full flex flex-col gap-1.5">
 				<legend className="mb-1.5 text-[11.5px] text-faint">CPUs</legend>

@@ -12,7 +12,11 @@
 // (preview.ts: guest web servers in an iframe). With several CPUs (?smp=N,
 // config.ts) it loads the SMP kernel instead and boots it in worker mode,
 // whose worker starts the other CPUs; whatever stops that before the
-// kernel runs reloads once on one CPU (bootUpOnce()).
+// kernel runs reloads once on one CPU (bootUpOnce()). The kernel is the
+// base bundle, with the distro image ?distro= picks (config.ts) attached
+// read-only by URL (createKernel({ distro }); inline it is opened here
+// first, for the resume check), and the Alpine-only parts (apk index
+// prefetch, the stand-ins, /root/README) run only on Alpine.
 import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
@@ -27,15 +31,15 @@ import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.
 import { writeReadme } from "./readme.ts";
 import { writeShims } from "./shims.ts";
 import SHIM from "./kw-shim.sh?raw";
-import PATH_SH from "../../kernel/guest/kw-path.sh?raw";
+import PATH_SH from "../../guest/base/rootfs/etc/profile.d/kw-path.sh?raw";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
 import { takeResumeRequest } from "./ui.ts";
 import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from "./windows.ts";
 import {
-	BootError, ConsoleRouter, KernelInstance, WorkerKernel, bundledBoot, createKernel, loadKernelModule, snapshotDiskMismatch,
-	type BlockDevice, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot,
+	BootError, ConsoleRouter, KernelInstance, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, snapshotDiskMismatch,
+	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot,
 } from "./sdk.ts";
 
 /** An error tagged with what failed (fetch, compile, memory, boot) and the boot stage it belongs to. */
@@ -116,8 +120,16 @@ export function start(): void {
 	const send = (s: string | Uint8Array) => vm?.write(s);
 	/** This load boots the SMP kernel on several CPUs (config.ts; never resumed, never suspended). */
 	const smp = cfg.cpus > 1;
-	/** The kernel this load runs: the UP bundle, or the SMP one (sdk.ts kernelSmpUrl). */
+	/** The kernel this load runs: the base's UP bundle, or its SMP one (sdk.ts kernelSmpUrl). */
 	const kernelUrl = smp ? cfg.kernelSmpUrl! : cfg.kernelUrl;
+	/** The image this load boots (null: ?distro=none). */
+	const distro = cfg.distro;
+	/** The session's distro (session.ts). */
+	const distroRef = distro ? { name: distro.name, url: distro.url } : null;
+	/** Inline: the distro image, opened ahead (the snapshot's first disk, for the resume check). */
+	let distroDisk: DistroDisk | null = null;
+	/** Only Alpine has apk, wget and the texts the page writes (apk.ts, shims.ts, readme.ts). */
+	const alpine = cfg.guest === "alpine";
 
 	// --- display and input (kwfb, kwinput; ?display=0 turns them off): display.ts --------------
 	const display = createDisplayUi({
@@ -195,7 +207,7 @@ export function start(): void {
 			if (cfg.data && !/no IndexedDB/.test(data.reason ?? "")) warn(`No data disk: ${data.reason}`, ms);
 			return;
 		}
-		const dev = "/dev/wda";
+		const dev = distro ? "/dev/wdb" : "/dev/wda"; // the distro image is wda
 		if (data.notice) {
 			ui.check("data", "Data disk", "warn", `${dev}, not saved`, data.notice);
 			warn(`Data disk ${dev}: ${data.notice}`, ms);
@@ -351,13 +363,18 @@ export function start(): void {
 	KW.ready = () => guestReady;
 	// The fx, claude and opencode stand-ins in ~/.local/bin (shims.ts), written
 	// before a ?demo= relaunch, which may run one.
-	const shimsWritten = guestReady.then((vm) => writeShims(vm, { shim: SHIM, pathSh: PATH_SH }, (m) => ui.log(m, "h")));
+	// They download with wget, which only Alpine has (Debian's image has neither wget nor curl).
+	const shimsWritten = guestReady.then((vm) => alpine ? writeShims(vm, { shim: SHIM, pathSh: PATH_SH }, (m) => ui.log(m, "h"))
+		: ui.log(`[shims] skipped: the fx, claude and opencode stand-ins need Alpine (this boot runs ${cfg.guest})`, "h"));
 	// ?demo=<id>: launch that demo again (launcher.ts sets it when one launches).
 	void shimsWritten.then(launchFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
-	if (cfg.net) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
-	// Intro notes in /root/README, once per data disk (readme.ts).
-	void guestReady.then((vm) => writeReadme(vm, (m) => ui.log(m, "h")), () => {});
+	if (cfg.net && alpine) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
+	// Intro notes in /root/README, once per data disk (readme.ts); written for Alpine.
+	if (alpine) void guestReady.then((vm) => writeReadme(vm, (m) => ui.log(m, "h"), { upper: `/data/distros/${cfg.guest}/upper` }), () => {});
+	// What the base booted (/run/kw-base: the image id, the upper layer), for the
+	// Environment rows, About and diagnostics.
+	void guestReady.then(showBase, () => {});
 	KW.preview = { open: openPreview, close: closePreview, url: previewUrl };
 	// Paste, the key bar, the touch controls and the shortcuts act on the current window.
 	KW.term = {
@@ -462,7 +479,13 @@ export function start(): void {
 				write(okLine(resumed.note) + "\r\n\r\n" + summary() + "\r\n");
 				if (resumed.screen?.length) write(resumed.screen); // the console as it was (the guest does not redraw it)
 				write(replay);
-			} else write(okLine(`Started Linux${cmdlineNote()}`, (ui.stageTime("boot") ?? 0) + (ui.stageTime("userspace") ?? 0)) + "\r\n\r\n" + intro() + "\r\n" + replay);
+			} else {
+				// Two steps: the kernel until it runs /init, then the base mounting the
+				// distro image (its first blocks come over HTTP) and the distro's init.
+				const user = cfg.distro ? cfg.guest[0]!.toUpperCase() + cfg.guest.slice(1) : "the base shell";
+				write(okLine(`Started Linux${cmdlineNote()}`, ui.stageTime("boot")) + "\r\n" +
+					okLine(`Started ${user}`, ui.stageTime("userspace")) + "\r\n\r\n" + intro() + "\r\n" + replay);
+			}
 			replay = "";
 		}
 	}
@@ -475,19 +498,20 @@ export function start(): void {
 		else if (!cfg.verbose && (replay += t).length > 65536) replay = replay.slice(-49152);
 	}
 	const KSTAMP_RE = /^\[ *\d+\.\d+\] */;
-	// The guest's boot-health check fell back to safe mode (kernel/guest/overlay/root.sh),
-	// or it reset a data disk written by a guest of another architecture (kernel/guest/kw-data.sh).
-	let userTail = "", safeSeen = false, resetSeen = false;
+	// The base's check of the root with the data disk's changes failed, so this boot
+	// runs the plain image (safe mode), or it found no distro to boot and started its
+	// base shell (guest/base/initramfs/init).
+	let userTail = "", safeSeen = false, baseSeen = false;
 	const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").trim();
 	function watchUser(t: string) {
-		if (safeSeen && resetSeen) return;
+		if (safeSeen && baseSeen) return;
 		userTail = (userTail + t).slice(-2048);
-		const r = resetSeen ? null : /kw-data: RESET: ([^\r\n]*)\r?\n/.exec(userTail);
-		if (r) {
-			resetSeen = true;
-			const note = plain(r[1]!);
-			ui.hostLog(`[host] the guest reset the data disk: ${note}`);
-			ui.archReset(note);
+		const rs = baseSeen ? null : /unkernel base shell \([^)\r\n]*\): ([^\r\n]*)\r?\n/.exec(userTail);
+		if (rs) {
+			baseSeen = true;
+			const reason = plain(rs[1]!);
+			ui.hostLog(`[host] the base started its base shell: ${reason}`);
+			ui.baseShell(reason);
 		}
 		const m = safeSeen ? null : /kw-overlay: SAFE MODE: ([^\r\n]*)\r?\n/.exec(userTail);
 		if (!m) return;
@@ -542,7 +566,7 @@ export function start(): void {
 			const ms = performance.now() - t0Download;
 			const rate = `${(d.loaded / 1048576 / Math.max(ms / 1000, 0.001)).toFixed(1)} MiB/s`;
 			ui.stage("kernel", "done", `${d.url} · ${fmtMiB(d.loaded)} · ${rate}`);
-			ok(`Downloaded ${smp ? "unkernel-alpine-smp.wasm" : "unkernel-alpine.wasm"}, ${fmtMiB(d.loaded)}`, ms);
+			ok(`Downloaded ${smp ? "unkernel-smp.wasm" : "unkernel.wasm"}, ${fmtMiB(d.loaded)}`, ms);
 			// The kernel compiles while it downloads (compileStreaming); what is left shows as the compile step.
 			ui.stage("compile", "active");
 			ui.setState("booting", "Compiling");
@@ -589,11 +613,12 @@ export function start(): void {
 		}
 		if (!meta) return null;
 		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}`;
-		const inlineDisks = !cfg.worker ? disks as BlockDevice[] : null;
+		// Inline: the disks as the snapshot lists them, the distro image first.
+		const inlineDisks = !cfg.worker ? [...(distroDisk ? [distroDisk] : []), ...disks as BlockDevice[]] : null;
 		// A data disk that changed since can never resume it: forget it then.
 		const stale = inlineDisks ? snapshotDiskMismatch(meta.disks, inlineDisks)
 			: cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null;
-		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices()) ?? stale;
+		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices(), distroRef) ?? stale;
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
 			ui.hostLog(`[host] suspended session (${label}) not offered: ${why}`);
@@ -634,7 +659,7 @@ export function start(): void {
 		const run = async () => {
 			const snap = await target.snapshot({ stop: true });
 			tSnap = performance.now() - t0;
-			return saveSession(snap, { saved: Date.now(), kernelUrl: cfg.kernelUrl, devices: sessionDevices(), screen: screenTail.text(), worker: cfg.worker });
+			return saveSession(snap, { saved: Date.now(), kernelUrl: cfg.kernelUrl, devices: sessionDevices(), screen: screenTail.text(), worker: cfg.worker, distro: distroRef });
 		};
 		const p = run();
 		suspending = p.then(() => null, (e: unknown) => (e as Error)?.message ?? String(e));
@@ -686,7 +711,7 @@ export function start(): void {
 		}
 		if (!meta) return false;
 		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}`;
-		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices()) ??
+		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices(), distroRef) ??
 			(cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null);
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
@@ -702,6 +727,40 @@ export function start(): void {
 			return false;
 		}
 		return bootUpOnce(`resuming the session suspended ${ago(meta.saved)}, which runs on one CPU`, true);
+	}
+
+	// --- the distro image and what the base made of it ---------------------------------
+	/** The distro image's HttpBase counters (inline only: the worker reads it there). */
+	const distroStats = () => (distroDisk?.inner as { base?: { stats?: { requests: number; bytes: number } } } | undefined)?.base?.stats;
+	/** The image as the host read it (its superblock), as a boot line and the Distro row. */
+	function showDistro(info: { fs: string; size: number; label: string; uuid: string }, ms: number | null) {
+		if (!distro) return;
+		ok(`Attached the ${distro.name[0]!.toUpperCase()}${distro.name.slice(1)} image (${fmtMiB(info.size)}, streamed)`, ms);
+		ui.check("distro", "Distro", cfg.distroWhy ? "warn" : "pass", distro.name, `${cfg.distroWhy ? `${cfg.distroWhy}; ` : ""}${distro.url}: ${info.fs}, ${fmtMiB(info.size)}, label ${info.label}, uuid ${info.uuid}; read-only /dev/wda, read with Range requests as the guest needs it`);
+		ui.hostLog(`[host] distro: ${distro.url} (${info.fs}, ${info.size} bytes, uuid ${info.uuid})${ms != null ? ` opened in ${fmtS(ms)}` : ""}`);
+	}
+	/** Once user space runs: /run/kw-base (guest/base/initramfs/init) says which image booted and where its changes go. */
+	async function showBase(vm: KernelHandle) {
+		try {
+			// Shell builtins only: a program (cat) would be read from the distro image, over HTTP.
+			const r = await vm.exec("/bin/sh", ["-c", 'while IFS= read -r l; do echo "$l"; done < /run/kw-base']);
+			if (r.exitCode !== 0) throw new Error(r.stderr.trim() || `exit ${r.exitCode}`);
+			const kv: Record<string, string> = {};
+			for (const l of r.stdout.split("\n")) if (l.includes("=")) kv[l.slice(0, l.indexOf("="))] = l.slice(l.indexOf("=") + 1);
+			const st = distroStats();
+			const reads = st ? `; ${st.requests} range requests, ${fmtMiB(st.bytes)} of the image read so far` : "";
+			ui.hostLog(`[host] base: name=${kv.name ?? ""} image=${kv.image ?? ""} upper=${kv.upper ?? ""} why=${kv.why ?? ""}${reads}`);
+			if (kv.upper === "none") return; // the base shell: watchUser() said why
+			if (kv.image) ui.distroBooted(kv.image);
+			if (distro) ui.check("distro", "Distro", cfg.distroWhy ? "warn" : "pass", kv.image || distro.name,
+				`${cfg.distroWhy ? `${cfg.distroWhy}; ` : ""}${distro.url}${vm.distro ? `: ${vm.distro.fs}, ${fmtMiB(vm.distro.size)}` : ""}; read-only /dev/wda${reads}`);
+			const why = kv.why ?? "";
+			if (kv.upper === "data") ui.check("overlay", "Root", "pass", "overlay, changes on the data disk", `${kv.state}/upper over the ${kv.name} image`);
+			else if (why === "kw.root=initramfs") ui.check("overlay", "Root", "warn", "safe mode (kw.root=initramfs)", `the plain ${kv.name} image; changes in memory, ${kv.state}/upper unused this boot`);
+			else if (!why.startsWith("safe mode")) ui.check("overlay", "Root", "info", "overlay, changes in memory", why); // safe mode: watchUser() said why
+		} catch (e) {
+			ui.hostLog(`[host] /run/kw-base: ${(e as Error)?.message ?? e}`);
+		}
 	}
 
 	// --- boot --------------------------------------------------------------------
@@ -722,6 +781,19 @@ export function start(): void {
 		};
 		// Several CPUs: the SMP kernel, once a suspended session was offered (below).
 		let loading = smp ? null : load(kernelUrl);
+		// The image to boot (worker mode: the worker opens it from its URL).
+		if (cfg.distroWhy) {
+			warn(cfg.distroWhy);
+			ui.toast(cfg.distroWhy);
+		}
+		ui.check("distro", "Distro", cfg.distroWhy ? "warn" : "info", distro?.name ?? "none (base shell)",
+			cfg.distroWhy ?? (distro ? `${distro.url}, ${fmtMiB(distro.size)}` : "?distro=none: the base initramfs's shell, no distro image"));
+		// Inline: opened while the kernel downloads (one Range request and the first 64 KiB).
+		const tDistro = performance.now();
+		const distroOpening = distro && !cfg.worker
+			? openDistroDisk(distro.url, { log: (m) => { console.log(m); ui.hostLog(m); } }).then((d) => ({ d, ms: performance.now() - tDistro }))
+			: null;
+		distroOpening?.catch(() => {}); // awaited below
 		const session = sessionInfo();
 		session.catch(() => {});
 		let dataDisks: BlockDevice[] | DiskSpec[] = [];
@@ -749,10 +821,22 @@ export function start(): void {
 		setLive(null);
 		ok("Compiled the kernel", ui.stageTime("compile"));
 		ui.hostLog(`[host] kernel downloaded and compiled in ${fmtS(performance.now() - t0)}`);
-		const b = bundledBoot(module).initrd;
-		if (!b) throw tag(new Error(`${kernelUrl} has no bundled root file system`), "compile", "kernel");
-		ui.hostLog(`[host] root file system: bundled in ${kernelUrl} (${fmtMiB(b.length)} gzipped)`);
-		ok(`Found the bundled root fs (${fmtMiB(b.length)})`);
+		const bundle = bundledBoot(module);
+		const b = bundle.initrd;
+		if (!b) throw tag(new Error(`${kernelUrl} has no bundled base initramfs`), "compile", "kernel");
+		ui.hostLog(`[host] base initramfs: bundled in ${kernelUrl} (${fmtMiB(b.length)} gzipped)`);
+		ok(`Found the base initramfs (${fmtMiB(b.length)})`);
+		// The bundle's own command line unless ?append= gives one, with ?root= (kw.root=) after it.
+		if (!cfg.append && bundle.cmdline) cfg.cmdline = cfg.root ? `${bundle.cmdline} kw.root=${cfg.root}` : bundle.cmdline;
+		if (distroOpening) {
+			try {
+				const { d, ms } = await distroOpening;
+				distroDisk = d;
+				showDistro(d.info, ms);
+			} catch (e) {
+				throw tag(e, "distro", "kernel");
+			}
+		}
 		if (!cfg.worker) dataDisks = await openData(module);
 
 		await termReady.catch((e: unknown) => { throw tag(e, "terminal", ""); }); // the console needs it (and its size)
@@ -761,7 +845,17 @@ export function start(): void {
 			ui.stage("memory", "active", `${cfg.memMiB} MiB requested (${cfg.memWhy})`);
 		};
 		if (!cfg.worker) memoryStage(); // worker mode: once the worker runs
-		const log = (m: string) => { console.log(m); ui.hostLog(m); };
+		// A failed read of the distro image (the server went away, or the image was rebuilt:
+		// the SDK's strict HttpBase refuses a changed one) is an I/O error in the guest: say so.
+		let distroReadFailed = false;
+		const log = (m: string) => {
+			console.log(m);
+			ui.hostLog(m);
+			if (distro && !distroReadFailed && /^\[host\] block: wda op 0 /.test(m)) {
+				distroReadFailed = true;
+				KW.report("distro", `Reading the ${distro.name} image failed: the guest gets I/O errors from its root. If the image was rebuilt or the server stopped, reload the page.`, m, false);
+			}
+		};
 		// Worker mode: a worker that never reports back must not leave the page waiting.
 		let workerWatchdog: ReturnType<typeof setTimeout> | undefined;
 		if (cfg.worker) {
@@ -822,6 +916,7 @@ export function start(): void {
 					cpus: smp ? cfg.cpus : undefined, // the worker starts the other CPUs (js/web/cpu.ts)
 					shared: cfg.shared ? undefined : false, // shared memory where the page is cross-origin isolated (?shared=0: never)
 					disks: dataDisks as DiskSpec[], onDiskError: (_i, e) => saveError(e),
+					distro: distro?.url, // a spec the page makes (relative to the page); the worker opens it
 					net: browserNetSpec({ enabled: cfg.net, servers: cfg.wisp }), // Wisp, in the worker (net.ts)
 					restore, transferRestore: true, // the snapshot is read for this boot only
 				});
@@ -832,7 +927,7 @@ export function start(): void {
 						return inWorker(new URL(kernelUrl, location.href).href);
 					})
 					: createKernel({
-						...common, kernel: module, disks: dataDisks as BlockDevice[], restore,
+						...common, kernel: module, disks: dataDisks as BlockDevice[], restore, distro: distroDisk ?? undefined,
 						net: browserNet({ enabled: cfg.net, servers: cfg.wisp, log }), // Wisp (net.ts)
 					});
 			};
@@ -856,6 +951,8 @@ export function start(): void {
 		} catch (e) {
 			kernelStarting = false;
 			clearTimeout(workerWatchdog);
+			// The distro image (worker mode opens it in the worker): not a reason to try one CPU.
+			if (/^distro: /.test((e as Error)?.message ?? "")) throw tag(e, "distro", "kernel");
 			// Several CPUs that did not start (the worker, its JSPI, the shared memory): one CPU.
 			if (smp && bootUpOnce(`booting on ${cfg.cpus} CPUs failed (${(e as Error)?.message ?? e})`)) return;
 			const be = e instanceof BootError ? e : undefined;
@@ -878,6 +975,7 @@ export function start(): void {
 			g.kernel = inst.kernel;
 			KW.kernel = inst.kernel;
 		}
+		if (cfg.worker && vm.distro) showDistro(vm.distro, null);
 		if (vm instanceof WorkerKernel) {
 			workerDataAttached(vm, performance.now() - t0);
 			const shared = vm.transport === "shared";
@@ -961,10 +1059,12 @@ export function start(): void {
 	boot().catch((e: StageError) => {
 		console.error(e);
 		stopWindows("the boot failed");
-		failed(STEP[e.stageId ?? ""] ?? "Boot");
+		failed(e.kind === "distro" ? `Open the ${cfg.guest} image` : STEP[e.stageId ?? ""] ?? "Boot");
 		if (e.stageId) ui.stage(e.stageId, "fail", e.message);
 		const titles: Record<string, string> = { fetch: "Download failed", compile: "Kernel failed to compile", memory: "Not enough memory", boot: "Boot failed", terminal: "The terminal failed to start",
-			worker: "Worker mode cannot run in this browser" };
-		ui.fail(e.kind ?? "boot", e.message, (e.cause as Error | undefined)?.stack ?? e.stack, { title: titles[e.kind ?? ""] ?? "Boot failed" });
+			worker: "Worker mode cannot run in this browser", distro: "The distro image could not be opened" };
+		const hint = e.kind === "distro" ? `The page reads ${cfg.distro?.url ?? "the image"} from its own server with Range requests (web/scripts/kernel.ts picks the images; kernel/build.sh distro builds them). ` +
+			"Pick another distro under Options and Reboot, or boot with ?distro=none for the base shell." : undefined;
+		ui.fail(e.kind ?? "boot", e.message, (e.cause as Error | undefined)?.stack ?? e.stack, { title: titles[e.kind ?? ""] ?? "Boot failed", ...(hint ? { hint } : {}) });
 	});
 }

@@ -121,14 +121,12 @@ function DataDisk() {
 	const ui = KW.ui!;
 	const status = useStore((s) => s.dataStatus);
 	const safeNote = useStore((s) => s.safeNote);
-	const resetNote = useStore((s) => s.resetNote);
 	const file = useRef<HTMLInputElement>(null);
 	const safe = KW.config.root === "initramfs";
 	return (
 		<>
 			<p id="data-status" className="text-muted">{status}</p>
 			<p id="data-safe-note" hidden={!safeNote} className="mt-2 border-l-2 border-warn pl-3 text-fg">{safeNote}</p>
-			<p id="data-reset-note" hidden={!resetNote} className="mt-2 border-l-2 border-warn pl-3 text-fg">{resetNote}</p>
 			<div className="mt-3 flex flex-wrap gap-2">
 				<button id="data-export" type="button" className="btn btn-sm" title="Download /data as a .kwsparse.gz file" onClick={() => ui.dataExport()}>Export</button>
 				<button id="data-import" type="button" className="btn btn-sm" title="Replace /data with an exported file"

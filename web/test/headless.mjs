@@ -27,7 +27,7 @@
 //   modfail   the network drops the boot module (boot-*.js, or src/boot.ts
 //             with --dev): main.tsx reports it in the panel.
 //   lowmem    ?simulate=lowmem&mem=512: allocations above 128 MiB fail, the
-//             SDK falls back to 128 MiB and Alpine still boots to the shell
+//             SDK falls back to 128 MiB and the default image still boots to the shell
 //             and runs a command. (kwtest is not in release bundles, which
 //             the built page runs.)
 // Layout checks (nothing overflows or overlaps) run at both viewports.
@@ -95,7 +95,7 @@ const TOP_ROW = `(() => {
 })()`;
 // Keyboard focus is in the terminal's textarea (so the on-screen keyboard is up).
 const TERM_FOCUSED = "document.activeElement?.tagName === 'TEXTAREA' && document.getElementById('term').contains(document.activeElement)";
-// The Alpine prompt is "~ ⇒ " (kw-prompt.sh in kernel/guest/alpine.sh).
+// The prompt is "~ ⇒ " on every distro (guest/distro/*/rootfs/etc/profile.d/kw-prompt.sh).
 const PROMPT = "/⇒\\s*$/m";
 
 // --- scenarios -----------------------------------------------------------------
@@ -129,10 +129,12 @@ const scenarios = {
 		if (!/Linux version/.test(await page.evaluate("KW.ui.diagText()"))) throw new Error("the kernel log has no \"Linux version\"");
 		console.log(`  ${s.match(/Booted in .*$/m)[0]}`);
 		const k = await page.evaluate("KW.config.kernelUrl");
-		if (!/\/unkernel-alpine[^/]*\.wasm$/.test(k)) throw new Error(`the kernel is not unkernel-alpine.wasm: ${k}`);
-		console.log(`  kernel ${k}`);
+		if (!/\/unkernel(?!-smp)[^/]*\.wasm$/.test(k)) throw new Error(`the kernel is not the base bundle unkernel.wasm: ${k}`);
+		const distro = await page.evaluate("KW.config.distro?.url ?? ''");
+		if (!/^\/distros\/debian(-[0-9a-f]{16})?\.erofs$/.test(distro)) throw new Error(`the default distro is not the debian image: ${distro}`);
+		console.log(`  kernel ${k}, distro ${distro}`);
 		// kwemu's JIT tier works here too (lowered kernel, page main thread): hot code gets compiled.
-		await page.evaluate(`globalThis.kernel.sendInput(${JSON.stringify("sha256sum /bin/busybox | cut -c1-16; echo jit-$((6*7))\r")})`);
+		await page.evaluate(`globalThis.kernel.sendInput(${JSON.stringify("head -c 4000000 /dev/zero | sha256sum | cut -c1-16; echo jit-$((6*7))\r")})`);
 		await page.waitScreen("/^jit-42\\s*$/m", "sha256sum output");
 		const j = await page.evaluate("KW.jitStats()");
 		console.log(`  jit: ${j.compiled} compiled, ${j.live} live (max ${j.maxLive}), ${j.failed} failed, ${j.compileMs.toFixed(0)} ms compiling ${(j.bytes / 1024).toFixed(0)} KiB`);
@@ -186,6 +188,9 @@ const scenarios = {
 			// CPUs: only where the page has the SMP kernel and may boot it (else the choices above 1 are disabled).
 			const cpus = !!$("opt-cpus-2") && !$("opt-cpus-2").disabled;
 			if (cpus) check("opt-cpus-2", true);
+			// Distro: none (the base shell) is always there; the default is the radio checked now.
+			const distroDefault = document.querySelector("#opt-distro input:checked")?.id;
+			check("opt-distro-none", true);
 			await tick();
 			const all = KW.ui.rebootUrl(), wispShown = !$("opt-wisp-row").hidden, label = $("reboot").textContent;
 			net("off");
@@ -193,13 +198,14 @@ const scenarios = {
 			mem("auto"); net("default"); check("opt-jit", true); check("opt-verbose", false); set("opt-append", "", "input");
 			check("opt-data", true); check("opt-root", false); check("opt-worker", false); check("opt-fx", false);
 			if (cpus) check("opt-cpus-1", true);
+			if (distroDefault) check(distroDefault, true);
 			await tick();
-			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus };
+			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault };
 		})()`);
 		const q = new URLSearchParams(opts.all.split("?")[1]);
 		if (opts.before !== "/" || opts.reset !== "/" || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
 			|| q.get("mem") !== "64" || q.get("wisp") !== "wss://a.example/,wss://b.example/" || q.get("jit") !== "0" || q.get("verbose") !== "1"
-			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== "1" || q.get("fx") !== "1" || q.get("smp") !== (opts.cpus ? "2" : null) || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
+			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== "1" || q.get("fx") !== "1" || q.get("smp") !== (opts.cpus ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
 			throw new Error(`options do not map to the URL: ${JSON.stringify(opts)}`);
 		console.log(`  options -> ${decodeURIComponent(opts.all)}`);
 		await page.click('.tabs [data-tab="log"]');
@@ -324,7 +330,7 @@ const scenarios = {
 
 	async fetch404(page) {
 		await page.emulate(DESKTOP);
-		await page.send("Fetch.enable", { patterns: [{ urlPattern: "*unkernel-alpine*.wasm*" }] });
+		await page.send("Fetch.enable", { patterns: [{ urlPattern: "*/unkernel*.wasm*" }] });
 		page.on((m) => {
 			if (m.method === "Fetch.requestPaused") page.send("Fetch.fulfillRequest", { requestId: m.params.requestId, responseCode: 404, body: Buffer.from("not found\n").toString("base64") });
 		});

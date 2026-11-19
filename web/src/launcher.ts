@@ -31,7 +31,8 @@
 // Packages come from main; a demo with `community` enables community first
 // (lazy in the image, .agents/kernel/guest.md), once per guest.
 // A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
-// but disabled, with why.
+// but disabled, with why; so is one that needs Alpine (`packages`, `community`
+// or needs.alpine: apk, wget) on another distro (?distro=).
 // Launching a demo sets ?demo=<id> in the page's URL (history.replaceState),
 // so a reload launches it again once the guest is up (launchFromUrl, from
 // boot.ts); the last demo launched wins. Closing that demo's window (or its
@@ -78,7 +79,8 @@ export interface Demo {
 	icon?: string | DemoIcon;
 	/** The tile's gradient, top left to bottom right (CSS colours). */
 	colors?: [string, string];
-	needs?: { display?: boolean; net?: boolean; sound?: boolean };
+	/** alpine: runs only on Alpine (implied by packages and community). */
+	needs?: { display?: boolean; net?: boolean; sound?: boolean; alpine?: boolean };
 	/** The working directory in the guest. Default ~/demos/<id>. */
 	dir?: string;
 	/** Files to write, by path relative to dir (or absolute). */
@@ -114,6 +116,8 @@ export function unavailable(d: Demo): string | null {
 	if (d.needs?.display && !KW.config.display) return "needs the display (off with ?display=0)";
 	if (d.needs?.net && !KW.config.net) return "needs the network (off with ?net=0)";
 	if (d.needs?.sound && !KW.config.sound) return "needs sound (off with ?sound=0)";
+	if ((d.needs?.alpine || d.packages?.length || d.community) && KW.config.guest !== "alpine")
+		return `needs Alpine (apk); this boot runs ${KW.config.guest === "none" ? "no distro" : KW.config.guest} (Options, Distro)`;
 	return null;
 }
 

@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 14 Nov 2026 08:08:01 +0000
+Subject: [PATCH 5/6] Sound effects through OSS /dev/dsp, mixed in software
+
+---
+ fbdoom/i_sound.c     |   2 +
+ fbdoom/i_sound_oss.c | 282 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 284 insertions(+)
+ create mode 100644 fbdoom/i_sound_oss.c
+
+diff --git a/fbdoom/i_sound.c b/fbdoom/i_sound.c
+index 71947d2..6673bb4 100644
+--- a/fbdoom/i_sound.c
++++ b/fbdoom/i_sound.c
+@@ -64,6 +64,7 @@ int snd_sfxdevice = SNDDEVICE_SB;
+ 
+ extern void I_InitTimidityConfig(void);
+ extern sound_module_t sound_sdl_module;
++extern sound_module_t sound_oss_module;
+ extern sound_module_t sound_pcsound_module;
+ extern music_module_t music_sdl_module;
+ extern music_module_t music_opl_module;
+@@ -91,6 +92,7 @@ static int snd_mport = 0;
+ 
+ static sound_module_t *sound_modules[] = 
+ {
++    &sound_oss_module,
+ #ifdef FEATURE_SOUND
+     &sound_sdl_module,
+     &sound_pcsound_module,
+diff --git a/fbdoom/i_sound_oss.c b/fbdoom/i_sound_oss.c
+new file mode 100644
+index 0000000..5515913
+--- /dev/null
++++ b/fbdoom/i_sound_oss.c
+@@ -0,0 +1,282 @@
++//
++// Copyright(C) 2026 Pooya Parsa
++//
++// This program is free software; you can redistribute it and/or
++// modify it under the terms of the GNU General Public License
++// as published by the Free Software Foundation; either version 2
++// of the License, or (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// DESCRIPTION:
++//	Sound effects through OSS (/dev/dsp), mixed in software.
++//
++//	The WAD's sound effects (DMX format: 8-bit unsigned mono, usually
++//	11025 Hz) are mixed into 16-bit stereo at MIX_RATE, with each
++//	channel's volume and separation, and written from I_UpdateSound
++//	(once per frame) to keep about TARGET_MS of audio queued. The device
++//	is non-blocking and only as much as fits is written, so a stalled
++//	device never stalls the game. Without a device (or with -nosound)
++//	the game runs silently. No music.
++//
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/soundcard.h>
++
++#include "deh_str.h"
++#include "doomtype.h"
++#include "i_sound.h"
++#include "m_misc.h"
++#include "w_wad.h"
++#include "z_zone.h"
++
++#define NUM_CHANNELS 16
++#define MIX_RATE 22050
++#define TARGET_MS 90
++#define MAX_FRAMES 4096
++
++typedef struct
++{
++    const byte *data;   // unsigned 8-bit samples
++    unsigned int length;   // in samples
++    unsigned int pos;      // 16.16 fixed point
++    unsigned int step;     // 16.16 fixed point
++    int left, right;       // 0..255
++} channel_t;
++
++static channel_t channels[NUM_CHANNELS];
++static int dsp = -1;
++static int queued_max;     // bytes we aim to keep queued
++static int out_rate = MIX_RATE;
++static boolean use_sfx_prefix;
++static int16_t mixbuf[MAX_FRAMES * 2];
++
++static snddevice_t sound_oss_devices[] =
++{
++    SNDDEVICE_SB,
++    SNDDEVICE_PAS,
++    SNDDEVICE_GUS,
++    SNDDEVICE_WAVEBLASTER,
++    SNDDEVICE_SOUNDCANVAS,
++    SNDDEVICE_AWE32,
++};
++
++static boolean I_OSS_InitSound(boolean _use_sfx_prefix)
++{
++    int fmt = AFMT_S16_LE, ch = 2, rate = MIX_RATE;
++    int frag = (32 << 16) | 10;   // up to 32 fragments of 1 KiB
++
++    use_sfx_prefix = _use_sfx_prefix;
++    memset(channels, 0, sizeof(channels));
++
++    dsp = open("/dev/dsp", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++    if (dsp < 0)
++    {
++        printf("I_OSS_InitSound: no /dev/dsp (%s), no sound\n", strerror(errno));
++        return false;
++    }
++    ioctl(dsp, SNDCTL_DSP_SETFRAGMENT, &frag);
++    if (ioctl(dsp, SNDCTL_DSP_SETFMT, &fmt) < 0 || fmt != AFMT_S16_LE
++     || ioctl(dsp, SNDCTL_DSP_CHANNELS, &ch) < 0 || ch != 2
++     || ioctl(dsp, SNDCTL_DSP_SPEED, &rate) < 0 || rate < 8000)
++    {
++        printf("I_OSS_InitSound: /dev/dsp refuses 16-bit stereo, no sound\n");
++        close(dsp);
++        dsp = -1;
++        return false;
++    }
++    out_rate = rate;
++    queued_max = rate * 4 * TARGET_MS / 1000;
++    printf("I_OSS_InitSound: /dev/dsp, %d Hz, 16-bit stereo\n", rate);
++    return true;
++}
++
++static void I_OSS_ShutdownSound(void)
++{
++    if (dsp >= 0)
++    {
++        close(dsp);
++        dsp = -1;
++    }
++}
++
++static int I_OSS_GetSfxLumpNum(sfxinfo_t *sfx)
++{
++    char namebuf[9];
++
++    if (sfx->link != NULL)
++    {
++        sfx = sfx->link;
++    }
++    if (use_sfx_prefix)
++    {
++        M_snprintf(namebuf, sizeof(namebuf), "ds%s", DEH_String(sfx->name));
++    }
++    else
++    {
++        M_StringCopy(namebuf, DEH_String(sfx->name), sizeof(namebuf));
++    }
++    return W_GetNumForName(namebuf);
++}
++
++static void I_OSS_UpdateSoundParams(int handle, int vol, int sep)
++{
++    int left, right;
++
++    if (dsp < 0 || handle < 0 || handle >= NUM_CHANNELS)
++    {
++        return;
++    }
++    left = ((254 - sep) * vol) / 127;
++    right = (sep * vol) / 127;
++    channels[handle].left = left < 0 ? 0 : left > 255 ? 255 : left;
++    channels[handle].right = right < 0 ? 0 : right > 255 ? 255 : right;
++}
++
++static int I_OSS_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
++{
++    const byte *lump;
++    unsigned int lumplen, rate, length;
++    channel_t *c;
++
++    if (dsp < 0 || channel < 0 || channel >= NUM_CHANNELS)
++    {
++        return -1;
++    }
++    c = &channels[channel];
++    c->data = NULL;
++    if (sfxinfo->lumpnum < 0)
++    {
++        sfxinfo->lumpnum = I_OSS_GetSfxLumpNum(sfxinfo);
++    }
++    lump = W_CacheLumpNum(sfxinfo->lumpnum, PU_STATIC);
++    lumplen = W_LumpLength(sfxinfo->lumpnum);
++
++    // DMX header: format 3, rate, sample count (with 16 bytes of padding
++    // at each end, which are skipped).
++    if (lumplen < 8 || lump[0] != 0x03 || lump[1] != 0x00)
++    {
++        return -1;
++    }
++    rate = lump[2] | (lump[3] << 8);
++    length = lump[4] | (lump[5] << 8) | (lump[6] << 16) | ((unsigned int) lump[7] << 24);
++    if (length > lumplen - 8 || length <= 48 || rate == 0)
++    {
++        return -1;
++    }
++    c->length = length - 32;
++    c->pos = 0;
++    c->step = (unsigned int) (((unsigned long long) rate << 16) / out_rate);
++    c->data = lump + 8 + 16;
++    I_OSS_UpdateSoundParams(channel, vol, sep);
++    return channel;
++}
++
++static void I_OSS_StopSound(int handle)
++{
++    if (handle >= 0 && handle < NUM_CHANNELS)
++    {
++        channels[handle].data = NULL;
++    }
++}
++
++static boolean I_OSS_SoundIsPlaying(int handle)
++{
++    return handle >= 0 && handle < NUM_CHANNELS && channels[handle].data != NULL;
++}
++
++static void Mix(int frames)
++{
++    int i, f;
++
++    memset(mixbuf, 0, frames * 4);
++    for (i = 0; i < NUM_CHANNELS; ++i)
++    {
++        channel_t *c = &channels[i];
++        int16_t *out = mixbuf;
++
++        if (c->data == NULL)
++        {
++            continue;
++        }
++        for (f = 0; f < frames; ++f)
++        {
++            unsigned int idx = c->pos >> 16;
++            int s, l, r;
++
++            if (idx >= c->length)
++            {
++                c->data = NULL;
++                break;
++            }
++            s = (int) c->data[idx] - 128;
++            l = out[0] + s * c->left;
++            r = out[1] + s * c->right;
++            out[0] = l > 32767 ? 32767 : l < -32768 ? -32768 : l;
++            out[1] = r > 32767 ? 32767 : r < -32768 ? -32768 : r;
++            out += 2;
++            c->pos += c->step;
++        }
++    }
++}
++
++static void I_OSS_UpdateSound(void)
++{
++    audio_buf_info info;
++    int queued, frames, n;
++
++    if (dsp < 0)
++    {
++        return;
++    }
++    if (ioctl(dsp, SNDCTL_DSP_GETOSPACE, &info) < 0)
++    {
++        return;
++    }
++    queued = info.fragstotal * info.fragsize - info.bytes;
++    frames = (queued_max - queued) / 4;
++    if (frames > info.bytes / 4)
++    {
++        frames = info.bytes / 4;
++    }
++    if (frames > MAX_FRAMES)
++    {
++        frames = MAX_FRAMES;
++    }
++    if (frames <= 0)
++    {
++        return;
++    }
++    Mix(frames);
++    n = write(dsp, mixbuf, frames * 4);
++    (void) n;   // EAGAIN or a short write: the rest is dropped
++}
++
++static void I_OSS_CacheSounds(sfxinfo_t *sounds, int num_sounds)
++{
++    // Loaded on first use.
++}
++
++sound_module_t sound_oss_module =
++{
++    sound_oss_devices,
++    arrlen(sound_oss_devices),
++    I_OSS_InitSound,
++    I_OSS_ShutdownSound,
++    I_OSS_GetSfxLumpNum,
++    I_OSS_UpdateSound,
++    I_OSS_UpdateSoundParams,
++    I_OSS_StartSound,
++    I_OSS_StopSound,
++    I_OSS_SoundIsPlaying,
++    I_OSS_CacheSounds,
++};

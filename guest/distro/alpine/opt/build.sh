@@ -104,28 +104,38 @@ stamp="$(grep -v '^[[:space:]]*#' "${BASH_SOURCE[0]}" | sha256sum | cut -c1-16)-
 # aports comes from its GitHub mirror (same commits): gitlab.alpinelinux.org
 # answers raw file requests from GitHub's hosted runners with HTTP 418.
 # Upstream sources fall back to Alpine's distfiles mirror, as abuild does
-# (the builders' copies of them).
+# (the builders' copies of them), also when they answer with other bytes
+# (zlib.net did, to GitHub's hosted runners).
 fetch() {
-	local p=$1 s f u url="https://raw.githubusercontent.com/alpinelinux/aports/${commit[$1]}/main/$1"
+	local p=$1 s f u sum url="https://raw.githubusercontent.com/alpinelinux/aports/${commit[$1]}/main/$1"
 	local mirror="https://distfiles.alpinelinux.org/distfiles/v${ALPINE_VERSION%.*}"
+	local -A sha512
 	mkdir -p "$dl/$p"
 	fetch_verified "$url/APKBUILD" "$dl/$p/APKBUILD" "${apkbuild_sha256[$p]}"
 	mapfile -t srcs < <(set +u; . "$dl/$p/APKBUILD"; for s in $source; do echo "$s"; done)
 	ver=$(set +u; . "$dl/$p/APKBUILD"; echo "$pkgver-r$pkgrel")
+	while read -r sum s; do sha512[$s]=$sum; done < <(set +u; . "$dl/$p/APKBUILD"; echo "$sha512sums" | awk 'NF == 2')
 	for s in "${srcs[@]}"; do
 		case "$s" in
 		https://*|http://*) f="$dl/$p/${s##*/}"; set -- "$s" "$mirror/${s##*/}" ;;
 		*) f="$dl/$p/$s"; set -- "$url/$s" ;;
 		esac
-		[ -f "$f" ] && continue
+		sum=${sha512[${f##*/}]:-}
+		[ -n "$sum" ] || { echo "alpine-opt: $p: no sha512sum for ${f##*/}" >&2; exit 1; }
+		[ -f "$f" ] && [ "$(sha512sum < "$f" | cut -d' ' -f1)" = "$sum" ] && continue
+		rm -f "$f"
 		for u; do
-			curl -fsSL --retry 3 -o "$f.part" "$u" && mv "$f.part" "$f" && break
-			echo "alpine-opt: $u failed${2:+, trying the next source}" >&2
+			if curl -fsSL --retry 3 -o "$f.part" "$u"; then
+				[ "$(sha512sum < "$f.part" | cut -d' ' -f1)" = "$sum" ] && mv "$f.part" "$f" && break
+				echo "alpine-opt: $u: sha512 mismatch${2:+, trying the next source}" >&2
+			else
+				echo "alpine-opt: $u failed${2:+, trying the next source}" >&2
+			fi
+			rm -f "$f.part"
 			shift
 		done
 		[ -f "$f" ] || { echo "alpine-opt: cannot download ${f##*/}" >&2; exit 1; }
 	done
-	(set +u; cd "$dl/$p" && . ./APKBUILD && echo "$sha512sums" | awk 'NF == 2' | sha512sum -c --quiet)
 }
 
 # unpack PKG TARBALL DIR: a fresh source tree with the APKBUILD's patches,

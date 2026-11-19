@@ -16,7 +16,9 @@
 #                             rc, welcome and net, a login shell on hvc0 and
 #                             kwtty serve (respawned); poweroff, halt and
 #                             reboot in /usr/local/sbin signal it, and it
-#                             runs the layer's shutdown, then reboot(2)
+#                             runs the layer's shutdown, then reboot(2);
+#                             services: sysv-rc's runlevels 2, then 0 or 6
+#                             (/usr/sbin/runlevel; no policy-rc.d)
 #   /usr/lib/kw-distro        "debian"
 #   /usr/lib/kw-image         debian-<version>-<hash of the tree>
 #   /var/lib/apt/lists        the package lists of the image's date, as
@@ -25,8 +27,8 @@
 #                             by the image's apt at build time (needs the
 #                             base bundle and node; else left out)
 #   curl, ca-certificates, unzip, procps, less, vim-tiny, xz-utils, zstd,
-#   iproute2, htop, tmux, sudo, libatomic1 installed (DEBIAN_PACKAGES,
-#                             below; needs the same)
+#   iproute2, htop, tmux, sudo, libatomic1, sysv-rc installed
+#                             (DEBIAN_PACKAGES, below; needs the same)
 #   /usr/lib/kw-commands      "NAME PACKAGE" per command of main, for
 #                             kw-apt-install (command not found:
 #                             etc/profile.d/kw-apt.sh; tools/commands.py)
@@ -190,7 +192,9 @@ install_common "$stage"
 # The packages the image comes with, on top of the tarball's (with their
 # dependencies, no recommends). Adding one is adding its name here.
 # libatomic1: the official Node.js build links it (the kw layer's node shim).
-DEBIAN_PACKAGES="curl ca-certificates unzip procps less vim-tiny xz-utils zstd iproute2 htop tmux sudo libatomic1"
+# sysv-rc (with insserv and startpar): the service runner kw-init drives
+# (below, and rootfs/usr/local/sbin/kw-init).
+DEBIAN_PACKAGES="curl ca-certificates unzip procps less vim-tiny xz-utils zstd iproute2 htop tmux sudo libatomic1 sysv-rc"
 # Both are made by the image's own programs: the tree as it is at that
 # point becomes a first image (erofs, uncompressed), which boots on the
 # distroless bundle (guest/tools/vm-run.ts); files come out over exec's
@@ -277,6 +281,7 @@ else
 			$DEBIAN_PACKAGES > /tmp/kw-log 2>&1 ||
 			{ cat /tmp/kw-log; exit 1; }
 		[ \"\$(dpkg-query -W -f '\${db:Status-Abbrev}\n' $DEBIAN_PACKAGES | sort -u)\" = 'ii ' ]
+		update-rc.d sudo disable >> /tmp/kw-log 2>&1 || { cat /tmp/kw-log; exit 1; }
 		cd $u
 		find . -mindepth 1 -cnewer /tmp/kw-stamp -type c | sort > /tmp/kw-gone
 		find . -mindepth 1 -cnewer /tmp/kw-stamp ! -type c ! -path './var/log/*' \\
@@ -288,6 +293,17 @@ else
 	tar -xpf "$distro_out/$gen.pkgs.tar" -C "$stage" --no-same-owner
 	rm -f "$distro_out/$gen".{erofs,tar,id,uris,sums,pkgs.tar,gone}
 fi
+
+# --- services ------------------------------------------------------------------
+# Debian's packages enable their init scripts (update-rc.d: insserv's links
+# in /etc/rcN.d) and start them (invoke-rc.d), and kw-init runs runlevel 2
+# at boot. The image's policy-rc.d (docker's: exit 101, start nothing) goes,
+# so that an apt-get install starts its service as on a Debian system; it
+# stays for the build's own install above. sudo's script (enabled by the
+# build, disabled above) only clears /run/sudo, which is new at every boot.
+policy="$stage/usr/sbin/policy-rc.d"
+[ ! -e "$policy" ] || { grep -qx 'exit 101' "$policy" && rm "$policy"; } ||
+	{ echo "debian: $policy is not docker's exit 101 (upstream changed it?)" >&2; exit 1; }
 
 # --- the user -------------------------------------------------------------------
 # After the packages, whose scripts may add system users and groups. The

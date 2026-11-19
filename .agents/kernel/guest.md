@@ -245,12 +245,21 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   serve` (respawned); `poweroff`/`halt`/`reboot` in `/usr/local/sbin`
   signal it (through `sudo -n` for the user), and it stops
   everything, runs the layer's shutdown and calls reboot(2) through the
-  base's busybox. apt: `90kw` (no recommends, pdiffs or pty), debconf
+  base's busybox. Services are Debian's init scripts under sysv-rc (with
+  insserv and startpar, in `DEBIAN_PACKAGES`): kw-init runs runlevel 2
+  after net and 0 or 6 before it stops everything, only when that rc
+  directory has links to run; runlevel S (rcS.d) never runs, the layer's
+  rc does early boot. `/usr/sbin/runlevel` prints what kw-init writes to
+  `/run/kw-runlevel` (`N 2`), so that a package's invoke-rc.d starts its
+  service on install (`apt-get install cron`: running, and started at
+  every boot with a data disk). sudo's script is disabled (it only resets
+  `/run/sudo`). apt: `90kw` (no recommends, pdiffs or pty), debconf
   Noninteractive, the package lists of the image's date baked in
   (`DEBIAN_LISTS`, compressed by `tools/apt-lz4` as apt does) and apt's
   source cache made by the image's own apt at build time
   (`guest/tools/vm-run.ts` on the base bundle), so `apt-get install`
-  works with no `apt-get update` first. The image's `policy-rc.d` stays.
+  works with no `apt-get update` first. The image's `policy-rc.d`
+  (docker's `exit 101`) is removed after the build's own install.
   `DEBIAN_PACKAGES` in build.sh (curl, ca-certificates, unzip) are
   installed at build time by the image's apt in the same build VM, from
   .debs the host fetches from snapshot.debian.org (checked against the

@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# runlevel under kw-init: the previous and current runlevel, which kw-init
+# writes to /run/kw-runlevel (sysvinit's runlevel reads them from utmp).
+# invoke-rc.d asks it, and starts a package's service only in a runlevel
+# whose rc directory has the service's start link.
+
+# unkernel: runlevel under kw-init.
+if [ -s /run/kw-runlevel ]; then
+	cat /run/kw-runlevel
+else
+	echo unknown
+	exit 1
+fi

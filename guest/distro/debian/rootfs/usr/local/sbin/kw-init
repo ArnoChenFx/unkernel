@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # PID 1 of the Debian image (/sbin/init -> /usr/local/sbin/kw-init; Debian's
-# /sbin is a link to /usr/sbin; the image has no init system). The kw
-# layer's runtime (/usr/lib/kw/, from the base) does the rest: rc (mounts,
-# hostname, binfmt), welcome, net (DHCP), and at the end, after this has
-# stopped every process, shutdown (leave /data clean). In between it
+# /sbin is a link to /usr/sbin). The kw layer's runtime (/usr/lib/kw/, from
+# the base) does the rest: rc (mounts, hostname, binfmt), welcome, net
+# (DHCP), and at the end, after this has stopped every process, shutdown
+# (leave /data clean). Services are Debian's init scripts as sysv-rc runs
+# them: runlevel 2 after net (/etc/rc2.d, in insserv's order), 0 or 6 at
+# the end; runlevel S (rcS.d, initscripts' early boot) is the kw layer's rc
+# and never runs. /usr/sbin/runlevel reports the level from /run/kw-runlevel,
+# so that a package's invoke-rc.d starts what it installs. In between it
 # respawns the console's login shell on hvc0 (kwtty login: the user "user",
 # or kw.user= on the kernel command line) and kwtty serve, until poweroff,
 # halt or reboot (/usr/local/sbin) signal it (SIGUSR1, SIGUSR2); then
@@ -20,6 +24,19 @@ fi
 /usr/lib/kw/rc
 /usr/lib/kw/welcome
 /usr/lib/kw/net
+
+# Runs sysv-rc's rc for a runlevel change from $1 to $2, only when that
+# level's directory has a script to run (a boot without services starts no
+# shell for it): at boot a start link (a disabled service has K links in
+# rc2.d), at the end any.
+rc() {
+	echo "$1 $2" > /run/kw-runlevel
+	local links="/etc/rc$2.d/[SK][0-9][0-9]*"
+	[ "$1" != N ] || links="/etc/rc$2.d/S[0-9][0-9]*"
+	compgen -G "$links" >/dev/null || return 0
+	RUNLEVEL=$2 PREVLEVEL=$1 /etc/init.d/rc "$2"
+}
+rc N 2
 
 action=
 trap 'action=poweroff' USR1
@@ -52,6 +69,7 @@ while [ -z "$action" ]; do
 done
 
 trap '' USR1 USR2
+if [ "$action" = reboot ]; then rc 2 6; else rc 2 0; fi
 exec 3>&2 2>/dev/null   # no "Killed" notices for the children
 kill -TERM -1
 sleep 0.2

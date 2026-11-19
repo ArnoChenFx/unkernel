@@ -40,7 +40,7 @@
 "use strict";
 const DATA_DISK = "kwdisk:kwdata-v1";
 /** Databases the page is known to open, for browsers without indexedDB.databases(). */
-const KNOWN_DBS = [DATA_DISK, "kwsnap:session-v1"];
+const KNOWN_DBS = [DATA_DISK, "kwsnap:session-v2", "kwsnap:session-v1"];
 const out = document.getElementById("log");
 const log = (s) => { out.textContent += s + "\n"; };
 

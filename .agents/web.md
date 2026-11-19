@@ -488,8 +488,9 @@ sets sessionStorage `kw-resume` and reloads the same URL; the load reads it
 once and resumes without asking. A plain load offers to resume (`ui.ask`
 with Resume and Boot fresh) before the kernel starts.
 
-- `session.ts` keeps one session in IndexedDB `kwsnap:session-v1`, its own
-  database: `meta` (time, the page's kernel URL, the banner, the device
+- `session.ts` keeps one session in IndexedDB `kwsnap:session-v2`, its own
+  database (the first open on a page deletes `kwsnap:session-v1` and any
+  other older version, unawaited): `meta` (time, the page's kernel URL, the banner, the device
   options, the disks' snapshot state, the console's last 64 KiB) and
   `bytes` (the `encodeSnapshot()` Blob), written in one transaction. It
   never opens `kwdisk:kwdata-v1`.

@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The suspended session: Suspend (Ctrl-A z, KW.suspend()) saves the running
 // machine with the SDK's snapshot({ stop: true }) and keeps it here, in
-// IndexedDB "kwsnap:session-v1" (its own database; the data disk's
-// kwdisk:kwdata-v1 is never touched here); the next load offers to resume
+// IndexedDB "kwsnap:session-v2" (its own database, older versions are
+// deleted on first use; the data disk's kwdisk:kwdata-v1 is never touched
+// here); the next load offers to resume
 // it (boot.ts). One session at a time: "meta" (small, read to decide
 // whether to offer) and "bytes" (the encoded snapshot, a Blob) are written
 // in one transaction and deleted together.
@@ -16,8 +17,24 @@
 // guest keeps writing /data, which makes it unrestorable within seconds.
 import { decodeSnapshot, encodeSnapshot, type DiskSnapshotState, type KernelSnapshot } from "./sdk.ts";
 
-const DB = "kwsnap:session-v1";
+const DB_PREFIX = "kwsnap:session-v";
+const DB_VERSION = 2;
+const DB = `${DB_PREFIX}${DB_VERSION}`;
 const STORE = "session";
+
+let oldDropped = false;
+/**
+ * Delete the databases of older versions (kwsnap:session-v1 up to the one
+ * before DB_VERSION), once per page. Not awaited: deleting a missing one is
+ * a no-op, and one another tab still holds is deleted when that tab closes.
+ */
+function dropOldDbs(): void {
+	if (oldDropped) return;
+	oldDropped = true;
+	for (let v = 1; v < DB_VERSION; v++) {
+		try { indexedDB.deleteDatabase(`${DB_PREFIX}${v}`); } catch { /* ignore */ }
+	}
+}
 
 /** What the page needs to decide whether it can offer to resume. */
 export interface SessionMeta {
@@ -59,6 +76,7 @@ const reqP = <T>(r: IDBRequest<T>): Promise<T> =>
 	new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 
 function openDb(): Promise<IDBDatabase> {
+	dropOldDbs();
 	return new Promise((resolve, reject) => {
 		const r = indexedDB.open(DB, 1);
 		r.onupgradeneeded = () => { r.result.createObjectStore(STORE); };

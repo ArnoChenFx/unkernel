@@ -373,8 +373,13 @@ for (const name of ["alpine", "debian"]) {
 		test("command not found and the shims install packages as the user, through sudo (offline: they get as far as the package manager)", async (t) => {
 			const vm = await boot(t, { distro: img!.file });
 			// A default route, so that the tools see "a network" and go on to install; a name server
-			// that refuses at once, so that their downloads fail fast.
-			await asRoot(vm, "ip route add default dev lo && echo nameserver 127.0.0.1 > /etc/resolv.conf");
+			// that does not answer, with the shortest timeout and one attempt (musl ignores the port
+			// unreachable and would wait 5 s a lookup), so that their downloads fail fast.
+			await asRoot(vm, "ip route add default dev lo && printf 'nameserver 127.0.0.1\\noptions timeout:1 attempts:1\\n' > /etc/resolv.conf");
+			// Debian: apt-get is a stub that logs its uid and arguments and fails at once. A real
+			// apt-get takes ~8 s a run on the emulator, and offline the shims run three each
+			// (install, update, which exits 0, and the install again): ~100 s.
+			if (name === "debian") await asRoot(vm, `printf '%s\\n' '#!/bin/sh' 'echo "$(id -u) $*" >>/tmp/kw-apt.log' 'exit 100' >/usr/bin/apt-get`);
 			const cnf = name === "alpine" ? "/etc/kw-apk-install" : "/usr/local/sbin/kw-apt-install";
 			// rg: in neither image (Debian's has htop).
 			const r = await vm.exec(cnf, ["rg"], EXEC);
@@ -387,9 +392,19 @@ for (const name of ["alpine", "debian"]) {
 				assert.equal(s.exitCode, 127);
 				assert.match(s.stderr, /node: sudo apk add libgcc \(node needs libgcc_s\.so\.1\)/);
 			} else {
+				// A failed install fetches the lists; the update fails too, so no second install.
+				assert.match(r.stderr, /fetching the package lists/);
 				const d = await vm.exec("docker", ["ps"], EXEC);
 				assert.equal(d.exitCode, 127, d.stderr);
 				assert.match(d.stderr, /docker: sudo apt-get install docker\.io docker-cli crun/);
+				assert.match(d.stderr, /docker: installing docker\.io, docker-cli and crun failed/);
+				// Both ran apt-get as root.
+				assert.equal(await sh(vm, "cat /tmp/kw-apt.log"), [
+					"0 install -y -q --no-install-recommends ripgrep",
+					"0 update -q",
+					"0 install -y -q --no-install-recommends docker.io docker-cli crun",
+					"0 update -q",
+				].join("\n"));
 			}
 			await poweroff(vm);
 		});

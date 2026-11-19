@@ -63,11 +63,113 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   it changes) on every distro.
 - `/usr/lib/kw/shutdown`: with `/data` mounted, stop every process, then
   `/usr/lib/kw/data-stop` (data-disk.md); then sync.
+- `/usr/lib/kw/shim` and `/usr/lib/kw/bin/{fx,claude,opencode,node,npm,npx,bun,bunx}`
+  (Shims, below).
 - `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`
-  (`~/.local/bin` first on PATH, below), `/etc/profile.d/kw-term.sh`
+  (`~/.local/bin` first on PATH, `/usr/lib/kw/bin` last, below), `/etc/profile.d/kw-term.sh`
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
   `/usr/share/licenses/unkernel` (the GPL notice for these files).
+
+## Shims (fx, claude, opencode, node, bun)
+
+The kw layer's `/usr/lib/kw/bin/fx`, `claude`, `opencode`, `node`, `npm`,
+`npx`, `bun` and `bunx` link to `/usr/lib/kw/shim`, which installs the real program on
+its first call and runs it (described at its top). Every distro has them, the page and
+the CLI alike; `test/distro.test.ts` checks them on each image (no
+network).
+
+- PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for login shells, kwtty
+  for programs it starts), and the install goes to `~/.local/bin`, which
+  comes first, so later calls start the program directly and anything
+  else of those names (a user's own install) wins. A shell that ran the
+  shim keeps it hashed until `hash -r`, which costs one busybox `sh`
+  start per call (the shim execs the installed program).
+- The script runs the base's busybox `sh` (pipefail on any distro); its
+  other commands are the distro's. Downloads use wget, else curl: Alpine's
+  busybox wget, Debian's curl (the image has curl and ca-certificates).
+  It fails with exit 127 and a message when there is neither, no network
+  (no default route) or too little space.
+- The first call installs the newest release, straight from the URLs the
+  official installers use (fx.sh/setup.sh, claude.ai/install.sh,
+  opencode.ai/v2/install; none of them is run): fx at `~/.local/bin/fx`,
+  claude as `claude install` lays it out
+  (`~/.local/share/claude/versions/VER`, symlinked from `~/.local/bin`),
+  opencode in `~/.opencode/bin` (symlinked). `KW_FX_VERSION`,
+  `KW_CLAUDE_VERSION` (also `stable`) and `KW_OPENCODE_VERSION` pin one.
+  The musl builds on a musl distro (`/lib/ld-musl-*`), else the glibc
+  ones. No published checksum is checked (each would come from the same
+  host as the file, over the same verified TLS); gzip's CRC or zstd's
+  frame checksum covers the stream, and the result must be an ELF
+  program. claude comes as its `.zst` and needs zstd. The download
+  streams into a temporary file next to the final one (no copy in /tmp),
+  after a free-space check; one install at a time per tool (flock); a
+  cut-off one leaves nothing.
+- node, npm and npx install one thing: the Node.js release tarball,
+  unpacked as `~/.local/share/node/vVER` with `bin/node`, `npm` and `npx`
+  symlinked from `~/.local/bin` (so `npm install -g` writes into that
+  tree, and its programs are not on PATH). The newest LTS from the
+  release index, or `KW_NODE_VERSION` (`lts`, `latest`, a major version,
+  or `X.Y.Z`). glibc
+  distros get the official build (nodejs.org/dist, linux-arm64); Node.js
+  publishes no musl build for arm64 there, so Alpine gets the one of
+  unofficial-builds.nodejs.org (the project's own builder,
+  linux-arm64-musl). The musl build links `libgcc_s.so.1`, the glibc one
+  `libatomic.so.1`; when one is missing the shim installs its package
+  first, as root, with apk (`libgcc`) or apt-get (`libatomic1`); both
+  images have them (ALPINE_PACKAGES, DEBIAN_PACKAGES). The
+  `.tar.gz` (63 MB for 26.13.1, against 33 MB `.tar.xz`), unpacked with
+  pigz on Alpine; about 230 MB unpacked. Node CLI, 1 GiB, no data disk,
+  2026-11-19, node 26.13.1: Alpine first call 18.3 s (libgcc and pigz
+  included), then `npm --version` 4.9 s and `node -e 1` 1.8 s; Debian
+  18.3 s, then 3.0 and 0.4 s (23.4 s when apt-get installs libatomic1
+  first).
+- bun and bunx install bun as bun.sh/install lays it out (`~/.bun/bin/bun`,
+  symlinked from `~/.local/bin/bun` and `bunx`), but from the npm package
+  `npm install -g bun` picks (`@oven/bun-linux-aarch64[-musl]`): the
+  same program as the installer's
+  GitHub zip, which busybox unzip cannot read from a pipe (its entries
+  have data descriptors). The newest release, or `KW_BUN_VERSION`
+  (`X.Y.Z`). The musl build links `libstdc++.so.6`, which the shim
+  installs with apk first (`libstdc++`); the glibc one only glibc.
+  About 50 MB download, 100 MB unpacked (1.4.5). Node CLI, Alpine, 1 GiB,
+  no data disk, 2026-11-19, bun 1.4.5: first call 9.7 s (libstdc++ and
+  pigz included), then `bun -e` 0.06 s.
+- On Alpine it installs zstd (for claude) and pigz (unpacking 3x faster;
+  it works without) with apk when it can; Debian's image has zstd, and
+  GNU gzip unpacks opencode. Downloads use libcrypto's own choice of code
+  (AT_HWCAP: AES, PMULL, NEON), which kwemu's JIT translates; forcing its
+  C code (`OPENSSL_armcap=0`) made a 50 MB TLS 1.3 download over the host
+  loopback no faster (AES-128-GCM 10.5-13.1 s against 9.2-11.6 s,
+  ChaCha20-Poly1305 9.4-9.9 against 9.6-10.7; the network path and the
+  pipeline dominate) and costs AES 4x in `openssl speed`
+  (guest-packages.md).
+- Earlier pages wrote shims into `~/.local/bin` (`# kw-shim N` on line
+  2), which the data disk keeps on Alpine. They still work, come first on
+  PATH, and are replaced by the program they install; the kw layer's
+  shim installs over one.
+- Sizes and times on Alpine (Node CLI and SDK, 512 MiB, data disk,
+  2026-11-18): fx 4.5 MB download, 6.9 MB, first call 2.5 s, later ones
+  0.01 s; claude 2.1.327 127 MB (`.zst`), 357 MB, 23 s, then `--version`
+  0.2 s, `--help` 6 s; opencode 2.3.2 120 MB, 248 MB, 22 s, then
+  `--version` 6 s (its own startup); rechecked the same day on a fresh
+  data disk (fx 0.0.17, claude 2.1.327, opencode 2.3.2): first calls 2.2,
+  16.9 and 20.9 s, then 0.0, 0.1 and 4.3 s. All three also run at 256 MiB.
+  On Debian (Node CLI, 2026-11-19): fx 0.0.17 installs and runs; claude
+  2.1.328 (glibc build) at 1 GiB without a data disk, first call 18.8 s,
+  then `--version` 0.13 s. Without a data disk the root is in RAM (230 MiB
+  free at 512 MiB): fx installs, claude and opencode refuse with a
+  message; at 1 GiB claude fits.
+- claude's own auto-updater is left on: it may download a newer version
+  into `~/.local/share/claude/versions` in the background and keep the old
+  one until it cleans up, so up to twice its size on the data disk.
+- The guest downloads everything itself (TLS in the guest; on the page
+  through Wisp). The page could not fetch for it: downloads.claude.ai
+  sends no CORS headers and is https only; registry.npmjs.org and
+  releases.fx.sh send `Access-Control-Allow-Origin: *`, but the guest's TLS
+  is not the bottleneck any more (claude's `.zst` in 11 s and opencode's
+  tarball in 4 s through the default Wisp server from a server host,
+  2026-11-18).
 
 ## Distro images (`kernel/build.sh distro`, `guest/distro/`)
 
@@ -93,7 +195,11 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   `kwtty serve`, the layer's shutdown), and what "In the Alpine image"
   below lists. OpenSSL's engines, `legacy.so` and `*.dist` stay (the image
   is paged in on demand, not RAM-resident). An `apk add` cut off
-  mid-install needs no cleanup (data-disk.md).
+  mid-install needs no cleanup (data-disk.md). `ALPINE_PACKAGES` in
+  `pins.sh` (libgcc) are installed at build time as Debian's (below): the
+  image's apk in a build VM adds the pinned `.apk` files the host fetched,
+  and the changes to the overlay's upper layer are copied back into the
+  tree.
 - **Debian** (`distro/debian/`): debian:trixie-slim (pinned in
   `pins.sh`), Debian's own builds in full. `/sbin/init` ->
   `/usr/local/sbin/kw-init`, a bash PID 1: the layer's rc, welcome and
@@ -163,10 +269,11 @@ The files are in `guest/distro/alpine/rootfs/`.
   file.
 - **`~/.local/bin` first on PATH** (`/etc/profile.d/kw-path.sh`, from the
   kw layer): Alpine's
-  `/etc/profile` sets a fixed PATH; this prepends `$HOME/.local/bin` for
-  every login shell, and kwtty gives programs it starts directly the same
-  PATH. Per-user installs go there (`pip install --user`, the fx and
-  claude installers), and so do the page's stand-ins (web.md, Stand-ins).
+  `/etc/profile` sets a fixed PATH; this prepends `$HOME/.local/bin` and
+  appends `/usr/lib/kw/bin` (the shims) for every login shell, and
+  kwtty gives programs it starts directly the same PATH. Per-user installs
+  go there (`pip install --user`, the fx and claude installers, the
+  shims).
 - **bwrap shim** (`/usr/local/bin/bwrap`): no
   seccomp, so it drops `--seccomp FD` and runs `/usr/bin/bwrap` with the
   rest. GTK programs need it to load images (Xfce).

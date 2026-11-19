@@ -19,7 +19,9 @@
 #                           small): usr/bin/{kwtty,kw9p,kwvsock,kwshm,
 #                           kwwasi} (guest/src/), usr/sbin/kw-overlay,
 #                           usr/lib/kw/ (rc, welcome, net, udhcpc, shutdown,
-#                           data-stop: the runtime a distro's init calls),
+#                           data-stop: the runtime a distro's init calls;
+#                           shim and bin/: fx, claude, opencode, node,
+#                           npm, npx, bun, bunx on first use),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh}, the X.Org
 #                           fbdev/evdev config, usr/share/licenses/unkernel,
 #                           usr/lib/kw-base (the base's id), and an empty

@@ -25,8 +25,8 @@
 #                             by the image's apt at build time (needs the
 #                             base bundle and node; else left out)
 #   curl, ca-certificates, unzip, procps, less, vim-tiny, xz-utils, zstd,
-#   iproute2, htop, tmux, sudo installed (DEBIAN_PACKAGES, below; needs the
-#                             same)
+#   iproute2, htop, tmux, sudo, libatomic1 installed (DEBIAN_PACKAGES,
+#                             below; needs the same)
 #   /usr/lib/kw-commands      "NAME PACKAGE" per command of main, for
 #                             kw-apt-install (command not found:
 #                             etc/profile.d/kw-apt.sh; tools/commands.py)
@@ -178,7 +178,8 @@ install_common "$stage"
 # --- in the image: apt's source cache, the baked packages ----------------------------
 # The packages the image comes with, on top of the tarball's (with their
 # dependencies, no recommends). Adding one is adding its name here.
-DEBIAN_PACKAGES="curl ca-certificates unzip procps less vim-tiny xz-utils zstd iproute2 htop tmux sudo"
+# libatomic1: the official Node.js build links it (the kw layer's node shim).
+DEBIAN_PACKAGES="curl ca-certificates unzip procps less vim-tiny xz-utils zstd iproute2 htop tmux sudo libatomic1"
 # Both are made by the image's own programs: the tree as it is at that
 # point becomes a first image (erofs, uncompressed), which boots on the
 # distroless bundle (guest/tools/vm-run.ts); files come out over exec's

@@ -91,6 +91,24 @@ for (const name of ["alpine", "debian"]) {
 			await poweroff(vm);
 		});
 
+		test("the kw layer's shims: fx, claude, opencode, node, npm, npx, bun and bunx last on PATH; without a network the first call exits 127 and installs nothing", async (t) => {
+			const vm = await boot(t, { distro: img!.file });
+			const tools = ["fx", "claude", "opencode", "node", "npm", "npx", "bun", "bunx"];
+			const which = `for n in ${tools.join(" ")}; do command -v $n; done`;
+			const want = tools.map((n) => `/usr/lib/kw/bin/${n}`).join("\n");
+			assert.equal(await sh(vm, which), want, "kwtty's PATH");
+			const l = await vm.exec("sh", ["-lc", which], EXEC);
+			assert.equal(l.stdout.trim(), want, `a login shell's PATH: ${l.stderr}`);
+			const r = await vm.exec("fx", ["--version"], EXEC);
+			assert.equal(r.exitCode, 127);
+			assert.match(r.stderr, /^fx: not installed yet, and installing it needs a network/);
+			assert.equal(await sh(vm, "[ -e /root/.local/bin ] && echo yes || echo no"), "no");
+			// Anything else of the name wins: a program in ~/.local/bin (where an install goes).
+			await sh(vm, "mkdir -p /root/.local/bin && ln -s /bin/true /root/.local/bin/fx");
+			assert.equal(await sh(vm, "command -v fx"), "/root/.local/bin/fx");
+			await poweroff(vm);
+		});
+
 		test("a data disk keeps the root's changes across two boots, in /data/distros/<name>/upper", async (t) => {
 			const data = await dataDisk(name);
 			const token = `kw-${Math.random().toString(36).slice(2)}`;

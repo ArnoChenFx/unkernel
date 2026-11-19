@@ -959,13 +959,14 @@ static void __attribute__((noreturn)) session(int s)
 		char *d[6];
 
 		/* PATH: a login shell's (/etc/profile, then kw-path.sh), so that
-		 * programs started directly find /usr/local/bin and ~/.local/bin. */
+		 * programs started directly find /usr/local/bin, ~/.local/bin and
+		 * the shims in /usr/lib/kw/bin. */
 		if (asprintf(&d[0], "HOME=%s", home) < 0 ||
 		    asprintf(&d[1], "USER=%s", user) < 0 ||
 		    asprintf(&d[2], "LOGNAME=%s", user) < 0 ||
 		    asprintf(&d[3], "SHELL=%s", shell) < 0 ||
 		    asprintf(&d[4], "TERM=%s", o.term) < 0 ||
-		    asprintf(&d[5], "PATH=%s/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		    asprintf(&d[5], "PATH=%s/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin",
 			     strcmp(home, "/") ? home : "") < 0)
 			refuse(s, "out of memory");
 		for (int i = 0; i < 4; i++)

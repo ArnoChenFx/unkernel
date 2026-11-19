@@ -1,0 +1,290 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/shim (the kw layer): the shim for fx, claude, opencode,
+# node and bun; the comment below is what the image carries.
+
+# fx, claude, opencode, node (node, npm, npx) and bun (bun, bunx) on first
+# use, on every distro (unkernel's kw layer). /usr/lib/kw/bin/{fx,claude,
+# opencode,node,npm,npx,bun,bunx} link here, and kw-path.sh (and
+# kwtty) put that directory last on PATH, after ~/.local/bin and the
+# distro's own. The first call downloads the real program for this machine,
+# checks it, puts it at ~/.local/bin/TOOL and runs it with the same
+# arguments; later calls find it there first. Anything else named TOOL on
+# PATH wins over this shim. Delete ~/.local/bin/TOOL (and what it links to) to
+# uninstall.
+#
+# What it fetches (derived from the official installers, without running them):
+#   fx        https://releases.fx.sh/VERSION/fx-linux-ARCH.tar.gz
+#             VERSION from releases.fx.sh/latest.txt (or KW_FX_VERSION=vX.Y.Z).
+#   claude    https://downloads.claude.ai/claude-code-releases/VERSION/PLATFORM/claude.zst
+#             VERSION from .../latest (or KW_CLAUDE_VERSION=stable|latest|X.Y.Z),
+#             unpacked with zstd (installed with apk on Alpine), laid out as
+#             `claude install` does: ~/.local/share/claude/versions/VERSION,
+#             symlinked from ~/.local/bin/claude.
+#   opencode  https://registry.npmjs.org/SCOPE/cli-PLATFORM/-/cli-PLATFORM-VERSION.tgz
+#             VERSION and SCOPE from opencode.ai/update/api/latest/cli/npm (or
+#             KW_OPENCODE_VERSION=X.Y.Z); ~/.opencode/bin/opencode, symlinked
+#             from ~/.local/bin/opencode.
+#   node      https://nodejs.org/dist/vVERSION/node-vVERSION-linux-ARCH.tar.gz,
+#             on musl (Alpine) the unofficial-builds.nodejs.org build of
+#             the Node.js project (node-vVERSION-linux-ARCH-musl), VERSION
+#             the newest LTS in its index.json (or KW_NODE_VERSION=lts|
+#             latest|MAJOR|X.Y.Z); the tree in ~/.local/share/node/vVERSION,
+#             its bin/node, npm and npx symlinked from ~/.local/bin. Alpine
+#             needs libgcc for it (in the image; else installed with apk).
+#             npm install -g goes into that tree.
+#   bun       https://registry.npmjs.org/@oven/bun-PLATFORM/-/bun-PLATFORM-VERSION.tgz
+#             (what npm install -g bun installs: the same program as
+#             bun.sh/install's zip from GitHub, which cannot be unpacked
+#             from a stream), the newest release (or KW_BUN_VERSION=X.Y.Z),
+#             laid out as bun.sh/install does: ~/.bun/bin/bun, symlinked
+#             from ~/.local/bin/bun and ~/.local/bin/bunx. The musl build
+#             needs libstdc++ (installed with apk).
+# Nothing is checked against a published checksum: each would come from the
+# same host as the file, over the same TLS (verified on both distros), and
+# gzip's CRC or zstd's frame checksum catches a damaged stream. The result
+# must be an ELF program.
+# The shell is the base's busybox (pipefail on any distro); the other
+# commands are the distro's: wget, else curl, for the downloads (Alpine has
+# busybox wget, Debian curl). The download streams straight into its final
+# directory (no copy in /tmp); free space is checked first. One install at a
+# time per tool (flock); an interrupted one leaves nothing behind. Exit 127
+# when it cannot install.
+tool=${0##*/}
+# name: what gets installed (node for node, npm and npx; bun for bunx).
+case $tool in
+fx|claude|opencode) name=$tool ;;
+node|npm|npx) name=node ;;
+bun|bunx) name=bun ;;
+*) echo "kw shim: no shim for '$tool'" >&2; exit 127 ;;
+esac
+
+[ "${HOME:-/}" = / ] && [ "$(id -u)" = 0 ] && HOME=/root
+bin=$HOME/.local/bin
+link=$bin/$tool
+# installed: ~/.local/bin/TOOL is a program, not a shim that an earlier
+# page wrote there ("# kw-shim N" on line 2), which this replaces.
+installed() { [ -x "$link" ] && ! head -n 2 "$link" 2>/dev/null | grep -q '^# kw-shim [0-9]'; }
+run() { exec 9>&-; exec "$link" "$@"; }
+installed && run "$@"
+
+set -o pipefail
+gray= reset=
+[ -t 2 ] && gray='\033[90m' reset='\033[0m'
+say() { printf "${gray}%s${reset}\n" "$tool: $*" >&2; }
+die() { printf '%s\n' "$tool: $*" >&2; exit 127; }
+# get URL: the body on stdout, quiet; fails on an HTTP error.
+if command -v wget >/dev/null; then
+	get() { wget -q -U kw-shim -O - "$1"; }
+elif command -v curl >/dev/null; then
+	get() { curl -fsSL -A kw-shim "$1"; }
+else
+	die "not installed yet, and installing it needs wget or curl (this machine has neither)"
+fi
+# pkg CMD: CMD is there, or apk installs it now (as root, on Alpine).
+pkg() {
+	command -v "$1" >/dev/null && return
+	[ "$(id -u)" = 0 ] && command -v apk >/dev/null || return 1
+	say "apk add $1"
+	apk add -q --no-progress "$1" >/dev/null 2>&1
+	command -v "$1" >/dev/null
+}
+# needlib SONAME APK DEB: the shared library SONAME is there, or the
+# distro's apk or apt-get installs its package now (as root).
+haslib() { for d in /lib /usr/lib /lib/*-linux-gnu /usr/lib/*-linux-gnu; do [ -e "$d/$1" ] && return; done; return 1; }
+needlib() {
+	haslib "$1" && return
+	[ "$(id -u)" = 0 ] || die "needs $1; as root: apk add $2 (Alpine) or apt-get install $3 (Debian)"
+	if command -v apk >/dev/null; then
+		say "apk add $2 ($name needs $1)"
+		apk add -q --no-progress "$2" >/dev/null 2>&1
+	elif command -v apt-get >/dev/null; then
+		say "apt-get install $3 ($name needs $1)"
+		deb=$3
+		aptget() { apt-get install -y -q --no-install-recommends "$deb" </dev/null >/dev/null 2>&1; }
+		aptget || { apt-get update -q </dev/null >/dev/null 2>&1 && aptget; }  # the image's lists may be stale
+	fi
+	haslib "$1" || die "needs $1, and installing it failed (apk add $2, or apt-get install $3)"
+}
+
+case $(uname -m) in
+aarch64|arm64) fxarch=aarch64 plat=arm64 bunarch=aarch64 ;;
+x86_64|amd64) fxarch=x86_64 plat=x64 bunarch=x64 ;;
+*) die "no $tool build for $(uname -m)" ;;
+esac
+libc=
+ls /lib/ld-musl-* >/dev/null 2>&1 && libc=-musl
+
+awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null ||
+	die "not installed yet, and installing it needs a network (this machine has none)"
+
+mkdir -p "$bin" || die "cannot create $bin"
+exec 9>"/tmp/.kw-shim-$name.lock" && flock 9 || die "cannot lock /tmp/.kw-shim-$name.lock"
+installed && run "$@"  # another call installed it while this one waited
+
+# --- what to fetch -----------------------------------------------------------
+# url, dir (final directory), file (final name in dir), size (bytes, for the
+# space check; an upper bound where nothing tells it), top (a tree: unpack()
+# extracts into the directory $part, and $part/$top becomes $dir/$file;
+# links: its programs for ~/.local/bin, or the names in ~/.local/bin for
+# $dir/$file, $tool when empty)
+top= links=
+case $name in
+fx)
+	ver=${KW_FX_VERSION:-latest}
+	[ "$ver" = latest ] && { ver=$(get https://releases.fx.sh/latest.txt | tr -d '[:space:]') || die "cannot reach releases.fx.sh"; }
+	case $ver in v[0-9]*.[0-9]*.[0-9]*) ;; *) die "unexpected version '$ver'" ;; esac
+	url=https://releases.fx.sh/$ver/fx-linux-$fxarch.tar.gz
+	dir=$bin file=fx size=16000000
+	unpack() { tar -xzOf - fx && cat >/dev/null; } ;;
+claude)
+	B=https://downloads.claude.ai/claude-code-releases
+	ver=${KW_CLAUDE_VERSION:-latest}
+	case $ver in stable|latest) ver=$(get "$B/$ver") || die "cannot reach downloads.claude.ai" ;; esac
+	case $ver in [0-9]*.[0-9]*.[0-9]*) ;; *) die "unexpected version '$ver'" ;; esac
+	# The .zst is a third of the size (127 against 357 MB for 2.1.327, TLS
+	# 10 s, zstd 7 s, measured under kwemu on Alpine, 2026-11-18), and its
+	# frame checksum covers the program. zstd is a 1 MB package on Alpine;
+	# Debian's image has it.
+	pkg zstd || die "not installed yet, and installing it needs zstd (as root: apk add zstd)"
+	url=$B/$ver/linux-$plat$libc/claude.zst
+	dir=$HOME/.local/share/claude/versions file=$ver size=400000000
+	unpack() { zstd -dcq; } ;;
+opencode)
+	scope=@opencode
+	ver=${KW_OPENCODE_VERSION:-}
+	if [ -z "$ver" ]; then
+		m=$(get https://opencode.ai/update/api/latest/cli/npm) || die "cannot reach opencode.ai"
+		ver=$(printf %s "$m" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+		pkg=$(printf %s "$m" | sed -n 's/.*"package":"\([^"]*\)".*/\1/p')
+		[ -n "$ver" ] && [ -n "$pkg" ] || die "unexpected answer from opencode.ai"
+		scope=${pkg%/cli}
+	fi
+	ver=${ver#v}
+	case $ver in [0-9]*.[0-9]*.[0-9]*) ;; *) die "unexpected version '$ver'" ;; esac
+	case $scope in @[a-z0-9]*) ;; *) die "unexpected package scope '$scope'" ;; esac
+	t=linux-$plat$libc
+	url=https://registry.npmjs.org/$scope/cli-$t/-/cli-$t-$ver.tgz
+	dir=$HOME/.opencode/bin file=opencode size=280000000
+	unpack() { tar -xzOf - package/bin/opencode && cat >/dev/null; } ;;
+node)
+	if [ -n "$libc" ]; then
+		N=https://unofficial-builds.nodejs.org/download/release p=linux-$plat-musl
+	else
+		N=https://nodejs.org/dist p=linux-$plat
+	fi
+	ver=${KW_NODE_VERSION:-lts}
+	ver=${ver#v}
+	case $ver in
+	[0-9]*.[0-9]*.[0-9]*) ;;
+	lts|latest|[0-9]|[0-9][0-9]|[0-9][0-9][0-9])
+		# index.json: one release per line, newest first; no pre-releases.
+		case $ver in
+		lts) re='"lts":"' ;;
+		latest) re='"version":"v' ;;
+		*) re="\"version\":\"v$ver\\." ;;
+		esac
+		m=$(get "$N/index.json") || die "cannot reach ${N%/*}"
+		ver=$(printf '%s\n' "$m" | grep -F "\"$p\"" | grep -e "$re" |
+			sed -n 's/.*"version":"v\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | sed -n 1p)
+		[ -n "$ver" ] || die "no $p release matches KW_NODE_VERSION=${KW_NODE_VERSION:-lts}" ;;
+	*) die "unexpected KW_NODE_VERSION '$KW_NODE_VERSION'" ;;
+	esac
+	top=node-v$ver-$p
+	url=$N/v$ver/$top.tar.gz
+	dir=$HOME/.local/share/node file=v$ver size=240000000 links="node npm npx"
+	unpack() { tar -xzof - -C "$part"; }  # -o: not the tarball's owners
+	# The musl build links libgcc_s, the glibc one libatomic (both images
+	# have them: ALPINE_PACKAGES, DEBIAN_PACKAGES).
+	if [ -n "$libc" ]; then needlib libgcc_s.so.1 libgcc libgcc-s1; else needlib libatomic.so.1 libatomic libatomic1; fi ;;
+bun)
+	t=linux-$bunarch$libc
+	# x64 without AVX2 gets the baseline build, as bun.sh/install.
+	[ $bunarch = x64 ] && ! grep -qw avx2 /proc/cpuinfo && t=$t-baseline
+	ver=${KW_BUN_VERSION:-latest}
+	ver=${ver#bun-} ver=${ver#v}
+	case $ver in latest|[0-9]*.[0-9]*.[0-9]*) ;; *) die "unexpected KW_BUN_VERSION '$KW_BUN_VERSION'" ;; esac
+	m=$(get "https://registry.npmjs.org/@oven%2fbun-$t/$ver") || die "no bun $ver for $t on the npm registry"
+	ver=$(printf %s "$m" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+	url=$(printf %s "$m" | sed -n 's/.*"tarball":"\(https:[^"]*\)".*/\1/p')
+	size=$(printf %s "$m" | sed -n 's/.*"unpackedSize":\([0-9][0-9]*\).*/\1/p')
+	[ -n "$ver" ] && [ -n "$url" ] && [ -n "$size" ] || die "unexpected npm metadata for bun $ver"
+	dir=$HOME/.bun/bin file=bun links="bun bunx"
+	unpack() { tar -xzOf - package/bin/bun && cat >/dev/null; }
+	# The musl build links libstdc++ (not in Alpine's image), the glibc one
+	# only glibc.
+	[ -z "$libc" ] || needlib libstdc++.so.6 libstdc++ libstdc++6 ;;
+esac
+
+# --- space ---------------------------------------------------------------------
+rm -rf "$dir"/*.kw-part.* "$bin"/.*.kw-link.* 2>/dev/null  # left by a killed install
+free=$(( $(stat -f -c '%a * %S' "$bin") ))  # $dir is under $HOME too
+need=$(( size + 16 * 1048576 ))
+if [ "$free" -lt "$need" ]; then
+	mib() { echo "$(( ($1 + 1048575) / 1048576 )) MiB"; }
+	case $(stat -f -c %T "$bin") in
+	tmpfs|ramfs)
+		die "needs $(mib "$need") free, and only $(mib "$free") is: without a data disk the files live in memory." \
+			"Attach one (the page does unless ?data=0; the CLI with --data FILE) or give more memory (?mem=, --mem)." ;;
+	esac
+	die "needs $(mib "$need") free in $bin, and only $(mib "$free") is; not installed"
+fi
+mkdir -p "$dir" || die "cannot create $dir"
+
+# --- faster unpacking (measured under kwemu on Alpine, 2026-11-18) ------------
+case $name in
+opencode|bun)
+	# pigz (zlib's inflate) unpacks opencode's 120 MB tarball in 8 s,
+	# busybox's gunzip in 21 s. pigz is a 0.1 MB package.
+	if pkg pigz; then
+		unpack() { pigz -dc | { tar -xOf - "package/bin/$name" && cat >/dev/null; }; }
+	fi ;;
+node)
+	if pkg pigz; then
+		unpack() { pigz -dc | tar -xof - -C "$part"; }
+	fi ;;
+esac
+
+# --- download, unpack, check -------------------------------------------------
+part=$dir/$file.kw-part.$$
+pp=
+if [ -n "$top" ]; then mkdir "$part" || die "cannot create $part"; fi
+# The pipeline runs in the background so that a signal to this shell alone
+# (kill, timeout) interrupts the wait at once; the trap then stops it.
+cleanup() {
+	[ -z "$pp" ] || { pkill -P "$pp"; kill "$pp"; } 2>/dev/null
+	rm -rf "$part"
+}
+trap cleanup EXIT
+trap 'exit 130' INT HUP
+trap 'exit 143' TERM
+say "installing $name $ver ($url)"
+if [ -n "$top" ]; then
+	(get "$url" | unpack) &
+else
+	(get "$url" | unpack > "$part") &
+fi
+pp=$!
+wait $pp
+rc=$?
+pp=
+[ $rc = 0 ] || die "download failed: $url"
+elf=$part
+[ -z "$top" ] || elf=$part/$top/bin/$name
+[ "$(head -c 4 "$elf" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ] || die "$url: not an ELF program; not installed"
+# lnk TARGET NAME: ~/.local/bin/NAME -> TARGET, replaced in one rename.
+lnk() { ln -sfn "$1" "$bin/.$2.kw-link.$$" && mv -f "$bin/.$2.kw-link.$$" "$bin/$2" || die "cannot link $bin/$2"; }
+if [ -n "$top" ]; then
+	rm -rf "$dir/$file"  # a partial tree of the same version (moved, then killed)
+	mv "$part/$top" "$dir/$file" || die "cannot move it into $dir"
+	rm -rf "$part"
+	for n in $links; do lnk "$dir/$file/bin/$n" "$n"; done
+else
+	chmod 755 "$part"
+	mv -f "$part" "$dir/$file" || die "cannot move it into $dir"
+	for n in ${links:-$tool}; do [ "$dir/$file" = "$bin/$n" ] || lnk "$dir/$file" "$n"; done
+fi
+trap - EXIT INT HUP TERM
+if [ -n "$top" ]; then say "installed $dir/$file, linked from $bin"; else say "installed $link"; fi
+run "$@"

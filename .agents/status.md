@@ -231,6 +231,13 @@ Open:
      task that moves compiles its hot code again; exclusive pairs and
      CASP stay interpreter calls in compiled code (a64/jit.md, Atomics in
      compiled code).
+   - Scaling stops near 4x: independent shell loops ran 2.9x on 4 CPUs,
+     3.8x on 8 and 3.2x on 16 (Node, i7-10700K, 8 cores), 4.0x on 14
+     (Chrome, 14-thread Mac), so 8 CPUs give little over 4 (testing.md,
+     Profiling CPUs and worker mode, 2026-11-19). Not yet traced (a
+     `kernel/build.sh stats` kernel's per-CPU counters would say where the
+     CPUs wait). In Safari 27.2 parallel work got slower with every CPU
+     (0.4x on 4); the page boots one CPU there (`webkitEngine()`).
    - Under host load (kernel/smp.md, Waiting for another CPU): a
      synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
@@ -258,8 +265,8 @@ Open:
      one CPU. Run in headless Chromium (2 and 4 CPUs: boot, a terminal
      window, glimmer, the JIT on every CPU, parallel loops scaling) and
      by hand on a deployed build in desktop Chrome, Firefox and on iOS.
-     Not tried: desktop Safari, Android, a hidden tab (worker
-     throttling), long sessions. The page offers it when its release
+     Desktop Safari 27.2 runs it, slower with each CPU (above). Not
+     tried: Android, a hidden tab (worker throttling), long sessions. The page offers it when its release
      bundle carries the SMP patch, as releases do since 2026-11-17
      (testing.md, Release workflow, lists the SMP checks the workflow
      still lacks). Several CPUs on the aarch64 guest are checked in Node

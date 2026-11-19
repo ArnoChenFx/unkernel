@@ -426,6 +426,9 @@ other options.
   (below), since the answer picks the kernel. The SMP bundle is a hashed
   `/assets/` file like the UP one: the service worker (scope `/vm/`) never
   sees it, and the HTTP cache keeps each file on its own.
+- `/profile.html` (testing.md, Profiling CPUs and worker mode) measures
+  the configurations the defaults choose between; `SUGGESTED_CPUS`
+  carries the numbers it is based on.
 - Falling back: a failed SMP download or compile, or a `createKernel()`
   that rejects (the worker, its JSPI, the shared memory), calls
   `bootUpOnce()`: it stores the reason in sessionStorage `kw-up-once` and

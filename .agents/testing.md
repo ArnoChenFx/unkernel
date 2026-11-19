@@ -88,6 +88,39 @@ when chasing a race.
 When you measure something, follow the rules in a64/performance.md (machine, date,
 command, interleaved medians).
 
+## Profiling CPUs and worker mode
+
+Two twins time everyday guest work (command latency, a shell loop,
+fork+exec, gzip, sort, sha256sum, `find /usr`, and three parallel ones:
+4 loops, 8 sort pipelines, one loop per CPU of the widest configuration)
+in each configuration, one boot each, with medians over runs and the
+first run apart, and score the single-threaded and the parallel ones
+apart (geometric means). Use them before changing the CPU or worker
+defaults (web/src/config.ts `SUGGESTED_CPUS`), and to judge SMP work.
+
+- `/profile.html` (web/src/profile.ts; the dev server or a build): the
+  page's thread and a worker on 1 CPU, a worker on 2 to the device's
+  threads (up to `MAX_CPUS`), the longest frame gaps meanwhile, Copy
+  JSON / Copy table, and Host threads: workers and nested workers doing
+  the same work (do they run in parallel) and Atomics.wait/notify against
+  spinning round trips between two workers, without a kernel.
+- `node test/profile.ts [--cpus 1,2,4,8] [--no-main] [--runs 3] [--scale
+  1] [--distro debian] [--mem 512] [--no-jit] [--json FILE]`: the same on
+  Node (this thread, and worker threads), with the event loop's longest
+  lag instead of frame gaps; a markdown table on stdout.
+
+Results (Debian, 512 MiB, JIT; speedup of the parallel ones against one
+CPU in a worker; 2026-11-19):
+
+| Host | 1 CPU: worker vs main thread | 4 CPUs | 8 CPUs | most | single-threaded at 8 | boot 1 / 8 CPUs |
+| --- | --- | --- | --- | --- | --- | --- |
+| Chrome 157, macOS, 14 threads | same speed; frame gaps 9 ms vs 100 ms | 2.5-3.5x | 2.7-5.3x | 14: 2.7-4.7x | +5% | 0.21 / 0.54 s |
+| Safari 27.2, same Mac (reports 8) | same speed, smoother | 0.4-0.6x | 0.15-0.4x | | +7% | 0.23 / 0.63 s |
+| Node 24, Linux, i7-10700K, 16 threads | same speed; event loop lag 4 ms vs 23 ms | 2.9-3.3x | 2.9-3.8x | 16: 2.9-4.0x | +4% | 0.39 / 1.08 s |
+
+Parallel work tops out near 4x however many CPUs (status.md, SMP), and
+Safari gets slower with each CPU, which Host threads is there to explain.
+
 ## Release workflow (CI)
 
 `.github/workflows/release.yml` is the source for what CI does; the

@@ -398,6 +398,13 @@ parts that are easy to get wrong.
   threads: a worker's value never ran ahead of the main thread's,
   2026-11-16). In worker mode the kernel worker starts the CPU threads
   itself (`ServeKernelOptions.spawnCpu`). Exit terminates them.
+- Defaults: the SDK and the CLI boot one CPU on the calling thread
+  (snapshots, `--suspend` and the kwtest and abitest runs of testing.md
+  expect the UP kernel). For a host that serves other work, `worker:
+  true` costs nothing (same speed, the event loop free) and `cpus: 4` is
+  where parallel work stops gaining: `node test/profile.ts` (testing.md,
+  Profiling CPUs and worker mode; i7-10700K, 2026-11-19: 4 CPUs 2.9-3.3x,
+  8 2.9-3.8x, 16 no better, boot 0.39 s on 1 CPU against 0.81 s on 4).
 - `runCpu()` checks that the flag reads 2, instantiates the module with
   its own `wasm_switch_to` (its own resumers: JSPI stacks stay in their
   thread), clocks, `random_get`, `sched_yield`, kwemu's JIT imports and

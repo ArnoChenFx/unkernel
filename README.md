@@ -514,6 +514,12 @@ because a CPU blocks while it waits for another, which a page's main
 thread may not; `webCpuBlocker()` says why it cannot, and
 `vm.stats().cpus` how many CPUs the kernel got.
 
+On a server, `worker: true` keeps the event loop free at no cost in speed,
+and `cpus: 4` gets most of what more CPUs give (about 3x on parallel work;
+8 or 16 add little, and each CPU adds to boot time and takes 8 MiB of
+guest memory). `node test/profile.ts` measures your host, and the page's
+`/profile.html` a browser.
+
 ### Boot options and helpers
 
 ```js

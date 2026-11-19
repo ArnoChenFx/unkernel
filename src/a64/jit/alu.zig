@@ -211,6 +211,7 @@ fn produced(e: *Emit, at: At, kind: Kind, bk: ?u64, ccmp: bool, def: u4) void {
     e.x.alu.synced = kind == .exact;
     const last = at.k < 64 and e.x.alu.last & (@as(u64, 1) << @intCast(at.k)) != 0;
     if (last and !at.self_loop and !e.x.alu.synced) {
+        e.site = 3;
         materialise(e);
         e.set(cm.l_nzcv);
         e.x.alu.synced = true;
@@ -414,6 +415,8 @@ pub fn nzcv(e: *Emit) void {
 fn materialise(e: *Emit) void {
     const x = &e.x.alu;
     if (x.kind == .exact) return e.get(cm.l_nzcv);
+    e.statInc(jc.Jx.sync_site + e.site);
+    e.site = 0; // a sync no caller named is an exit
     // N: bit 63 of R to bit 31
     e.get(l_fr);
     e.k64(32);

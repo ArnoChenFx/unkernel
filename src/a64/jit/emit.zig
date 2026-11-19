@@ -216,6 +216,7 @@ fn generic(e: *Emit, o: Op, at: At) void {
 
 /// Write back what the module's code wrote (lazy NZCV first).
 fn spill(e: *Emit, u: Use) void {
+    e.site = 4;
     alu.sync(e);
     for (0..32) |s| {
         if (u.write & (@as(u32, 1) << @intCast(s)) != 0) store(e, W.i64_store, 3, @intCast(s), cm.local(@intCast(s)));
@@ -245,7 +246,12 @@ pub const l_e = cm.l_e;
 pub const l_region = cm.l_region;
 
 pub fn ops(cpu: *Cpu, b: *const Block) []const Op {
-    return cpu.opArena(Op)[b.op..][0..b.n];
+    return cpu.opArena(Op)[cpu.opIndex(b.op)..][0..b.n];
+}
+
+/// Arena slots of a block: its ops, then its raw words (tier.Blocks).
+pub fn slots(b: *const Block) u32 {
+    return b.n + (@as(u32, b.ninsn) + 3) / 4;
 }
 
 pub const nextPc = O.nextPc;
@@ -527,6 +533,126 @@ fn genFast(r: std.Random, out: []u32, pc: u64) usize {
     }
     _ = pc;
     return i;
+}
+
+/// Scalar FP that generic.zig translates with a fast path and an
+/// interpreter call (FADD, FSUB, FMUL, FDIV, FSQRT, SCVTF, UCVTF, FCVTZS,
+/// FCVTZU, FCVT) or without one (FMOV, FABS, FNEG, FMOV (immediate),
+/// FCSEL), on V0..V7 so that results feed later ops, and the operands
+/// they meet: edge FP values put into a register by MOVZ/MOVK and FMOV
+/// (zeros, denormals, the smallest and largest normals, values next to
+/// powers of two, infinities, quiet and signalling NaNs, either sign),
+/// integers next to 2^24, 2^53, 2^31, 2^63 and 2^64 for the conversions,
+/// FPCR with RMode, FZ and DN at random (the fast path needs RNE and no
+/// FZ) and FPSR with or without IXC (double FMUL/FDIV/FSQRT take the fast
+/// path only with IXC set), and after half the ops the flags they set
+/// (MRS FPSR into a register, then MSR FPSR, XZR).
+fn genFp(r: std.Random, out: []u32, pc: u64) usize {
+    _ = pc;
+    const v = struct {
+        fn reg(rr: std.Random) u32 {
+            return rr.uintLessThan(u32, 8);
+        }
+    };
+    const vd = v.reg(r);
+    const vn = v.reg(r);
+    const vm = v.reg(r);
+    const ftype: u32 = r.uintLessThan(u32, 2) << 22; // single, double
+    const x9: u32 = 9;
+    switch (r.uintLessThan(u32, 16)) {
+        0, 1, 2 => { // an edge value into Vd: top 16 bits by MOVZ, low bits by MOVK
+            const dbl = r.boolean();
+            const exps = [_]u32{ 0, 1, 2, 3, 0x3fe, 0x3ff, 0x400, 0x433, 0x434, 0x7fd, 0x7fe, 0x7ff };
+            const sexps = [_]u32{ 0, 1, 2, 3, 0x7e, 0x7f, 0x80, 0x96, 0x97, 0xfd, 0xfe, 0xff };
+            const sign: u32 = r.uintLessThan(u32, 2) << 15;
+            if (dbl) {
+                const e = exps[r.uintLessThan(usize, exps.len)];
+                const top: u32 = sign | (e << 4) | switch (r.uintLessThan(u32, 4)) {
+                    0 => 0,
+                    1 => 8, // quiet bit
+                    2 => 15,
+                    else => r.uintLessThan(u32, 16),
+                };
+                out[0] = 0xd2e0_0000 | (top << 5) | x9; // movz x9, #top, lsl 48
+                const low: u32 = switch (r.uintLessThan(u32, 4)) {
+                    0 => 0,
+                    1 => 1,
+                    2 => 0xffff,
+                    else => r.uintLessThan(u32, 65536),
+                };
+                out[1] = 0xf280_0000 | (low << 5) | x9; // movk x9, #low
+                out[2] = 0x9e67_0000 | (x9 << 5) | vd; // fmov dD, x9
+            } else {
+                const e = sexps[r.uintLessThan(usize, sexps.len)];
+                const top: u32 = sign | (e << 7) | switch (r.uintLessThan(u32, 4)) {
+                    0 => 0,
+                    1 => 0x40, // quiet bit
+                    2 => 0x7f,
+                    else => r.uintLessThan(u32, 128),
+                };
+                out[0] = 0x52a0_0000 | (top << 5) | x9; // movz w9, #top, lsl 16
+                const low: u32 = switch (r.uintLessThan(u32, 3)) {
+                    0 => 0,
+                    1 => 1,
+                    else => r.uintLessThan(u32, 65536),
+                };
+                out[1] = 0x7280_0000 | (low << 5) | x9; // movk w9, #low
+                out[2] = 0x1e27_0000 | (x9 << 5) | vd; // fmov sD, w9
+            }
+            return 3;
+        },
+        3 => { // an integer next to a precision or range limit into x9
+            const tops = [_]u32{ 0x0000, 0x0020, 0x001f, 0x0100, 0x00ff, 0x7fff, 0x8000, 0xffff, 0x4000 };
+            out[0] = 0xd2e0_0000 | (tops[r.uintLessThan(usize, tops.len)] << 5) | x9; // movz x9, #t, lsl 48
+            out[1] = 0xf280_0000 | (@as(u32, switch (r.uintLessThan(u32, 3)) {
+                0 => 0,
+                1 => 1,
+                else => r.uintLessThan(u32, 65536),
+            }) << 5) | x9;
+            out[2] = 0xf2a0_0000 | (r.uintLessThan(u32, 65536) << 5) | x9; // movk x9, #r, lsl 16
+            return 3;
+        },
+        4 => { // FPCR: mostly 0, else RMode / FZ / DN at random
+            const fc: u32 = if (r.uintLessThan(u32, 3) != 0) 0 else (r.uintLessThan(u32, 8) << 6) | (r.uintLessThan(u32, 2) << 9); // of FPCR >> 16
+            out[0] = 0xd2a0_0000 | (fc << 5) | x9; // movz x9, #fc, lsl 16
+            out[1] = 0xd51b_4400 | x9; // msr fpcr, x9
+            return 2;
+        },
+        5 => { // FPSR: 0, IXC, or everything
+            const fs: u32 = switch (r.uintLessThan(u32, 3)) {
+                0 => 0,
+                1 => 0x10,
+                else => 0x9f,
+            };
+            out[0] = 0xd280_0000 | (fs << 5) | x9;
+            out[1] = 0xd51b_4420 | x9; // msr fpsr, x9
+            return 2;
+        },
+        6, 7, 8 => out[0] = 0x1e20_0800 | ftype | (vm << 16) | (r.uintLessThan(u32, 4) << 12) | (vn << 5) | vd, // fmul, fdiv, fadd, fsub
+        9 => out[0] = 0x1e20_4000 | ftype | (r.uintLessThan(u32, 4) << 15) | (vn << 5) | vd, // fmov, fabs, fneg, fsqrt
+        10 => out[0] = if (r.boolean()) 0x1e62_4000 | (vn << 5) | vd else 0x1e22_c000 | (vn << 5) | vd, // fcvt sD, dN / dD, sN
+        11 => out[0] = 0x1e20_1000 | ftype | (r.uintLessThan(u32, 256) << 13) | vd, // fmov (immediate)
+        12 => { // fcsel after a compare
+            out[0] = 0xeb00_001f | (kt.anyReg(r) << 16) | ((kt.anyReg(r) & 30) << 5);
+            out[1] = 0x1e20_0c00 | ftype | (vm << 16) | (r.uintLessThan(u32, 16) << 12) | (vn << 5) | vd;
+            return 2;
+        },
+        13 => out[0] = 0x1e22_0000 | (r.uintLessThan(u32, 2) << 31) | ftype | (r.uintLessThan(u32, 2) << 16) | ((if (r.boolean()) x9 else kt.anyReg(r)) << 5) | vd, // scvtf, ucvtf
+        else => out[0] = 0x1e38_0000 | (r.uintLessThan(u32, 2) << 31) | ftype | (r.uintLessThan(u32, 2) << 16) | (vn << 5) | (if (r.uintLessThan(u32, 8) == 0) 31 else kt.dst(r)), // fcvtzs, fcvtzu
+    }
+    // Half the time the flags of this op alone: FPSR into a register, then
+    // cleared (the end state alone hides a flag that a later op sets too).
+    if (r.boolean()) {
+        out[1] = 0xd53b_4420 | kt.dst(r); // mrs xD, fpsr
+        out[2] = 0xd51b_4420 | 31; // msr fpsr, xzr
+        return 3;
+    }
+    return 1;
+}
+
+test "a64 jit: generic, scalar FP fast paths" {
+    try kt.kind(.generic, genFp, .{ .rounds = 400, .words = 48 });
+    try kt.kind(.generic, genFp, .{ .seed = 2, .rounds = 400, .words = 48 });
 }
 
 test "a64 jit: generic, inline forms" {

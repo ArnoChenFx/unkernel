@@ -294,6 +294,30 @@ pub inline fn newBlock(cpu: *Cpu) BlockState {
     return .{ .st = cpu.priv.jit.threshold };
 }
 
+/// Block-table replacement (kwemu lookupSlow): of a set's two ways, the one
+/// with less to lose: an empty way, else the one with less countdown
+/// progress (compiled counts as more than any); `alt` decides a tie. The
+/// way that stays loses half its progress, so a block that stopped running
+/// does not keep its way for ever.
+pub fn victim(cpu: *Cpu, ways: *[2]Block, alt: u8) usize {
+    const h0 = heatOf(cpu, &ways[0]);
+    const h1 = heatOf(cpu, &ways[1]);
+    if (h0 == h1) return alt;
+    const w: usize = @intFromBool(h1 < h0);
+    const keep = &ways[1 - w];
+    const s = keep.jx.st;
+    if (s != never and s < compiled) keep.jx.st = s + (cpu.priv.jit.threshold -| s) / 2;
+    return w;
+}
+
+fn heatOf(cpu: *Cpu, b: *const Block) u32 {
+    if (b.pc == std.math.maxInt(u64)) return 0;
+    const s = b.jx.st;
+    if (s >= compiled) return std.math.maxInt(u32);
+    if (s == never) return 0;
+    return cpu.priv.jit.threshold -| s;
+}
+
 /// Pool entry + 1 of b's code, 0 = not compiled.
 pub inline fn slotOf(b: *const Block) u32 {
     return if (b.jx.st >= compiled) (b.jx.st & slot_mask) + 1 else 0;
@@ -323,6 +347,16 @@ fn freeSlot(cpu: *Cpu, i: usize) void {
 /// and the overwrite resets that.
 pub inline fn drop(cpu: *Cpu, b: *Block) void {
     if (b.jx.st >= compiled) dropMember(cpu, b);
+}
+
+/// The tenured ring drops b's ops (kwemu.zig, `tenMakeRoom`): its code goes
+/// as in `drop`, and it is compiled again once it has counted to the
+/// threshold again.
+pub fn evict(cpu: *Cpu, b: *Block) void {
+    if (b.jx.st >= compiled) {
+        dropMember(cpu, b);
+        b.jx.st = cpu.priv.jit.threshold;
+    }
 }
 
 noinline fn dropMember(cpu: *Cpu, b: *Block) void {
@@ -501,7 +535,14 @@ pub const Jx = struct {
     /// pending), so a row adds up to at most its exit counter.
     pub const next_by = 26;
     pub const n_nx = 7;
-    pub const end = next_by + 4 * n_nx;
+    /// Lazy state (A64: NZCV) materialised by compiled code, by where
+    /// (`Emit.site`): an exit to `run` or a hand-back, a self-loop's or
+    /// member's own back edge, a branch to another member, right after a
+    /// producer whose result reaches the member's end, before a call of the
+    /// interpreter (and MRS NZCV).
+    pub const sync_site = next_by + 4 * n_nx;
+    pub const n_sites = 5;
+    pub const end = sync_site + n_sites;
 };
 
 /// Exit reasons of Jx.next_by.
@@ -702,9 +743,10 @@ pub const Error = error{ Unsupported, Overflow };
 // Entering a member: `run` looked the entered block up, so it is valid
 // under its page's current exec-TLB fill. A branch to a member m (from any
 // member, m itself included) goes through m's checked entry:
-//  - blocks[m].op is the op index m had when the module was emitted. A
-//    re-decode takes new ops (the arena only grows until a cache reset,
-//    which frees every module), so this is "still the same decode".
+//  - blocks[m].op is the op number m had when the module was emitted.
+//    Members' ops are in the tenured ring (kwemu.zig, `tenure`), numbered
+//    on for good, and a re-decode gives a block nursery ops (another
+//    number), so this is "still the same decode".
 //  - m is valid under the current fill of its own page: blocks[m].tgen
 //    equals l_g, the tgen of the member being run (a generation is unique
 //    to one fill of one page, and that fill is live), or else the
@@ -737,8 +779,10 @@ pub const Error = error{ Unsupported, Overflow };
 // region, on another page, that `run` often enters right after the region
 // left joins it as a guest. A member that is re-decoded only loses its own
 // entry (`dropMember`); copies of it in other regions fail the op check
-// from then on. A region is freed when no home member is left, when the
-// clock evicts it, when it is grown (replaced) or on a cache reset.
+// from then on. A region is freed when no home member is left (a member
+// re-decoded, or its ops dropped from the tenured ring), when the clock
+// evicts it, when it is grown (replaced) or on a cache reset; a nursery
+// reset leaves it alone.
 
 /// The blocks of a region being compiled (indices into cpu.priv.blocks;
 /// [0] is the block that got hot) and its emission state.
@@ -819,6 +863,8 @@ fn addMember(rg: *Region, i: u32) void {
 ///   l_region                    first of `n_region_locals` i64 locals,
 ///                               declared by `locals` when `region`
 ///   ops(cpu, b) []const Op      b's ops (b.n of them, terminator last)
+///   slots(b) u32                op-arena slots b uses (ops and anything
+///                               the ISA keeps after them; `tenure`)
 ///   supported(o) bool           translated (else handed back before it)
 ///   blockUse(ops) Use           usage of a translated prefix
 ///   beginMember(e, ops)         a block's or member's code starts (ops: its
@@ -878,6 +924,9 @@ pub fn Jit(comptime I: type) type {
             rg: ?*Region = null,
             /// The ISA's emission state.
             x: I.EmitExt = .{},
+            /// Statistics: which kind of site the next `I.sync` serves
+            /// (Jx.sync_site + site).
+            site: u8 = 0,
 
             pub fn op(e: *Emit, b: u8) void {
                 if (e.pos < buf_size) {
@@ -1017,6 +1066,7 @@ pub fn Jit(comptime I: type) type {
             /// Leave with pc = npc and result code `code` (branch to the exit
             /// with `brExit`, or fall through to it at the block's end).
             pub fn exit(e: *Emit, npc: u64, code: u64) void {
+                e.site = 0;
                 I.sync(e);
                 e.k64(npc);
                 e.set(I.l_npc);
@@ -1084,6 +1134,7 @@ pub fn Jit(comptime I: type) type {
                 e.op(W.i64_sub);
                 e.set(l_jl);
                 // the loop head: an ISA may know state is dead there
+                e.site = 1;
                 if (@hasDecl(I, "syncHead")) I.syncHead(e) else I.sync(e);
                 e.op(W.br);
                 e.uleb(e.nest - 2); // the loop
@@ -1120,6 +1171,7 @@ pub fn Jit(comptime I: type) type {
                     e.op(W.i64_sub);
                     e.set(l_jl);
                     e.statInc(Jx.region_hops);
+                    e.site = 1;
                     if (@hasDecl(I, "syncHead")) I.syncHead(e) else I.sync(e);
                     e.op(W.br);
                     e.uleb(e.nest - rg.self);
@@ -1128,6 +1180,7 @@ pub fn Jit(comptime I: type) type {
                 if ((rg.block(t).pc ^ rg.block(rg.cur).pc) >> 12 != 0) e.statInc(Jx.region_cross);
                 e.k64(2 * t);
                 e.set(l_next);
+                e.site = 2;
                 I.sync(e);
                 e.op(W.br);
                 e.uleb(e.nest - rg.top);
@@ -1180,6 +1233,13 @@ pub fn Jit(comptime I: type) type {
                 st.skips += 1;
                 return false;
             }
+            // Compiled blocks' ops live in the tenured ring (kwemu.zig, `nops`),
+            // numbered on for good; when the numbers run out, everything
+            // compiled goes (b's ops may go with it: look it up again).
+            if (cpu.tenuredWorn()) {
+                cpu.resetTenured();
+                if (b.op == kwemu.op_gone) return true;
+            }
             windowOpen(cpu);
             // An interrupt that is already pending (an IPI sent just before the
             // window opened, whose sender may now be waiting) is taken first: the
@@ -1190,7 +1250,8 @@ pub fn Jit(comptime I: type) type {
             var rg: Region = .{ .cpu = cpu };
             gatherRegion(cpu, b, &rg);
             install(cpu, &rg, b.pc >> 12, null);
-            return windowClose(cpu);
+            // Making room in the tenured ring may have dropped b's ops.
+            return windowClose(cpu) or b.op == kwemu.op_gone;
         }
 
         /// Compile region `rg` (member 0 first) into a free pool entry for virtual
@@ -1215,6 +1276,23 @@ pub fn Jit(comptime I: type) type {
             // emits strictly less, so this ends; a module that did not fit is never
             // handed to the host. The code does not depend on the pool entry, so it
             // is emitted before one is taken.
+            // Members' code is checked against their op number (`checkedEntry`),
+            // which must outlive nursery resets: their ops move to the tenured
+            // ring first. Making room there drops its oldest blocks, which may
+            // be members (tenured before): those are left out, and nothing is
+            // compiled if b is one.
+            for (rg.idx[0..rg.n]) |x| {
+                const m = &cpu.priv.blocks[x];
+                cpu.tenure(m, I.slots(m));
+            }
+            if (b.op == kwemu.op_gone) return;
+            var kept: usize = 0;
+            for (rg.idx[0..rg.n]) |x| {
+                if (cpu.priv.blocks[x].op == kwemu.op_gone) continue;
+                rg.idx[kept] = x;
+                kept += 1;
+            }
+            rg.n = kept;
             var closed = false;
             var limit: usize = b.n;
             const len = while (true) {
@@ -1245,7 +1323,8 @@ pub fn Jit(comptime I: type) type {
                 }
             };
             if (grow) |g| {
-                freeSlot(cpu, g);
+                // (Making room in the tenured ring may have freed it already.)
+                if (st.owner[g] != 0) freeSlot(cpu, g);
                 st.exit_grows += 1;
             }
             const i = allocSlot(cpu);
@@ -1325,12 +1404,13 @@ pub fn Jit(comptime I: type) type {
             addMember(&rg, blockIndex(cpu, b));
             windowOpen(cpu);
             install(cpu, &rg, st.page[s], s);
-            return windowClose(cpu);
+            // Making room in the tenured ring may have dropped b's ops.
+            return windowClose(cpu) or b.op == kwemu.op_gone;
         }
 
         /// A decoded block that may be a region member.
         fn usable(cpu: *Cpu, b: *const Block) bool {
-            return b.pc != std.math.maxInt(u64) and I.supported(I.ops(cpu, b)[0]) and !selfLoop(cpu, b);
+            return b.pc != std.math.maxInt(u64) and b.op != kwemu.op_gone and I.supported(I.ops(cpu, b)[0]) and !selfLoop(cpu, b);
         }
 
         /// A pass through `b` is about to run: whether it runs compiled. Counts the
@@ -1665,9 +1745,8 @@ pub fn Jit(comptime I: type) type {
             e.k64(b.ninsn);
             e.op(W.i64_lt_u);
             e.op(W.i32_or);
-            // The same decoded block: its ops start where they did when this
-            // module was emitted (a re-decode takes new ops until a cache reset,
-            // which frees every module).
+            // The same decoded block: its ops have the number they had when
+            // this module was emitted (tenured op numbers are never reused).
             e.get(l_cpu);
             e.addr();
             e.mem(W.i32_load, 2, at + @offsetOf(Block, "op"));

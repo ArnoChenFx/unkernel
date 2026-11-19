@@ -95,6 +95,15 @@ const ppn_mask: u64 = (1 << 44) - 1;
 // slow path. A store hitting a marked chunk retires the generations of
 // every exec mapping of that page and ends the current block right after
 // the store, so self-modifying code is seen at the next instruction.
+//
+// The op arena (`nops`): blocks are decoded into the nursery; when it is
+// full only the nursery is discarded (`resetNursery`): the blocks stay in
+// the table with their compile countdown and are decoded again on their
+// next use. A block's ops are copied to the tenured ring when it is
+// compiled (`tenure`), so compiled code survives nursery resets; the ring
+// makes room by dropping its oldest blocks and their code. The table's
+// replacement keeps the way with more countdown progress (jitcore.zig,
+// `victim`).
 
 const max_block = 64;
 /// Block table: 2-way set associative (a pair of hot blocks whose pcs
@@ -104,7 +113,24 @@ const nblocks = 2 * nsets;
 /// Op arena (16 bytes per op, 6 MiB). With 128K ops, node's startup
 /// filled it every ~2M instructions (about 270 resets per `npx --version`,
 /// each freeing every compiled block); 384K ops cut npx by ~7%.
+/// Two parts: the nursery [0, Priv.nursery), where blocks are decoded, and
+/// the tenured part after it, where a block's ops are copied when it is
+/// compiled (`tenure`). A full nursery is reset without touching compiled
+/// code (`resetNursery`); the tenured part is a ring whose oldest blocks
+/// make room (their code is dropped).
 const nops = 384 * 1024;
+pub const ten_default = 64 * 1024;
+/// Tenured ops are numbered on from Priv.nursery for good (Block.op; the
+/// ring position is that number modulo the ring's size, `opIndex`), so a
+/// number names one copy and a module's member check (jitcore.zig,
+/// checkedEntry) never mistakes a later copy for the one it was emitted
+/// from. Past this number every tenured block is dropped and the numbering
+/// starts again (`resetTenured`).
+const ten_renumber: u32 = 0xf000_0000;
+/// Block.op of a block whose ops were discarded by a nursery or tenured
+/// reset: its pc, host and compile countdown stay (a re-decode of the same
+/// pc and host takes the countdown over), and it is never revalidated.
+pub const op_gone: u32 = std.math.maxInt(u32);
 const nmarks = 4096;
 const no_tgen = std.math.maxInt(u64);
 const mark_wild = std.math.maxInt(u64);
@@ -204,7 +230,15 @@ const Priv = extern struct {
     /// Set by a store that hit decoded code / by FENCE.I: end the block.
     smc: u32,
     gen: u64,
+    /// Next free op of the nursery / end of the nursery (= start of the
+    /// tenured ring) / the ring's next free and oldest used op (numbers, see
+    /// `ten_renumber`) / its size - 1 (a power of two; tests shrink both
+    /// parts).
     ops_used: u64,
+    nursery: u64,
+    ten_head: u64,
+    ten_tail: u64,
+    ten_mask: u64,
     /// Counters, maintained only with -Dkwemu-stats (see `Stats`).
     stats: Stats,
     tlb_r: [dtlb_n]Tlb,
@@ -498,14 +532,29 @@ pub const Cpu = extern struct {
 
     /// Record that `mask` chunks of `page` hold decoded code.
     fn markCode(self: *Cpu, page: u64, mask: u64) void {
+        if (!self.markChunks(page, mask)) return;
+        // Stores to this page must now take the slow path.
+        for (&self.priv.tlb_w) |*e| {
+            if (e.tag != invalid_tag and e.tag & code_flag == 0 and (e.tag << page_shift) +% e.add == page)
+                e.tag |= code_flag;
+        }
+    }
+
+    /// The mark part of `markCode`; false if the page's write-TLB entries
+    /// need no new flag.
+    fn markChunks(self: *Cpu, page: u64, mask: u64) bool {
         const m = self.markSlot(page);
         const key = page | 1;
         if (m.key == key) {
             // Only when the slot is this page's alone: then its write-TLB
-            // entries were flagged when these bits were set (or at fill).
-            // In a wild slot the bits may be another page's, and this
-            // page's entries may predate them.
-            if (m.mask & mask == mask) return;
+            // entries were flagged when its first bits were set (or at
+            // fill; a store clears an entry's flag only when the page has
+            // no marked chunk left), so more chunks of a marked page need
+            // no scan. In a wild slot the bits may be another page's, and
+            // this page's entries may predate them.
+            const was = m.mask;
+            m.mask |= mask;
+            return was == 0;
         } else if (m.key != mark_wild) {
             if (m.key == 0 or m.mask == 0) {
                 m.key = key;
@@ -513,11 +562,7 @@ pub const Cpu = extern struct {
             } else m.key = mark_wild;
         }
         m.mask |= mask;
-        // Stores to this page must now take the slow path.
-        for (&self.priv.tlb_w) |*e| {
-            if (e.tag != invalid_tag and e.tag & code_flag == 0 and (e.tag << page_shift) +% e.add == page)
-                e.tag |= code_flag;
-        }
+        return true;
     }
 
     /// A store of `len` bytes at host address `host` (in a code-flagged
@@ -539,6 +584,8 @@ pub const Cpu = extern struct {
         return m.mask != 0;
     }
 
+    /// Drop every decoded block and all compiled code (kw_cpu_init,
+    /// kw_set_isa, kw_host_reset, tests).
     pub fn resetCache(self: *Cpu) void {
         count(self, "resets", 1);
         if (stats_on) for (&self.priv.blocks) |*b| a64_tier.axLost(self, b, true);
@@ -549,12 +596,141 @@ pub const Cpu = extern struct {
             bs[i].pc = std.math.maxInt(u64);
             bs[i].tgen = no_tgen;
         }
+        self.clearMarks();
+        self.priv.ops_used = 0;
+        self.priv.ten_head = self.priv.nursery;
+        self.priv.ten_tail = self.priv.nursery;
+    }
+
+    fn clearMarks(self: *Cpu) void {
         const ms: [*]volatile Mark = &self.priv.marks;
         for (0..nmarks) |i| {
             ms[i].key = 0;
             ms[i].mask = 0;
         }
+    }
+
+    /// The nursery is full: discard the ops of every block decoded there.
+    /// Compiled blocks keep running (their ops are in the tenured part); the
+    /// other blocks stay in the table with their pc, host and compile
+    /// countdown (`op_gone`), so a block that is decoded again goes on
+    /// counting where it was instead of starting over.
+    noinline fn resetNursery(self: *Cpu) void {
+        count(self, "resets", 1);
+        if (stats_on) a64_tier.axReset(self);
+        // Code marks are rebuilt from the blocks whose ops stay: only
+        // tenured blocks can still be valid.
+        self.clearMarks();
+        const bs: [*]volatile Block = &self.priv.blocks;
+        for (0..nblocks) |i| {
+            if (bs[i].pc == std.math.maxInt(u64) or bs[i].op == op_gone) continue;
+            if (bs[i].op < self.priv.nursery) {
+                if (jc.enabled) std.debug.assert(bs[i].jx.st < jc.compiled);
+                bs[i].op = op_gone;
+                bs[i].tgen = no_tgen;
+            } else _ = self.markChunks(bs[i].host & ~page_mask, bs[i].mask);
+        }
+        // Stores into the marked pages take the slow path (markCode does
+        // this per page).
+        for (&self.priv.tlb_w) |*e| {
+            if (e.tag != invalid_tag and e.tag & code_flag == 0 and self.isMarked((e.tag << page_shift) +% e.add))
+                e.tag |= code_flag;
+        }
         self.priv.ops_used = 0;
+    }
+
+    /// Free every compiled module and discard the ops of every block copied
+    /// to the tenured ring (they keep pc, host and countdown, as in
+    /// `resetNursery`); the numbering starts again. Their code marks stay
+    /// until the next nursery reset (marks may cover more than decoded code).
+    pub fn resetTenured(self: *Cpu) void {
+        if (stats_on) a64_tier.axTenReset(self);
+        if (jc.enabled) jc.releaseAll(self);
+        const bs: [*]volatile Block = &self.priv.blocks;
+        for (0..nblocks) |i| {
+            if (bs[i].pc == std.math.maxInt(u64) or bs[i].op == op_gone) continue;
+            if (bs[i].op >= self.priv.nursery) {
+                bs[i].op = op_gone;
+                bs[i].tgen = no_tgen;
+            }
+        }
+        self.priv.ten_head = self.priv.nursery;
+        self.priv.ten_tail = self.priv.nursery;
+    }
+
+    /// The tenured numbering is close to its end (`ten_renumber`).
+    pub inline fn tenuredWorn(self: *const Cpu) bool {
+        return self.priv.ten_head >= ten_renumber;
+    }
+
+    /// Arena index of the op numbered `op` (Block.op + k).
+    pub inline fn opIndex(self: *const Cpu, op: u64) usize {
+        const n = self.priv.nursery;
+        return @intCast(if (op < n) op else n + ((op - n) & self.priv.ten_mask));
+    }
+
+    /// A record of the tenured ring: one slot before a block's ops.
+    const TenRecord = extern struct {
+        /// Block index (`no_block`: padding up to the ring's end).
+        block: u32,
+        /// Slots, this one included.
+        size: u32,
+        _: u64 = 0,
+    };
+    const no_block = std.math.maxInt(u32);
+
+    fn tenRecord(self: *Cpu, at: u64) *volatile TenRecord {
+        return @ptrCast(&self.priv.ops[self.opIndex(at)]);
+    }
+
+    /// Make room for `n` slots at the ring's head: the oldest records go.
+    /// Their blocks' ops are discarded (`op_gone`, countdown and table entry
+    /// kept, as in `resetNursery`) and their compiled code dropped.
+    fn tenMakeRoom(self: *Cpu, n: u64) void {
+        std.debug.assert(n <= self.priv.ten_mask + 1);
+        while (self.priv.ten_head + n - self.priv.ten_tail > self.priv.ten_mask + 1) {
+            const r = self.tenRecord(self.priv.ten_tail);
+            if (r.block != no_block) {
+                const b = &self.priv.blocks[r.block];
+                if (b.op == self.priv.ten_tail + 1) {
+                    if (stats_on) a64_tier.axTenEvict(self, b);
+                    if (jc.enabled) jc.evict(self, b);
+                    b.op = op_gone;
+                    b.tgen = no_tgen;
+                }
+            }
+            self.priv.ten_tail += r.size;
+        }
+    }
+
+    /// b is about to be compiled: copy its `slots` arena slots (ops and
+    /// whatever the ISA keeps after them) to the tenured ring, unless they
+    /// are there already. The nursery copy stays as it is until the next
+    /// nursery reset (`run` may still be running it). This may drop the
+    /// ring's oldest blocks (`tenMakeRoom`): the caller checks the blocks it
+    /// holds for `op_gone`.
+    pub fn tenure(self: *Cpu, b: *Block, slots: u32) void {
+        if (b.op >= self.priv.nursery) return;
+        const need: u64 = slots + 1;
+        const size = self.priv.ten_mask + 1;
+        // A record does not wrap around the ring's end: pad up to it.
+        const at = (self.priv.ten_head - self.priv.nursery) & self.priv.ten_mask;
+        if (at + need > size) {
+            self.tenMakeRoom(size - at);
+            self.tenRecord(self.priv.ten_head).* = .{ .block = no_block, .size = @intCast(size - at) };
+            self.priv.ten_head += size - at;
+        }
+        self.tenMakeRoom(need);
+        const head = self.priv.ten_head;
+        self.tenRecord(head).* = .{
+            .block = @intCast((@intFromPtr(b) - @intFromPtr(&self.priv.blocks)) / @sizeOf(Block)),
+            .size = @intCast(need),
+        };
+        const src: [*]const volatile Op = @ptrCast(&self.priv.ops[b.op]);
+        const dst: [*]volatile Op = @ptrCast(&self.priv.ops[self.opIndex(head + 1)]);
+        for (0..slots) |i| dst[i] = src[i];
+        self.priv.ten_head = head + need;
+        b.op = @intCast(head + 1);
     }
 
     // ---- memory interface used by core.Interp and the block executor ---------
@@ -685,7 +861,7 @@ pub const Cpu = extern struct {
         const host = try self.execHost(pc);
         const gen = self.execGen(pc);
         for (self.priv.blocks[set..][0..2]) |*b| {
-            if (b.pc == pc and b.host == host and D.validate(self, b)) {
+            if (b.pc == pc and b.host == host and b.op != op_gone and D.validate(self, b)) {
                 b.tgen = gen;
                 self.markCode(host & ~page_mask, b.mask);
                 count(self, "revalidated", 1);
@@ -696,17 +872,23 @@ pub const Cpu = extern struct {
         const v = &self.priv.victim[set / 2];
         // Reuse a way that already holds this pc (stale copy), else the victim.
         const way: usize = if (self.priv.blocks[set].pc == pc) 0 else if (self.priv.blocks[set + 1].pc == pc) 1 else blk: {
-            const w = v.*;
+            const w = if (jc.enabled) jc.victim(self, self.priv.blocks[set..][0..2], v.*) else v.*;
             v.* ^= 1;
             break :blk w;
         };
         const b = &self.priv.blocks[set + way];
-        if (self.priv.ops_used + D.max_slots > nops) self.resetCache();
-        if (stats_on) a64_tier.axLost(self, b, false);
+        if (self.priv.ops_used + D.max_slots > self.priv.nursery) self.resetNursery();
+        // The same pc and host decoded again (after a reset discarded its
+        // ops, or with new contents): it goes on counting towards the
+        // compile threshold.
+        const heat: u32 = if (jc.enabled and b.pc == pc and b.host == host and b.jx.st < jc.compiled) b.jx.st else jc.never;
+        if (stats_on) a64_tier.axDecode(self, b, pc, host);
+        if (stats_on and heat == jc.never) a64_tier.axLost(self, b, false);
         if (jc.enabled) jc.drop(self, b); // its code belongs to the old contents
         D.decode(self, b, pc, host);
         b.tgen = gen;
         b.jx = if (jc.enabled) jc.newBlock(self) else .{};
+        if (jc.enabled and heat != jc.never) b.jx.st = heat;
         self.markCode(host & ~page_mask, b.mask);
         return b;
     }
@@ -736,7 +918,7 @@ pub const Cpu = extern struct {
     fn validate(self: *Cpu, b: *const Block) bool {
         const page = b.host & ~page_mask;
         var pc = b.pc;
-        for (self.priv.ops[b.op..][0..b.ninsn]) |op| {
+        for (self.priv.ops[self.opIndex(b.op)..][0..b.ninsn]) |op| {
             const h = page + (pc & page_mask);
             if (op.h == .straddle) return hostLoad(u16, h) == op.raw;
             if (op.raw & 3 == 3) {
@@ -824,7 +1006,7 @@ pub const Cpu = extern struct {
     /// pc of the op `k` instructions into block `b` (riscv).
     fn pcAt(self: *Cpu, b: *const Block, k: usize) u64 {
         var pc = b.pc;
-        for (self.priv.ops[b.op..][0..k]) |op| pc = nextPc(op, pc);
+        for (self.priv.ops[self.opIndex(b.op)..][0..k]) |op| pc = nextPc(op, pc);
         return pc;
     }
 };
@@ -864,6 +1046,8 @@ pub fn cpuInit(cpu: *Cpu) void {
     for (0..cpu_size / 8) |i| words[i] = 0;
     cpu.priv.hart = .{}; // all implemented extensions enabled
     cpu.priv.gen = 1;
+    cpu.priv.nursery = nops - ten_default;
+    cpu.priv.ten_mask = ten_default - 1;
     cpu.flushAll();
     cpu.resetCache();
     if (jc.enabled) jc.init(cpu);
@@ -937,7 +1121,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         count(cpu, "blocks", 1);
         count(cpu, "block_insns", blk.ninsn);
         left -= blk.ninsn;
-        var first: [*]const Op = cpu.priv.ops[blk.op..].ptr;
+        var first: [*]const Op = cpu.priv.ops[cpu.opIndex(blk.op)..].ptr;
         var o = first;
         // JIT: self-loop passes continue while left >= lim (see jit.loopLimit).
         var lim: u64 = blk.ninsn;
@@ -962,7 +1146,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 // A region charges every further member in full before it
                 // runs (like blk above); `code` refers to the last one.
                 blk = jit.lastBlock(cpu);
-                first = cpu.priv.ops[blk.op..].ptr;
+                first = cpu.priv.ops[cpu.opIndex(blk.op)..].ptr;
                 const code: u32 = @intCast(ret & 0xff);
                 if (stats_on) {
                     jitStats(cpu, b, blk, jl -% (ret >> 8), code);
@@ -1053,7 +1237,7 @@ noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64
     } else {
         st.insns += charged - (b.ninsn - code);
         st.handbacks += 1;
-        const o = cpu.priv.ops[b.op + code];
+        const o = cpu.priv.ops[cpu.opIndex(b.op + code)];
         st.hb[@intFromEnum(o.h)] += 1;
         if (o.h == .generic) st.hb_gen[genericClass(o.raw)] += 1;
     }

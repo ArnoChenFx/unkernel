@@ -593,6 +593,18 @@ fn fuzzOne(gpa: std.mem.Allocator, seed: u64, max_insns: u64) !void {
     const r = f.rng.random();
     const T = &f.m[0];
     const Rm = &f.m[1];
+    {
+        // Half the runs on a small op arena: nursery resets (blocks keep
+        // their table entry and countdown, their ops are decoded again) and,
+        // with the JIT, a tenured ring that drops its oldest compiled blocks
+        // happen during the run. A separate random stream, as below.
+        var ar = Rng.init(seed ^ 0x3c6e_f372_fe94_f82b);
+        if (ar.random().boolean()) {
+            T.cpu.priv.nursery = 100 + ar.random().uintLessThan(u64, 3000);
+            T.cpu.priv.ten_mask = (@as(u64, 2048) << ar.random().uintLessThan(u6, 3)) - 1;
+            T.cpu.resetCache();
+        }
+    }
     if (jc.enabled) {
         // The JIT machine: a random compile threshold (eager or after a few
         // passes), region size and growth threshold, and a flush asked for

@@ -128,10 +128,24 @@ is the reference loop), `-Dkwemu-a64-fuzz=N` and `-Dkwemu-a64-fuzz-seed`
   2.98 s, `seq 250000 | gzip | gunzip` 2.96 vs 3.03 s, an ash counting
   loop 2.97 vs 3.01 s.
 - **Cache.** 32K block slots, 384K ops (6 MiB of the 8 MiB `KW_CPU_SIZE`),
-  a 4096-entry code-page filter. When the op arena fills, the whole cache
-  (and every compiled block) is reset. A 16 or 32 MiB `KW_CPU_SIZE` was no
-  faster, and 32 MiB does not boot with 48 or 64 MiB of guest memory. The
-  block table cannot grow past 64K entries: region members are u16 block
+  a 4096-entry code-page filter. The op arena has two parts: a nursery
+  (320K ops) where blocks are decoded, and a tenured ring (64K) where a
+  block's ops are copied when it is compiled. When the nursery fills, only
+  its ops are discarded: blocks keep their table entry with pc, host and
+  compile countdown (`op_gone`), and a re-decode of the same pc and host
+  goes on counting where it was; compiled code keeps running. The ring
+  makes room by dropping its oldest blocks (and their code). Tenured ops
+  are numbered on for good (the ring position is the number modulo its
+  size), so a module's member check (`blocks[m].op`) never mistakes a
+  later copy for the one it was emitted from. The block table replaces
+  the way with less countdown progress (compiled counts as most); the way
+  that stays loses half its progress. Only kw_cpu_init, kw_set_isa and
+  kw_host_reset drop everything. Measured on the A64 image (a64.md, The
+  op arena): node's working set is larger than the arena (84% of it still
+  live at a nursery reset), so keeping countdowns and code is what pays.
+  A 16 or 32 MiB `KW_CPU_SIZE` was no faster (riscv, before the split),
+  and 32 MiB does not boot with 48 or 64 MiB of guest memory. The block
+  table cannot grow past 64K entries: region members are u16 block
   indexes.
 - **FP.** All five rounding modes and flags are exact. RNE uses host-float
   fast paths with exact inexact detection. f64 FMA uses Boldo & Melquiond's
@@ -1215,10 +1229,10 @@ it, since that is what limits growth. Exits into self-loop modules
 (`sort`, `tar | gzip`) are the other large group. For FP, directed
 rounding and results outside the fast-path range are still handed back.
 
-Node startup: fix the arena reset policy first (compact or partial resets
-that keep compiled pcs), then retune the threshold (the adaptive scheme
-above); cheaper modules (unused locals), cheaper enter and transitions,
-and a faster interpreter on cold code are what is left.
+Node startup: the arena keeps countdowns and compiled code across nursery
+resets now (Cache, above; measured on A64); retuning the threshold (the
+adaptive scheme above), cheaper modules (unused locals), cheaper enter and
+transitions, and a faster interpreter on cold code are what is left.
 
 Guest HTTPS: the self-loop, TLB-cache and T-table ideas were measured
 and dropped (Rejected designs), and clmul/clmulh fusion shares no work.

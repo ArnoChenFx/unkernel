@@ -50,8 +50,9 @@ pub const Blocks = struct {
     pub fn validate(cpu: *Cpu, b: *const Block) bool {
         const page = b.host & ~page_mask;
         const arena = cpu.opArena(Op);
-        const o = arena[b.op..][0..b.ninsn];
-        const raw: [*]const u32 = @ptrCast(arena + b.op + b.n);
+        const at = cpu.opIndex(b.op);
+        const o = arena[at..][0..b.ninsn];
+        const raw: [*]const u32 = @ptrCast(arena + at + b.n);
         var pc = b.pc;
         for (o, 0..) |op, k| {
             if (Cpu.hostRead(u32, page + (pc & page_mask)) != raw[k]) return false;
@@ -114,6 +115,7 @@ pub const Blocks = struct {
         const words: [*]volatile u32 = @ptrCast(arena + start + n);
         for (0..ninsn) |k| words[k] = raw[k];
         cpu.priv.ops_used += n + (ninsn + 3) / 4;
+        ar(cpu, Ar.dec_slots, n + (ninsn + 3) / 4);
         b.* = .{
             .pc = pc,
             .tgen = 0,
@@ -130,7 +132,7 @@ pub const Blocks = struct {
 /// pc of the op `k` instructions into block `b`.
 pub fn pcAt(cpu: *Cpu, b: *const Block, k: usize) u64 {
     var pc = b.pc;
-    for (cpu.opArena(Op)[b.op..][0..k]) |o| pc = ops.nextPc(o, pc);
+    for (cpu.opArena(Op)[cpu.opIndex(b.op)..][0..k]) |o| pc = ops.nextPc(o, pc);
     return pc;
 }
 
@@ -298,7 +300,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         kwemu.count(cpu, "block_insns", b.ninsn);
         left -= b.ninsn;
         var blk = b;
-        var first: [*]const Op = arena + blk.op;
+        var first: [*]const Op = arena + cpu.opIndex(blk.op);
         var o = first;
         // Budget runOps may spend on further self-loop passes.
         var cap = left;
@@ -320,7 +322,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 // A region charges every further member in full before it
                 // runs (like blk above); `code` refers to the last one.
                 blk = jc.lastBlock(cpu);
-                first = arena + blk.op;
+                first = arena + cpu.opIndex(blk.op);
                 const code: u32 = @intCast(ret & 0xff);
                 if (kwemu.stats_on) jitStats(cpu, b, blk, jl -% (ret >> 8), code);
                 if (code >= jc.code_done) {
@@ -460,6 +462,136 @@ pub fn axLost(cpu: *Cpu, b: *const Block, reset: bool) void {
     ax(cpu, if (reset) Ax.blocks_lost_reset else Ax.blocks_lost_drop, 1);
 }
 
+/// -Dkwemu-stats: arena counters, in the unused tail of Stats.op_hist
+/// (`Ar.base + i`).
+pub const Ar = struct {
+    pub const base = 150;
+    /// Nursery resets; at each: blocks and slots still live in the nursery,
+    /// blocks in the tenured part, tenured slots in use, compiled blocks.
+    pub const nursery_resets = 0;
+    pub const live_blocks = 1;
+    pub const live_slots = 2;
+    pub const ten_blocks = 3;
+    pub const ten_slots = 4;
+    pub const ten_resets = 5;
+    /// Decodes by what the block-table way held: the same pc and host with
+    /// its ops discarded by a reset, the same pc and host with other
+    /// contents, the same pc at another host, another block, nothing.
+    pub const dec_gone = 6;
+    pub const dec_changed = 7;
+    pub const dec_host = 8;
+    pub const dec_evict = 9;
+    pub const dec_empty = 10;
+    pub const dec_slots = 11;
+    /// Countdown progress a re-decode took over (charged instructions).
+    pub const heat_kept = 12;
+    pub const compiled_blocks = 13;
+    /// Tenured blocks dropped to make room, and how many were compiled.
+    pub const ten_evicted = 14;
+    pub const ten_evicted_compiled = 15;
+};
+
+inline fn ar(cpu: *Cpu, i: usize, n: u64) void {
+    if (kwemu.stats_on) cpu.priv.stats.op_hist[Ar.base + i] += n;
+}
+
+/// -Dkwemu-stats: `generic` ops executed, by FP form, in Stats.op_hist
+/// from `fp_base` (`fpForm`; 26 forms up to the end of op_hist).
+pub const fp_base = 166;
+/// 0..7 FADD/FSUB/FMUL/FDIV (D, S each), 8 FSQRT, 9 FABS/FNEG, 10 FMOV
+/// (register), 11 FCVT, 12 FRINT*, 13 FMAX/FMIN*, 14 FNMUL, 15 SCVTF, 16
+/// UCVTF, 17 FCVTZS, 18 FCVTZU, 19 other conversions, 20 FCSEL, 21 FMOV
+/// (immediate), 22 FMADD and friends, 23 FCMP, FCCMP, 24 loads and stores
+/// (ldst group), 25 anything else (AdvSIMD, system, ...).
+pub fn fpForm(raw: u32) usize {
+    switch (decode.route(raw)) {
+        .fp => {},
+        .ldst => return 24,
+        else => return 25,
+    }
+    const dbl = c.bits(raw, 23, 22) == 1;
+    if (c.bit(raw, 24)) return 22;
+    if (!c.bit(raw, 21) or c.bits(raw, 15, 10) == 0) {
+        const op = c.bits(raw, 20, 16); // rmode:opcode
+        return switch (op) {
+            0b00_010 => 15,
+            0b00_011 => 16,
+            0b11_000 => 17,
+            0b11_001 => 18,
+            else => 19,
+        };
+    }
+    if (c.bits(raw, 14, 10) == 0b10000) {
+        const op = c.bits(raw, 20, 15);
+        return switch (op) {
+            0 => 10,
+            1, 2 => 9,
+            3 => 8,
+            4...7 => 11,
+            else => 12,
+        };
+    }
+    if (c.bits(raw, 13, 10) == 0b1000) return 23;
+    if (c.bits(raw, 12, 10) == 0b100) return 21;
+    return switch (c.bits(raw, 11, 10)) {
+        0b01 => 23,
+        0b11 => 20,
+        else => switch (c.bits(raw, 15, 12)) {
+            0 => if (dbl) 4 else 5,
+            1 => if (dbl) 6 else 7,
+            2 => if (dbl) 0 else 1,
+            3 => if (dbl) 2 else 3,
+            8 => 14,
+            else => 13,
+        },
+    };
+}
+
+/// -Dkwemu-stats: a nursery reset is about to happen.
+pub fn axReset(cpu: *Cpu) void {
+    if (!kwemu.stats_on) return;
+    ar(cpu, Ar.nursery_resets, 1);
+    for (&cpu.priv.blocks) |*b| {
+        if (b.pc == std.math.maxInt(u64) or b.op == kwemu.op_gone) continue;
+        const n = @as(u64, b.n) + (@as(u64, b.ninsn) + 3) / 4;
+        if (b.op < cpu.priv.nursery) {
+            ar(cpu, Ar.live_blocks, 1);
+            ar(cpu, Ar.live_slots, n);
+        } else ar(cpu, Ar.ten_blocks, 1);
+        if (jc.enabled and b.jx.st >= jc.compiled) ar(cpu, Ar.compiled_blocks, 1);
+    }
+    ar(cpu, Ar.ten_slots, cpu.priv.ten_head - cpu.priv.ten_tail);
+}
+
+pub fn axTenReset(cpu: *Cpu) void {
+    ar(cpu, Ar.ten_resets, 1);
+}
+
+/// -Dkwemu-stats: block b's tenured ops make room for newer ones.
+pub fn axTenEvict(cpu: *Cpu, b: *const Block) void {
+    ar(cpu, Ar.ten_evicted, 1);
+    if (jc.enabled and b.jx.st >= jc.compiled) ar(cpu, Ar.ten_evicted_compiled, 1);
+}
+
+/// -Dkwemu-stats: block-table way `b` is about to receive a decode of pc
+/// at host.
+pub fn axDecode(cpu: *Cpu, b: *const Block, pc: u64, host: u64) void {
+    if (!kwemu.stats_on) return;
+    const i: usize = if (b.pc == std.math.maxInt(u64))
+        Ar.dec_empty
+    else if (b.pc != pc)
+        Ar.dec_evict
+    else if (b.host != host)
+        Ar.dec_host
+    else if (b.op == kwemu.op_gone)
+        Ar.dec_gone
+    else
+        Ar.dec_changed;
+    ar(cpu, i, 1);
+    if (jc.enabled and b.pc == pc and b.host == host and b.jx.st != jc.never and b.jx.st < jc.compiled)
+        ar(cpu, Ar.heat_kept, cpu.priv.jit.threshold -| b.jx.st);
+}
+
 /// -Dkwemu-stats: copy the core's compile counters into the Ax words.
 pub fn axCore(cpu: *Cpu) void {
     if (!kwemu.stats_on or !jc.enabled) return;
@@ -489,7 +621,7 @@ noinline fn jitStats(cpu: *Cpu, entry: *const Block, b: *const Block, extra: u64
     } else {
         st.insns += charged - (b.ninsn - code);
         st.handbacks += 1;
-        st.hb[@intFromEnum(cpu.opArena(Op)[b.op + code].h)] += 1;
+        st.hb[@intFromEnum(cpu.opArena(Op)[cpu.opIndex(b.op + code)].h)] += 1;
     }
     _ = jit.C.countExit(cpu, b, code);
 }

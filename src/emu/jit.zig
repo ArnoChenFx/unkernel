@@ -87,7 +87,12 @@ pub const EmitExt = struct {
 };
 
 pub fn ops(cpu: *Cpu, b: *const Block) []const Op {
-    return cpu.priv.ops[b.op..][0..b.n];
+    return cpu.priv.ops[cpu.opIndex(b.op)..][0..b.n];
+}
+
+/// Arena slots of a block (its ops; the raw bits are in them).
+pub fn slots(b: *const Block) u32 {
+    return b.n;
 }
 
 pub fn supported(o: Op) bool {

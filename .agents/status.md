@@ -26,9 +26,10 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 ## Roadmap
 
 1. **JIT**: AMOs and LR/SC, bigger regions (most remaining exits leave
-   full ones), exits into self-loop modules, the op arena's reset policy
-   (node startup), AES and GHASH codegen (guest HTTPS). Details in
-   kwemu.md (Numbers, Next steps).
+   full ones), exits into self-loop modules, AES and GHASH codegen (guest
+   HTTPS). Details in kwemu.md (Numbers, Next steps). The op arena keeps
+   countdowns and compiled code across resets (kwemu.md, Cache; measured
+   on aarch64, a64.md, The op arena).
 2. **ISA extensions**: all of RVA23U64 is in except V (and its
    sub-extensions), Supm (dropped) and Zkt (not advertised: kwemu's AES
    uses data-indexed tables). Next: V; a constant-time AES (bitsliced
@@ -558,12 +559,15 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **aarch64: AdvSIMD arithmetic, FP arithmetic and crypto are calls of
-  the interpreter in compiled code.** The A64 JIT (a64.md, JIT) translates
-  every ALU, memory and branch op and the frequent FP moves, compares and
-  AdvSIMD moves inline (generic.zig); the other generic ops are calls of
-  the reference interpreter through the kernel's function table, with the
-  module's registers spilled around them (2026-11-18).
+- **aarch64: AdvSIMD arithmetic, FMA and crypto are calls of the
+  interpreter in compiled code.** The A64 JIT (a64.md, JIT) translates
+  every ALU, memory and branch op, the frequent FP moves, compares and
+  AdvSIMD moves, and scalar FP arithmetic and conversions (with a fast
+  path that needs FPCR's defaults and calls the interpreter off it; double
+  FMUL, FDIV and FSQRT only once FPSR.IXC is set) inline (generic.zig);
+  the other generic ops are calls of the reference interpreter through
+  the kernel's function table, with the module's registers spilled around
+  them (2026-11-18).
 - **aarch64: SHA512 is off by default (`kw.isa=+sha512` turns it on),
   because OpenSSL's SHA-512 is 12.5x slower with HWCAP_SHA512.** Its
   ARMv8.2 path (SHA512H and AdvSIMD) is all generic ops, its integer path
@@ -598,13 +602,13 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   packages and the JIT's generic calls and inline forms (2026-11-18,
   a64.md, Where apk's time goes) the apk commands take 6-25% longer than
   on riscv64, although they run about 12% fewer instructions; sort is
-  level, gzip 10% faster, the ash loop 10% slower. apk runs 13-22% of its
-  instructions in blocks still counting down to the compile threshold;
-  a lower threshold and a heat table across processes did not pay
-  (compiles cost about 0.3 ms each). The ranked levers left are in
-  a64.md (JIT, What is left): apk's countdown share, NZCV
-  materialisation, entries into compiled code, the malloc lock's
-  exclusives.
+  level, gzip 10% faster, the ash loop 10% slower. apk runs 13-24% of its
+  instructions in blocks still counting down to the compile threshold
+  (node's npm 55%); a lower threshold and a heat table across processes
+  did not pay (compiles cost about 0.3 ms each). The ranked levers left
+  are in a64.md (JIT, What is left): cold code (the interpreter, decodes),
+  `run`'s entry path and region prologues (about 5% each of the apk/shell
+  rows), NZCV materialisation (about 3%), the malloc lock's exclusives.
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
   nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
   `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but

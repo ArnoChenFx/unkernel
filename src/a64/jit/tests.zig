@@ -176,3 +176,80 @@ test "a64 jit: a flush asked for during a compile looks the block up again" {
     try t.expectEqual(@as(u64, 3), m.cpu.icount);
     try t.expect(hook.flushes >= 1);
 }
+
+/// An outer loop of `iters` passes over a self-loop at 0x10000 (x1 counts
+/// down from 100) and a chain of 19 pages from 0x40000, each 40 ADDs of x3
+/// and a branch to the next; a 20th page counts x2 down and branches back
+/// to 0x10000, then SVC. Each pass decodes about 1000 arena slots.
+fn chainProgram(m: *Machine, iters: u16) void {
+    const add_x0_1: u32 = 0x9100_0400; // add x0, x0, #1
+    const add_x3_1: u32 = 0x9100_0463; // add x3, x3, #1
+    const subs_x1_1: u32 = 0xf100_0421; // subs x1, x1, #1
+    const subs_x2_1: u32 = 0xf100_0442; // subs x2, x2, #1
+    const bne_back3: u32 = 0x5400_0000 | ((@as(u32, @bitCast(@as(i32, -2))) & 0x7ffff) << 5) | 1; // b.ne . - 8
+    const movz_x1_100: u32 = 0xd280_0c81;
+    m.code(0x10000, &.{ add_x0_1, subs_x1_1, bne_back3, movz_x1_100, b(0x10010, 0x40000) });
+    var w: [41]u32 = undefined;
+    for (0..40) |i| w[i] = add_x3_1;
+    for (0..19) |p| {
+        const va = 0x40000 + p * 4096;
+        w[40] = b(va + 160, va + 4096);
+        m.code(va, &w);
+    }
+    const last = 0x40000 + 19 * 4096;
+    m.code(last, &.{ subs_x2_1, 0x5400_0000 | ((@as(u32, @truncate((0x10000 -% (last + 4)) >> 2)) & 0x7ffff) << 5) | 1, svc });
+    m.regs.x[1] = 100;
+    m.regs.x[2] = iters;
+    m.regs.pc = 0x10000;
+}
+
+fn shrinkArena(m: *Machine, nursery: u64, tenured: u64) void {
+    m.cpu.priv.nursery = nursery;
+    m.cpu.priv.ten_mask = tenured - 1;
+    m.cpu.resetCache();
+}
+
+test "a64 jit: nursery resets and the tenured ring keep running the right code" {
+    // Nursery of 600 slots (a reset every pass); tenured rings that hold
+    // less than everything compiled (the oldest go), or all of it.
+    for ([_]u64{ 2048, 4096, 65536 }) |ten| {
+        var ms: [2]Machine = .{ try Machine.init(t.allocator), try Machine.init(t.allocator) };
+        defer for (&ms) |*m| m.deinit();
+        for (&ms) |*m| {
+            chainProgram(m, 6);
+            shrinkArena(m, 600, ten);
+        }
+        const kt = ms[0].run(1 << 30);
+        const kr = ms[1].runRef(1 << 30);
+        try t.expectEqual(@as(u32, mach.EV_SYSCALL), kr);
+        try t.expectEqual(kr, kt);
+        try t.expectEqual(ms[1].cpu.icount, ms[0].cpu.icount);
+        try t.expect(std.mem.eql(u8, std.mem.asBytes(&ms[0].regs), std.mem.asBytes(&ms[1].regs)));
+        try t.expectEqual(@as(u64, 6 * 19 * 40), ms[0].regs.x[3]);
+        if (jc.enabled and ten >= 4096) {
+            // Everything is compiled once (eager host: at its first pass) and
+            // stays compiled across the nursery resets of later passes.
+            const st = jitStats(&ms[0]);
+            try t.expect(st.compiles <= 23);
+            try t.expect(st.entries >= 6 * 20);
+        }
+    }
+}
+
+test "a64 jit: a block decoded again after a nursery reset goes on counting" {
+    if (!jc.enabled) return error.SkipZigTest;
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    chainProgram(&m, 5);
+    shrinkArena(&m, 600, 60000);
+    m.cpu.priv.jit.threshold = 1000;
+    try t.expectEqual(@as(u32, mach.EV_SYSCALL), m.run(1 << 30));
+    // The first chain page (41 instructions) ran 5 times, each pass decoded
+    // anew after a reset: 5 * 41 charged in all, not just the last pass's.
+    const pc: u64 = 0x40000;
+    const set = kwemu.blockSet(pc);
+    const blk = for (m.cpu.priv.blocks[set..][0..2]) |*x| {
+        if (x.pc == pc) break x;
+    } else return error.TestUnexpectedResult;
+    try t.expectEqual(@as(u32, 1000 - 5 * 41), blk.jx.st);
+}

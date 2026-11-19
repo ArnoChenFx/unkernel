@@ -194,6 +194,7 @@ inline fn stored(r: u32) Next {
 noinline fn execGeneric(cpu: *Cpu, x: [*]u64, raw: u32, pc: u64) Next {
     kwemu.count(cpu, "generic_ops", 1);
     if (kwemu.stats_on) cpu.priv.stats.jit.hb_gen[tier.Ax.gen_class + tier.genClass(raw)] += 1;
+    if (kwemu.stats_on) cpu.priv.stats.op_hist[tier.fp_base + tier.fpForm(raw)] += 1;
     const regs: *Regs = @ptrCast(@alignCast(x));
     regs.pc = pc;
     const s: c.St = .{ .r = regs, .h = &cpu.priv.hart, .m = cpu };

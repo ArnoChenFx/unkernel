@@ -14,7 +14,7 @@
 //      or VERCEL is set, whose builds have no vendor/ and must ship a
 //      release): vendor/build/bundle/unkernel.wasm and at least one image
 //      in vendor/build/distro/ (kernel/build.sh base and distro, or all).
-//   3. Else the newest GitHub release of this repository (KW_KERNEL_RELEASE=
+//   3. Else the Latest GitHub release of this repository (KW_KERNEL_RELEASE=
 //      <tag>: that one), which must carry unkernel.wasm, distros.json and
 //      every image distros.json names; a release from before this layout
 //      (unkernel-alpine.wasm only) is refused with what to do instead.
@@ -62,7 +62,8 @@
 //   KW_LOCAL=1 | 0            use a local build when there is one (default,
 //                             except when CI or VERCEL is set) | never
 //   GITHUB_TOKEN, GH_TOKEN    for the GitHub API (60 requests an hour without
-//                             one; past that, the release feed is used)
+//                             one; past that, github.com's /releases/latest
+//                             redirect is used)
 //   KW_GITHUB_API, KW_GITHUB  the API and web origins (default
 //                             https://api.github.com, https://github.com):
 //                             a stand-in server for testing
@@ -271,32 +272,34 @@ async function localSource(base: string, images: PageImage[], why: string): Prom
 interface Asset { url: string; sha256?: string }
 interface Resolved { tag: string; date: string; assets: Map<string, Asset> | null }
 
-/** The release to use: from the API (with the assets' digests), else from the feed (assets unknown). */
+/**
+ * The release to use: from the API (with the assets' digests), else from
+ * the web's /releases/latest redirect (assets unknown). The newest is the
+ * one GitHub marks Latest: release lists and the release feed are not in
+ * publishing order (tags of one version and day, v0.2.0-<date>-<hash>,
+ * sort by their hash).
+ */
 async function resolve(want?: string): Promise<Resolved> {
 	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-	const res = await fetch(`${GITHUB_API}/repos/${REPO}/releases${want ? `/tags/${want}` : "?per_page=10"}`, {
+	const res = await fetch(`${GITHUB_API}/repos/${REPO}/releases/${want ? `tags/${want}` : "latest"}`, {
 		headers: { ...UA, accept: "application/vnd.github+json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
 	});
 	if (res.ok) {
-		type R = { tag_name: string; draft: boolean; published_at: string; assets: { name: string; browser_download_url: string; digest?: string | null }[] };
-		const r = ([] as R[]).concat(await res.json()).find((r) => !r.draft);
-		if (!r) throw new Error(`${REPO} has no releases`);
+		const r = await res.json() as { tag_name: string; published_at: string; assets: { name: string; browser_download_url: string; digest?: string | null }[] };
 		const assets = new Map(r.assets.map((a) => [a.name, { url: a.browser_download_url, sha256: a.digest?.replace(/^sha256:/, "") || undefined }]));
 		return { tag: r.tag_name, date: r.published_at, assets };
 	}
-	if (res.status === 404 && want) throw new Error(`${REPO} has no release ${want}`);
-	// Rate limited (or the API is down): the release feed has no limit, but no assets.
-	log(`GitHub API: ${res.status} ${res.statusText}; using the release feed`);
-	let tag = want, date = "";
+	if (res.status === 404) throw new Error(want ? `${REPO} has no release ${want}` : `${REPO} has no releases`);
+	// Rate limited (or the API is down): the web's redirect has no limit, but no assets.
+	log(`GitHub API: ${res.status} ${res.statusText}; using ${GITHUB}/${REPO}/releases/latest`);
+	let tag = want;
 	if (!tag) {
-		const feed = await fetch(`${GITHUB}/${REPO}/releases.atom`, { headers: UA });
-		if (!feed.ok) throw new Error(`release feed: ${feed.status} ${feed.statusText}`);
-		const entry = /<entry>([\s\S]*?)<\/entry>/.exec(await feed.text())?.[1] ?? "";
-		tag = /\/releases\/tag\/([^"]+)"/.exec(entry)?.[1];
-		date = /<updated>([^<]+)<\/updated>/.exec(entry)?.[1] ?? "";
-		if (!tag) throw new Error(`${REPO} has no releases`);
+		const latest = await fetch(`${GITHUB}/${REPO}/releases/latest`, { headers: UA, redirect: "manual" });
+		tag = /\/releases\/tag\/([^/?#]+)/.exec(latest.headers.get("location") ?? "")?.[1];
+		if (!tag) throw new Error(`${GITHUB}/${REPO}/releases/latest: ${latest.status} ${latest.statusText}, no release`);
+		tag = decodeURIComponent(tag);
 	}
-	return { tag, date, assets: null };
+	return { tag, date: "", assets: null };
 }
 
 /** The error for a release that does not have this layout. */

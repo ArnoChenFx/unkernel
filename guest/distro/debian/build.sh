@@ -32,6 +32,12 @@
 #   /usr/lib/kw-commands      "NAME PACKAGE" per command of main, for
 #                             kw-apt-install (command not found:
 #                             etc/profile.d/kw-apt.sh; tools/commands.py)
+#   /usr/local/bin/docker     the docker shim: installs docker.io, docker-cli
+#                             and crun on first use, writes daemon.json for
+#                             this kernel, starts the service, defaults to
+#                             --network host; its runtime is
+#                             /usr/local/libexec/kw-docker-runtime (crun
+#                             without a device cgroup)
 #   user                      the default user of the console and kwtty
 #                             sessions (uid 1000, bash, /home/user with
 #                             /etc/skel's files and the README), in sudo,

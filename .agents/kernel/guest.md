@@ -281,6 +281,33 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   The user's `~/.bashrc` (from `/etc/skel`, whose two prompt lines the
   build makes no-ops) leaves the prompt to kw-prompt.sh; the build adds
   the group input (gid 101), which udev's package would.
+- **Docker (Debian)**: `/usr/local/bin/docker` (ahead of `/usr/bin` on
+  PATH, run for every call, described at its top) installs docker.io,
+  docker-cli (a Recommends in trixie) and crun on first use (apt-get,
+  through `sudo -n`; exit 127 offline), adds the user to the group docker
+  (until the next login it runs the CLI through `sudo -n -E -u USER`),
+  starts the service when dockerd is not running and waits for its
+  socket; sysv-rc starts it at every boot after that. It writes
+  `/etc/docker/daemon.json` (when missing) for what the kernel lacks:
+  iptables, ip6tables and the default bridge off (no netfilter, no
+  bridge), cgroupns host (no CGROUP_NS), and the data root outside the
+  root's overlay, on which overlay2 cannot put its upper layers:
+  `/data/distros/debian/docker` with a data disk (a `kw-overlay discard`
+  keeps it), else a tmpfs on `/var/lib/docker`. The runtime is
+  `/usr/local/libexec/kw-docker-runtime`: crun after two edits of the
+  bundle's config.json, one rule allowing every device (the device
+  cgroup is a BPF program, there is no bpf(2), and crun goes on without
+  it when no rule denies; runc adds rules of its own and fails) and no
+  empty `blockIO` (crun then wants the io controller; cgroup2 has only
+  pids). So containers can open any device node they make, and Docker
+  drops `--memory` with a warning. The default network would be an
+  empty namespace, so the shim adds `--network host` to run, create and
+  build unless the arguments name a network; `-p` is ignored, a
+  container's ports are the guest's. `docker build` is the legacy builder
+  (no buildx); no compose. Node CLI, 1 GiB, data disk, 2026-11-19, Docker
+  26.1.5: first `docker run --rm alpine` 58 s (45 MB of packages, the
+  pull), then 1-3 s; debian:trixie-slim pulled and run 21 s; a build with
+  `apk add` 5 s; dockerd and containerd about 130 MB RSS.
 
 ## Data disk template (`kernel/build.sh datadisk`)
 

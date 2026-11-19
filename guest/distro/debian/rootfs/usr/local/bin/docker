@@ -1,0 +1,139 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# docker shim of the Debian image, /usr/local/bin/docker (ahead of
+# /usr/bin on PATH): makes sure Docker is installed, configured for this
+# kernel and running, then runs the real CLI (/usr/bin/docker).
+# - Install, once: docker.io, docker-cli (a Recommends, which the image
+#   leaves out) and crun, with apt-get as root (directly, or through
+#   `sudo -n`), after writing /etc/docker/daemon.json so that the service
+#   the package starts already uses it. The user is added to the group
+#   docker; until their next login this shim runs the CLI through
+#   `sudo -n -E -u USER`, which picks up the new group.
+# - daemon.json (written when missing): the kernel has no netfilter and no
+#   bridge (no iptables, no default bridge network), no cgroup namespaces
+#   (cgroupns host), and the root is an overlay, on which overlay2 cannot
+#   put its upper layers: with a data disk the data root is
+#   /data/distros/debian/docker (outside the root's overlay, so a
+#   kw-overlay discard leaves the images there), else a tmpfs mounted on
+#   /var/lib/docker for this boot. The runtime is
+#   /usr/local/libexec/kw-docker-runtime (crun; there is no BPF for the
+#   device cgroup).
+# - Start: the init script (`service docker start`, which sysv-rc also
+#   runs at boot) when dockerd is not running; then wait for its socket.
+# - Network: containers get the guest's own (--network host) for run,
+#   create and build unless the arguments name a network: the default
+#   network of a container would be an empty namespace, with no route
+#   out. Ports a container listens on are the guest's (-p is ignored).
+# Exit 127 when Docker is missing and cannot be installed (no network, no
+# root), 1 when dockerd does not start (the end of /var/log/docker.log).
+
+# unkernel: install, configure and start Docker, then run its CLI.
+real=/usr/bin/docker
+sock=/run/docker.sock
+conf=/etc/docker/daemon.json
+gray= reset=
+[ -t 2 ] && gray=$'\033[90m' reset=$'\033[0m'
+say() { printf '%s%s%s\n' "$gray" "docker: $*" "$reset" >&2; }
+die() { printf '%s\n' "docker: $*" >&2; exit "${rc:-1}"; }
+sudo=()
+asroot() { "${sudo[@]}" "$@"; }
+need_root() {
+	[ "$EUID" = 0 ] && return
+	sudo -n true 2>/dev/null || { rc=127 die "$1 needs root: run it as root once (sudo docker ...)"; }
+	sudo=(sudo -n)
+}
+# (/run/docker.pid is root's only)
+running() { pgrep -x dockerd >/dev/null; }
+
+# --- install --------------------------------------------------------------------
+# The data root on a file system that overlay2 can use: the data disk, else
+# a tmpfs over /var/lib/docker.
+data_root() {
+	if grep -qx 'upper=data' /run/kw-base 2>/dev/null && mountpoint -q /data; then
+		echo "/data/distros/$(cat /usr/lib/kw-distro)/docker"
+	else
+		mountpoint -q /var/lib/docker || asroot sh -c 'mkdir -p /var/lib/docker && mount -t tmpfs -o mode=710 kw-docker /var/lib/docker'
+	fi
+}
+write_conf() {
+	local root
+	root=$(data_root)
+	asroot mkdir -p /etc/docker || return
+	{
+		echo '{'
+		[ -z "$root" ] || echo "  \"data-root\": \"$root\","
+		cat <<-'EOF'
+		  "iptables": false,
+		  "ip6tables": false,
+		  "bridge": "none",
+		  "default-cgroupns-mode": "host",
+		  "default-runtime": "kw-crun",
+		  "runtimes": { "kw-crun": { "path": "/usr/local/libexec/kw-docker-runtime" } }
+		}
+		EOF
+	} | asroot tee "$conf" >/dev/null
+}
+installed() { [ -x $real ] && [ -x /usr/sbin/dockerd ] && [ -x /usr/bin/crun ]; }
+if ! installed || [ ! -e $conf ]; then
+	need_root "setting up Docker"
+	installed || awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null ||
+		rc=127 die "not installed yet, and installing it needs a network (this machine has none)"
+	[ -e $conf ] || write_conf || die "cannot write $conf"
+	if ! installed; then
+		# Not on the terminal's input: dpkg would eat what was typed ahead.
+		install() { asroot apt-get install -y -q --no-install-recommends docker.io docker-cli crun </dev/null >&2; }
+		say "${sudo:+sudo }apt-get install docker.io docker-cli crun"
+		printf %s "$gray" >&2
+		install || { asroot apt-get update -q </dev/null >&2 && install; }  # the image's lists may be stale
+		ok=$?
+		printf %s "$reset" >&2
+		[ $ok = 0 ] || rc=127 die "installing docker.io, docker-cli and crun failed"
+		[ "$EUID" = 0 ] || asroot usermod -aG docker "$(id -un)" || die "cannot add $(id -un) to the group docker"
+	fi
+fi
+
+# --- start ----------------------------------------------------------------------
+if ! running; then
+	need_root "starting dockerd"
+	# Without a data root in daemon.json: the tmpfs, again after a reboot.
+	grep -q '"data-root"' $conf || data_root >/dev/null
+	say "${sudo:+sudo }service docker start"
+	asroot service docker start >/dev/null || die "service docker start failed"
+fi
+for _ in $(seq 600); do
+	[ -S $sock ] && break
+	running || die "dockerd stopped; the end of /var/log/docker.log:"$'\n'"$(tail -n 5 /var/log/docker.log 2>/dev/null)"
+	sleep 0.1
+done
+[ -S $sock ] || die "dockerd did not create $sock in 60 s (/var/log/docker.log)"
+
+# --- network: the guest's, unless the arguments name one --------------------------
+# The command: the first argument after the CLI's own options.
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+	case ${args[i]} in
+	--config|-c|--context|-H|--host|-l|--log-level|--tlscacert|--tlscert|--tlskey) i=$((i + 2)) ;;
+	-*) i=$((i + 1)) ;;
+	*) break ;;
+	esac
+done
+cmd=${args[i]-}
+case $cmd in container|image|builder) i=$((i + 1)) cmd="$cmd ${args[i]-}" ;; esac
+case $cmd in
+run|create|build|"container run"|"container create"|"image build"|"builder build")
+	net=
+	for a in "${args[@]:i+1}"; do
+		case $a in --network|--network=*|--net|--net=*) net=1; break ;; esac
+	done
+	[ -n "$net" ] || args=("${args[@]:0:i+1}" --network host "${args[@]:i+1}") ;;
+esac
+
+# The socket is root:docker 0660: a user just added to the group has it
+# only from the next login on.
+if [ -w $sock ] || [ "$EUID" = 0 ]; then
+	exec $real "${args[@]}"
+fi
+sudo -n true 2>/dev/null || die "no access to $sock: log in again (the group docker), or use sudo"
+exec sudo -n -E -u "$(id -un)" -- $real "${args[@]}"

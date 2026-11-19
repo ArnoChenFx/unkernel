@@ -23,6 +23,11 @@ Things to try
                     Installed into ~/.local/bin the first time you run
                     one (claude and opencode are 250-360 MB, so they
                     need the data disk or plenty of memory).
+@if debian
+  docker run --rm -it alpine
+                    Docker is installed and started the first time you
+                    run docker. Containers use the guest's network.
+@end
   glimmer           A tiny game, with graphics and sound.
   python3 -m http.server 8000
                     A guest web server (on the web page it opens in the

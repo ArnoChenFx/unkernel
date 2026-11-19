@@ -28,7 +28,9 @@ missing).
   serves several.
 - State in `/data/distros/NAME/`: `upper`, `work`, `lower` (the image id
   the upper was last used with), `history` (image changes),
-  `discard` (a pending discard), `discarded-TIME/` (set-aside changes).
+  `discard` (a pending discard), `discarded-TIME/` (set-aside changes),
+  and on Debian `docker` (Docker's data root, which the docker shim puts
+  there; kernel/guest.md).
   Nothing else on `/data` is read (a disk written by an earlier guest, with
   `/data/overlay`, keeps it untouched and starts with no changes).
   `/run/kw-base` describes the boot (`name=`, `image=`,

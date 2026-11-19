@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# Docker's runtime in the Debian image (/etc/docker/daemon.json, written by
+# the docker shim, /usr/local/bin/docker): crun, called as runc is by
+# containerd's shim, with two changes to the bundle's config.json first.
+# - The device cgroup: on cgroup2 it is a BPF program, and the kernel has
+#   no bpf(2). crun goes on without it when no rule denies anything, so the
+#   rules become one: allow every device. runc cannot: it adds rules of its
+#   own that allow only mknod, and then fails.
+# - "blockIO":{}, which Docker always sets: crun then wants the io
+#   controller, and cgroup2 here has only pids.
+# Docker writes the spec as compact JSON in Go's field order (resources
+# starts with devices, whose rules hold no brackets), which the sed
+# expressions expect; if that changes, crun's own error shows.
+
+# unkernel: crun without a device cgroup or the io controller.
+bundle= prev=
+for a; do
+	case $prev in --bundle|-b) bundle=$a ;; esac
+	case $a in --bundle=*) bundle=${a#--bundle=} ;; esac
+	prev=$a
+done
+if [ -n "$bundle" ] && [ -f "$bundle/config.json" ]; then
+	sed -i -e 's/"resources":{"devices":\[[^]]*\]/"resources":{"devices":[{"allow":true,"access":"rwm"}]/' \
+		-e 's/,"blockIO":{}//' "$bundle/config.json" || exit 1
+fi
+exec /usr/bin/crun "$@"

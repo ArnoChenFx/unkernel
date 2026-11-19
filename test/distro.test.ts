@@ -95,7 +95,7 @@ for (const name of ["alpine", "debian"]) {
 			await poweroff(vm);
 		});
 
-		test("the kw layer's shims: fx, claude, opencode, node, npm, npx, bun, bunx, uv and uvx last on PATH; without a network the first call exits 127 and installs nothing", async (t) => {
+		test("the kw layer's shims: fx, claude, opencode, node, npm, npx, bun, bunx, uv and uvx last on PATH; without a network the first call exits 127 and installs nothing (Debian's docker shim too)", async (t) => {
 			const vm = await boot(t, { distro: img!.file });
 			const tools = ["fx", "claude", "opencode", "node", "npm", "npx", "bun", "bunx", "uv", "uvx"];
 			const which = `for n in ${tools.join(" ")}; do command -v $n; done`;
@@ -110,6 +110,14 @@ for (const name of ["alpine", "debian"]) {
 			// Anything else of the name wins: a program in ~/.local/bin (where an install goes).
 			await sh(vm, "mkdir -p ~/.local/bin && ln -s /bin/true ~/.local/bin/fx");
 			assert.equal(await sh(vm, "command -v fx"), `${HOME}/.local/bin/fx`);
+			if (name === "debian") {
+				// The image's docker shim, ahead of /usr/bin; offline it sets up nothing.
+				assert.equal(await sh(vm, "command -v docker"), "/usr/local/bin/docker");
+				const d = await vm.exec("docker", ["ps"], EXEC);
+				assert.equal(d.exitCode, 127, d.stderr);
+				assert.match(d.stderr, /^docker: not installed yet, and installing it needs a network/);
+				assert.equal(await sh(vm, "[ -e /etc/docker ] && echo yes || echo no"), "no");
+			}
 			await poweroff(vm);
 		});
 
@@ -378,6 +386,10 @@ for (const name of ["alpine", "debian"]) {
 				const s = await vm.exec("node", ["--version"], { ...EXEC, env: { KW_NODE_VERSION: "24.0.0" } });
 				assert.equal(s.exitCode, 127);
 				assert.match(s.stderr, /node: sudo apk add libgcc \(node needs libgcc_s\.so\.1\)/);
+			} else {
+				const d = await vm.exec("docker", ["ps"], EXEC);
+				assert.equal(d.exitCode, 127, d.stderr);
+				assert.match(d.stderr, /docker: sudo apt-get install docker\.io docker-cli crun/);
 			}
 			await poweroff(vm);
 		});

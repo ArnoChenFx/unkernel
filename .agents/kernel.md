@@ -99,8 +99,10 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 2 (1 was the riscv64 guest's contract as a whole,
-  2 the arm64 one). `tlb.c` compares it with `kw_abi_version()` at boot
+- `KW_ABI_VERSION` is 2. The riscv64 guest's contract had numbers of its
+  own (its releases carry 8), so a number names a contract only together
+  with the guest; the page build refuses a release whose number is not
+  this one (web.md, The page's kernel). `tlb.c` compares it with `kw_abi_version()` at boot
   and panics on a mismatch. Bump it, in both copies, on any change to the
   layout or the semantics; the header describes the current contract
   only, no list of steps. A new `KW_ISA_*` bit is an ABI change;
@@ -1234,8 +1236,11 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   (`zig cc -target aarch64-linux-none -nostdlib -ffreestanding -static -O2
   -fno-stack-protector`); boot it like kwtest with
   `rdinit=/usr/bin/abitest` (`abitest: 0 failure(s)`, exit 0). It tests
-  this kernel's ABI, not qemu-user's. Not in an image yet: the image
-  scripts should build it beside kwtest once they are ported.
+  this kernel's ABI, not qemu-user's. `alpine.sh` builds it into the test
+  archive beside kwtest (`alpine-test.cpio`, and `alpine.cpio` unless
+  `KW_RELEASE=1`), and the release workflow runs it on 1 and 2 CPUs. Its
+  SA_RESTART check has a child write to the pipe after a 100 ms sleep,
+  past the parent's 20 ms alarm, whatever the CPU's speed.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).

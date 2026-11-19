@@ -2,11 +2,11 @@
 
 unkernel runs Linux 7.3, compiled to a single wasm module (`arch/wasm` with an
 MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
-Linux ELF (ARMv8.0-A with FP, AdvSIMD, AES, PMULL, SHA1, SHA2, CRC32, LSE,
-SHA512, SHA3), run
-by kwemu: a Zig interpreter with a wasm JIT tier, linked into the kernel.
-README.md is the overview, and kernel/README.md covers the kernel side,
-the devices and the guest image.
+Linux ELF (ARMv8.0-A with FP and AdvSIMD, plus AES, PMULL, SHA1, SHA2,
+CRC32, LSE, SHA512 and SHA3), run by kwemu, a software CPU in Zig linked
+into the kernel: a reference interpreter, a decoded-op tier and a wasm
+JIT. README.md is the overview, and kernel/README.md covers the kernel
+side, the devices and the guest image.
 
 kwemu's guest CPU is AArch64 (src/a64, .agents/a64.md: a decoded-op tier
 over a reference interpreter, and a JIT that compiles hot blocks to
@@ -107,8 +107,9 @@ Details are in the area files.
   (js.md).
 - The image's busybox, zlib, openssl and apk-tools are rebuilt from
   pinned aports commits (`kernel/guest/alpine-opt.sh`; `KW_ALPINE_OPT=0`
-  keeps Alpine's builds), without FP or AdvSIMD code in hot paths and
-  with libcrypto on its integer code. An Alpine update needs new pins
+  keeps Alpine's builds), without FP or AdvSIMD code in hot paths;
+  libcrypto picks its crypto-extension code from AT_HWCAP, which the JIT
+  compiles where the host has wasm SIMD. An Alpine update needs new pins
   there; `alpine.sh` stops until they match (guest-packages.md).
 - Guest C programs in the image (`kernel/guest/*.c`) are built for the
   generic ARMv8.0 CPU. Check new code with the coverage classifier
@@ -130,7 +131,9 @@ Details are in the area files.
 - **Guest image**: `kernel/build.sh alpine` or `kernel/build.sh disk`.
 - **Page**: a kernel or guest change reaches the deployed page with the
   next release (`.github/workflows/release.yml`, run by hand). `pnpm dev`
-  runs it as soon as `kernel/build.sh` has rebuilt the bundle.
+  runs it as soon as `kernel/build.sh` has rebuilt the bundle. A page
+  build refuses a release whose kwemu ABI is not `include/kw_emu.h`'s, so
+  after an ABI bump cut a release before deploying (web.md).
 
 ## Tests
 

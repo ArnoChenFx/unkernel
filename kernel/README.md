@@ -3,7 +3,7 @@
 This directory holds the Linux kernel built as a single wasm64 module (Joel
 Severin's `arch/wasm`, reworked). User space is unmodified aarch64 Linux ELF
 (ARMv8.0-A), run by the kwemu software CPU (`src/a64`, contract in
-`include/kw_emu.h`; a decoded-op interpreter and an early JIT). The CPU walks real page
+`include/kw_emu.h`; a decoded-op interpreter and a wasm JIT). The CPU walks real page
 tables, so fork, mmap and copy-on-write behave like real Linux. A stock
 Alpine aarch64 minirootfs boots to a shell under Node, in
 Chromium, and in WebKit (Safari 27+, whose JSPI it needs), and Ubuntu Base
@@ -121,10 +121,10 @@ and `stats` are separate and not part of `all`):
   reproducible: fixed `-U` and `hash_seed`, and `E2FSPROGS_FAKE_TIME` /
   `SOURCE_DATE_EPOCH` for the timestamps. `all` runs it before `bundle`, and
   without mke2fs warns and goes on.
-* **alpine** (`guest/alpine.sh`), the only initramfs, `vendor/build/initramfs/alpine.cpio`, and `alpine-test.cpio`, which always has kwtest and kwbench:
+* **alpine** (`guest/alpine.sh`), the only initramfs, `vendor/build/initramfs/alpine.cpio`, and `alpine-test.cpio`, which always has kwtest, abitest and kwbench:
   * The Alpine minirootfs 3.24.4 (version and checksum pinned in `tools/env.sh`, `ALPINE_TARBALL=file` overrides). It gets a small `/init` and an inittab with `hvc0::respawn:-/bin/sh` and `::respawn:/usr/bin/kwtty serve` (see vsock).
-  * busybox, zlib, libcrypto, libssl, libapk and apk are the same Alpine packages rebuilt for kwemu's CPU (`guest/alpine-opt.sh`: gcc 16 `-O2 -march=armv8-a` without the vectorizer and with integer registers only where a file allows it, linked with lld; libcrypto on its integer code instead of the NEON and crypto-extension code that kwemu interprets). That made an ash loop about 11% faster, gzip and gunzip 30-50%, `apk add` of larger packages 11%, OpenSSL's SHA-256 2.3x, AES-GCM 1.7x and ChaCha20-Poly1305 30x as fast (2026-11-18); `KW_ALPINE_OPT=0` keeps Alpine's builds. Every other package is Alpine's own aarch64 build. The disk image gets them too. Details in `.agents/guest-packages.md`.
-  * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target aarch64-linux-musl -mcpu=generic` (ARMv8.0), so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell. They come as a second cpio archive after the image's, which the kernel unpacks after the first. With `KW_RELEASE=1` (set by the release workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release bundles, the npm package and the deployed page have no kwtest; boot a release bundle with `--initrd alpine-test` to run it. The choice is in `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel cache key. Both archives have the same image id (`/usr/lib/kw-image`), which leaves the test programs out.
+  * busybox, zlib, libcrypto, libssl, libapk and apk are the same Alpine packages rebuilt for kwemu's CPU (`guest/alpine-opt.sh`: gcc 16 `-O2 -march=armv8-a` without the vectorizer and with integer registers only where a file allows it, linked with lld; libcrypto picks its NEON and crypto-extension code from AT_HWCAP, as upstream, which kwemu's JIT compiles). That made an ash loop about 11% faster, gzip and gunzip about 30%, `apk add` of larger packages 11% (2026-11-18); OpenSSL in the image does AES-128-GCM at 99 MB/s, SHA-256 at 157 and ChaCha20-Poly1305 at 203 (2026-11-18). `KW_ALPINE_OPT=0` keeps Alpine's builds. Every other package is Alpine's own aarch64 build. The disk image gets them too. Details in `.agents/guest-packages.md`.
+  * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target aarch64-linux-musl -mcpu=generic` (ARMv8.0), so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell, and `/usr/bin/abitest` (`guest/abitest.c`, freestanding, no libc: the arm64 user ABI as exec leaves it; `rdinit=/usr/bin/abitest`). They come as a second cpio archive after the image's, which the kernel unpacks after the first. With `KW_RELEASE=1` (set by the release workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release bundles, the npm package and the deployed page have no kwtest; boot a release bundle with `--initrd alpine-test` to run it. The choice is in `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel cache key. Both archives have the same image id (`/usr/lib/kw-image`), which leaves the test programs out.
   * `/usr/bin/glimmer`, built the same way (see Display, input and sound), and so are `/usr/bin/kwvsock`, `/usr/bin/kwshm`, `/usr/bin/kwtty` and `/usr/bin/kw9p` (see vsock, Host file systems and Shared memory).
   * The cpio archive is written by `tools/mkcpio.py`; no root is needed.
 * **disk** (`guest/alpine-disk.sh`, `DISK_SIZE`, default 512M; `all` keeps
@@ -297,8 +297,8 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
   `alpine-keys`. Add more with `apk add --root /usr/gnemul/qemu-ARCH --arch
   APKARCH --keys-dir /usr/share/apk/keys/APKARCH PKG` (APKARCH is `x86` for
   i386 and `armv7` for arm). Expect it to be several times slower than
-  native aarch64 code (riscv64 kwemu with its JIT measured about 7x): qemu's
-  TCG output is interpreted by kwemu like any other code.
+  native aarch64 code: qemu's TCG output is new code to kwemu, which
+  interprets it or compiles it again like any other.
 * **`kw-arch ARCH [command...]`** runs a command (default: a shell) with
   `uname` and `arch` reporting x86_64, riscv64, i686 or armv7l instead of
   aarch64, for installers that pick their download by `uname -m`:
@@ -835,9 +835,10 @@ from source). Everything is self-hosted except the Wisp fallback.
   (`web/src/demos/`, one file each); web servers open in the preview. The
   page ships nothing for them, so most need the network.
 * **What it downloads.** One file: `web/kernel/unkernel-alpine.wasm`, the
-  `bundle` output attached to the newest GitHub release (10.6 MiB, without
-  an SMP patch section if the release has one;
-  `web/scripts/kernel.ts` fetches it when the page is built; `pnpm dev`
+  `bundle` output attached to the newest GitHub release (11.7 MiB for this
+  tree's release build, 2026-11-18; without its SMP patch section;
+  `web/scripts/kernel.ts` fetches it when the page is built, and refuses
+  a release whose kwemu ABI differs from `include/kw_emu.h`'s; `pnpm dev`
   runs the local build's copy), a Vite asset (`/assets/unkernel-alpine-<hash>.wasm` in the
   build; the runtime takes the initramfs and command line from its custom
   sections). The page has no other kernel, root fs or disk.
@@ -927,9 +928,10 @@ from source). Everything is self-hosted except the Wisp fallback.
   promise, or starts a fresh stack through the `ret_from_fork` export (a
   promising export). The kernel C stack (`__stack_pointer`) and `current`
   are Wasm globals, saved in Wasm locals across the switch (`entry.S`).
-  * The kernel is uniprocessor with `ARCH_NO_PREEMPT`.
-  * Memory is non-shared, so the kernel needs neither SharedArrayBuffer nor
-    COOP/COEP (the page sends COOP/COEP anyway).
+  * The default kernel is uniprocessor with `ARCH_NO_PREEMPT`.
+  * Its memory is non-shared, so it needs neither SharedArrayBuffer nor
+    COOP/COEP (the page sends COOP/COEP anyway). The SMP build is the
+    exception (Not done / stubbed, SMP).
 * **Interrupts are polled.** The timer is a one-shot expiry compared against
   the host monotonic clock. Console input arrives as a host-set bit in
   `wasm_host_irqs` (IRQ 1, which kicks hvc). Both are checked:
@@ -988,9 +990,9 @@ from source). Everything is self-hosted except the Wisp fallback.
   * User space makes new code visible with DC CVAU and IC IVAU. There is no
     vDSO. Handlers return to `sa_restorer`, else through a `[sigpage]`
     special mapping that holds `mov x8, #139; svc #0`.
-  * Missing for now: vector (AdvSIMD) floating point, which the
-    interpreter rejects with SIGILL (`.agents/a64.md`); Alpine's busybox
-    `sleep` hits it (`fcvtzs d31, d0`).
+  * Not implemented, so SIGILL: SVE/SME, SM3/SM4, FP16 arithmetic, RNDR
+    and later-architecture encodings (`.agents/a64.md`, State). AT_HWCAP
+    advertises none of them.
 * **Console.** `hvc_wasm` on WASI fds 1 (output) and 0 (input, read only
   after a zero-timeout `poll_oneoff`, so it never blocks), `console=hvc0`.
 * **Network.** `kwnet`, IRQ 2; see Networking.
@@ -1043,7 +1045,7 @@ suspend only when the host returns a promise.
   (kwshm, optional; see .agents/kernel.md), the display, input and sound
   imports (optional),
   `wasm_driver_console_size` (console rows << 16 | cols, 0 = unknown) and `wasm_dump_stacktrace`. kwemu, when built with its JIT tier
-  (`KWEMU_JIT=1`; off for the aarch64 guest, which it cannot compile yet), adds `kw_host_jit_caps`, `kw_host_jit_compile` and
+  (`KWEMU_JIT=1`, the default), adds `kw_host_jit_caps`, `kw_host_jit_compile` and
   `kw_host_jit_free` (contract in `include/kw_emu.h`; host
   `js/core/jit.ts`): the host compiles a hot block's module synchronously
   against the kernel's memory and `table.set`s it into one of 1024 kwemu
@@ -1093,11 +1095,13 @@ switching, no block or net device, no JIT).
 * SMP is experimental: a second build (`arch/wasm/configs/kw_smp.config`,
   `kernel/build.sh smp`, `.agents/kernel.md`, SMP) runs one kernel instance per
   CPU in worker threads on a shared memory (CLI `--smp N`; the page's
-  `?smp=N`, in Web Workers, once its bundle carries the SMP kernel),
+  `?smp=N`, in Web Workers, when its bundle carries the SMP patch, as
+  release bundles do),
   each CPU with its own JIT. It has every device, all served by CPU 0
   (disk I/O from other CPUs is handed to it), but no snapshots yet. A task moves to another CPU only on its way back to
   user mode (the load balancer, `taskset`); one asleep in a system call
-  stays where it is until it returns. The released kernel is UP. linux-wasm's NOMMU mode (programs as Wasm
+  stays where it is until it returns. One CPU (the UP kernel) is the
+  default everywhere. linux-wasm's NOMMU mode (programs as Wasm
   modules), its Wasm binfmt and its wasm32 build are not part of this
   port.
 * Kernel stack overflow is not detected (16 KiB shadow stacks). A wasm

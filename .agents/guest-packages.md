@@ -96,11 +96,10 @@ ones (Measurements).
 - **Size.** The image grows by about 570 KiB (busybox 995 KiB against
   919 KiB, libcrypto 4.9 MiB against 4.4 MiB), the gzipped initramfs
   in the bundle by 0.3 MiB; initramfs pages stay resident.
-- **`build.sh all` does not see the script.** Its check of whether the
-  disk image is current does not list `alpine-opt.sh`, because changing
-  `kernel/build.sh` would invalidate the CI caches. After changing the
-  script, run `kernel/build.sh disk`. Plain `alpine-opt.sh` rebuilds
-  everything; with package names it rebuilds only those.
+- **`build.sh all` rebuilds the disk image** when `alpine-opt.sh` is
+  newer than it (its check of whether the disk is current lists the
+  script). Plain `alpine-opt.sh` rebuilds everything; with package names
+  it rebuilds only those.
 - **Host tools:** meson, ninja, pkg-config, patch, lua 5.x (apk's help
   text), and perl with FindBin, IPC::Cmd and File::Compare (openssl's
   Configure). busybox's host tools build with `zig cc`. `setup.sh
@@ -110,7 +109,8 @@ ones (Measurements).
   `.stamp`, the APKBUILDs; about 9 MB), under the key
   `alpine-opt-<hash of alpine-opt.sh and env.sh>`, exact match only. On a
   miss the rebuild adds a few minutes (riscv64's took 233 s on a 4-core
-  runner, 2026-11-16).
+  runner, 2026-11-16; the aarch64 one has not run in CI yet, and took
+  79 s on 16 cores locally, 2026-11-18).
 - **Keep the other caches.** The existing cache keys hash
   `kernel/build.sh` and `kernel/tools/env.sh`, and a kernel cache miss
   costs about an hour. So the rebuild is not a `build.sh` step. Before
@@ -176,7 +176,7 @@ With libcrypto on its HWCAP paths and the JIT translating them
 JIT with the image's libcrypto still patched to its integer paths and
 SHA512 off): `apk add python3` 4.08 to 3.36 s, `apk add git` 2.34 to
 2.10, `apk update` 1.26 to 1.23, the other rows within noise; sum of the
-20 rows of `vendor/hand-build/bench-cmds.sh` 23.71 to 22.55 s. Package
+20 rows of `test/guest-bench.sh` 23.71 to 22.55 s. Package
 installs verify SHA-256 and download over TLS (AES-GCM).
 
 **OpenSSL in the image** (`openssl speed -evp ALG -bytes 16384

@@ -42,16 +42,17 @@ path runs at wasm speed.
   native).
 - **fork at native speed**: fork + exit + wait takes about 60 µs, against
   about 70 µs natively and 1.2 ms under qemu-system.
-- **A JIT for user code** (riscv64 guest; the aarch64 JIT compiles only
-  a few instruction kinds so far): hot riscv64 code is compiled to wasm while it runs. A
-  tight loop takes 2.5 ns per iteration (1.8 native, 28 without the JIT),
-  and https downloads in the guest reach 30 MB/s.
+- **A JIT for user code**: hot aarch64 code, including the AES, PMULL and
+  SHA instructions OpenSSL uses, is compiled to wasm while it runs. With
+  it a shell loop runs 1.6 times and `sort` 2.3 times as fast as on the
+  interpreter alone, and OpenSSL in the guest does AES-128-GCM at about
+  100 MB/s and SHA-256 at about 160 MB/s.
 
-These numbers were measured with the riscv64 guest. The aarch64 guest has
-a decoded-op interpreter and an early JIT, so CPU-bound work in it runs
-slower than riscv64 with its JIT (`apk search` over the main index: 1.1 s
-against 0.75 s, 2026-11-17). CPU-heavy programs are well behind native.
-[Benchmarks](#-benchmarks) has the full numbers.
+The syscall and fork numbers were measured on 2026-11-14 (with the
+riscv64 user space the project started with; the path through the kernel
+is the same), the JIT numbers on 2026-11-18. CPU-heavy programs are well
+behind native: `apk search` over the main index takes about 0.8 s, `apk
+add python3` about 3.4 s. [Benchmarks](#-benchmarks) has the full numbers.
 
 ## 🐧 A real kernel
 
@@ -78,8 +79,8 @@ overlayfs, behaves as it does on a server, because it runs the same code.
 - **aarch64 user space**: ARMv8.0-A with FP and AdvSIMD plus the AES,
   PMULL, SHA1, SHA2, SHA512, SHA3, CRC32 and LSE atomics extensions, so
   distribution binaries and
-  OpenSSL's hardware AES, GHASH and SHA paths run unchanged; AdvSIMD
-  floating point is still being finished. aarch64 is a first-class port of
+  OpenSSL's hardware AES, GHASH and SHA paths run unchanged. aarch64 is a
+  first-class port of
   every distribution, so their full, current package archives are
   available.
 
@@ -230,22 +231,26 @@ The design helps most with syscalls. These were measured under Node:
   <img alt="Time per operation for native, qemu-user, qemu-system and unkernel: getppid 110, 320, 1662 and 172 ns; read 64 B from /dev/zero 161, 481, 2247 and 172 ns; pipe write + read 417, 1032, 7256 and 482 ns; fork + exit + wait 73, 537, 1178 and 57 µs" src="assets/performance.svg" width="760">
 </p>
 
-In this test (riscv64 guest) fork is faster than native. Pure computation is slower. The JIT
-runs a tight integer loop at about 3900 MIPS (about 270 interpreted), and
-real Alpine work (`sort`, `gzip`, `sha256sum`, `awk`) runs 1.7 to 4.6 times
-faster than without it, which is still well behind native.
+In this test (2026-11-14) fork is faster than native. Pure computation is
+slower. kwemu's decoded-op interpreter runs integer code at about 250-300
+million guest instructions per second under Node (2026-11-17), and the
+JIT makes real Alpine work 1.6 to 2.3 times as fast as that (2026-11-18:
+an ash loop 2.5 s against 4.0 s, `seq 100000 | sort -r` 3.1 s against
+7.1 s, `seq 250000 | gzip | gunzip` 3.5 s against 6.5 s), which is still
+well behind native.
 
 ### 🚧 Known limits
 
-- One CPU in the released kernel. Several CPUs (SMP) are experimental,
-  not in a release yet, and cannot be suspended.
+- One CPU by default. Several CPUs (SMP: `--smp`, the page's `?smp=`)
+  are experimental and cannot be suspended.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
 - No ptrace register sets, so `strace` and `gdb` don't work. No seccomp.
-- The aarch64 JIT compiles only a few instruction kinds so far (the
-  decoded-op interpreter runs integer code at about 250-300 MIPS under
-  Node).
+- Code that runs only a few times (a large program's startup, such as
+  `npm`'s) stays on the interpreter, and FP and AdvSIMD floating point
+  run through it even inside compiled code. Without wasm SIMD in the host
+  engine, OpenSSL's AES and SHA paths run on the interpreter too.
 - A wasm trap in the kernel ends the session.
 
 ## 🧩 Use it from JavaScript
@@ -512,7 +517,9 @@ the DOM's `WebAssembly` types, so a Node-only TypeScript project needs `"lib":
 ## 🛠️ Building from source
 
 You need Linux (x86-64 or arm64), Zig 0.16, Node 24, clang 21+ with the
-wasm target, and the usual build tools. `./setup.sh --check` lists what's
+wasm target, and the usual build tools, plus meson, lua and perl for the
+guest packages that are rebuilt for kwemu (on x86-64; elsewhere
+`KW_ALPINE_OPT=0` keeps Alpine's builds). `./setup.sh --check` lists what's
 missing. The first build takes about 12 minutes, most of it spent on a
 patched `wasm-ld`, and uses 5 GiB of disk.
 

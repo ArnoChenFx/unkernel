@@ -73,9 +73,8 @@ sends the guest's TCP through a Wisp server instead (handshake with
 Origin: http://localhost, which wss://wisp.pi0.io:6680/ requires).
 
 kwemu's JIT tier (hot guest code compiled to WebAssembly) is offered by default;
---no-jit runs the interpreter only (the aarch64 JIT compiles only a few
-instruction kinds so far; a kernel built without it never asks, and --stats
-then says "not in this kernel"). --stats prints the JIT counters at exit, and kwemu's own (exits, compiled share) from a
+--no-jit runs the interpreter only (a kernel built without the JIT never
+asks, and --stats then says "not in this kernel"). --stats prints the JIT counters at exit, and kwemu's own (exits, compiled share) from a
 kernel built by kernel/build.sh stats.
 
 --worker runs the kernel in a worker thread (createKernel({ worker: true })),

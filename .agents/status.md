@@ -76,13 +76,18 @@ for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
    (or `fd_pread`-backed) kwblk/kwnet imports, that is what a standalone
    WASI runtime still needs. The generic services already use WASI
    preview 1.
-8. **SMP** is a design question. It needs shared memory (so cross-origin
-   isolation and a secure context), one kernel instance per worker,
-   per-CPU kwemu state and JIT tables, wasm atomics for AMOs and LR/SC,
-   and TLB shootdowns through the polled IRQ bits. JSPI-suspended stacks
-   cannot move between threads, so a task moves only where its stack can
-   be dropped and it can start on a fresh one (step 3); parking assumes
-   UP in the places listed in kernel.md, Parking.
+8. **SMP** (experimental; kernel.md, SMP; js.md, CPU threads; web.md,
+   Several CPUs). The SMP kernel is a second build of the same tree, one
+   kernel instance per CPU thread on a shared memory (so cross-origin
+   isolation and a secure context in browsers), with per-CPU kwemu state
+   and JIT tables, wasm atomics for the guest's exclusives and LSE
+   atomics, and TLB shootdowns through the polled IRQ bits; release
+   bundles carry the patch to it. JSPI-suspended stacks cannot move
+   between threads, so a task moves only where its stack can be dropped
+   and it can start on a fresh one (step 3); parking assumes UP in the
+   places listed in kernel.md, Parking. The steps that built it follow
+   with their measurements, taken on the riscv64 guest the project had
+   then (2026-11-16 and 17); what is open comes after them.
    Step 1, toolchain (2026-11-16, on the `smp` branches): the UP kernel
    builds with atomics and links with `--shared-memory` (kernel.md,
    Memory model), survives Binaryen's lowering, and passes kwtest (JIT
@@ -443,9 +448,9 @@ for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
      other cross-CPU calls; a wakeup onto a compiling CPU starts after
      the compile), and so does a flush whose IPI was already on its way
      when the compile began; modules are not shared between CPUs, so a
-     task that moves compiles its hot code again; FENCE and PAUSE are
-     handed back to the interpreter on SMP (an atomic RMW in compiled
-     code would do).
+     task that moves compiles its hot code again; exclusive pairs and
+     CASP stay interpreter calls in compiled code (a64.md, Exclusives and
+     atomics in compiled code).
    - Under host load (after steps 6 and 7): a synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
      again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);
@@ -473,12 +478,12 @@ for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
      window, glimmer, the JIT on every CPU, parallel loops scaling) and
      by hand on a deployed build in desktop Chrome, Firefox and on iOS.
      Not tried: desktop Safari, Android, a hidden tab (worker
-     throttling), long sessions. The page offers it
-     only once a release bundle carries the SMP patch (the next release:
-     `kernel/build.sh` builds both kernels and the bundle with the patch,
-     kernel.md, Two kernels, and the release workflow runs it). That
-     workflow's SMP steps are unexercised (testing.md, Release workflow,
-     says what they still need).
+     throttling), long sessions. The page offers it when its release
+     bundle carries the SMP patch, as releases do since 2026-11-17
+     (testing.md, Release workflow, lists the SMP checks the workflow
+     still lacks). Several CPUs on the aarch64 guest are checked in Node
+     only (kwtest on 2 and 4 CPUs, abitest on 2, 2026-11-18), not on the
+     page.
    - Deferred fork and wakeup changes, measured 2026-11-16 (kwfork,
      9 alternating rounds; patches and a README with their base in
      `vendor/smp-deferred/`, which is gitignored like all of vendor):

@@ -52,7 +52,10 @@ The API differs from 0.13-0.15. Examples of all of these are in
   atomics and bulk memory for an SMP kernel).
 - The guest programs (kwtest, kwbench, glimmer, kwtty, kw9p, kwvsock,
   kwshm) are built with `zig cc` (`aarch64-linux-musl`, `-mcpu=generic`,
-  static).
+  static); abitest freestanding (`aarch64-linux-none`, `-nostdlib`).
+- `zig build test` compares the A64 test guests with `qemu-aarch64`
+  (`QEMU_AARCH64=` names another binary) and skips the comparison, with a
+  note, when it is missing; `setup.sh --check` reports it as optional.
 
 ## Host tools
 
@@ -69,8 +72,9 @@ The API differs from 0.13-0.15. Examples of all of these are in
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
 - `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`;
   `KW_ALPINE_OPT=0` skips it) also needs meson, ninja, pkg-config, patch,
-  lua 5.x, and perl with FindBin, IPC::Cmd and File::Compare
-  (guest-packages.md).
+  lua 5.x, perl with FindBin, IPC::Cmd and File::Compare, xz (Bootlin's
+  tarball) and sha512sum (the APKBUILDs' source sums) (guest-packages.md),
+  and an x86_64 host for Bootlin's gcc.
 - `setup.sh` runs only ELF binaries for its version checks, so a wrapper
   that installs packages on first use is never triggered.
 

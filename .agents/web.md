@@ -47,12 +47,11 @@ the dev server's own responses) and `__KW_BUILD__`.
 ## The page's kernel: a local build in dev, the newest release in a build
 
 - The page loads only `web/kernel/page/unkernel-alpine.wasm` (gitignored):
-  the lowered kernel with Alpine bundled, about 10 MB. `splitKernel()`
+  the lowered kernel with Alpine bundled, about 12 MB (7 MB gzipped). `splitKernel()`
   (`web/scripts/kernel.ts`) makes it from `web/kernel/unkernel-alpine.wasm`
   (the file the rest of this list is about) without its SMP patch section
   (js.md, CPU threads), so it is byte for byte that file when there is
-  none, as in every release so far (the release workflow builds bundles
-  with it from the next release on; testing.md). When there is one, it also writes
+  none (release bundles have one since 2026-11-17; testing.md). When there is one, it also writes
   `web/kernel/page/unkernel-alpine-smp.wasm`, the SMP bundle the patch
   makes, which the `unkernel:kernel-smp` plugin emits as its own hashed
   asset and `src/sdk.ts` exports as `kernelSmpUrl` (null without it,
@@ -91,6 +90,18 @@ the dev server's own responses) and `__KW_BUILD__`.
   release instead of the newest, in dev too.
 - A release (the workflow, run by hand) changes a deployed page only once
   the page is rebuilt.
+- The kernel must match the page: `fetchKernel()` reads the kernel's
+  kwemu ABI (`kw_abi_version()`, through `kernelInfo()` in
+  `kernel/tools/bundle.mjs`) and refuses a release whose number is not
+  `include/kw_emu.h`'s `KW_ABI_VERSION`, in a build and in dev (a local
+  file only gets a warning). The page's texts, demos (the Ubuntu demo's
+  arm64 tarball, the launcher's aarch64 packages) and the data disk's
+  guest-architecture reset are written for this checkout's guest, so a
+  release of another guest (the riscv64 releases carry ABI 8, the arm64
+  contract is 2) must not be deployed with it. Order after an ABI change:
+  merge, cut a release (the workflow), then deploy the page; a page build
+  before the release fails with that message (or give `KW_KERNEL` or a
+  matching `KW_KERNEL_RELEASE`).
 - `web/src/sdk.ts` imports `js/core/index.ts`, `js/web/memory.ts` and
   `js/web/platform.ts`, not `js/web.ts`, whose own bundled kernel would
   become a second 10 MB asset. Its `kernelUrl` becomes a hashed Vite asset,
@@ -230,7 +241,7 @@ other options.
 - `smpBlocker()` (config.ts) disables the choices above 1, with the
   reason under them (`#opt-cpus-note`) and in the Environment tab's
   "Guest CPUs" row: no SMP kernel in the page's bundle (`kernelSmpUrl`
-  null, every release so far), no cross-origin isolation (a plain-http
+  null: a bundle without the SMP patch), no cross-origin isolation (a plain-http
   LAN page), no Web Workers or no `Atomics.waitAsync`
   (`webCpuBlocker({ worker: true })`), or one host thread. Such a load
   with `?smp=N` boots on one CPU as usual and says why.

@@ -17,11 +17,10 @@ parameters, documented at its top), `store.ts` (the UI state, read with
 drive, plus `rebootUrl()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
-it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `shims.ts` and `kw-shim.sh` (the fx, claude and opencode stand-ins; Stand-ins below), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
+it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
-`preview.ts` (the guest preview's page side), `fx.ts` (the fx coding
-agent's panel: the workspace, the stores, the key mapping), `sw.ts` (the service
+`preview.ts` (the guest preview's page side), `sw.ts` (the service
 worker's registration and the update check), `launcher.ts` (how a demo
 runs; the demos are in `src/demos/`), `style.css`
 (Tailwind theme, the dialog, wterm's colours). `src/components/`: `App.tsx`
@@ -29,8 +28,7 @@ runs; the demos are in `src/demos/`), `style.css`
 launcher overlay),
 `Panel.tsx` (the dialog), `Options.tsx`, `Display.tsx` (the display layer,
 rotation, mouse and touch input, touch controls), `Keys.tsx` (extra keys),
-`Overlays.tsx` (splash, toast, paste and confirm dialogs), `Fx.tsx` (the fx
-panel), `About.tsx`
+`Overlays.tsx` (splash, toast, paste and confirm dialogs), `About.tsx`
 (the status line's triangle and the credits dialog), `Preview.tsx`
 (the preview panel), `icons.tsx`. `src/env.d.ts` declares `__KW_BUILD__`,
 which `vite.config.ts` defines: the Linux release read from the committed
@@ -236,6 +234,8 @@ deploying the page needs no kernel toolchain.
 - Safe areas are the CSS variables `--st`, `--sr`, `--sb`, `--sl` (style.css). On iOS,
   `--sb` is 0: the page keeps the top inset but takes the whole height below it, and the
   status line moves its ends in by `--sc` (half the bottom inset) for the round corners.
+  On macOS outside fullscreen, `main.tsx` sets `mac-window` on the root and `--sc` is
+  8 px, for the window's round bottom corners.
   In a home screen app (standalone) `App.tsx` sizes `#app` to the screen's height,
   rounded down, unless the keyboard is up, because iOS can report a shorter viewport there.
 - An unknown or failed boot step must end in `ui.fail(...)`, so the
@@ -282,7 +282,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   after `write()` returned and yields a task (a MessageChannel, which
   background tabs do not throttle) every 16 ms or 256 KiB. `KW.windows`
   is their API. Checked by hand only (no browser test yet).
-- `?worker=1` (experimental, and implied by `?smp=N`) boots through the SDK's worker mode (js.md):
+- `?worker=1` (experimental, and implied by `?cpus=N`) boots through the SDK's worker mode (js.md):
   the page compiles the kernel and passes the `WebAssembly.Module`; disks
   and the network are specs built in the worker. The data disk in worker
   mode follows data-disk.md (Persistence in the browser). `KW.kernel` and
@@ -313,7 +313,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   for the Distro and Root rows, About (the image id) and diagnostics'
   config line (`distro=`, `image=`). Where a feature or text is Alpine's
   (apk, wget, the README), it is gated on `cfg.guest === "alpine"` (Rules,
-  Stand-ins, Launcher). Failures: an image that does not open (404, a
+  Launcher). Failures: an image that does not open (404, a
   server without Range, not erofs/ext4) is `ui.fail` (kind `distro`, with
   a hint); a read that fails later (the image changed or the server
   stopped; the guest gets EIO) is a non-fatal `KW.report`; the base's
@@ -322,7 +322,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   scratch script, not in `web/test/`) on the built Node server and the dev
   server, from a scratch build of the current sources: both distros, the
   switch through Options and Reboot, per-distro changes on the data disk,
-  `?data=0`, `?worker=1`, `?smp=2`, `?root=initramfs`, `?distro=none` and
+  `?data=0`, `?worker=1`, `?cpus=2`, `?root=initramfs`, `?distro=none` and
   an unknown name, suspend and resume (inline and worker) and the refusal
   across distros, the data disk reset (`KW.resetData()`), and the
   failures above (404, no Range, a changed ETag, by request interception).
@@ -383,10 +383,10 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 
 ## Several CPUs
 
-The CPUs option (System tab, Options, `#opt-cpus-<n>` radios; `?smp=N`,
+The CPUs option (System tab, Options, the `#opt-cpus` slider; `?cpus=N`,
 config.ts) boots the SMP kernel on N CPUs (kernel/smp.md; js.md, CPU
 threads). Default 1: the UP kernel, exactly as without the option (the
-same files and code paths; `#opt-cpus-1`). It applies on Reboot, like the
+same files and code paths). It applies on Reboot, like the
 other options.
 
 - Choices: 1, 2, 4 and 8 up to `navigator.hardwareConcurrency` (the
@@ -394,18 +394,19 @@ other options.
   hardwareConcurrency / 2), marked "(suggested)" (none below 4 threads).
   Half the host's threads stay free for the page, the browser and other
   tabs: a guest CPU whose thread the host deschedules stalls the CPUs
-  that wait for it (status.md, SMP, under host load). A larger `?smp=` is
+  that wait for it (status.md, SMP, under host load). A larger `?cpus=` is
   capped at the thread count.
-- `smpBlocker()` (config.ts) disables the choices above 1, with the
-  reason under them (`#opt-cpus-note`) and in the Environment tab's
+- `smpBlocker()` (config.ts) disables the slider, with the
+  reason under it (`#opt-cpus-note`) and in the Environment tab's
   "Guest CPUs" row: no SMP kernel in the page's bundle (`kernelSmpUrl`
   null: a bundle without the SMP patch), no cross-origin isolation (a plain-http
   LAN page), no Web Workers or no `Atomics.waitAsync`
   (`webCpuBlocker({ worker: true })`), or one host thread. Such a load
-  with `?smp=N` boots on one CPU as usual and says why.
+  with `?cpus=N` boots on one CPU as usual and says why.
 - With several CPUs, boot.ts loads `kernelSmpUrl` instead of `kernelUrl`
   (streaming compile; the UP bundle is not fetched) and boots in worker
-  mode (`cfg.worker` is set, the Worker thread option is not), with
+  mode (`cfg.worker` is set, not `?worker=1`; Options shows the Worker
+  thread box ticked and disabled, keeping its own value for one CPU), with
   `cpus`; the kernel worker starts the other CPUs as nested Web Workers.
   The download starts only after the suspended session was offered
   (below), since the answer picks the kernel. The SMP bundle is a hashed
@@ -416,7 +417,7 @@ other options.
   `bootUpOnce()`: it stores the reason in sessionStorage `kw-up-once` and
   reloads; that load boots on one CPU the usual way (inline unless
   `?worker=1`) and shows the reason (`cfg.smpWhy`: the Guest CPUs row,
-  the CPUs note, diagnostics). `?smp=` stays in the URL, so the next
+  the CPUs note, diagnostics). `?cpus=` stays in the URL, so the next
   Reboot tries again. If sessionStorage refuses, the failure is reported
   instead (no reload loop). A kernel worker that cannot start CPU threads
   (`webCpuBlocker()` there) runs the SMP kernel on one CPU: the Guest
@@ -428,7 +429,7 @@ other options.
   the kernel worker, so the terminal gets a few hundred chunks for
   `seq 1 200000` instead of one message per write, and output from a task
   on CPU 1 is not held up while CPU 0 runs user code. Headless Chromium,
-  `?smp=2` (2026-11-17, before, then after): `seq 1 200000` on CPU 1
+  `?cpus=2` (2026-11-17, before, then after): `seq 1 200000` on CPU 1
   37.7-38.4 s and 2.8 s (CPU 0: 2.3-2.5 s); echo of a shell on CPU 1
   while CPU 0 spins, median 9.4 and 0.57 ms; lines printed in turn on
   CPUs 0 and 1 in order either way; the default load unchanged.
@@ -439,17 +440,17 @@ other options.
   one CPU (`bootUpOnce()` with `kw-resume`) and resumes it; "Boot on N
   CPUs" boots SMP and, when the session has a data disk, deletes it (that
   boot changes the disk), else keeps it.
-- The boot summary says "on N CPUs, in Web Workers"; diagnostics' config
+- The boot summary says "on N CPUs"; diagnostics' config
   line has `cpus=`.
 - Checked in headless Chromium (Playwright's build, the built page from
   the l2 patch bundle, 2026-11-17, a scratch script, not in `web/test/`):
-  the default load fetched only the UP bundle and ran on one CPU; `?smp=2`
-  and `?smp=4` fetched only the SMP bundle, `nproc` gave 2 and 4, a
+  the default load fetched only the UP bundle and ran on one CPU; `?cpus=2`
+  and `?cpus=4` fetched only the SMP bundle, `nproc` gave 2 and 4, a
   terminal window, glimmer's test pattern, key and sound through worker
   mode worked, the JIT compiled on every CPU, and n parallel awk loops
   took 1.14x (2 CPUs) and 1.20x (4) the time of one; a plain-http LAN
   load disabled the option and booted on one CPU; a blocked SMP download
-  reloaded on one CPU; a UP session resumed from a `?smp=2` load ("Resume
+  reloaded on one CPU; a UP session resumed from a `?cpus=2` load ("Resume
   on 1 CPU") and was deleted by "Boot on 2 CPUs"; a page from the newest
   release (no patch) showed the option disabled and booted UP. Also the
   Vite dev server (nested worker from source).
@@ -535,7 +536,7 @@ docked right of the stage (`Preview.tsx`), or in a tab of its own, at
 `/vm/<vmId>/<port>/<path>`. The vmId is random per booted kernel
 (`preview.ts`). Ways to open it: Ctrl-A p (it opens on the last port, or
 8000; pressed again it hides or shows the panel), the Preview section in
-the System tab, the status line's globe icon on the right (`#bar-preview`,
+the Guest tab, the status line's globe icon on the right (`#bar-preview`,
 which hides and shows it; the port is in its tooltip), and `KW.preview.open(port)`. On wide screens the panel takes part of the
 stage's width, so the terminal (and the display offered to the guest) gets
 narrower; its left edge sets the split (localStorage `kw.previewSplit`,
@@ -621,118 +622,9 @@ has no Options control.
   python3`, then `cd /tmp/www && python3 -m http.server 8000`. Then Ctrl-A
   p, and "Go" after changing the port.
 
-## fx
-
-The status line's `fx` button (`#bar-fx`, after the display and preview
-icons; in the ⋯ menu on phones) and Ctrl-A f
-start fx, the coding agent from fx.sh, in a panel (`#fx`, `Fx.tsx`, the
-store's `fx`); pressed again they hide and show it, and its `[×]`
-(`#fx-close`) stops fx. `?fx` (or `?fx=1`) starts it at load, once the
-preflight passes, without waiting for the kernel; its Options control is
-the `fx` check box (`#opt-fx`), and an `?fx` already in the URL stays as
-written on Reboot. It is no terminal window: no status line tab, its
-wterm (`#fx-term`) is outside `#terms`, so display.ts never routes its keys
-to the guest. Docked right of the stage (and of the preview) on wide
-screens, with its own split (localStorage `kw.fxSplit`, default 38%, the
-drag shared with the preview: `dragSplit()`); over the stage under 720 px.
-`fx.ts` describes the rest at its top:
-
-- It runs libfx's wasm terminal (`createFxTerminal()`, npm `libfx`,
-  Apache-2.0) under JSPI on the page's thread next to the kernel. wterm,
-  libfx and `fx-term.wasm` (4 MB) load on first use, not with the page, and
-  the service worker does not precache libfx's wasm (`unkernel:asset-list`
-  in vite.config.ts; libfx also emits `fx-core.wasm`, which the page never
-  fetches). libfx is excluded from Vite's dependency pre-bundling, which
-  would break its `new URL("./fx-term.wasm", import.meta.url)`.
-- Its one tool, `shell.run`, is a workspace adapter: `/bin/sh -lc
-  <command>` through `vm.exec()` as root in `/root`, after user space runs
-  (`KW.ready`), with fx's own deadline (at most 30 s) and Ctrl-C as the
-  abort signal. `permission: "allow-sandboxed"`: no prompt per command.
-  `/root/AGENTS.md` from the guest, else built-in instructions about the
-  machine.
-- Sign-in is fx's `/login` (Vercel device login; the URL opens in a new
-  tab). vercel.com serves its OAuth discovery document without CORS
-  headers (2026-11-16), so `fxFetch()` falls back to a copy of the four
-  fields fx reads; the endpoints on api.vercel.com send CORS headers.
-  Without it the sign-in fails in a browser and fx offers API key entry,
-  which its wasm build does not have. The OAuth session, fx's settings, its
-  prompt history and the conversation are in `fx.ts`'s module memory only,
-  out of reach of other scripts (not in storage, not on `window` or `KW`), so
-  a reload signs out. Keys `kw.fx.*` from an earlier build are removed.
-- Checked by hand, plus a scratch run on 2026-11-16 (headless Chromium,
-  built page): the panel docks and hides, Vercel sign-in reaches the device
-  code, the narrow layout covers the stage. No browser test.
-- The guest's own `fx` command is a stand-in (Stand-ins below); the hidden
-  fx demo (`?demo=fx`, `src/demos/fx.ts`) just runs it.
-
-## Stand-ins (fx, claude, opencode)
-
-`shims.ts` writes `~/.local/bin/fx`, `claude` and `opencode` with one
-`vm.exec()` once user space runs, before a `?demo=` relaunch (boot.ts
-passes it the texts of `kw-shim.sh` and `guest/base/rootfs/etc/profile.d/kw-path.sh` as Vite
-`?raw` imports; shims.ts itself has none, so `test/api.test.ts` runs its
-shell text through the SDK). Each is `kw-shim.sh` with its name filled in;
-both files describe the rest at their top:
-
-- Alpine only (they download with wget, which Debian's image lacks):
-  boot.ts writes them only on the alpine image.
-- Writing: when the file is missing, or holds an older stand-in (`# kw-shim
-  N` on line 2: bump N when kw-shim.sh changes). A program there (not a
-  script, or a symlink) is never touched; one the user deleted comes back
-  as a stand-in at the next start. Each write holds the stand-in's lock.
-  `/etc/profile.d/kw-path.sh` is written too when missing (the base's kw
-  layer carries it; a change in the upper layer can hide it). In the
-  overlay's upper layer, so once per data disk and distro; once per boot
-  with `?data=0`.
-- The first call installs the newest release, straight from the URLs the
-  official installers use (fx.sh/setup.sh, claude.ai/install.sh,
-  opencode.ai/v2/install; none of them is run), and is replaced by it: fx
-  in place (`~/.local/bin/fx`), claude as `claude install` lays it out
-  (`~/.local/share/claude/versions/VER`, symlinked from `~/.local/bin`),
-  opencode in `~/.opencode/bin` (symlinked). `KW_FX_VERSION`,
-  `KW_CLAUDE_VERSION` (also `stable`) and `KW_OPENCODE_VERSION` pin one.
-  Checked: claude against its manifest's SHA-256 and size, opencode against
-  the npm registry's sha512; fx publishes no checksums, so only gzip's CRC
-  and the ELF header (as its own installer). The download streams through
-  the hash into a temporary file next to the final one (no copy in /tmp),
-  after a free-space check; one install at a time per tool; a cut-off one
-  leaves nothing; without a network the stand-in says so and exits 127.
-  It installs zstd and pigz with apk when it can (unpacking 3x faster), and
-  works without them. Downloads use libcrypto's own choice of code
-  (AT_HWCAP: AES, PMULL, NEON), which kwemu's JIT translates; forcing
-  its C code (`OPENSSL_armcap=0`, done here until 2026-11-18, when those
-  paths were interpreted) made a 50 MB TLS 1.3 download over the host
-  loopback no faster (AES-128-GCM 10.5-13.1 s against 9.2-11.6 s,
-  ChaCha20-Poly1305 9.4-9.9 against 9.6-10.7; the network path and the
-  pipeline dominate) and costs AES 4x in `openssl speed`
-  (guest-packages.md).
-- Sizes and times (Node CLI and SDK, 512 MiB, data disk, 2026-11-18): fx
-  4.5 MB download, 6.9 MB, first call 2.5 s, later ones 0.01 s; claude
-  2.1.327 127 MB (`.zst`), 357 MB, 23 s, then `--version` 0.2 s, `--help`
-  6 s; opencode 2.3.2 120 MB, 248 MB, 22 s, then `--version` 6 s (its own
-  startup); rechecked the same day on a fresh data disk (fx 0.0.17, claude
-  2.1.327, opencode 2.3.2): first calls 2.2, 16.9 and 20.9 s, then 0.0,
-  0.1 and 4.3 s. All three also run at 256 MiB. Without a data disk the root is
-  in RAM (230 MiB free at 512 MiB): fx installs, claude and opencode refuse
-  with a message; at 1 GiB claude fits.
-- claude's own auto-updater is left on: it may download a newer version
-  into `~/.local/share/claude/versions` in the background and keep the old
-  one until it cleans up, so up to twice its size on the data disk.
-- The guest downloads everything itself (wget, TLS in the guest, through
-  Wisp on the page). download.ts could not help much: downloads.claude.ai
-  sends no CORS headers and is https only; registry.npmjs.org and
-  releases.fx.sh send `Access-Control-Allow-Origin: *`, but the guest's TLS
-  is not the bottleneck any more (claude's `.zst` in 11 s and opencode's
-  tarball in 4 s through the default Wisp server from a server host,
-  2026-11-18).
-- Checked with the SDK (the exact `vm.exec()`, then each tool from a login
-  shell and directly) and in `test/api.test.ts` (no network). The page
-  itself was not opened.
-
 ## Launcher
 
-The status line's first item (`❯` and the shortcut as key caps,
-`#bar-launcher`), ⌘K on Apple
+The status line's first item (`❯`, `#bar-launcher`), ⌘K on Apple
 devices, Ctrl-Shift-O or Ctrl-A o open the launcher (`#launcher`, `Launcher.tsx`, the store's `launcher`):
 an overlay over the whole page in the manner of macOS Launchpad, the page
 blurred behind a grid of tiles (glyph and gradient from the demo) and a
@@ -750,22 +642,29 @@ After the demos comes a gray System tile that opens the dialog
 The demos are one file each in `src/demos/`, listed in order in
 `src/demos/index.ts`; `launcher.ts` runs them. The page ships no assets for
 them, so a demo is text only (`Demo` in launcher.ts): `files` written under
-its directory (`~/demos/<id>` by default) with one `vm.exec()` each, plus
-a generated `run.sh` there (`/etc/kw-apk-enable` when the demo sets
-`community`, `apk add` of the `packages` not yet installed, then the
-`commands`, each printed before it runs, under `set -e`). A new terminal
+its directory (`~/demos/<id>` by default) with one `vm.exec()` each (or a
+function that loads them at launch with a dynamic import, which keeps
+their text out of the page's main chunk), plus
+a generated `run.sh` there for the running distro (the `packages` it
+names for that distro, `{ alpine, debian }`, not yet installed: on Alpine
+`/etc/kw-apk-enable` when the demo sets `community`, then `apk add`; on
+Debian `apt-get install`, again after `apt-get update` when the baked lists
+name a version the mirror dropped; then the `commands`, each printed
+before it runs, under `set -e`). A demo runs only on the distros its
+`packages` name; its scripts handle what else differs (Doom's and
+Ubuntu's, with no `packages`, run on both). A new terminal
 window named after the demo runs `sh -lc` with a wrapper in place of the
 login shell: `cd <dir> && ./run.sh`, then `exec` the login shell, so the
 window stays to edit and rerun (an INT trap keeps the wrapper alive through
 Ctrl-C). Typing the command into a fresh shell lost the start of the line,
 because the login discards input typed ahead of its prompt. The preview opens once the
-guest answers http on the first of its `ports`. Alpine's nginx default
+guest answers http on the first of its `ports`. The distros' nginx default
 site also listens on `[::]:80`, which fails in the guest (no IPv6), so the
 nginx demo replaces it. A demo may carry repository sources as text (Vite `?raw` or
-`import.meta.glob`): Doom brings `web/src/demos/doom/fbdoom` (fbDOOM built in
+`import.meta.glob`; the file needs an extension, doom/files.ts says why): Doom brings `web/src/demos/doom/fbdoom.sh` (fbDOOM built in
 the guest with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound; the
 first run took 22 s to the first frame, a later one 0.2 s, 2026-11-18) and
-its `patches/` this way, and these GPL-2.0-or-later texts keep their license
+its `patches/` this way, loaded at launch (`doom/files.ts`), and these GPL-2.0-or-later texts keep their license
 (their SPDX headers) inside the MIT bundle. Files with absolute paths land outside the demo directory, and
 files from an earlier launch are never removed. A demo's `downloads`
 (url, SHA-256, size, guest path, an optional `unless` shell test) are
@@ -786,8 +685,7 @@ default Wisp server) the riscv64 Ubuntu Base tarball (31 MB) took 1.5 to
 to push (Node SDK, 2026-11-18). A demo with `hidden` set is left out of the launcher. A demo runs once at a time: picking one whose window
 is open (a dot under its tile) shows that window. A demo whose `needs`
 (display, net, sound) the page's options rule out is dimmed, with why; so
-is one that needs Alpine (`packages`, `community` or `needs.alpine`: Ubuntu,
-Doom and fx) on another distro.
+is one whose `packages` leave out this boot's distro.
 Launching a demo sets `?demo=<id>` in the URL (`history.replaceState`), and
 a page with `?demo=` launches that demo once the guest is up, so a reload
 reopens the last demo launched; Reboot keeps it. Closing that demo's

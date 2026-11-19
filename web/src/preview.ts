@@ -168,7 +168,7 @@ export function previewEscape(): string | null {
 	return m ? m[0] + location.pathname + location.search + location.hash : null;
 }
 
-// ---- the preview panel's actions (Ctrl-A p, the System tab, the status line, KW.preview) ----
+// ---- the preview panel's actions (Ctrl-A p, the Guest tab, the status line, KW.preview) ----
 const portOf = (v: unknown): number | null => {
 	const n = Number(v);
 	return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;

@@ -37,6 +37,12 @@ LOG=/tmp/speak.log
 B='\033[1m' D='\033[90m' C='\033[36m' N='\033[0m'
 VOICE=en+m7
 trap : INT
+# The voice variants: /usr/share/espeak-data on Alpine, under
+# /usr/lib/<triplet> on Debian.
+VARIANTS=
+for d in /usr/share/espeak-data /usr/lib/*/espeak-data; do
+	if [ -d "$d/voices/!v" ]; then VARIANTS=$d/voices/!v; fi
+done
 
 # speak VOICE TEXT. portaudio's device probe writes its findings to stderr
 # on every start; they go to the log, shown only when espeak fails.
@@ -101,7 +107,7 @@ words() {
 		/*)
 			v=${"$"}{line#/}
 			# A variant (in !v) goes on top of English; anything else is a language.
-			if [ -e "/usr/share/espeak-data/voices/!v/$v" ]; then v="en+$v"; fi
+			if [ -e "$VARIANTS/$v" ]; then v="en+$v"; fi
 			speak "$v" "$v" && VOICE=$v
 			;;
 		*) speak "$VOICE" "$line" ;;
@@ -173,6 +179,6 @@ export default {
 	colors: ["#8b5cf6", "#1e1b4b"],
 	needs: { net: true, sound: true },
 	files: { "speak.sh": { content: SPEAK, mode: 0o755 } },
-	packages: ["espeak"],
+	packages: { alpine: ["espeak"], debian: ["espeak"] },
 	commands: ["./speak.sh"],
 } satisfies Demo;

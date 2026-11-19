@@ -2,15 +2,11 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Nitro: a standalone Nitro v3 server (the `runtime` template of
 // `nitro create`: no build step) with its routes as plain ES modules (.mjs)
-// and nitro as its only dependency, installed by upm and served by
-// `nitro dev` on port 3000.
-//
-// No npm: install-upm.sh fetches upm's tarball straight from the npm
-// registry with wget, unpacks it to /usr/local/lib/upm and links upm and
-// upx into /usr/local/bin (once per guest). upm then installs nitro and its
-// six dependencies (about 7 MB) into app/node_modules, with
-// --min-release-age 0: by default upm picks only versions at least a day
-// old, and the demo should get the newest nitro the day it comes out.
+// and nitro as its only dependency, installed by `bun install` and served
+// by `nitro dev` under Bun (`bun --bun`, so the nitro bin's node shebang
+// does not pick Node) on port 3000. Nothing to install first: `bun` is the
+// kw layer's shim on every distro (guest/base, /usr/lib/kw/shim), which
+// fetches Bun on first use.
 //
 // The app is the scaffold minus its devDependencies (@types/node and
 // typescript, for editors only), plus two routes (api/runtime, the guest's
@@ -20,26 +16,6 @@
 // `nitro dev` listens on 0.0.0.0 (the guest has no IPv6) and picks up
 // edited routes.
 import type { Demo } from "../launcher.ts";
-
-const INSTALL_UPM = `#!/bin/sh
-# Installs upm (https://github.com/unjs/upm) from the npm registry, without
-# npm: the latest tarball, unpacked to /usr/local/lib/upm, with upm and upx
-# linked into /usr/local/bin. Does nothing when upm is already there.
-set -e
-command -v upm >/dev/null && exit 0
-url=$(wget -qO- https://registry.npmjs.org/upm/latest | sed -n 's/.*"tarball":"\\([^"]*\\)".*/\\1/p')
-[ -n "$url" ] || { echo "install-upm.sh: no tarball URL for upm" >&2; exit 1; }
-echo "$url"
-tmp=$(mktemp -d)
-wget -qO- "$url" | tar xzf - -C "$tmp"
-rm -rf /usr/local/lib/upm
-mkdir -p /usr/local/lib /usr/local/bin
-mv "$tmp/package" /usr/local/lib/upm
-rmdir "$tmp"
-ln -sf /usr/local/lib/upm/dist/upm.mjs /usr/local/bin/upm
-ln -sf /usr/local/lib/upm/dist/upx.mjs /usr/local/bin/upx
-echo "upm $(upm --version) in /usr/local/bin"
-`;
 
 const PACKAGE = `{
   "name": "nitro-app",
@@ -86,10 +62,10 @@ export default defineHandler(() => {
 const RUNTIME = `import os from "node:os";
 import { defineHandler } from "nitro";
 
-// The guest's own numbers: Node on aarch64 Linux, compiled to WebAssembly.
+// The guest's own numbers: Bun on aarch64 Linux, compiled to WebAssembly.
 export default defineHandler(() => {
   return {
-    node: process.version,
+    runtime: typeof Bun === "undefined" ? "Node " + process.version : "Bun " + Bun.version,
     platform: process.platform,
     arch: os.arch(),
     kernel: os.type() + " " + os.release(),
@@ -207,11 +183,11 @@ const PAGE = `<!doctype html>
 </nav>
 <main>
 	<h1>Nitro, running in your browser.</h1>
-	<p class="lead">A standalone Nitro v3 server. <code>nitro dev</code> runs the ES modules in <code>server/</code> with no build step, on Alpine's aarch64 Node, on a Linux kernel compiled to WebAssembly.</p>
+	<p class="lead">A standalone Nitro v3 server. <code>nitro dev</code> runs the ES modules in <code>server/</code> with no build step, on Bun's aarch64 build, on a Linux kernel compiled to WebAssembly.</p>
 	<div class="mono" id="who">connecting...</div>
 
 	<div class="card stats">
-		<div><span>Runtime</span><b id="h-node">-</b></div>
+		<div><span>Runtime</span><b id="h-runtime">-</b></div>
 		<div><span>Architecture</span><b id="h-arch">-</b></div>
 		<div><span>Kernel</span><b id="h-kernel">-</b></div>
 		<div><span>Memory</span><b id="h-mem">-</b></div>
@@ -282,7 +258,7 @@ async function poll() {
 			if (!r.ok) throw new Error("HTTP " + r.status);
 			const s = await r.json();
 			set("who", s.hostname + " · " + s.platform + " · up " + dur(s.uptime));
-			set("h-node", s.node);
+			set("h-runtime", s.runtime);
 			set("h-arch", s.arch);
 			set("h-kernel", s.kernel);
 			set("h-mem", s.memory);
@@ -304,14 +280,13 @@ poll();
 export default {
 	id: "nitro",
 	title: "Nitro",
-	desc: "A standalone Nitro server, installed with upm straight from the npm registry, on nitro dev",
+	desc: "A standalone Nitro server, installed and run with Bun, on nitro dev",
 	// The Nitro logo: the bolt in a circle from nitro.build/icon.svg (not in
 	// Simple Icons), without its blurred arc.
 	icon: { svg: '<path fill-rule="evenodd" d="M35.2166 7.02016C28.0478 -1.38317 15.4241 -2.38397 7.02077 4.78481C-1.38256 11.9536 -2.38336 24.5773 4.78542 32.9806C11.9542 41.3839 24.5779 42.3847 32.9812 35.216C41.3846 28.0472 42.3854 15.4235 35.2166 7.02016ZM25.2525 17.5175C26.0233 17.5175 26.5155 18.3527 26.1287 19.0194L26.0175 19.2111L18.4696 31.6294C18.3293 31.8602 18.0788 32.001 17.8088 32.001H17.0883C16.5946 32.001 16.2336 31.5349 16.3573 31.0569L18.4054 23.1384C18.5691 22.5053 18.0912 21.888 17.4373 21.888H14.2914C13.6375 21.888 13.1596 21.2708 13.3232 20.6377L16.4137 8.68289C16.5261 8.28056 16.8904 7.99734 17.3081 8.00208C17.3587 8.00266 17.4046 8.0035 17.4427 8.0047L20.6109 8.00465C21.217 8.00436 21.684 8.53896 21.6023 9.13949L21.5828 9.28246L20.3746 16.349C20.2702 16.9598 20.7406 17.5175 21.3603 17.5175H25.2525Z"/>', viewBox: "0 0 40 40" },
 	colors: ["#f27cec", "#31b2f3"],
 	needs: { net: true },
 	files: {
-		"install-upm.sh": { content: INSTALL_UPM, mode: 0o755 },
 		"app/package.json": PACKAGE,
 		"app/nitro.config.ts": CONFIG,
 		"app/tsconfig.json": TSCONFIG,
@@ -321,7 +296,6 @@ export default {
 		"app/server/api/echo.post.mjs": ECHO,
 		"app/public/index.html": PAGE,
 	},
-	packages: ["nodejs"],
-	commands: ["./install-upm.sh", "cd app", "upm i --min-release-age 0", "upm run dev --host 0.0.0.0 --port 3000"],
+	commands: ["cd app", "bun install", "bun --bun run dev --host 0.0.0.0 --port 3000"],
 	ports: [3000],
 } satisfies Demo;

@@ -16,8 +16,6 @@
 //   ⌘K on Apple devices (free there: the terminal sends nothing for ⌘) and
 //   Ctrl-Shift-O everywhere (Ctrl-K is readline's kill-line, so not that);
 // - Ctrl-A p opens the guest preview (preview.ts), or hides and shows it;
-//   Ctrl-A f opens fx, the coding agent, in a side panel working on the VM
-//   (fx.ts), then hides and shows it;
 //   Ctrl-A s suspends (session.ts: the next load offers to resume).
 // While a dialog is open the keys act on it directly (DIALOG_KEYS) and
 // never reach the terminal or the guest under it.
@@ -27,7 +25,6 @@
 // evdev keyboard (X, games) too.
 import { openAbout } from "./components/About.tsx";
 import { setDisplayShown } from "./display.ts";
-import { toggleFx } from "./fx.ts";
 import { KW } from "./kw.ts";
 import { toggleLauncher } from "./launcher.ts";
 import { previewCovers, togglePreview, yieldPreview } from "./preview.ts";
@@ -43,7 +40,7 @@ const isCmdA = (e: KeyboardEvent) => APPLE && e.metaKey && !e.ctrlKey && !e.altK
 const isPrefix = (e: KeyboardEvent) => isCtrlA(e) || isCmdA(e);
 export const CHORD = "Ctrl-Shift";
 
-const TABS: Tab[] = ["status", "env", "log", "errors", "keys"];
+const TABS: Tab[] = ["status", "guest", "env", "log", "errors", "keys"];
 
 // ---- terminal windows (windows.ts, KW.windows): the prefix and the status line ----
 /** Show window n (0: the console), over the dialog and the guest's display. */
@@ -98,7 +95,8 @@ export const COMMANDS: Command[] = [
 	{ keys: ["0", "t"], chord: "Digit0", label: "Window 0: the console (closes the dialog)", run: () => selectWindow(0) },
 	{ keys: ["n", "c"], label: "New terminal window (1 to 9: its own shell)", run: newWindow },
 	{ keys: ["x"], label: "Close the current terminal window (asks first)", run: () => void closeWindow() },
-	{ keys: ["k"], label: "System: options, data disk", run: () => KW.ui!.openPanel("status") },
+	{ keys: ["k"], label: "System: options for the next boot", run: () => KW.ui!.openPanel("status") },
+	{ keys: ["g"], label: "Guest: data disk, preview", run: () => KW.ui!.openPanel("guest") },
 	{ keys: ["i"], label: "Environment: browser, memory, storage, JIT", run: () => KW.ui!.openPanel("env") },
 	{ keys: ["l"], label: "Kernel log", run: () => KW.ui!.openPanel("log") },
 	{ keys: ["e"], label: "Errors", run: () => KW.ui!.openPanel("errors") },
@@ -109,7 +107,6 @@ export const COMMANDS: Command[] = [
 	} },
 	{ keys: ["o"], chord: "KeyO", meta: "KeyK", label: "Demos: the launcher (again closes it)", run: toggleLauncher },
 	{ keys: ["p"], label: "Preview a web server in the guest (the last port, or 8000; again hides or shows it)", run: togglePreview },
-	{ keys: ["f"], label: "fx: the coding agent, in a side panel, working on this VM (again hides or shows it)", run: toggleFx },
 	{ keys: ["y"], label: "Copy diagnostics (in a dialog, c also)", run: () => KW.ui!.copyDiagnostics() },
 	{ keys: ["r"], label: "Reboot (asks first)", run: () => KW.ui!.confirmReboot() },
 	{ keys: ["s"], label: "Suspend: save the system in this browser and stop (asks first; the next load offers to resume)", run: () => void KW.ui!.confirmSuspend() },
@@ -118,7 +115,7 @@ export const COMMANDS: Command[] = [
 
 /** In an open dialog, without the prefix. */
 export const DIALOG_KEYS: Array<[string, string]> = [
-	["k i l e ?", "System, Environment, Kernel log, Errors, Keys"],
+	["k g i l e ?", "System, Guest, Environment, Kernel log, Errors, Keys"],
 	["← →  [ ]", "Previous, next tab"],
 	["↑ ↓", "Scroll"],
 	["Tab  ⇧Tab", "Move between controls (they stay in the dialog)"],
@@ -200,7 +197,7 @@ export function installShortcuts(): () => void {
 		if (onButton && (e.key === "Enter" || e.key === " ")) return;
 		swallow(e); // nothing reaches the terminal under the dialog
 		const i = TABS.indexOf(s.tab);
-		const tab = ({ k: "status", i: "env", l: "log", e: "errors", "?": "keys" } as Record<string, Tab>)[e.key];
+		const tab = ({ k: "status", g: "guest", i: "env", l: "log", e: "errors", "?": "keys" } as Record<string, Tab>)[e.key];
 		if (tab) ui.selectTab(tab);
 		else if (e.key === "ArrowLeft" || e.key === "[") ui.selectTab(TABS[(i + TABS.length - 1) % TABS.length]!);
 		else if (e.key === "ArrowRight" || e.key === "]") ui.selectTab(TABS[(i + 1) % TABS.length]!);

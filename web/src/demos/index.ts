@@ -3,9 +3,7 @@
 // The launcher's demos, one file each, in the order the menu lists them.
 // A new demo: a file here that default-exports a Demo (launcher.ts), added below.
 import type { Demo } from "../launcher.ts";
-import aquarium from "./aquarium.ts";
 import doom from "./doom.ts";
-import fx from "./fx.ts";
 import dos from "./dos.ts";
 import git from "./git.ts";
 import glimmer from "./glimmer.ts";
@@ -25,4 +23,4 @@ import tmux from "./tmux.ts";
 import ubuntu from "./ubuntu.ts";
 import valkey from "./valkey.ts";
 
-export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, fx, sshfs, nginx, node, nitro, python, postgres, sqlite, valkey, radio, speak, aquarium, dos, doom];
+export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, sshfs, nginx, node, nitro, python, postgres, sqlite, valkey, radio, speak, dos, doom];

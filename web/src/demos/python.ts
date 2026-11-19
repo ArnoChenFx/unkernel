@@ -309,7 +309,7 @@ PAGE = string.Template("""<!doctype html>
     </div>
     <span class="pill">$count</span>
   </div>
-  <p>This page comes from <code>app.py</code>: <code>http.server</code>, <code>sqlite3</code> and <code>html</code> from the standard library, no pip. Python is Alpine's aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Notes are stored in SQLite; times are the guest's clock.</p>
+  <p>This page comes from <code>app.py</code>: <code>http.server</code>, <code>sqlite3</code> and <code>html</code> from the standard library, no pip. Python is the distro's aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Notes are stored in SQLite; times are the guest's clock.</p>
 
   <form method="post" action="./">
     <textarea name="message" maxlength="$max_message" placeholder="Leave a note..." required></textarea>
@@ -384,7 +384,7 @@ export default {
 	files: {
 		"app.py": { content: APP, mode: 0o755 },
 	},
-	packages: ["python3"],
+	packages: { alpine: ["python3"], debian: ["python3"] },
 	commands: ["python3 -u app.py"],
 	ports: [8000],
 } satisfies Demo;

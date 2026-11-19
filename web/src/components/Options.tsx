@@ -3,10 +3,10 @@
 // Options in the System tab: one control per URL parameter (config.ts)
 // except ?simulate. Reboot loads the page with them (ui.rebootUrl()); Font
 // size applies at once and is kept in localStorage. Terminal style: on/off
-// options are [x] check boxes, Network and CPUs are (•) radio choices,
-// Memory and Font size are sliders over their sizes. CPUs are disabled,
-// with the reason, where the page cannot boot more than one (config.ts
-// smpBlocker()). Distro (?distro=) lists the page's images and none.
+// options are [x] check boxes, Network and Distro are (•) radio choices,
+// CPUs, Memory and Font size are sliders over their counts and sizes. The
+// CPUs slider is disabled, with the reason, where the page cannot boot more
+// than one (config.ts smpBlocker()). Distro (?distro=) lists the page's images and none.
 //
 // The fields are controlled by the store. Besides onChange, native listeners
 // on the form (capture phase, so non-bubbling events count too) read every
@@ -41,12 +41,15 @@ function Field({ label, wide, hidden, id, children }: { label: string; wide?: bo
 	);
 }
 
-/** [x] Label, with a note under it. The input is real (keyboard, screen readers), drawn as text. */
-function Check({ id, name, on, off, value, label, note }: { id: string; name: keyof Opts; on: string; off: string; value: string; label: string; note?: string }) {
-	const checked = value === on;
+/**
+ * [x] Label, with a note under it. The input is real (keyboard, screen readers), drawn as text.
+ * A forced box is shown ticked and disabled, its stored value kept (Worker thread with several CPUs).
+ */
+function Check({ id, name, on, off, value, label, note, forced }: { id: string; name: keyof Opts; on: string; off: string; value: string; label: string; note?: string; forced?: boolean }) {
+	const checked = forced || value === on;
 	return (
-		<label className="group flex cursor-pointer items-start gap-2 py-0.5 text-muted select-none hover:text-fg">
-			<input id={id} name={name} type="checkbox" data-on={on} data-off={off} checked={checked} onChange={onField} className="peer sr-only" />
+		<label className={`group flex items-start gap-2 py-0.5 text-muted select-none ${forced ? "cursor-not-allowed" : "cursor-pointer hover:text-fg"}`}>
+			<input id={id} name={name} type="checkbox" data-on={on} data-off={off} checked={checked} disabled={forced} onChange={onField} className="peer sr-only" />
 			<span aria-hidden="true" className="whitespace-pre peer-focus-visible:outline-2 peer-focus-visible:outline-accent">
 				<span className="text-faint">[</span><span className={checked ? "text-ok" : ""}>{checked ? "x" : " "}</span><span className="text-faint">]</span>
 			</span>
@@ -59,11 +62,11 @@ function Check({ id, name, on, off, value, label, note }: { id: string; name: ke
 }
 
 /** (•) one of several. */
-function Radio({ id, name, value, current, label, disabled }: { id: string; name: keyof Opts; value: string; current: string; label: string; disabled?: boolean }) {
+function Radio({ id, name, value, current, label }: { id: string; name: keyof Opts; value: string; current: string; label: string }) {
 	const checked = value === current;
 	return (
-		<label className={`flex items-center gap-1.5 text-muted select-none ${disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:text-fg"}`}>
-			<input id={id} name={name} type="radio" value={value} checked={checked} disabled={disabled} onChange={onField} className="peer sr-only" />
+		<label className="flex cursor-pointer items-center gap-1.5 text-muted select-none hover:text-fg">
+			<input id={id} name={name} type="radio" value={value} checked={checked} onChange={onField} className="peer sr-only" />
 			<span aria-hidden="true" className="whitespace-pre peer-focus-visible:outline-2 peer-focus-visible:outline-accent">
 				<span className="text-faint">(</span><span className={checked ? "text-ok" : ""}>{checked ? "•" : " "}</span><span className="text-faint">)</span>
 			</span>
@@ -79,8 +82,11 @@ type Stop = { value: string; tick: string; label: string; note?: string };
  * back), with the current value beside the label and each stop's tick label
  * under it, plus an optional note under that (Memory: "auto" under the size
  * auto picks). A tick is clickable and lines up with the thumb's centre there.
+ * A disabled slider (CPUs where only one is possible) says why in its note.
  */
-function Slider({ id, name, label, value, stops }: { id: string; name: string; label: string; value: string; stops: Stop[] }) {
+function Slider({ id, name, label, value, stops, disabled, note, noteId }: {
+	id: string; name: string; label: string; value: string; stops: Stop[]; disabled?: boolean; note?: string; noteId?: string;
+}) {
 	const i = Math.max(0, stops.findIndex((s) => s.value === value)), last = stops.length - 1;
 	const at = (k: number) => `calc(${last ? k / last : 0} * (100% - var(--thumb)) + var(--thumb) / 2)`;
 	const cur = stops[i]!.label;
@@ -91,15 +97,17 @@ function Slider({ id, name, label, value, stops }: { id: string; name: string; l
 				<output htmlFor={id} className="font-mono text-[12px] text-fg tabular-nums">{cur}</output>
 			</div>
 			<input id={id} name={name} type="range" min={0} max={last} step={1} value={i} data-values={stops.map((s) => s.value).join(",")}
-				aria-valuetext={cur} onChange={onField} className="slider w-full" style={{ "--fill": at(i) } as never} />
-			<div className={`relative font-mono text-[11px] leading-[14px] select-none ${stops.some((s) => s.note) ? "h-7" : "h-3.5"}`} aria-hidden="true">
+				disabled={disabled} aria-valuetext={cur} aria-describedby={note ? noteId : undefined} onChange={onField}
+				className="slider w-full disabled:cursor-not-allowed disabled:opacity-50" style={{ "--fill": at(i) } as never} />
+			<div className={`relative font-mono text-[11px] leading-[14px] select-none ${stops.some((s) => s.note) ? "h-7" : "h-3.5"} ${disabled ? "opacity-50" : ""}`} aria-hidden="true">
 				{stops.map((s, k) => (
-					<span key={s.value} onClick={() => pick(name, s.value)} style={{ left: at(k) }}
-						className={`absolute top-0 flex -translate-x-1/2 cursor-pointer flex-col items-center tabular-nums hover:text-fg ${k === i ? "text-fg" : ""}`}>
+					<span key={s.value} onClick={disabled ? undefined : () => pick(name, s.value)} style={{ left: at(k) }}
+						className={`absolute top-0 flex -translate-x-1/2 flex-col items-center tabular-nums ${disabled ? "" : "cursor-pointer hover:text-fg"} ${k === i ? "text-fg" : ""}`}>
 						{s.tick}{s.note && <span className="text-[10px] text-ok">{s.note}</span>}
 					</span>
 				))}
 			</div>
+			{note && <small id={noteId} className="text-[11.5px] text-faint">{note}</small>}
 		</div>
 	);
 }
@@ -144,11 +152,17 @@ export function Options() {
 	}));
 	const fontValue = fontPref === String(autoPx) ? "auto" : fontPref;
 
-	// CPUs: 1, 2, 4, 8 up to the host's threads, the suggested count and a ?smp= that is none of them.
-	const cpus = [...new Set([...CPU_COUNTS.filter((n) => n <= cfg.cpuMax), ...(cfg.cpuSuggested ? [cfg.cpuSuggested] : []), cfg.smpParam])].sort((a, b) => a - b);
+	// CPUs: 1, 2, 4, 8 up to the host's threads, the suggested count and a ?cpus= that is none of them.
+	const cpus: Stop[] = [...new Set([...CPU_COUNTS.filter((n) => n <= cfg.cpuMax), ...(cfg.cpuSuggested ? [cfg.cpuSuggested] : []), cfg.smpParam])].sort((a, b) => a - b)
+		.map((n) => {
+			const sug = n === cfg.cpuSuggested && n > 1;
+			return { value: String(n), tick: String(n), label: `${n} CPU${n > 1 ? "s" : ""}${sug ? " (suggested)" : ""}`, note: sug ? "suggested" : undefined };
+		});
+	// More than one CPU runs each in a Web Worker (config.ts: worker), so Worker thread is ticked and locked.
+	const smp = o.cpus !== "1" && !cfg.smpBlocked;
 	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`
 		: cfg.smpWhy ? `This boot runs on one CPU: ${cfg.smpWhy}.`
-		: "Experimental. More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); no Suspend.";
+		: "More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); no Suspend.";
 
 	// Distro: the images (debian first) and none, the base shell.
 	const mib1 = (n: number) => `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MiB`;
@@ -169,8 +183,8 @@ export function Options() {
 				<Check id="opt-sound" name="sound" on="on" off="off" value={o.sound} label="Sound" note="ALSA and /dev/dsp" />
 				<Check id="opt-verbose" name="verbose" on="keep" off="clear" value={o.verbose} label="Verbose boot" note="show all kernel messages" />
 				<Check id="opt-root" name="root" on="safe" off="overlay" value={o.root} label="Safe mode" note="boot without your changes" />
-				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" note={o.cpus !== "1" && !cfg.smpBlocked ? "experimental; on with several CPUs" : "experimental"} />
-				<Check id="opt-fx" name="fx" on="on" off="off" value={o.fx} label="fx" note="start the coding agent at load" />
+				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" forced={smp}
+					note={smp ? "always on with several CPUs" : "the kernel off the page's main thread"} />
 			</div>
 
 			<fieldset className="col-span-full flex flex-col gap-1.5">
@@ -198,17 +212,8 @@ export function Options() {
 				<small id="opt-distro-note" className="text-[11.5px] text-faint">{distroNote}</small>
 			</fieldset>
 
-			<fieldset className="col-span-full flex flex-col gap-1.5">
-				<legend className="mb-1.5 text-[11.5px] text-faint">CPUs</legend>
-				<div className="flex flex-wrap gap-x-5 gap-y-1" role="radiogroup" id="opt-cpus">
-					{cpus.map((n) => (
-						<Radio key={n} id={`opt-cpus-${n}`} name="cpus" value={String(n)} current={o.cpus} disabled={!!cfg.smpBlocked && n > 1}
-							label={n === cfg.cpuSuggested && n > 1 ? `${n} (suggested)` : String(n)} />
-					))}
-				</div>
-				<small id="opt-cpus-note" className="text-[11.5px] text-faint">{cpuNote}</small>
-			</fieldset>
-			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] gap-x-12 gap-y-5">
+			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] items-start gap-x-12 gap-y-5">
+				<Slider id="opt-cpus" name="cpus" label="CPUs" value={o.cpus} stops={cpus} disabled={!!cfg.smpBlocked} note={cpuNote} noteId="opt-cpus-note" />
 				<Slider id="opt-mem" name="mem" label="Memory" value={memValue} stops={mem} />
 				<Slider id="opt-font" name="font" label="Font size" value={fontValue} stops={fonts} />
 			</div>

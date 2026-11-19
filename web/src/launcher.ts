@@ -8,11 +8,15 @@
 // preview opened on the ports it serves.
 //
 // launch(demo):
-// 1. writes the demo's files under its directory (~/demos/<id> unless it
+// 1. writes the demo's files (loaded first when the demo gives a loader)
+//    under its directory (~/demos/<id> unless it
 //    sets dir) through vm.exec(), one exec per file (waiting for the
-//    guest's kwtty while it boots), and run.sh there: community enabled if
-//    the demo asks, `apk add` of the packages not yet installed, then the
-//    commands, each printed before it runs, under set -e;
+//    guest's kwtty while it boots), and run.sh there: the running distro's
+//    packages not yet installed (Alpine: community enabled if the demo
+//    asks, then `apk add`; Debian: `apt-get install`, once more after
+//    `apt-get update` when the image's baked package lists name a version
+//    the mirror no longer has), then the commands, each printed before it
+//    runs, under set -e;
 // 1b. gets the demo's downloads on the page (download.ts: plain http over
 //    Wisp, checked against their SHA-256, kept in the browser's cache) and
 //    pushes each into the guest, unless its `unless` test passes in dir or
@@ -28,11 +32,14 @@
 //    preview on the first (preview.ts) and toasts the others.
 // A demo runs once at a time: launching one whose window is open (a window
 // named after it, even after run.sh ended) shows that window instead.
-// Packages come from main; a demo with `community` enables community first
-// (lazy in the image, .agents/kernel/guest.md), once per guest.
+// A demo names its packages per distro (`packages: { alpine, debian }`), since
+// the names differ; its scripts handle what else differs (paths, wget on
+// Alpine and curl on Debian, apk's or dpkg's database). Alpine's come from
+// main; a demo with `community` enables community first (lazy in the image,
+// .agents/kernel/guest.md), once per guest.
 // A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
-// but disabled, with why; so is one that needs Alpine (`packages`, `community`
-// or needs.alpine: apk, wget) on another distro (?distro=).
+// but disabled, with why; so is one whose `packages` leave out this boot's
+// distro (?distro=).
 // Launching a demo sets ?demo=<id> in the page's URL (history.replaceState),
 // so a reload launches it again once the guest is up (launchFromUrl, from
 // boot.ts); the last demo launched wins. Closing that demo's window (or its
@@ -50,6 +57,9 @@ export interface DemoFile {
 	mode?: number;
 }
 
+/** A demo's files, by path relative to its dir (or absolute). */
+export type DemoFiles = Record<string, string | DemoFile>;
+
 /** A tile's pictogram: SVG elements (paths, shapes) as static markup from this repository. */
 export interface DemoIcon {
 	svg: string;
@@ -63,6 +73,11 @@ export interface DemoDownload extends FileSpec {
 	/** A shell test run in dir: when it succeeds the file is not needed, and nothing is fetched. */
 	unless?: string;
 }
+
+/** The distro images a demo can name packages for. */
+export type Distro = "alpine" | "debian";
+const DISTROS: Distro[] = ["alpine", "debian"];
+const isDistro = (s: string): s is Distro => (DISTROS as string[]).includes(s);
 
 export interface Demo {
 	id: string;
@@ -79,18 +94,25 @@ export interface Demo {
 	icon?: string | DemoIcon;
 	/** The tile's gradient, top left to bottom right (CSS colours). */
 	colors?: [string, string];
-	/** alpine: runs only on Alpine (implied by packages and community). */
-	needs?: { display?: boolean; net?: boolean; sound?: boolean; alpine?: boolean };
+	needs?: { display?: boolean; net?: boolean; sound?: boolean };
 	/** The working directory in the guest. Default ~/demos/<id>. */
 	dir?: string;
-	/** Files to write, by path relative to dir (or absolute). */
-	files?: Record<string, string | DemoFile>;
+	/**
+	 * Files to write, by path relative to dir (or absolute), or a function
+	 * that loads them when the demo launches (a dynamic import), which keeps
+	 * their text out of the page's main chunk.
+	 */
+	files?: DemoFiles | (() => Promise<DemoFiles>);
 	/** Files fetched by the page and pushed into the guest before run.sh starts. */
 	downloads?: DemoDownload[];
-	/** Alpine packages to install first (those not installed yet). */
-	packages?: string[];
 	/**
-	 * Some packages are in community: enable it first (/etc/kw-apk-enable).
+	 * Packages to install first (those not installed yet), per distro. With
+	 * it, the demo runs only on the distros it names (an empty list: nothing
+	 * to install there).
+	 */
+	packages?: Partial<Record<Distro, string[]>>;
+	/**
+	 * Alpine: some packages are in community: enable it first (/etc/kw-apk-enable).
 	 * The image starts apk with main only, since every apk command parses
 	 * all enabled indexes and community's makes that ~2 s slower.
 	 */
@@ -111,13 +133,28 @@ export function setLauncher(open: boolean): void {
 }
 export const toggleLauncher = (): void => setLauncher(!ui$().get().launcher);
 
+/** The distros the demo runs on, or null for any. */
+export function demoDistros(d: Demo): Distro[] | null {
+	return d.packages ? DISTROS.filter((x) => d.packages![x]) : null;
+}
+
+/** The packages the demo installs on this boot's distro. */
+export function demoPackages(d: Demo): string[] {
+	const g = KW.config.guest;
+	return isDistro(g) ? d.packages?.[g] ?? [] : [];
+}
+
+const DISTRO_NAMES: Record<Distro, string> = { alpine: "Alpine", debian: "Debian" };
+
 /** Why the demo cannot run on this page, or null. */
 export function unavailable(d: Demo): string | null {
 	if (d.needs?.display && !KW.config.display) return "needs the display (off with ?display=0)";
 	if (d.needs?.net && !KW.config.net) return "needs the network (off with ?net=0)";
 	if (d.needs?.sound && !KW.config.sound) return "needs sound (off with ?sound=0)";
-	if ((d.needs?.alpine || d.packages?.length || d.community) && KW.config.guest !== "alpine")
-		return `needs Alpine (apk); this boot runs ${KW.config.guest === "none" ? "no distro" : KW.config.guest} (Options, Distro)`;
+	const on = demoDistros(d);
+	const g = KW.config.guest;
+	if (on && !(isDistro(g) && on.includes(g)))
+		return `runs on ${on.map((x) => DISTRO_NAMES[x]).join(" or ")}; this boot runs ${g === "none" ? "no distro" : isDistro(g) ? DISTRO_NAMES[g] : g} (Options, Distro)`;
 	return null;
 }
 
@@ -130,7 +167,7 @@ case "$1" in */*) mkdir -p "\${1%/*}";; esac
 cat > "$1"
 chmod "$2" "$1"`;
 
-async function writeFiles(vm: KernelHandle, dir: string, files: NonNullable<Demo["files"]>) {
+async function writeFiles(vm: KernelHandle, dir: string, files: DemoFiles) {
 	for (const [rel, f] of Object.entries(files)) {
 		const { content, mode = 0o644 } = typeof f === "string" ? { content: f } : f;
 		const path = rel.startsWith("/") ? rel : `${dir}/${rel}`;
@@ -177,15 +214,29 @@ async function pushDownloads(vm: KernelHandle, d: Demo, dir: string): Promise<vo
 	}
 }
 
-/** run.sh: the packages, then the commands, each printed (dim, after a $) before it runs. */
+/** run.sh for this boot's distro: the packages, then the commands, each printed (dim, after a $) before it runs. */
 export function runScript(d: Demo): string {
 	const step = (shown: string, cmd = shown) => `printf '\\033[90m$ %s\\033[0m\\n' ${q(shown)}\n${cmd}\n`;
-	const pk = (d.packages ?? []).map(q).join(" ");
+	const pkgs = demoPackages(d);
+	const pk = pkgs.map(q).join(" ");
+	let install = "";
+	if (pk && KW.config.guest === "alpine") {
+		install = (d.community ? step("/etc/kw-apk-enable   # community") : "") +
+			step(`apk add ${pkgs.join(" ")}`, `apk info -e ${pk} >/dev/null 2>&1 || apk add ${pk}`);
+	} else if (pk) {
+		// stdin from /dev/null: dpkg would eat what was typed ahead. The image's
+		// package lists are baked in and age: when a version is gone from the
+		// mirror, the install fails, and runs again after apt-get update.
+		const get = `apt-get install -y -q --no-install-recommends ${pk} </dev/null`;
+		install = step(`apt-get install ${pkgs.join(" ")}`,
+			`[ "$(dpkg-query -W -f='\${db:Status-Status}\\n' ${pk} 2>/dev/null | grep -cx installed)" = ${pkgs.length} ] ||\n` +
+			`	${get} || { apt-get update -q </dev/null && ${get}; }`);
+	}
 	return `#!/bin/sh
-# The ${d.title} demo, written by the unkernel launcher. Edit it and run it again.
+# The ${d.title} demo, written by the unkernel launcher for ${KW.config.guest}. Edit it and run it again.
 set -e
 cd "$(dirname "$0")"
-${d.community ? step("/etc/kw-apk-enable   # community") : ""}${pk ? step(`apk add ${(d.packages ?? []).join(" ")}`, `apk info -e ${pk} >/dev/null 2>&1 || apk add ${pk}`) : ""}${d.commands.map((c) => step(c)).join("")}`;
+${install}${d.commands.map((c) => step(c)).join("")}`;
 }
 
 // Runs in a demo's window as `sh -lc WRAP_SH sh DIR SHOWN`: run.sh in DIR
@@ -270,7 +321,8 @@ export async function launch(d: Demo, opts: { keepUrl?: boolean } = {}): Promise
 	try {
 		const dir = d.dir ?? `~/demos/${d.id}`;
 		try {
-			await writeFiles(vm, dir, { ...d.files, "run.sh": { content: runScript(d), mode: 0o755 } });
+			const files = typeof d.files === "function" ? await d.files() : d.files;
+			await writeFiles(vm, dir, { ...files, "run.sh": { content: runScript(d), mode: 0o755 } });
 			await pushDownloads(vm, d, dir);
 			// sh -l, so run.sh gets the login environment (PATH, the apk hooks).
 			const win = KW.windows.open({ name: d.id, file: "/bin/sh", args: ["-lc", WRAP_SH, "sh", dir.replace(/^~\//, ""), dir] });

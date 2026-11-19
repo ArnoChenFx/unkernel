@@ -180,14 +180,15 @@ const scenarios = {
 			const set = (id, v, ev = "change") => { $(id).value = v; $(id).dispatchEvent(new Event(ev)); };
 			const check = (id, on) => { $(id).checked = on; $(id).dispatchEvent(new Event("change")); };
 			const net = (v) => check("opt-net-" + v, true);
-			const mem = (v) => set("opt-mem", String($("opt-mem").dataset.values.split(",").indexOf(v)), "input");
+			const range = (id, v) => set(id, String($(id).dataset.values.split(",").indexOf(v)), "input");
+			const mem = (v) => range("opt-mem", v);
 			const before = KW.ui.rebootUrl();
 			mem("64"); net("custom"); set("opt-wisp", "wss://a.example/, wss://b.example/", "input");
 			check("opt-jit", false); check("opt-verbose", true); set("opt-append", "console=hvc0 rdinit=/bin/sh", "input");
-			check("opt-data", false); check("opt-root", true); check("opt-worker", true); check("opt-fx", true);
-			// CPUs: only where the page has the SMP kernel and may boot it (else the choices above 1 are disabled).
-			const cpus = !!$("opt-cpus-2") && !$("opt-cpus-2").disabled;
-			if (cpus) check("opt-cpus-2", true);
+			check("opt-data", false); check("opt-root", true); check("opt-worker", true);
+			// CPUs: only where the page has the SMP kernel and may boot it (else the slider is disabled).
+			const cpus = !$("opt-cpus").disabled && $("opt-cpus").dataset.values.split(",").includes("2");
+			if (cpus) range("opt-cpus", "2");
 			// Distro: none (the base shell) is always there; the default is the radio checked now.
 			const distroDefault = document.querySelector("#opt-distro input:checked")?.id;
 			check("opt-distro-none", true);
@@ -196,8 +197,8 @@ const scenarios = {
 			net("off");
 			const off = KW.ui.rebootUrl();
 			mem("auto"); net("default"); check("opt-jit", true); check("opt-verbose", false); set("opt-append", "", "input");
-			check("opt-data", true); check("opt-root", false); check("opt-worker", false); check("opt-fx", false);
-			if (cpus) check("opt-cpus-1", true);
+			check("opt-data", true); check("opt-root", false); check("opt-worker", false);
+			if (cpus) range("opt-cpus", "1");
 			if (distroDefault) check(distroDefault, true);
 			await tick();
 			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault };
@@ -205,7 +206,7 @@ const scenarios = {
 		const q = new URLSearchParams(opts.all.split("?")[1]);
 		if (opts.before !== "/" || opts.reset !== "/" || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
 			|| q.get("mem") !== "64" || q.get("wisp") !== "wss://a.example/,wss://b.example/" || q.get("jit") !== "0" || q.get("verbose") !== "1"
-			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== "1" || q.get("fx") !== "1" || q.get("smp") !== (opts.cpus ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
+			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== "1" || q.get("cpus") !== (opts.cpus ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
 			throw new Error(`options do not map to the URL: ${JSON.stringify(opts)}`);
 		console.log(`  options -> ${decodeURIComponent(opts.all)}`);
 		await page.click('.tabs [data-tab="log"]');

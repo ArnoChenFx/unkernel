@@ -217,6 +217,6 @@ export default {
 		"seed.txt": SEED,
 		"showcase.sh": { content: SHOWCASE, mode: 0o755 },
 	},
-	packages: ["valkey", "valkey-cli"],
+	packages: { alpine: ["valkey", "valkey-cli"], debian: ["valkey-server", "valkey-tools"] },
 	commands: ["./start.sh", "./seed.sh", "./showcase.sh", "valkey-cli"],
 } satisfies Demo;

@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// nginx: installed from Alpine's main repository, serving a page from the
+// nginx: installed from the distro's repository, serving a page from the
 // demo's directory on port 80, shown in the guest preview.
 //
-// Alpine's /etc/nginx/http.d/default.conf also listens on [::]:80, and the
-// guest has no IPv6, so nginx would refuse to start. site.conf replaces it
-// (the default only answers 404) without that line. The files live in
+// The distro's default site (Alpine: /etc/nginx/http.d/default.conf;
+// Debian: /etc/nginx/sites-enabled/default, a symlink into sites-available)
+// also listens on [::]:80, and the guest has no IPv6, so nginx would refuse
+// to start. site.sh replaces it with site.conf, which has no such line.
+// Debian's package does not start nginx (the image's policy-rc.d). The files live in
 // /srv/nginx, not under ~, since nginx's workers (user nginx) cannot read
 // /root. The access log follows in the window; Ctrl-C stops that, not nginx.
 import type { Demo } from "../launcher.ts";
 
-const SITE = `# The unkernel nginx demo: replaces Alpine's default site, which also
+const SITE = `# The unkernel nginx demo: replaces the distro's default site, which also
 # listens on [::]:80 (the guest has no IPv6, so nginx would not start).
 server {
 	listen 80 default_server;
@@ -21,6 +23,20 @@ server {
 		try_files $uri $uri/ =404;
 	}
 }
+`;
+
+const SITE_SH = `#!/bin/sh
+# Installs site.conf as the distro's default site.
+set -e
+cd "$(dirname "$0")"
+if [ -d /etc/nginx/http.d ]; then
+	conf=/etc/nginx/http.d/default.conf # Alpine
+else
+	conf=/etc/nginx/sites-enabled/default # Debian: a symlink into sites-available
+	rm -f "$conf"
+fi
+cp site.conf "$conf"
+echo "site.conf is $conf"
 `;
 
 const PAGE = `<!doctype html>
@@ -43,13 +59,13 @@ const PAGE = `<!doctype html>
 <body>
 <main>
 	<h1>Hello from nginx</h1>
-	<p>This page is served by nginx, running on Linux in this browser tab. The kernel is WebAssembly, nginx is the aarch64 binary from Alpine, and this request went from the page to the guest over vsock.</p>
+	<p>This page is served by nginx, running on Linux in this browser tab. The kernel is WebAssembly, nginx is the distro's own aarch64 binary, and this request went from the page to the guest over vsock.</p>
 	<dl>
 		<dt>nginx</dt><dd><!--# echo var="nginx_version" --></dd>
 		<dt>Guest time</dt><dd><!--# echo var="date_local" --></dd>
 		<dt>Your request</dt><dd><code><!--# echo var="request_method" --> <!--# echo var="request_uri" --></code></dd>
 	</dl>
-	<p>Edit <code>/srv/nginx/www/index.html</code> in the terminal and reload this preview. The config is <code>/etc/nginx/http.d/default.conf</code>; <code>nginx -s reload</code> applies changes.</p>
+	<p>Edit <code>/srv/nginx/www/index.html</code> in the terminal and reload this preview. The config is <code>/srv/nginx/site.conf</code>: <code>./site.sh &amp;&amp; nginx -s reload</code> applies changes.</p>
 </main>
 </body>
 </html>
@@ -66,11 +82,12 @@ export default {
 	dir: "/srv/nginx",
 	files: {
 		"site.conf": SITE,
+		"site.sh": { content: SITE_SH, mode: 0o755 },
 		"www/index.html": PAGE,
 	},
-	packages: ["nginx"],
+	packages: { alpine: ["nginx"], debian: ["nginx"] },
 	commands: [
-		"cp site.conf /etc/nginx/http.d/default.conf",
+		"./site.sh",
 		"mkdir -p /run/nginx",
 		"nginx -t -q",
 		"nginx -s reload 2>/dev/null || nginx",

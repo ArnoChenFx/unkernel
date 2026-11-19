@@ -17,7 +17,7 @@
 // archive VFS: Enter on it browses it like a directory.
 import type { Demo } from "../launcher.ts";
 
-const README = `Midnight Commander in unkernel: the aarch64 build of mc from Alpine,
+const README = `Midnight Commander in unkernel: the distro's aarch64 build of mc,
 running on Linux, compiled to WebAssembly, in this browser tab.
 
 The left panel is this directory, the right one is /proc: the kernel's
@@ -63,7 +63,7 @@ const UNKERNEL = `unkernel, layer by layer
 
   your browser      runs one WebAssembly module
   the kernel        Linux, built for arch/wasm with an MMU
-  user space        unmodified aarch64 Alpine Linux binaries
+  user space        unmodified aarch64 Linux binaries
   kwemu             the aarch64 CPU inside the kernel, with a JIT
                     that turns hot guest code into WebAssembly
 
@@ -115,7 +115,7 @@ export default {
 		"samples/unkernel.txt": UNKERNEL,
 		"samples/planets.csv": PLANETS,
 	},
-	packages: ["mc"],
+	packages: { alpine: ["mc"], debian: ["mc"] },
 	commands: [
 		"tar czf samples.tar.gz samples",
 		"mc -S modarin256-defbg \"$PWD\" /proc",

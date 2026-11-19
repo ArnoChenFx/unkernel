@@ -27,6 +27,11 @@
 // - Each window's size follows the stage like window 0's (the hidden ones
 //   too: they are hidden with visibility, so they keep their box), and goes
 //   to the shell with resize() (SIGWINCH).
+// - A tty N window (opened without a name) shows the program in the
+//   foreground of its terminal in the status line (vim, top) while it is
+//   not the shell itself. Every second while such a window runs, one
+//   vm.exec() reads them all from /proc (FG_SH); not while the page is
+//   hidden or the system suspended, nor while the last one still runs.
 import { WTerm } from "@wterm/dom";
 import { trackBottom, type Bottom } from "./bottom.ts";
 import { KW, type WindowInfo, type WindowsApi } from "./kw.ts";
@@ -42,6 +47,15 @@ const PENDING_MAX = 65536;
 /** The output reader yields a task after this long or this much. */
 const SLICE_MS = 16, SLICE_BYTES = 262144;
 const SGR = { gray: "\x1b[90m", red: "\x1b[1;31m", off: "\x1b[0m" };
+/** How often the foreground programs of the tty N windows are read. */
+const FG_MS = 1000;
+/**
+ * A line per shell pid: the name of its terminal's foreground process group
+ * leader (tpgid, the 6th field after the name in /proc/<pid>/stat), or an
+ * empty line while the shell itself is in front or it cannot be read.
+ */
+const FG_SH = 'for p; do t=; c=; read -r s 2>/dev/null </proc/$p/stat && { set -- ${s##*\\) }; t=$6; }; ' +
+	'[ "$t" -gt 0 ] 2>/dev/null && [ "$t" != "$p" ] && read -r c 2>/dev/null </proc/$t/comm; echo "$c"; done';
 
 /** wterm's font: it takes the row height from --term-row-height, not from the font, so set both, at wterm's own ratio. */
 export function setTermFont(el: HTMLElement, px: number): void {
@@ -91,8 +105,12 @@ function yieldTask(): Promise<void> {
 
 interface Win {
 	n: number;
-	/** Shown in the status line: "sh", or what the launcher runs in it. */
+	/** Shown in the status line: "tty N", or what the launcher runs in it. */
 	name: string;
+	/** A tty N window (no name given): the status line shows its foreground program (fg). */
+	tty: boolean;
+	/** The program in the foreground of its terminal when it is not the shell, else "" (pollFg). */
+	fg: string;
 	el: HTMLElement;
 	term: WTerm;
 	bottom: Bottom;
@@ -148,8 +166,36 @@ export function createWindows(opts: WindowsOptions): Windows {
 	const termOf = (n: number): WTerm | null => (n === 0 ? opts.term0 : wins.get(n)?.term ?? null);
 
 	function publish() {
-		const list = [...wins.values()].sort((a, b) => a.n - b.n).map((w) => ({ n: w.n, name: w.name, state: w.state, note: w.note }));
+		const list = [...wins.values()].sort((a, b) => a.n - b.n).map((w) => ({ n: w.n, name: w.name, state: w.state, note: w.note, fg: w.fg }));
 		$.set({ wins: list });
+	}
+
+	/** The tty N windows whose shell runs: those pollFg() reads. */
+	const ttys = () => [...wins.values()].filter((w) => w.tty && w.state === "open" && w.session);
+	let fgTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Poll while there is a tty N window to read (see the top of this file). */
+	function scheduleFg() {
+		if (fgTimer === undefined && ttys().length) fgTimer = setTimeout(() => void pollFg(), FG_MS);
+	}
+	async function pollFg() {
+		const list = ttys();
+		try {
+			if (!list.length || document.hidden || $.get().suspended || !opts.alive()) return;
+			const vm = await opts.ready();
+			const r = await vm.exec("/bin/sh", ["-c", FG_SH, "sh", ...list.map((w) => String(w.session!.pid))]);
+			const lines = r.stdout.split("\n");
+			let changed = false;
+			list.forEach((w, i) => {
+				const fg = (lines[i] ?? "").trim();
+				if (!w.gone && w.fg !== fg) { w.fg = fg; changed = true; }
+			});
+			if (changed) publish();
+		} catch {
+			// The kernel stopped or the guest could not run it: try again next time.
+		} finally {
+			fgTimer = undefined;
+			scheduleFg();
+		}
 	}
 
 	/** Show window n (it exists), hide and pause the others. */
@@ -299,11 +345,13 @@ export function createWindows(opts: WindowsOptions): Windows {
 		p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
 	});
 
-	async function open({ select: sel = true, name = "sh", file, args }: { select?: boolean; name?: string; file?: string; args?: string[] } = {}): Promise<WindowInfo> {
+	async function open({ select: sel = true, name, file, args }: { select?: boolean; name?: string; file?: string; args?: string[] } = {}): Promise<WindowInfo> {
 		if (!opts.alive()) throw new Error("The kernel is not running: reboot to open terminal windows");
 		let n = 1;
 		while (wins.has(n)) n++;
 		if (n > MAX_WINDOWS) throw new Error(`All ${MAX_WINDOWS} terminal windows are open`);
+		const tty = name === undefined;
+		name ??= `tty ${n}`;
 		const el = document.createElement("div");
 		el.id = `term-${n}`;
 		el.className = "term-win term-off";
@@ -312,7 +360,7 @@ export function createWindows(opts: WindowsOptions): Windows {
 		host().appendChild(el);
 		const bottom = trackBottom(el); // before wterm's own ResizeObserver
 		const w: Win = {
-			n, name, el, bottom, term: null as unknown as WTerm, state: "opening", note: "", session: null,
+			n, name, tty, fg: "", el, bottom, term: null as unknown as WTerm, state: "opening", note: "", session: null,
 			abort: new AbortController(), pending: [], pendingBytes: 0, gone: false,
 		};
 		w.term = new WTerm(el, {
@@ -371,6 +419,7 @@ export function createWindows(opts: WindowsOptions): Windows {
 		publish();
 		void pump(w, s);
 		watch(w, s);
+		scheduleFg();
 		return info(w);
 	}
 

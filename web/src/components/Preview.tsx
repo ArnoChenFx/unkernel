@@ -27,7 +27,7 @@ const readSplit = (): number => {
 /**
  * A docked panel's left edge sets its share of the row (pointer capture: an
  * iframe under the pointer does not take the moves); kept in localStorage
- * under `key` when the drag ends. Preview and fx (Fx.tsx) use it.
+ * under `key` when the drag ends.
  */
 export function dragSplit(e: ReactPointerEvent<HTMLElement>, split: number, setSplit: (v: number) => void, setDragging: (on: boolean) => void, key: string): void {
 	if (e.button !== 0) return;

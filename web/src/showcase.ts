@@ -316,7 +316,7 @@ async function demo(s: DemoStep, chapter: string): Promise<void> {
 /** Open a shell window, type commands into it, close it. */
 async function shell(title: string, sub: string, chapter: string, cmds: string[], hold = 800): Promise<void> {
 	if (warmOnly) return;
-	const w = await KW.windows!.open({ name: "sh" });
+	const w = await KW.windows!.open();
 	try {
 		await caption(title, sub, { chapter });
 		await typeAt(w.n, SH, ["clear", ...cmds]);

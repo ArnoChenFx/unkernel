@@ -9,14 +9,14 @@
 // a wterm terminal with a systemd-style boot transcript, the status
 // indicator and stages (ui.ts), and the kernel's console as window 0, with
 // more terminal windows over vsock (windows.ts), and the guest preview
-// (preview.ts: guest web servers in an iframe). With several CPUs (?smp=N,
+// (preview.ts: guest web servers in an iframe). With several CPUs (?cpus=N,
 // config.ts) it loads the SMP kernel instead and boots it in worker mode,
 // whose worker starts the other CPUs; whatever stops that before the
 // kernel runs reloads once on one CPU (bootUpOnce()). The kernel is the
 // base bundle, with the distro image ?distro= picks (config.ts) attached
 // read-only by URL (createKernel({ distro }); inline it is opened here
 // first, for the resume check), and the Alpine-only parts (apk index
-// prefetch, the stand-ins, /root/README) run only on Alpine.
+// prefetch, /root/README) run only on Alpine.
 import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
@@ -29,16 +29,13 @@ import { forgetDemo, launchFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.ts";
 import { writeReadme } from "./readme.ts";
-import { writeShims } from "./shims.ts";
-import SHIM from "./kw-shim.sh?raw";
-import PATH_SH from "../../guest/base/rootfs/etc/profile.d/kw-path.sh?raw";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
 import { takeResumeRequest } from "./ui.ts";
 import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from "./windows.ts";
 import {
-	BootError, ConsoleRouter, KernelInstance, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, snapshotDiskMismatch,
+	BootError, ConsoleRouter, KernelInstance, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot,
 } from "./sdk.ts";
 
@@ -128,7 +125,7 @@ export function start(): void {
 	const distroRef = distro ? { name: distro.name, url: distro.url } : null;
 	/** Inline: the distro image, opened ahead (the snapshot's first disk, for the resume check). */
 	let distroDisk: DistroDisk | null = null;
-	/** Only Alpine has apk, wget and the texts the page writes (apk.ts, shims.ts, readme.ts). */
+	/** Only Alpine has apk and the texts the page writes (apk.ts, readme.ts). */
 	const alpine = cfg.guest === "alpine";
 
 	// --- display and input (kwfb, kwinput; ?display=0 turns them off): display.ts --------------
@@ -361,13 +358,8 @@ export function start(): void {
 	});
 	KW.windows = windows;
 	KW.ready = () => guestReady;
-	// The fx, claude and opencode stand-ins in ~/.local/bin (shims.ts), written
-	// before a ?demo= relaunch, which may run one.
-	// They download with wget, which only Alpine has (Debian's image has neither wget nor curl).
-	const shimsWritten = guestReady.then((vm) => alpine ? writeShims(vm, { shim: SHIM, pathSh: PATH_SH }, (m) => ui.log(m, "h"))
-		: ui.log(`[shims] skipped: the fx, claude and opencode stand-ins need Alpine (this boot runs ${cfg.guest})`, "h"));
 	// ?demo=<id>: launch that demo again (launcher.ts sets it when one launches).
-	void shimsWritten.then(launchFromUrl, () => {});
+	void guestReady.then(launchFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
 	if (cfg.net && alpine) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
 	// Intro notes in /root/README, once per data disk (readme.ts); written for Alpine.
@@ -438,8 +430,7 @@ export function start(): void {
 	let replay = ""; // user-space output during the boot phase, redrawn below the summary
 	// Each step already shows its own time: the summary is the total from page load.
 	const summary = () => `${SGR.dim}Booted in${SGR.off} ${SGR.bold}${fmtS(Date.now() - KW.t0)}${SGR.off}` +
-		(smp ? ` ${SGR.dim}on ${cfg.cpus} CPUs, in Web Workers (experimental, ?smp=${cfg.smpParam})${SGR.off}`
-			: cfg.worker ? ` ${SGR.dim}in a Web Worker (experimental, ?worker=1)${SGR.off}` : "") + "\r\n";
+		(smp ? ` ${SGR.dim}on ${cfg.cpus} CPUs${SGR.off}` : cfg.worker ? ` ${SGR.dim}in a Web Worker${SGR.off}` : "") + "\r\n";
 	// Two lines under the summary of a fresh boot: the source (an OSC 8 link,
 	// which wterm opens on Ctrl/⌘-click) and how to open the demo launcher.
 	const link = (url: string, text: string) => `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
@@ -678,7 +669,7 @@ export function start(): void {
 
 	// --- several CPUs: what falls back to one ---------------------------------------
 	/**
-	 * Reload this tab once on one CPU (config.ts reads UP_ONCE_KEY; ?smp= stays
+	 * Reload this tab once on one CPU (config.ts reads UP_ONCE_KEY; ?cpus= stays
 	 * in the URL, so the next Reboot tries again), optionally resuming the
 	 * suspended session. False if sessionStorage refuses the note, which would
 	 * make the reload try the same again: then the caller reports the failure.
@@ -799,7 +790,7 @@ export function start(): void {
 		let dataDisks: BlockDevice[] | DiskSpec[] = [];
 		if (cfg.worker) {
 			// The worker builds the data disk and the network from specs.
-			ui.check("worker", "Worker mode", "warn", cfg.workerParam ? "experimental (?worker=1)" : `for ${cfg.cpus} CPUs (?smp=${cfg.smpParam})`,
+			ui.check("worker", "Worker mode", "pass", cfg.workerParam ? "on (?worker=1)" : `for ${cfg.cpus} CPUs (?cpus=${cfg.smpParam})`,
 				"the kernel, the data disk, the network, the display, input and sound devices run in a Web Worker" + (smp ? ", which starts the other CPUs as workers of its own" : ""));
 			ui.hostLog(`[host] worker mode: the kernel runs in a Web Worker, with the data disk, the network, the display, input and sound${smp ? `; ${cfg.cpus} CPUs` : ""}`);
 			dataDisks = await dataSpec();
@@ -964,7 +955,10 @@ export function start(): void {
 		}
 		kernelStarting = false;
 		clearTimeout(workerWatchdog);
-		void vm.exited.then(() => { vmExited = true; });
+		// The guest's WASI programs (.wasm files, run by kwwasi over vsock port 1021)
+		// on the page's wasm engine, each in a Web Worker (js/web/wasi.ts).
+		const wasi = vm.vsock ? serveWasiPrograms(vm.vsock, { log }) : undefined;
+		void vm.exited.then(() => { vmExited = true; wasi?.close(); });
 		g.vm = vm;
 		KW.vm = vm;
 		// The guest preview (preview.ts) relays /vm/<id>/<port>/ to vm.fetch().
@@ -988,8 +982,8 @@ export function start(): void {
 		if (smp) {
 			// The worker gives the SMP kernel one CPU where it cannot start their threads (it logs why).
 			const got = vm.stats().cpus;
-			ui.check("smp", "Guest CPUs", got > 1 ? "pass" : "warn", got > 1 ? `${got} (?smp=${cfg.smpParam})` : `1 (asked for ${cfg.cpus})`,
-				got > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory (experimental)"
+			ui.check("smp", "Guest CPUs", got > 1 ? "pass" : "warn", got > 1 ? `${got} (?cpus=${cfg.smpParam})` : `1 (asked for ${cfg.cpus})`,
+				got > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory"
 					: "the kernel worker could not start CPU threads (the Kernel log says why): the SMP kernel runs on one CPU");
 			ui.hostLog(`[host] SMP kernel on ${got} CPU${got > 1 ? "s" : ""} (${cfg.cpus} asked)`);
 			if (got < cfg.cpus) ui.toast(`Running on ${got} CPU${got > 1 ? "s" : ""}: the worker could not start more`);

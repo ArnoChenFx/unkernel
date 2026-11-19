@@ -9,7 +9,7 @@ import type { KWError } from "./kw.ts";
 
 export type State = "checking" | "loading" | "booting" | "running" | "halted" | "error";
 export type CheckResult = "pass" | "fail" | "warn" | "info";
-export type Tab = "status" | "env" | "log" | "errors" | "keys";
+export type Tab = "status" | "guest" | "env" | "log" | "errors" | "keys";
 
 export interface Check { id: string; label: string; r: CheckResult; value: string; note: string }
 
@@ -48,7 +48,8 @@ export const MAX_WINDOWS = 9;
  * the guest's server; open: the shell runs; ended: the session failed or
  * was lost, and the window shows why until it is closed.
  */
-export interface Win { n: number; name: string; state: "opening" | "open" | "ended"; note: string }
+/** fg: the program in the foreground of a tty N window, when it is not the shell (windows.ts); else "". */
+export interface Win { n: number; name: string; state: "opening" | "open" | "ended"; note: string; fg: string }
 
 /** A question in the confirm dialog; `cancel` labels the other button (default "Cancel"). */
 export interface Ask { title: string; msg: string; ok: string; cancel?: string; danger?: boolean; id: number }
@@ -98,8 +99,6 @@ export interface UiState {
 	wins: Win[];
 	/** The guest preview panel (preview.ts, components/Preview.tsx): the guest port shown, whether it is shown or hidden, and whether it fills the stage ([□]); null: closed. */
 	preview: { port: number; shown: boolean; fill: boolean } | null;
-	/** fx, the coding agent (fx.ts, components/Fx.tsx): running, and shown or hidden; null: not running. */
-	fx: { shown: boolean } | null;
 	/** The demo launcher (components/Launcher.tsx) covers the page. */
 	launcher: boolean;
 	/** The Options as chosen (components/Options.tsx), read by rebootUrl(). */
@@ -118,11 +117,10 @@ export interface Options {
 	data: "on" | "off";
 	root: "overlay" | "safe";
 	worker: "on" | "off";
-	/** CPUs, "1" to "8" (?smp=). */
+	/** CPUs, "1" to "8" (?cpus=). */
 	cpus: string;
 	/** The distro image (?distro=): a name, or "none". */
 	distro: string;
-	fx: "on" | "off";
 }
 
 type Listener = () => void;

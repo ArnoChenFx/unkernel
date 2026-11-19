@@ -42,7 +42,7 @@
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
 //                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
-//   ?worker=1                          experimental: run the kernel in a Web Worker (the SDK's
+//   ?worker=1                          run the kernel in a Web Worker (the SDK's
 //                                      createKernel({ worker: true })), so it never blocks the
 //                                      page. The data disk and the Wisp network are built in the
 //                                      worker from specs; the display, input devices and sound
@@ -54,7 +54,7 @@
 //                                      on the page's thread.
 //   ?shared=0                          with ?worker=1: messages even where shared memory works
 //                                      (to compare the two)
-//   ?smp=N                             experimental: boot the SMP kernel on N CPUs (2 to 8, at most
+//   ?cpus=N                            boot the SMP kernel on N CPUs (2 to 8, at most
 //                                      navigator.hardwareConcurrency), each CPU in a Web Worker
 //                                      of its own on one shared memory; implies ?worker=1 (CPU 0
 //                                      blocks while it waits for another CPU, which a page's main
@@ -63,10 +63,7 @@
 //                                      cross-origin isolation (https or localhost); otherwise, or
 //                                      when the SMP kernel fails to load or start, the page boots
 //                                      on one CPU as usual (smpBlocker(), boot.ts). No Suspend.
-//                                      Default (and ?smp=1): one CPU, the UP kernel.
-//   ?fx (or ?fx=1)                     start fx, the coding agent, in its side panel once the
-//                                      page passes its preflight (fx.ts; the status line's fx
-//                                      button does the same later). ?fx=0 is off, as is no ?fx.
+//                                      Default (and ?cpus=1): one CPU, the UP kernel.
 //   ?demo=<id>                         launch that demo once the guest is up (launcher.ts). The
 //                                      launcher sets it on each launch, so a reload reopens the
 //                                      last demo, and closing its window removes it; read
@@ -144,13 +141,13 @@ export interface Config {
 	workerParam: boolean;
 	/** The SMP kernel's URL (sdk.ts kernelSmpUrl), or null when the page has none. */
 	kernelSmpUrl: string | null;
-	/** ?smp= as given (1 to 8; 1 when absent): the CPUs option. */
+	/** ?cpus= as given (1 to 8; 1 when absent): the CPUs option. */
 	smpParam: number;
 	/** CPUs this load boots with: smpParam where possible (capped at cpuMax), else 1. */
 	cpus: number;
 	/** Why this page cannot boot more than one CPU (smpBlocker()), or null. */
 	smpBlocked: string | null;
-	/** Why this load boots on one CPU although ?smp= asks for more, or null. */
+	/** Why this load boots on one CPU although ?cpus= asks for more, or null. */
 	smpWhy: string | null;
 	/** The most CPUs offered: navigator.hardwareConcurrency, at most 8 (the kernel's limit). */
 	cpuMax: number;
@@ -158,8 +155,6 @@ export interface Config {
 	cpuSuggested: number;
 	/** Worker mode: shared memory for input and frames where it works (?shared=0: messages). */
 	shared: boolean;
-	/** ?fx: start fx (fx.ts) in its panel at load. */
-	fx: boolean;
 	verbose: boolean;
 	simulate: string[];
 	/** A touch device or a mobile user agent. */
@@ -218,7 +213,7 @@ export function readConfig(search: string = location.search): Config {
 	const hc = navigator.hardwareConcurrency || 1;
 	const cpuMax = Math.max(1, Math.min(MAX_CPUS, hc));
 	const half = Math.min(4, Math.floor(hc / 2));
-	const smpParam = Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("smp"))) || 1));
+	const smpParam = Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1));
 	const smpBlocked = smpBlocker();
 	const upOnce = smpParam > 1 ? takeUpOnce() : null;
 	const smpWhy = smpParam < 2 ? null : smpBlocked ?? upOnce;
@@ -264,7 +259,6 @@ export function readConfig(search: string = location.search): Config {
 		cpuMax,
 		cpuSuggested: half >= 2 ? Math.min(half, cpuMax) : 0,
 		shared: params.get("shared") !== "0",
-		fx: params.has("fx") && params.get("fx") !== "0",
 		verbose: params.get("verbose") === "1",
 		simulate: (params.get("simulate") || "").split(",").filter(Boolean),
 		mobile,

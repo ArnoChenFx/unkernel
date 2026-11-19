@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Node.js: Alpine's aarch64 nodejs (main, about 25 MB) serving a live
-// dashboard on port 3000 with node:http alone, so no npm install.
+// Node.js: the official aarch64 Node.js build serving a live dashboard on
+// port 3000 with node:http alone, so no npm install. Nothing to install
+// either: `node` is the kw layer's shim on every distro (guest/base,
+// /usr/lib/kw/shim), which fetches the newest LTS on first use.
 //
 // The page polls api/stats every 2 s with fetch: the preview relays plain
 // HTTP only (no WebSockets, no streamed responses such as SSE, no cookies).
@@ -189,7 +191,7 @@ const PAGE = `<!doctype html>
 		</div>
 		<span class="live" id="live"><i></i><span id="livetext">waiting</span></span>
 	</header>
-	<p>This page comes from <code>node:http</code> in <code>server.mjs</code>. Node is Alpine's aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Every number below is the guest's own, polled every 2 seconds.</p>
+	<p>This page comes from <code>node:http</code> in <code>server.mjs</code>. Node is the official aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Every number below is the guest's own, polled every 2 seconds.</p>
 
 	<div class="hero">
 		<div><span>process.version</span><b id="h-version">-</b></div>
@@ -369,7 +371,6 @@ export default {
 		"server.mjs": SERVER,
 		"index.html": PAGE,
 	},
-	packages: ["nodejs"],
 	commands: ["node server.mjs"],
 	ports: [3000],
 } satisfies Demo;

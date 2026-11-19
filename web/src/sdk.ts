@@ -16,13 +16,14 @@ export * from "../../js/core/index.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
 export { DATA_DISK_NAME, importDataDisk, openDataDisk, openDistroDisk, resetDataDisk } from "../../js/web/disk.ts";
 export { webCpuBlocker } from "../../js/web/cpu.ts";
+export { serveWasiPrograms } from "../../js/web/wasi.ts";
 
 /**
  * The kernel the page runs on one CPU: the base bundle (vmlinux32.wasm +
  * the base initramfs, kernel/tools/bundle.mjs) without its SMP patch
  * (web/scripts/kernel.ts baseSplit()). And the SMP kernel of the same
  * bundle, its own hashed asset, or null when the bundle has no SMP patch:
- * fetched only when the page boots on more than one CPU (?smp=N, config.ts;
+ * fetched only when the page boots on more than one CPU (?cpus=N, config.ts;
  * boot.ts).
  */
 export { kernelSmpUrl, kernelUrl };

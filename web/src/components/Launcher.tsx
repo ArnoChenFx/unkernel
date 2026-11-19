@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The demo launcher: the status line's first item (❯ and its shortcut as
-// key caps, LauncherButton) and the overlay it opens (Launchpad), in the manner of
+// The demo launcher: the status line's first item (❯, LauncherButton) and
+// the overlay it opens (Launchpad), in the manner of
 // macOS Launchpad: the page blurred behind a grid of tiles, one per demo
 // (../demos/), with a search field over them. A tile runs its demo in a new
 // terminal window (launcher.ts).
@@ -20,31 +20,25 @@
 // - A demo with `hidden` set is left out.
 // - A demo the page cannot run (launcher.ts, unavailable()) is dimmed, with
 //   why in its tooltip and under the grid while it is selected.
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { DEMOS } from "../demos/index.ts";
 import { KW } from "../kw.ts";
-import { launch, setLauncher, toggleLauncher, unavailable, type Demo, type DemoIcon } from "../launcher.ts";
+import { demoPackages, launch, setLauncher, toggleLauncher, unavailable, type Demo, type DemoIcon } from "../launcher.ts";
 import { APPLE, CHORD, PREFIX } from "../shortcuts.ts";
 import { useStore, type Tab } from "../store.ts";
 
-/** A key cap: the launcher's shortcut beside ❯. */
-const Cap = ({ children }: { children: string }) => (
-	<kbd className="inline-grid h-[17px] min-w-[17px] place-items-center rounded-[4px] border border-line-strong bg-hover px-1 font-sans text-[10.5px] leading-none font-medium text-muted shadow-[inset_0_-1px_0_var(--color-line-strong)] transition-colors group-hover:border-faint group-hover:text-fg">{children}</kbd>
-);
-
-export function LauncherButton() {
+/** hint: the which-key label the status line shows before ❯ while the prefix is armed. */
+export function LauncherButton({ hint }: { hint?: ReactNode }) {
 	const open = useStore((s) => s.launcher);
 	return (
 		<button
 			id="bar-launcher" type="button" title={`Demos (${APPLE ? "⌘K" : `${CHORD}-O`}, or ${PREFIX} o)`} aria-label="unkernel: Demos"
 			aria-haspopup="dialog" aria-expanded={open} aria-controls="launcher"
 			onClick={(e) => { if (e.detail) e.currentTarget.blur(); toggleLauncher(); }}
-			className={`brand group flex flex-none items-center gap-2 border-r border-line px-2.5 text-fg transition-colors hover:bg-hover max-sm:px-2 ${open ? "bg-hover" : ""}`}
+			className={`brand group flex flex-none items-center border-r border-line px-3.5 text-fg transition-colors hover:bg-hover max-sm:px-3 ${open ? "bg-hover" : ""}`}
 		>
+			{hint}
 			<span className="text-fg">❯</span>
-			<span aria-hidden="true" className="flex items-center gap-[3px] max-sm:hidden">
-				{(APPLE ? ["⌘", "K"] : ["Ctrl", "⇧", "O"]).map((k) => <Cap key={k}>{k}</Cap>)}
-			</span>
 		</button>
 	);
 }
@@ -111,7 +105,7 @@ function Pad() {
 			return {
 				id: d.id, title: d.title, desc: d.desc, icon: d.icon ?? d.title[0]!.toUpperCase(), colors: d.colors ?? GRAY, why, win,
 				tip: why ? `${d.title}: ${why}` : win ? `${d.title} runs in window ${win}: shows it`
-					: `${d.desc}${d.packages?.length ? `\nInstalls: ${d.packages.join(" ")}` : ""}\nRuns: ${d.commands.join("; ")}`,
+					: `${d.desc}${demoPackages(d).length ? `\nInstalls: ${demoPackages(d).join(" ")}` : ""}\nRuns: ${d.commands.join("; ")}`,
 				run: () => void launch(d),
 			};
 		}),

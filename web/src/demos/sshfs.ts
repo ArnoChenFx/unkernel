@@ -110,7 +110,7 @@ export default {
 		"mount.sh": { content: MOUNT_SH, mode: 0o755 },
 		"tour.sh": { content: TOUR_SH, mode: 0o755 },
 	},
-	packages: ["sshfs", "tree", "mc"],
+	packages: { alpine: ["sshfs", "tree", "mc"], debian: ["sshfs", "tree", "mc"] },
 	commands: [
 		"cat ABOUT",
 		"./mount.sh",

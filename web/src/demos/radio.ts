@@ -108,6 +108,6 @@ export default {
 	colors: ["#f59e0b", "#9f1239"],
 	needs: { net: true, sound: true },
 	files: { "radio.sh": { content: RADIO, mode: 0o755 } },
-	packages: ["mpg123"],
+	packages: { alpine: ["mpg123"], debian: ["mpg123", "wget"] },
 	commands: ["./radio.sh"],
 } satisfies Demo;

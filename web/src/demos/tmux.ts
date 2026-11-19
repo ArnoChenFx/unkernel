@@ -52,7 +52,7 @@ while :; do
 done
 `;
 
-const README = `tmux in unkernel: a terminal multiplexer, the aarch64 build from Alpine,
+const README = `tmux in unkernel: a terminal multiplexer, the distro's aarch64 build,
 running on Linux in this browser tab.
 
   Ctrl-B %   split left and right        Ctrl-B "   split top and bottom
@@ -77,7 +77,7 @@ export default {
 		"stats.sh": { content: STATS, mode: 0o755 },
 		"README": README,
 	},
-	packages: ["tmux", "htop"],
+	packages: { alpine: ["tmux", "htop"], debian: ["tmux", "htop"] },
 	commands: [
 		"tmux has-session -t demo 2>/dev/null || ./layout.sh",
 		"tmux attach -t demo",

@@ -136,7 +136,7 @@ The page takes a few URL parameters:
 | `?jit=0` | Interpreter only |
 | `?data=0` | No persistent disk, a fresh system every time |
 | `?worker=1` | Run the kernel in a Web Worker (experimental) |
-| `?smp=2` | Boot on several CPUs, each in a Web Worker (experimental; only where the page has the SMP kernel and is cross-origin isolated) |
+| `?cpus=2` | Boot on several CPUs, each in a Web Worker (experimental; only where the page has the SMP kernel and is cross-origin isolated) |
 
 Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you
@@ -250,7 +250,7 @@ well behind native.
 
 ### 🚧 Known limits
 
-- One CPU by default. Several CPUs (SMP: `--smp`, the page's `?smp=`)
+- One CPU by default. Several CPUs (SMP: `--cpus`, the page's `?cpus=`)
   are experimental and cannot be suspended.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
@@ -587,9 +587,8 @@ Thanks to:
   patches and the Kbuild toolchain wrapper.
 - [iSH](https://github.com/ish-app/ish) and [v86](https://github.com/copy/v86),
   for showing how to build a fast user-mode emulator and a wasm JIT.
-- [Alpine Linux](https://alpinelinux.org/), [wterm](https://wterm.dev/),
-  [Binaryen](https://github.com/WebAssembly/binaryen) and
-  [fx](https://fx.sh/) (the page's coding agent, libfx, Apache-2.0).
+- [Alpine Linux](https://alpinelinux.org/), [wterm](https://wterm.dev/) and
+  [Binaryen](https://github.com/WebAssembly/binaryen).
 
 ## 📄 License
 

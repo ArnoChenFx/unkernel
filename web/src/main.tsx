@@ -11,7 +11,6 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { App } from "./components/App.tsx";
 import { readConfig } from "./config.ts";
-import { openFx } from "./fx.ts";
 import { KW } from "./kw.ts";
 import { previewEscape } from "./preview.ts";
 import { checkSupport } from "./sdk.ts";
@@ -24,6 +23,17 @@ const back = previewEscape();
 if (back) {
 	location.replace(back);
 	await new Promise(() => {});
+}
+
+// A macOS window has round bottom corners, which the status line runs into
+// (style.css, .mac-window); a fullscreen window covers the whole screen and
+// has none. An iPad reports Macintosh too, with touch points.
+if (/Macintosh/.test(navigator.userAgent) && !navigator.maxTouchPoints) {
+	const fit = () => document.documentElement.classList.toggle("mac-window",
+		!document.fullscreenElement && !matchMedia("(display-mode: fullscreen)").matches && window.outerHeight < screen.height);
+	fit();
+	addEventListener("resize", fit);
+	document.addEventListener("fullscreenchange", fit);
 }
 
 const cfg = (KW.config = readConfig());
@@ -46,15 +56,15 @@ async function preflight(): Promise<boolean> {
 	ui.check("secure", "Secure context", isSecureContext ? "pass" : "info", isSecureContext ? "yes" : `no (${location.protocol}//${location.hostname})`,
 		isSecureContext ? "" : "not required: plain http on a LAN address is fine; only the clipboard and device-memory APIs are hidden");
 	ui.check("coi", "Cross-origin isolated", "info", crossOriginIsolated ? "yes" : "no",
-		"not required; with ?worker=1 it lets input and frames cross through shared memory instead of messages, and several CPUs (?smp=) need it");
+		"not required; with ?worker=1 it lets input and frames cross through shared memory instead of messages, and several CPUs (?cpus=) need it");
 	const devMem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
 	ui.check("devmem", "Device memory", "info", devMem ? `${devMem} GB` : "unknown", devMem ? "" : isSecureContext ? "API not supported" : "hidden on insecure origins");
 	ui.check("mem", "Kernel memory", "info", `${cfg.memMiB} MiB requested`, cfg.memWhy);
 	ui.check("cpu", "CPU threads", "info", String(navigator.hardwareConcurrency || "unknown"));
-	// Several guest CPUs (?smp=N, config.ts): what this load boots with, and why not more.
+	// Several guest CPUs (?cpus=N, config.ts): what this load boots with, and why not more.
 	ui.check("smp", "Guest CPUs", cfg.smpParam < 2 ? "info" : cfg.cpus > 1 ? "pass" : "warn",
-		cfg.cpus > 1 ? `${cfg.cpus} (?smp=${cfg.smpParam})` : cfg.smpParam > 1 ? `1 (asked for ${cfg.smpParam})` : "1",
-		cfg.smpWhy ?? (cfg.cpus > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory (experimental)"
+		cfg.cpus > 1 ? `${cfg.cpus} (?cpus=${cfg.smpParam})` : cfg.smpParam > 1 ? `1 (asked for ${cfg.smpParam})` : "1",
+		cfg.smpWhy ?? (cfg.cpus > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory"
 			: cfg.smpBlocked ? `several CPUs are unavailable: ${cfg.smpBlocked}` : "Options, CPUs, boots the SMP kernel on several"));
 	ui.check("input", "Input", "info", (cfg.coarse ? "touch" : "mouse/keyboard") + (navigator.maxTouchPoints ? `, ${navigator.maxTouchPoints} touch points` : ""));
 	ui.check("viewport", "Viewport", "info", `${innerWidth}×${innerHeight} @${devicePixelRatio || 1}x`);
@@ -89,8 +99,6 @@ for (const e of KW.errors.slice()) ui.onError(e);
 if (ui.state() !== "error") {
 	preflight().then(async (ok) => {
 		if (!ok) return;
-		// ?fx: fx needs JSPI, which the preflight checked; it does not wait for the kernel.
-		if (KW.config.fx) openFx();
 		ui.splash("Loading", "Boot script…");
 		const timer = setTimeout(() => {
 			if (!KW.started) ui.fail("watchdog", "The boot module did not start within 20 s", "No error was reported; module scripts may be blocked or very slow to load.");

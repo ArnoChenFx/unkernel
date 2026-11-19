@@ -80,7 +80,7 @@ function hintFor(msg: string): string {
 	const smp = (KW.config?.cpus ?? 1) > 1;
 	if (/panic|trap|unreachable|RuntimeError/i.test(msg) || (smp && /\bCPU \d/.test(msg)))
 		return "The kernel stopped. The kernel log tab has the last console lines; Copy diagnostics and reboot." +
-			(smp ? " Several CPUs are experimental: set CPUs to 1 under Options to boot as usual." : "");
+			(smp ? " To rule out the SMP kernel, set CPUs to 1 under Options and reboot." : "");
 	return "";
 }
 
@@ -111,7 +111,6 @@ export function createUi(cfg: Config) {
 		worker: cfg.workerParam ? "on" : "off",
 		cpus: String(cfg.smpParam),
 		distro: cfg.distroParam,
-		fx: cfg.fx ? "on" : "off",
 	};
 	// Where the root's changes live on the data disk: per distro (guest/base/initramfs/init).
 	const upperDir = `/data/distros/${cfg.guest}/upper`;
@@ -132,7 +131,7 @@ export function createUi(cfg: Config) {
 			rotate: store("fbRotate") === "1", layout: padLayout(store("padLayout")),
 			touchMode: store("touchMode") === "trackpad" ? "trackpad" : "mouse",
 			controls: store("padHidden") !== "1" },
-		win: 0, wins: [], preview: null, fx: null, launcher: false,
+		win: 0, wins: [], preview: null, launcher: false,
 		options,
 	} satisfies UiState);
 
@@ -396,7 +395,7 @@ export function createUi(cfg: Config) {
 		$.set({ fatal: { title: e.title || titles[e.kind] || `Stopped: ${e.kind}`, msg: e.message, hint: e.hint || "" } });
 		if (!$.get().splash.hidden) $.set({ splash: { title: e.title || "Couldn't start", msg: e.message, hidden: false, error: true, details: true } });
 		KW.term?.notice(`[host] ${e.message}`);
-		ui.openPanel("status");
+		ui.openPanel("errors");
 	}
 
 	// ---- diagnostics / copy / reboot ---------------------------------------
@@ -461,12 +460,9 @@ export function createUi(cfg: Config) {
 		set("data", o.data === "off" ? "0" : null);
 		set("root", o.root === "safe" ? "initramfs" : null);
 		set("worker", o.worker === "on" ? "1" : null);
-		set("smp", o.cpus === "1" ? null : o.cpus);
+		set("cpus", o.cpus === "1" ? null : o.cpus);
 		set("distro", o.distro === DEFAULT_DISTRO ? null : o.distro);
-		if (o.fx === "off") set("fx", null);
-		else if (!cfg.fx) set("fx", "1"); // an existing ?fx (any value but 0) stays as written
-		// URLSearchParams writes a bare ?fx as fx=: keep it bare, so the URL stays as given.
-		const q = p.toString().replace(/(^|&)fx=(?=&|$)/, "$1fx");
+		const q = p.toString();
 		return location.pathname + (q ? `?${q}` : "");
 	}
 	let rebooting = false;

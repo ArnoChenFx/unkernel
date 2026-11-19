@@ -34,9 +34,11 @@
 	--st: env(safe-area-inset-top, 0px); --sb: env(safe-area-inset-bottom, 0px);
 	/* The status line's height, without the bottom safe area. */
 	--bar-h: 28px;
-	/* Extra side padding of the status line where the screen's bottom corners are round (iOS, below). */
+	/* Extra side padding of the status line where the screen's or window's bottom corners are round (iOS and macOS, below). */
 	--sc: 0px;
 }
+/* A macOS window outside fullscreen (main.tsx): its bottom corners are round. */
+:root.mac-window { --sc: 8px; }
 /* iOS (only its WebKit knows -webkit-touch-callout): the page keeps the top
    safe area (status bar, notch, Dynamic Island) but takes the whole height
    below it. The status line goes down to the bottom edge, over the home
@@ -145,7 +147,7 @@
    while scrolling. The other windows lie over #term in the same box, and
    the ones not shown are hidden with visibility (and inert), so they keep
    their size and their grid follows the stage like the shown one. */
-#terms .wterm, #fx-term.wterm {
+#terms .wterm {
 	width: 100%; height: 100%; padding: 0; border-radius: 0; box-shadow: none;
 	scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: #333 transparent;
 	overscroll-behavior: contain;
@@ -160,6 +162,6 @@
 #terms .term-win { position: absolute; inset: 0; }
 #terms .term-off { visibility: hidden; }
 /* iOS zooms the page when a field under 16 px takes focus: wterm's hidden input inherits the terminal font. */
-#app.mobile #terms textarea, #app.mobile #fx-term textarea { font-size: 16px !important; }
+#app.mobile #terms textarea { font-size: 16px !important; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

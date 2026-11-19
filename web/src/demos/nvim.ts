@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Neovim: Neovim 0.12 from Alpine's community repository (about 7 MB with
-// its libraries), with a small config of its own and no plugins (each
+// its libraries), or Debian's 0.10, which lacks some of what follows, with a small config of its own and no plugins (each
 // would be a download on every first launch): a start screen, a Space menu
 // that lists its keys after a pause, a fuzzy finder, a floating terminal,
 // a status line and the page's colours. Neovim itself brings tree-sitter
@@ -37,8 +37,11 @@ o.fillchars = { eob = " " }
 o.list = true
 o.listchars = { tab = "│ ", trail = "·", leadmultispace = "│   " }
 o.shortmess:append("sI")
-o.completeopt = { "menuone", "noselect", "popup", "fuzzy" }
-o.winborder = "rounded"
+-- fuzzy and winborder are 0.11 (Debian's Neovim is 0.10): pcall'd.
+if not pcall(function() o.completeopt = { "menuone", "noselect", "popup", "fuzzy" } end) then
+	pcall(function() o.completeopt = { "menuone", "noselect", "popup" } end)
+end
+pcall(function() o.winborder = "rounded" end)
 pcall(function() vim.o.autocomplete = true end) -- completion as you type (0.12)
 pcall(function() vim.o.pumborder = "rounded" end)
 -- 0.12's message UI: no "Press ENTER", and no command line row until used.
@@ -303,7 +306,7 @@ au("VimEnter", { once = true, callback = function()
 end })
 -- Tree-sitter highlighting wherever Neovim has the grammar.
 au("FileType", { callback = function(ev) pcall(vim.treesitter.start, ev.buf) end })
-au("TextYankPost", { callback = function() vim.hl.on_yank({ timeout = 180 }) end })
+au("TextYankPost", { callback = function() (vim.hl or vim.highlight).on_yank({ timeout = 180 }) end })
 au("ModeChanged", { callback = function() vim.cmd.redrawstatus() end })
 
 vim.keymap.set("n", "<C-p>", files)
@@ -315,7 +318,7 @@ vim.keymap.set("n", "<Esc>", "<Cmd>nohlsearch<CR>")
 
 const README = `# Neovim on unkernel
 
-Neovim 0.12, the aarch64 build from Alpine, on Linux compiled to
+Neovim, the distro's aarch64 build, on Linux compiled to
 WebAssembly, in this browser tab. The setup is one file with no plugins:
 config/nvim/init.lua (Space s opens it).
 
@@ -359,6 +362,6 @@ export default {
 		"README.md": README,
 		"hello.c": HELLO,
 	},
-	packages: ["neovim"],
+	packages: { alpine: ["neovim"], debian: ["neovim"] },
 	commands: ['XDG_CONFIG_HOME="$PWD/config" nvim'],
 } satisfies Demo;

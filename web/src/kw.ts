@@ -94,7 +94,7 @@ export interface KWGlobal {
 	suspend?: () => Promise<{ bytes: number; ms: number }>;
 	/** The running showcase (showcase.ts): skip the current step, pause and resume between steps. */
 	showcase?: { skip(): void; pause(): void; resume(): void };
-	/** The kernel once user space runs (rejects if it never does), once the boot module runs; fx.ts runs its commands there. */
+	/** The kernel once user space runs (rejects if it never does), once the boot module runs. */
 	ready?: () => Promise<KernelHandle>;
 	/** The terminal windows, once the boot module runs. */
 	windows?: WindowsApi;

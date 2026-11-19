@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // SQLite: Alpine's aarch64 sqlite (the sqlite3 shell, main, about 1.4 MB to
-// download with readline and ncurses), querying the running guest itself:
+// download with readline and ncurses) or Debian's sqlite3, querying the running guest itself:
 // SQL over the live Linux in the browser, where the postgres demo has a seeded
 // dataset. No server and no ports: sqlite3 is the interface.
 //
@@ -10,7 +10,11 @@
 // L:, o:, I:, D:, p:, i: and R: lines, records separated by blank lines;
 // /etc/apk/world), the processes (/proc/<pid>/status and cmdline), the mounts
 // (/proc/mounts) and a few facts (uname, /proc/cpuinfo's feature list,
-// /proc/meminfo). busybox awk turns each into INSERT statements, quoting with
+// /proc/meminfo). On Debian the packages come from dpkg's database instead
+// (/var/lib/dpkg/status, the info/*.list files for the file counts, the
+// machine-readable /usr/share/doc/*/copyright files for a license, and
+// apt-mark showmanual for what was asked for; no build times or install_if).
+// awk (busybox's or Debian's mawk) turns each into INSERT statements, quoting with
 // a q variable since the programs sit in single quotes. The snapshot tables
 // are dropped and made again, so a rerun sees packages installed meanwhile;
 // the runs table is kept and gets a row per run. The database lives in
@@ -20,8 +24,10 @@
 //
 // Dependencies are kept as written (so:libc.musl-aarch64.so.1, cmd:sh,
 // /bin/sh), and the needs view resolves them through provides (each package's
-// own name plus its p: names) to package-to-package edges. tree.sql walks
-// them down from a package; apk-del.sql works out what apk del would remove:
+// own name plus its p: names, or Debian's Provides) to package-to-package
+// edges (every installed alternative of a Debian a | b). tree.sql walks them
+// down from a package; remove.sql works out what removing it would take
+// with it (apk del, or apt remove then apt autoremove):
 // what /etc/apk/world asks for (but that package), closed over needs, plus
 // the install_if packages (i:, like ssl_client) whose conditions all stay,
 // is kept, and the rest goes. An install_if package that only a kept
@@ -59,6 +65,10 @@ function n(x) { return x == "" ? "NULL" : x + 0 }
 function sn(x) { return x == "" ? "NULL" : s(x) }'
 
 packages() {
+	if [ -f /lib/apk/db/installed ]; then apk_packages; else dpkg_packages; fi
+}
+
+apk_packages() {
 	awk -v q="'" "$LIB"'
 	function flush() {
 		if (name != "")
@@ -100,6 +110,61 @@ packages() {
 	{ for (i = 1; i <= NF; i++) if ($i !~ /^!/) { t = $i; sub(/[@<>=~].*/, "", t); print "INSERT INTO world VALUES (" s(t) ");" } }' /etc/apk/world
 }
 
+# Debian: the installed paragraphs of dpkg's status file; the .list files
+# (read first) count each package's paths, the copyright files give the
+# first License: of those in the machine-readable format.
+dpkg_packages() {
+	awk -v q="'" "$LIB"'
+	# The names in a Depends or Provides value: every alternative, without
+	# version constraints or architecture qualifiers.
+	function names(v, table, a, b, i, j, k, m, t) {
+		k = split(v, a, ",")
+		for (i = 1; i <= k; i++) {
+			m = split(a[i], b, "|")
+			for (j = 1; j <= m; j++) {
+				t = b[j]
+				sub(/\(.*/, "", t); sub(/:.*/, "", t); gsub(/[ \t]/, "", t)
+				if (t != "") print "INSERT INTO " table " VALUES (" s(name) ", " s(t) ");"
+			}
+		}
+	}
+	function flush() {
+		if (name != "" && status ~ / installed$/) {
+			print "INSERT INTO packages VALUES (" s(name) ", " s(ver) ", " sn(desc) ", " sn(lic[name]) ", " sn(orig == "" ? name : orig) ", " \
+				(size == "" ? "NULL" : size * 1024) ", " (files[name] + 0) ", " (deps == "" ? 0 : split(deps, tmp, ",")) ", NULL, " \
+				sn(url) ", " sn(maint) ");\nINSERT INTO provides VALUES (" s(name) ", " s(name) ");"
+			if (deps != "") names(deps, "deps")
+			if (prov != "") names(prov, "provides")
+		}
+		name = ver = desc = orig = size = url = maint = status = deps = prov = ""
+	}
+	FILENAME ~ /\.list$/ {
+		p = FILENAME; sub(/^.*\//, "", p); sub(/\.list$/, "", p); sub(/:.*/, "", p)
+		files[p]++
+		next
+	}
+	FILENAME ~ /\/copyright$/ {
+		if (FNR == 1) { p = FILENAME; sub(/\/copyright$/, "", p); sub(/^.*\//, "", p); dep5 = $0 ~ /^Format:/ }
+		if (dep5 && /^License:/ && !(p in lic)) { v = $0; sub(/^License:[ \t]*/, "", v); lic[p] = v }
+		next
+	}
+	/^$/ { flush(); next }
+	/^[ \t]/ { next } # a continuation line
+	{ i = index($0, ":"); k = substr($0, 1, i - 1); v = substr($0, i + 1); sub(/^[ \t]+/, "", v) }
+	k == "Package" { name = v }
+	k == "Status" { status = v }
+	k == "Version" { ver = v }
+	k == "Description" { desc = v }
+	k == "Source" { orig = v; sub(/ .*/, "", orig) }
+	k == "Installed-Size" { size = v }
+	k == "Homepage" { url = v }
+	k == "Maintainer" { maint = v }
+	k == "Depends" || k == "Pre-Depends" { deps = deps (deps == "" ? "" : ", ") v }
+	k == "Provides" { prov = v }
+	END { flush() }' /var/lib/dpkg/info/*.list /usr/share/doc/*/copyright /var/lib/dpkg/status
+	apt-mark showmanual | awk -v q="'" "$LIB"'{ print "INSERT INTO world VALUES (" s($1) ");" }'
+}
+
 processes() {
 	for d in /proc/[0-9]*; do
 		{ cat "$d/status" && printf 'Cmdline:\t' && tr '\0' ' ' < "$d/cmdline" && echo; } 2>/dev/null || true
@@ -135,7 +200,7 @@ mounts() {
 
 facts() {
 	{
-		printf 'Alpine\t%s\n' "$(cat /etc/alpine-release)"
+		printf 'os\t%s\n' "$(. /etc/os-release && echo "$PRETTY_NAME")"
 		printf 'kernel\t%s\n' "$(uname -sr)"
 		printf 'machine\t%s\n' "$(uname -m)"
 		awk -F': *' '{ k = $1; sub(/[ \t]+$/, "", k) }
@@ -165,27 +230,29 @@ DROP TABLE IF EXISTS world;
 DROP TABLE IF EXISTS processes;
 DROP TABLE IF EXISTS mounts;
 DROP TABLE IF EXISTS system;
--- /lib/apk/db/installed, one row per package.
+-- /lib/apk/db/installed (Debian: /var/lib/dpkg/status), one row per package.
 CREATE TABLE packages (
 	name TEXT PRIMARY KEY,
 	version TEXT NOT NULL,
 	description TEXT,
 	license TEXT,
-	origin TEXT,     -- the source package (aport) it was built from
+	origin TEXT,     -- the source package (aport, Debian source) it was built from
 	size INTEGER,    -- installed size in bytes
 	files INTEGER,   -- files it installed
 	deps INTEGER,    -- dependencies it declares
-	built TEXT,      -- build time (UTC)
+	built TEXT,      -- build time (UTC; not on Debian)
 	url TEXT,
 	maintainer TEXT
 );
--- Dependencies as declared (D:): a package, so:libfoo.so.1, cmd:foo, /bin/sh.
+-- Dependencies as declared (D:, Debian's Depends and Pre-Depends): a package,
+-- so:libfoo.so.1, cmd:foo, /bin/sh.
 CREATE TABLE deps (pkg TEXT NOT NULL, dep TEXT NOT NULL);
--- The names each package answers to: its own, and those it provides (p:).
+-- The names each package answers to: its own, and those it provides (p:, Provides).
 CREATE TABLE provides (pkg TEXT NOT NULL, name TEXT NOT NULL);
--- Installed automatically once all of these are (i:).
+-- Installed automatically once all of these are (i:; none on Debian).
 CREATE TABLE install_if (pkg TEXT NOT NULL, cond TEXT NOT NULL);
--- /etc/apk/world: what was asked for; everything else came as a dependency.
+-- /etc/apk/world (Debian: apt-mark showmanual): what was asked for; everything
+-- else came as a dependency.
 CREATE TABLE world (name TEXT NOT NULL);
 -- Package-to-package dependency edges: deps resolved through provides.
 CREATE VIEW needs AS
@@ -218,6 +285,9 @@ COMMIT;
 EOF
 } > snapshot.sql
 sqlite3 -batch -bail -init /dev/null system.db < snapshot.sql
+# The package the sqlite3 shell came in, for showcase.sql's tree.sql and remove.sql.
+if [ -f /lib/apk/db/installed ]; then self=sqlite; else self=sqlite3; fi
+printf '.parameter set @pkg %s\n' "$self" > self.sql
 
 counts=$(sqlite3 -batch -init /dev/null system.db "SELECT printf('Snapshot %d: %d packages, %d processes, %d mounts',
 	(SELECT max(id) FROM runs), (SELECT count(*) FROM packages), (SELECT count(*) FROM processes),
@@ -254,9 +324,10 @@ FROM tree t JOIN packages p ON p.name = t.name
 ORDER BY t.path;
 `;
 
-const APK_DEL = String.raw`-- What apk del @pkg would remove (.param set @pkg sqlite, then .read
--- apk-del.sql; apk del -s <pkg> asks apk itself). Kept: what /etc/apk/world
--- asks for, but @pkg, with everything it needs, plus the install_if
+const REMOVE = String.raw`-- What removing @pkg would take with it (.param set @pkg sqlite, then .read
+-- remove.sql): apk del, or apt remove then apt autoremove (apk del -s <pkg>
+-- asks apk itself). Kept: what the world table asks for, but @pkg, with
+-- everything it needs, plus the install_if
 -- packages whose conditions all stay, with what they need. The rest goes.
 WITH RECURSIVE
 	kept0(name) AS (
@@ -279,7 +350,7 @@ WITH RECURSIVE
 	gone AS (SELECT name, version, size FROM packages WHERE name NOT IN kept)
 SELECT name AS removed, version, size / 1024 AS KiB FROM gone
 UNION ALL
-SELECT '(nothing: ' || @pkg || ' is not in /etc/apk/world, or what stays needs it)', NULL, NULL
+SELECT '(nothing: ' || @pkg || ' was not asked for (the world table), or what stays needs it)', NULL, NULL
 WHERE NOT EXISTS (SELECT 1 FROM gone)
 ORDER BY 1;
 `;
@@ -327,7 +398,8 @@ SELECT license, count(*) AS packages,
 	substr('██████████████████████████████', 1, max(1, round(30.0 * count(*) / max(count(*)) OVER ()))) AS chart
 FROM packages
 GROUP BY license
-ORDER BY packages DESC, license;
+ORDER BY packages DESC, license
+LIMIT 12;
 
 .print
 .print '── Packages by origin, the source package each was built from'
@@ -338,13 +410,13 @@ GROUP BY origin
 HAVING count(*) > 1
 ORDER BY packages DESC, origin;
 
-.parameter set @pkg sqlite
+.read self.sql
 .print
-.print "── What sqlite pulls in, its dependencies resolved through so: names (tree.sql, recursive CTEs)"
+.print "── What the sqlite3 shell's package pulls in, its dependencies resolved through provides (tree.sql, recursive CTEs)"
 .read tree.sql
 .print
-.print '── What apk del sqlite would remove, worked out from /etc/apk/world (apk-del.sql)'
-.read apk-del.sql
+.print '── What removing that package would take with it, worked out from what was asked for (remove.sql)'
+.read remove.sql
 .parameter clear
 
 .print
@@ -389,14 +461,14 @@ const SQLITERC = String.raw`-- sqlite3's settings for the demo session (sqlite3 
 .print "  .tables                                  the tables; .schema packages for one's columns"
 .print "  SELECT origin, name, max(size) FROM packages GROUP BY origin ORDER BY 3 DESC;"
 .print "                                           the biggest package per origin (bare columns)"
-.print "  SELECT pkg FROM needs WHERE dep = 'readline';     what needs readline"
-.print "  .param set @pkg apk-tools                then .read tree.sql (what it pulls in)"
-.print "                                           or .read apk-del.sql (what apk del would remove)"
+.print "  SELECT * FROM needs WHERE dep LIKE '%readline%';  what needs readline"
+.print "  .param set @pkg NAME                     then .read tree.sql (what it pulls in)"
+.print "                                           or .read remove.sql (what removing it takes)"
 .print "  SELECT user, count(*), sum(rss_kib) FROM processes GROUP BY user;"
 .print "  SELECT pid, name, rss_kib FROM processes WHERE ppid = 1;     what init started"
 .print "  .mode json, .mode markdown or .mode csv, then a query; .mode box goes back"
 .print "  .shell ./snapshot.sh                     a fresh snapshot without leaving"
-.print "                                           (apk add something in another window first)"
+.print "                                           (install something in another window first)"
 .print "  .quit leaves; ./run.sh takes a new snapshot, and the runs table grows"
 .print
 `;
@@ -413,9 +485,9 @@ export default {
 		"snapshot.sh": { content: SNAPSHOT, mode: 0o755 },
 		"showcase.sql": SHOWCASE,
 		"tree.sql": TREE,
-		"apk-del.sql": APK_DEL,
+		"remove.sql": REMOVE,
 		"sqliterc": SQLITERC,
 	},
-	packages: ["sqlite"],
+	packages: { alpine: ["sqlite"], debian: ["sqlite3"] },
 	commands: ["./snapshot.sh", "sqlite3 system.db '.read showcase.sql'", "sqlite3 -init sqliterc system.db"],
 } satisfies Demo;

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The dialog: a terminal-style window over the stage, above the status
-// line, with its title in the top border. Tabs: System (a fatal error,
-// Options, the data disk, the guest preview), Environment (the checks), Kernel log, Errors and
-// Keys (the shortcuts). Footer: the keys that work here, Copy diagnostics,
+// line, with its title in the top border. Tabs: System (Options), Guest
+// (the data disk, the guest preview), Environment (the checks), Kernel log,
+// Errors (the fatal one first, with its title) and Keys (the shortcuts). Footer: the keys that work here, Copy diagnostics,
 // Suspend and Reboot. shortcuts.ts drives it from the keyboard.
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { KW } from "../kw.ts";
@@ -13,8 +13,8 @@ import { useStore, type Check, type Tab } from "../store.ts";
 import { fmtT } from "../ui.ts";
 import { Options } from "./Options.tsx";
 
-const TABS: Array<[Tab, string, string]> = [["status", "k", "System"], ["env", "i", "Environment"], ["log", "l", "Kernel log"], ["errors", "e", "Errors"], ["keys", "?", "Keys"]];
-const TITLE: Record<Tab, string> = { status: "system", env: "environment", log: "kernel log", errors: "errors", keys: "keys" };
+const TABS: Array<[Tab, string, string]> = [["status", "k", "System"], ["guest", "g", "Guest"], ["env", "i", "Environment"], ["log", "l", "Kernel log"], ["errors", "e", "Errors"], ["keys", "?", "Keys"]];
+const TITLE: Record<Tab, string> = { status: "system", guest: "guest", env: "environment", log: "kernel log", errors: "errors", keys: "keys" };
 
 export function Panel() {
 	const ui = KW.ui!;
@@ -64,9 +64,10 @@ export function Panel() {
 
 				<div id="pbody" ref={body} className="min-h-0 flex-1 overflow-auto overscroll-contain px-4 pb-4">
 					<section data-pane="status" {...pane("status")}>
-						<Fatal />
 						<H3>Options</H3>
 						<Options />
+					</section>
+					<section data-pane="guest" {...pane("guest")}>
 						<H3>Data disk</H3>
 						<DataDisk />
 						<H3>Preview</H3>
@@ -83,7 +84,7 @@ export function Panel() {
 
 				<div className="flex flex-none items-center gap-2 border-t border-line px-3 py-2 select-none">
 					<p className="min-w-0 flex-1 truncate text-[11.5px] text-faint max-md:hidden">
-						<K>esc</K> close <K>k i l e ?</K> tabs <K>c</K> copy <K>s</K> suspend <K>r</K> reboot
+						<K>esc</K> close <K>k g i l e ?</K> tabs <K>c</K> copy <K>s</K> suspend <K>r</K> reboot
 					</p>
 					<button id="copy" type="button" className="btn btn-sm max-md:flex-1" onClick={() => ui.copyDiagnostics()}>Copy diagnostics</button>
 					{/* The SMP kernel cannot be saved (no parking): no Suspend with several CPUs. */}
@@ -105,17 +106,6 @@ const H3 = ({ children }: { children: ReactNode }) => (
 		<span className="w-3 border-t border-line" />{children}<span className="flex-1 border-t border-line" />
 	</h3>
 );
-
-function Fatal() {
-	const f = useStore((s) => s.fatal);
-	return (
-		<div id="fatal" role="alert" hidden={!f} className="mt-3 border border-err/50 bg-err/10 px-3 py-2.5">
-			<b id="fatal-title" className="mb-1 block font-semibold text-err">✗ {f?.title}</b>
-			<p id="fatal-msg" className="break-words whitespace-pre-wrap text-fg">{f?.msg}</p>
-			<p id="fatal-hint" hidden={!f?.hint} className="mt-2 text-muted">{f?.hint}</p>
-		</div>
-	);
-}
 
 function DataDisk() {
 	const ui = KW.ui!;
@@ -218,19 +208,25 @@ function LogPane({ body }: { body: RefObject<HTMLDivElement | null> }) {
 	return <pre id="log" ref={pre} className="mt-3 text-[11.5px] leading-normal break-words whitespace-pre-wrap text-muted" />;
 }
 
+/** The errors, oldest first; the one that stopped the system (the store's fatal) with its title, and highlighted. */
 function Errors() {
 	const errors = useStore((s) => s.errors);
+	const f = useStore((s) => s.fatal);
 	if (!errors.length) return <p id="errors-empty" className="py-10 text-center text-faint">No errors so far.</p>;
+	const stop = f ? errors.findIndex((e) => e.fatal) : -1;
 	return (
 		<ul id="errors" className="mt-3 space-y-3">
 			{errors.map((e, i) => (
-				<li key={i} className={`border-l-2 pl-3 ${e.fatal ? "border-err" : "border-line-strong"}`}>
+				<li key={i} id={i === stop ? "fatal" : undefined} role={i === stop ? "alert" : undefined}
+					className={`border-l-2 pl-3 ${i === stop ? "border-err bg-err/10 py-2 pr-3" : e.fatal ? "border-err" : "border-line-strong"}`}>
 					<div className="mb-0.5 flex items-center gap-2 text-[11.5px] text-faint">
 						<span className={e.fatal ? "text-err" : "text-fg"}>[{e.kind}]</span>
 						<span className="tabular-nums">+{fmtT(e.t)}{e.fatal ? " · fatal" : ""}</span>
 					</div>
-					<div className="break-words whitespace-pre-wrap">{e.message}</div>
-					{e.hint && <div className="mt-1 text-[11.5px] text-faint">{e.hint}</div>}
+					{i === stop && <b id="fatal-title" className="mb-0.5 block font-semibold text-err">✗ {f!.title}</b>}
+					<div id={i === stop ? "fatal-msg" : undefined} className="break-words whitespace-pre-wrap">{e.message}</div>
+					{i === stop ? <div id="fatal-hint" hidden={!e.hint} className="mt-1 text-[11.5px] text-muted">{e.hint}</div>
+						: e.hint && <div className="mt-1 text-[11.5px] text-faint">{e.hint}</div>}
 					{e.detail && (
 						<details className="mt-1">
 							<summary className="cursor-pointer text-[11.5px] text-faint hover:text-muted">details</summary>

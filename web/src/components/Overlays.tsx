@@ -29,7 +29,7 @@ export function Splash() {
 				<Mark size={44} className="mx-auto mb-5" />
 				<h1 id="splash-title" className="mb-1.5 font-mono text-[15px] font-medium tracking-tight group-data-error:text-err">{s.title}</h1>
 				<p id="splash-msg" className="font-mono text-[12.5px] break-words text-muted group-data-error:whitespace-pre-wrap group-data-error:text-fg">{s.msg}</p>
-				{s.details && <button id="splash-details" type="button" className="btn mt-5" onClick={() => KW.ui!.openPanel("status")}>Show details</button>}
+				{s.details && <button id="splash-details" type="button" className="btn mt-5" onClick={() => KW.ui!.openPanel("errors")}>Show details</button>}
 			</div>
 		</div>
 	);

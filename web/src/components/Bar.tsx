@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The status line at the bottom, tmux style. Left: ❯ and the launcher's
-// shortcut (just ❯ below sm), which opens the demo launcher (Launcher.tsx, also Ctrl-A o), the
-// windows (the console, the terminal windows 1 to 9, and last + for a new
-// window; the current one is inverted; terminal windows have a × while
-// current or under the pointer), and the prefix and what it takes while it
-// is armed. Right, in groups: the views, inverted while shown (a monitor for
+// The status line at the bottom, tmux style. Left: ❯, which opens
+// the demo launcher (Launcher.tsx, also Ctrl-A o), the
+// windows (a terminal icon and a name: con, the console, then the terminal
+// windows 1 to 9, tty N or the demo they run, and last + for a new window;
+// the current one is inverted; terminal windows have a × while
+// current or under the pointer), and the prefix: ^A, faint, which opens the
+// Keys tab, or while it is armed, highlighted with what it takes. Right, in
+// groups: the views, inverted while shown (a monitor for
 // the guest's display while a program has it open; a globe for the preview
-// while it is open, Preview.tsx has its close; fx, fx.ts, which starts the
-// agent in its side panel, then hides and shows it); the data disk's used
-// space (opens System) and kernel memory (opens Environment); the dialog's
-// tabs (^A, faint, which opens the Keys tab and hides while the prefix is
-// armed; the Kernel log; Errors with their count, only while there are any);
-// Suspend (a pause icon while the system runs; a play icon, Resume, once
-// suspended) and Reboot; the About triangle (About.tsx), and last System,
-// which also shows the state in its colour. Below sm, all but the display,
+// while it is open, Preview.tsx has its close); the data disk's used
+// space (opens System) and kernel memory (opens Environment); Errors with
+// their count, only while there are any; Suspend (a pause icon while the
+// system runs; a play icon, Resume, once suspended) and Reboot; the About
+// triangle (About.tsx); and last the Kernel log and System, which also shows
+// the state in its colour. Below sm, all but the display,
 // the preview and Errors move into a ⋯ menu (More). The windows and icons
 // are buttons, so phones get around by tapping; on touch the line is taller
 // and its buttons wider (--bar-h, style.css).
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { toggleFx } from "../fx.ts";
 import { KW } from "../kw.ts";
 import { previewCovers, togglePreview, useNarrow } from "../preview.ts";
 import { PREFIX, PREFIX_SHORT, closeWindow, newWindow, selectWindow, toggleDisplay } from "../shortcuts.ts";
@@ -86,11 +85,11 @@ const PlayIcon = () => <Icon><path d="M7 4.5v15L19.5 12 7 4.5Z" /></Icon>;
 const ErrIcon = () => <Icon><path d="M12 3.5 2.5 20h19L12 3.5Z" /><path d="M12 10v4.5M12 17.5h0" /></Icon>;
 /** A monitor on a stand: the guest's display. */
 const DisplayIcon = () => <Icon><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8M12 16v4" /></Icon>;
+/** A prompt in a window: the console and the terminal windows. */
+const TermIcon =() => <Icon><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12.5 15H17" /></Icon>;
 /** A globe: the preview of a web server in the guest. */
 const PreviewIcon = () => <Icon><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9c-2.5-2.6-3.8-5.6-3.8-9S9.5 5.6 12 3Z" /></Icon>;
 
-/** The window number: a shortcut on keyboards, left out on phones. */
-const N = ({ n }: { n: string }) => <span className="max-sm:hidden">{n}:</span>;
 
 /** Bytes, short: 512K, 37M, 1.5G. */
 const fmtSize = (n: number) =>
@@ -101,7 +100,7 @@ type Item = [string, ReactNode, () => void];
 /**
  * Narrow screens (below sm): the right side keeps only the display, the
  * preview and Errors, and the rest moves into this menu, in groups: System,
- * the data disk, memory; Kernel log, Keys, fx; Suspend or Resume, Reboot;
+ * the data disk, memory; Kernel log, Keys; Suspend or Resume, Reboot;
  * About. Esc, a pick or a tap outside closes it.
  */
 function More() {
@@ -111,7 +110,6 @@ function More() {
 	const state = useStore((s) => s.state);
 	const suspended = useStore((s) => s.suspended);
 	const disk = useStore((s) => s.disk);
-	const fx = useStore((s) => s.fx);
 	const mem = KW.memActualMiB || KW.config.memMiB;
 	useEffect(() => {
 		if (!open) return;
@@ -127,13 +125,12 @@ function More() {
 	const groups: Item[][] = [
 		[
 			["System", <SysIcon />, () => ui.openPanel("status")],
-			...(disk ? [[`Data disk ${fmtSize(disk.used)}/${fmtSize(disk.size)}`, <DiskIcon />, () => ui.openPanel("status")] as Item] : []),
+			...(disk ? [[`Data disk ${fmtSize(disk.used)}/${fmtSize(disk.size)}`, <DiskIcon />, () => ui.openPanel("guest")] as Item] : []),
 			[`Memory ${mem >= 1024 ? `${mem / 1024}G` : `${mem}M`}`, <MemIcon />, () => ui.openPanel("env")],
 		],
 		[
 			["Kernel log", <LogIcon />, () => ui.openPanel("log")],
 			["Keyboard shortcuts", <span className="w-[13px] text-center text-[10px]">{PREFIX_SHORT}</span>, () => ui.openPanel("keys")],
-			[fx ? (fx.shown ? "Hide fx" : "Show fx") : "fx coding agent", <span className="text-[10px] font-semibold">fx</span>, toggleFx],
 		],
 		[
 			...(suspended ? [["Resume", <PlayIcon />, ui.resume] as Item]
@@ -185,28 +182,27 @@ export function Bar() {
 	const term = !panel && !picture && !covers;
 	const tab = (t: Tab) => () => ui.togglePanel(t);
 	const canOpen = wins.length < MAX_WINDOWS && state !== "halted" && state !== "error";
-	const fx = useStore((s) => s.fx);
 
 	return (
 		<footer id="bar" aria-label="Status line" className="relative flex min-h-[calc(var(--bar-h)+var(--sb))] flex-none items-stretch gap-2 border-t border-line bg-surface pr-[max(4px,var(--sr),var(--sc))] pb-(--sb) pl-[max(var(--sl),var(--sc))] font-mono text-[12px] leading-none select-none">
 			<div className="flex min-w-0 flex-1 items-stretch gap-px overflow-hidden">
-				<LauncherButton />
-				<Seg id="bar-win-0" on={term && win === 0} title="Console (hvc0), window 0" hint="0" onClick={() => selectWindow(0)}><N n="0" />con</Seg>
+				<LauncherButton hint={<Hint k="o" />} />
+				<Seg id="bar-win-0" on={term && win === 0} title="Console (hvc0), window 0" hint="0" onClick={() => selectWindow(0)}><span className="mr-1 inline-flex"><TermIcon /></span>con</Seg>
 				{wins.map((w) => (
 					<Seg
 						key={w.n} id={`bar-win-${w.n}`} on={term && win === w.n} hint={String(w.n)} onClick={() => selectWindow(w.n)}
 						onClose={() => void closeWindow(w.n)} closeTitle={`Close terminal window ${w.n} (${PREFIX} x)`}
 						title={`Terminal window ${w.n}${w.state === "opening" ? ", starting" : w.state === "ended" ? `, ended: ${w.note}` : ""}`}
 						className={w.state === "ended" && win !== w.n ? "text-err" : w.state === "opening" && win !== w.n ? "text-faint" : ""}
-					>{w.n}:{w.name}</Seg>
+					><span className="mr-1 inline-flex"><TermIcon /></span>{w.fg || w.name}</Seg>
 				))}
 				{canOpen && <Seg id="bar-new" title="New terminal window" label="New terminal window" hint="n" onClick={newWindow} className="ml-1.5 text-faint">+</Seg>}
-				{prefix && (
+				{prefix ? (
 					<>
 						<span className="flex flex-none items-center bg-warn px-1.5 font-semibold text-black">{PREFIX_SHORT}</span>
-						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · f fx · y copy · s suspend · r reboot · ? keys · esc cancel</span>
+						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · y copy · s suspend · r reboot · ? keys · esc cancel</span>
 					</>
-				)}
+				) : <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
 			</div>
 			<div className="flex flex-none items-stretch gap-px">
 				{display.attached && (
@@ -219,19 +215,15 @@ export function Bar() {
 						<PreviewIcon />
 					</Seg>
 				)}
-				<Seg id="bar-fx" on={!!fx?.shown} title={fx ? `fx, the coding agent: ${fx.shown ? "hide" : "show"} it` : "fx, the coding agent: start it in a side panel, working on this VM"}
-					label="fx coding agent" hint="f" onClick={toggleFx} className="font-semibold max-sm:hidden">fx</Seg>
 				{disk && (
-					<Seg hint="k" onClick={tab("status")} className="gap-1.5 tabular-nums max-md:hidden"
-						title={`Data disk (/data): ${fmtSize(disk.used)} of ${fmtSize(disk.size)} in use${disk.saved ? ", saved in this browser" : ", in memory only"}. Counts blocks ever written; df in the guest is exact. Opens System.`}>
+					<Seg hint="g" onClick={tab("guest")} className="gap-1.5 tabular-nums max-md:hidden"
+						title={`Data disk (/data): ${fmtSize(disk.used)} of ${fmtSize(disk.size)} in use${disk.saved ? ", saved in this browser" : ", in memory only"}. Counts blocks ever written; df in the guest is exact. Opens Guest.`}>
 						<DiskIcon />{fmtSize(disk.used)}<span className="opacity-60">/{fmtSize(disk.size)}</span>
 					</Seg>
 				)}
 				<Seg hint="i" onClick={tab("env")} className="gap-1.5 tabular-nums max-md:hidden" title={`Kernel memory: ${mem} MiB. Opens Environment.`}>
 					<MemIcon />{mem >= 1024 ? `${mem / 1024}G` : `${mem}M`}
 				</Seg>
-				{!prefix && <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
-				<Seg id="bar-log" on={panel === "log"} title="Kernel log" hint="l" label="Show the kernel log" onClick={tab("log")} className="max-sm:hidden"><LogIcon /></Seg>
 				{(errors > 0 || panel === "errors") && (
 					<Seg id="bar-errors" on={panel === "errors"} title="Errors" hint="e" label={`Errors: ${errors}`} onClick={tab("errors")}>
 						<span className={`inline-flex items-center gap-1 ${panel === "errors" ? "" : "text-err"}`}><ErrIcon />{errors > 0 && errors}</span>
@@ -243,6 +235,7 @@ export function Bar() {
 				<Seg id="bar-reboot" title="Reboot (asks first while the system runs)" hint="r" label="Reboot" onClick={() => void ui.confirmReboot()} className="max-sm:hidden"><RebootIcon /></Seg>
 				<About hint={<Hint k="a" />} className="max-sm:hidden" />
 				<More />
+				<Seg id="bar-log" on={panel === "log"} title="Kernel log" hint="l" label="Show the kernel log" onClick={tab("log")} className="max-sm:hidden"><LogIcon /></Seg>
 				{/* System: the icon is red on an error and dim once halted (style.css);
 				    the state's name is only in the tooltip and for screen readers. */}
 				<button

@@ -154,6 +154,6 @@ export default {
 	needs: { net: true },
 	community: true,
 	files: { "dos.sh": { content: DOS, mode: 0o755 } },
-	packages: ["qemu-system-i386", "qemu-ui-curses", "mtools"],
+	packages: { alpine: ["qemu-system-i386", "qemu-ui-curses", "mtools"], debian: ["qemu-system-x86", "mtools", "wget"] },
 	commands: ["./dos.sh"],
 } satisfies Demo;

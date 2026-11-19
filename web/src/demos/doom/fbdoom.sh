@@ -7,8 +7,9 @@
 #
 # The first run builds the game here, in the guest, then starts it; later
 # runs start at once:
-# - installs a C compiler with apk (tcc by default, about 8 MiB to download;
-#   FBDOOM_CC=gcc or clang works too, if slower to get),
+# - installs a C compiler with apk (Alpine) or apt-get (Debian): tcc by
+#   default, about 8 MiB to download; FBDOOM_CC=gcc or clang works too, if
+#   slower to get,
 # - downloads fbDOOM's source at a pinned commit (github.com/maximevince/
 #   fbDOOM, GPL-2.0-or-later), checks its sha256, applies the patches in
 #   /usr/share/unkernel/fbdoom (web/src/demos/doom/patches) and compiles it,
@@ -17,9 +18,10 @@
 # Everything goes to /data/fbdoom when the persistent data disk is mounted
 # (kept across boots, safe mode, kw-overlay discard and image updates), else to
 # /var/lib/fbdoom (gone at power off); FBDOOM_DIR overrides the place.
-# The compiler goes wherever apk installs (with the data disk: the overlay
-# root, so it persists too). Settings and saves are in DIR/.fbdoom/.
-#   fbdoom --remove-compiler   apk del the packages the build installed
+# The compiler goes wherever the package manager installs (with the data
+# disk: the overlay root, so it persists too). Settings and saves are in
+# DIR/.fbdoom/.
+#   fbdoom --remove-compiler   remove the packages the build installed
 #   fbdoom --remove            delete DIR (the game, the WAD, saves)
 # A new image with other patches rebuilds the game at the next run.
 #
@@ -43,14 +45,32 @@ wad_kib=55296    # zip 23.6 MiB + WAD 27.5 MiB, with some room
 
 cc=${FBDOOM_CC:-tcc}
 case $cc in
-tcc) cc_pkgs="tcc tcc-libs-static musl-dev linux-headers patch"
-	cc_flags= cc_kib=40960 cc_mib=8 ;;
-gcc) cc_pkgs="gcc musl-dev linux-headers patch"
-	cc_flags="-O2 -std=gnu99" cc_kib=256000 cc_mib=78 ;;
-clang) cc_pkgs="clang21 linux-headers patch"
-	cc_flags="-O2 -std=gnu99" cc_kib=307200 cc_mib=108 ;;
+tcc) cc_flags= cc_kib=40960 cc_mib=8 ;;
+gcc) cc_flags="-O2 -std=gnu99" cc_kib=256000 cc_mib=78 ;;
+clang) cc_flags="-O2 -std=gnu99" cc_kib=307200 cc_mib=108 ;;
 *) echo "fbdoom: FBDOOM_CC must be tcc, gcc or clang" >&2; exit 2 ;;
 esac
+# The packages: Alpine's (apk) or Debian's (apt-get; libc6-dev brings the
+# kernel's headers, linux-libc-dev).
+if command -v apk >/dev/null; then
+	pm=apk
+	case $cc in
+	tcc) cc_pkgs="tcc tcc-libs-static musl-dev linux-headers patch" ;;
+	gcc) cc_pkgs="gcc musl-dev linux-headers patch" ;;
+	clang) cc_pkgs="clang21 linux-headers patch" ;;
+	esac
+	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
+	pkg_remove() { apk del -q --no-progress "$@"; }
+else
+	pm=apt-get
+	case $cc in
+	tcc) cc_pkgs="tcc libc6-dev patch" ;;
+	gcc) cc_pkgs="gcc libc6-dev patch" ;;
+	clang) cc_pkgs="clang libc6-dev patch" ;;
+	esac
+	pkg_installed() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = installed ]; }
+	pkg_remove() { apt-get remove -y -q "$@" </dev/null >/dev/null; }
+fi
 
 gray=$(printf '\033[90m') reset=$(printf '\033[0m')
 [ -t 1 ] || gray= reset=
@@ -80,7 +100,7 @@ case $1 in
 --remove-compiler)
 	pkgs=$(cat "$dir/.compiler-added" 2>/dev/null)
 	[ -n "$pkgs" ] || { echo "fbdoom: the build installed no packages"; exit 0; }
-	apk del -q --no-progress $pkgs && rm -f "$dir/.compiler-added" && echo "fbdoom: removed $pkgs"
+	pkg_remove $pkgs && rm -f "$dir/.compiler-added" && echo "fbdoom: removed $pkgs"
 	exit ;;
 esac
 
@@ -101,12 +121,12 @@ if [ -n "$get_bin$get_wad" ]; then
 	rm -rf .part
 	mkdir .part || die "cannot write to $dir"
 
-	# Space: the compiler where apk installs (/), the build and the WAD in DIR.
+	# Space: the compiler where packages install (/), the build and the WAD in DIR.
 	need_cc=0
 	missing=
 	if [ -n "$get_bin" ]; then
 		for p in $cc_pkgs; do
-			apk info -e "$p" >/dev/null 2>&1 || missing="$missing $p"
+			pkg_installed "$p" || missing="$missing $p"
 		done
 		[ -n "$missing" ] && need_cc=$cc_kib
 	fi
@@ -131,11 +151,18 @@ if [ -n "$get_bin$get_wad" ]; then
 
 	# fetch URL FILE SHA256
 	fetch() {
-		# wget shows its progress on a terminal (the WAD is 24 MiB, and the
-		# page's network may be slow).
-		q=-q
-		[ -t 2 ] && q=
-		wget $q -O "$2" "$1" || {
+		# wget (Alpine) or curl (Debian) shows its progress on a terminal (the
+		# WAD is 24 MiB, and the page's network may be slow).
+		if command -v wget >/dev/null; then
+			q=-q
+			[ -t 2 ] && q=
+			get() { wget $q -O "$2" "$1"; }
+		else
+			q=-sS
+			[ -t 2 ] && q=-#
+			get() { curl -fL $q -o "$2" "$1"; }
+		fi
+		get "$1" "$2" || {
 			rm -rf .part
 			die "download failed: $1 (network or server problem)"
 		}
@@ -168,12 +195,19 @@ if [ -n "$get_bin$get_wad" ]; then
 	if [ -n "$get_bin" ]; then
 		if [ -n "$missing" ]; then
 			next "installing the compiler:$missing (about $cc_mib MiB to download)"
-			# tcc is in community, which the image leaves off until needed.
-			[ $cc != tcc ] || [ ! -x /etc/kw-apk-enable ] || /etc/kw-apk-enable
-			if ! ls /var/cache/apk/APKINDEX.*.tar.gz >/dev/null 2>&1; then
-				apk update -q --no-progress || die "apk update failed (network?)"
+			if [ $pm = apk ]; then
+				# tcc is in community, which the image leaves off until needed.
+				[ $cc != tcc ] || [ ! -x /etc/kw-apk-enable ] || /etc/kw-apk-enable
+				if ! ls /var/cache/apk/APKINDEX.*.tar.gz >/dev/null 2>&1; then
+					apk update -q --no-progress || die "apk update failed (network?)"
+				fi
+				apk add -q --no-progress $missing || die "apk add$missing failed"
+			else
+				# The image's package lists are baked in and age: when a version
+				# is gone from the mirror, fetch them again and retry once.
+				inst() { apt-get install -y -q --no-install-recommends $missing </dev/null; }
+				inst || { apt-get update -q </dev/null && inst; } || die "apt-get install$missing failed"
 			fi
-			apk add -q --no-progress $missing || die "apk add$missing failed"
 			# Remember what was added for this, for --remove-compiler.
 			echo $missing $(cat .compiler-added 2>/dev/null) | tr ' ' '\n' | sort -u | tr '\n' ' ' > .compiler-added
 		fi

@@ -3,12 +3,13 @@
 // Ubuntu: Ubuntu Base 26.10 arm64 (glibc 2.44, dpkg, apt 3.3, bash, uutils
 // coreutils; no init system), fetched at run time from cdimage.ubuntu.com
 // (the URL and SHA-256 below are this demo's own pin), and run in a chroot
-// on the Alpine guest. Nothing from Ubuntu is in the page.
+// on the guest (Alpine or Debian). Nothing from Ubuntu is in the page.
 //
 // The page fetches the tarball (35 MB; `downloads`, download.ts) and pushes
 // it into the demo's directory, unless the tree is there already. ubuntu.sh
 // extracts that copy and deletes it; without it (the page's fetch failed)
-// it downloads the tarball itself over https. Either way the tarball is
+// it downloads the tarball itself over https (wget on Alpine, curl on
+// Debian). Either way the tarball is
 // streamed through sha256sum into tar, and a wrong sum deletes what was
 // extracted. The tree (about 110 MB)
 // goes to /data/ubuntu with the data disk (kept: later runs start at once),
@@ -20,12 +21,15 @@
 //
 // Each run enters a private mount namespace (unshare -m, all mounts private),
 // mounts proc, sysfs, /dev (rbind, so /dev/pts too), tmpfs on /run and
-// /tmp, and Alpine's /root on Ubuntu's /root, so both share one home (kept
-// with the data disk, under the overlay root, like the tree itself; Ubuntu's
-// .bashrc is copied in once, and a ~/.bash_profile that sources it, which
-// Alpine's sh never reads), copies Alpine's resolv.conf in, and runs bash -l as root in the
-// chroot with a clean environment. The mounts go away with the namespace
-// when that shell exits, back to Alpine's shell in the window. apt works
+// /tmp, and the guest's /root on Ubuntu's /root, so both share one home
+// (kept with the data disk, under the overlay root, like the tree itself;
+// Ubuntu's .bashrc is copied in when there is none, and on Alpine a
+// ~/.bash_profile that sources it, which Alpine's sh never reads; Debian's
+// ~/.profile already sources ~/.bashrc, and a ~/.bash_profile would hide
+// it from Debian's own bash), copies the guest's resolv.conf in, and runs
+// bash -l as root in the chroot with a clean environment. The mounts go
+// away with the namespace when that shell exits, back to the guest's shell
+// in the window. apt works
 // (its sources are archive.ubuntu.com and security.ubuntu.com over plain
 // http); apt-get update reads about 20 MB of indexes.
 import type { Demo } from "../launcher.ts";
@@ -43,12 +47,13 @@ const OURS_SH = '[ "$(od -An -tx1 -j18 -N2 "$R/usr/bin/bash" 2>/dev/null | tr -d
 
 const UBUNTU_SH = String.raw`#!/bin/sh
 # Ubuntu Base 26.10 arm64 from cdimage.ubuntu.com, in a chroot on this
-# Alpine guest. Written by the unkernel launcher's Ubuntu demo.
+# guest (Alpine or Debian). Written by the unkernel launcher's Ubuntu demo.
 set -e
 NAME=${NAME}
 URL=${TARBALL_URL}
 SHA256=${SHA256}
 B='\033[1m' D='\033[90m' N='\033[0m'
+GUEST=$(. /etc/os-release && echo "$NAME")
 
 if mountpoint -q /data; then
 	R=/data/ubuntu WHERE="on the data disk, kept across reboots"
@@ -68,7 +73,11 @@ if [ ! -x "$R/usr/bin/bash" ]; then
 		fetch() { cat "$NAME"; }
 	else
 		printf "$D%s$N\n" "Fetching $NAME (35 MB) from cdimage.ubuntu.com into $R"
-		fetch() { wget -O - "$URL"; }
+		if command -v wget >/dev/null; then
+			fetch() { wget -O - "$URL"; }
+		else
+			fetch() { curl -fL "$URL"; }
+		fi
 	fi
 	rm -rf "$R.tmp" sum.fifo sum.txt
 	mkdir -p "$R.tmp"
@@ -97,18 +106,21 @@ if [ -e /etc/resolv.conf ]; then
 	cp /etc/resolv.conf "$R/etc/resolv.conf"
 fi
 
-# Home: Alpine's /root, bind-mounted below. Ubuntu's .bashrc is copied in
-# once; bash's login reads ~/.bash_profile, which Alpine's sh never does
-# (it reads ~/.profile), so each shell keeps its own setup.
+# Home: the guest's /root, bind-mounted below. Ubuntu's .bashrc is copied
+# in when there is none. bash's login reads ~/.bash_profile, else
+# ~/.profile: Debian's ~/.profile sources ~/.bashrc already (and a
+# ~/.bash_profile would hide it from Debian's bash), Alpine's sh reads only
+# ~/.profile, so there a ~/.bash_profile gives Ubuntu's bash its setup.
 [ -e /root/.bashrc ] || cp "$R/root/.bashrc" /root/.bashrc
-[ -e /root/.bash_profile ] || printf '%s\n' "# bash login shells (the Ubuntu demo); Alpine's sh reads ~/.profile instead." \
-	'[ -f ~/.bashrc ] && . ~/.bashrc' > /root/.bash_profile
+[ -e /root/.bash_profile ] || grep -qs bashrc /root/.profile ||
+	printf '%s\n' "# bash login shells (the Ubuntu demo); Alpine's sh reads ~/.profile instead." \
+		'[ -f ~/.bashrc ] && . ~/.bashrc' > /root/.bash_profile
 
 . "$R/etc/os-release"
-printf "\n$B%s$N\n" "$PRETTY_NAME (arm64, from cdimage.ubuntu.com) in a chroot on the Alpine guest"
-printf "$D%s$N\n" "Root: $R, $WHERE; home: /root, shared with Alpine." \
+printf "\n$B%s$N\n" "$PRETTY_NAME (arm64, from cdimage.ubuntu.com) in a chroot on the $GUEST guest"
+printf "$D%s$N\n" "Root: $R, $WHERE; home: /root, shared with $GUEST." \
 	"Try: cat /etc/os-release; ldd --version; apt-get update && apt-get install -y htop" \
-	"(apt-get update reads about 20 MB of indexes). exit returns to Alpine."
+	"(apt-get update reads about 20 MB of indexes). exit returns to $GUEST."
 
 # A private mount namespace: the mounts go away when the shell exits.
 exec unshare -m /bin/sh -c '
@@ -134,7 +146,7 @@ export default {
 	// Crafted: a ring with three dots, after Ubuntu's Circle of Friends.
 	icon: { svg: '<circle cx="12" cy="12" r="6.2" fill="none" stroke="currentColor" stroke-width="2.4"/><g stroke="#c34113" stroke-width="1.6"><circle cx="20.6" cy="12" r="2.6"/><circle cx="7.7" cy="19.45" r="2.6"/><circle cx="7.7" cy="4.55" r="2.6"/></g>' },
 	colors: ["#e95420", "#5e2750"],
-	needs: { net: true, alpine: true },
+	needs: { net: true },
 	files: { "ubuntu.sh": { content: UBUNTU_SH, mode: 0o755 } },
 	downloads: [{ url: TARBALL_URL, sha256: SHA256, size: SIZE, path: NAME, unless: `${ROOT_SH}; ${OURS_SH}` }],
 	commands: ["./ubuntu.sh"],

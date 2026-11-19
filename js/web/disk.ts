@@ -3,7 +3,8 @@
 // Browser disks: an image served over HTTP (read lazily with Range
 // requests) under a copy-on-write overlay that is saved in IndexedDB, and
 // the persistent data disk (an ext4 file system kept in IndexedDB).
-import { CowDisk, HttpBase, SparseBase, ZeroBase, type OverlayStore, type StoreIndex } from "../core/block.ts";
+import { BaseDisk, CowDisk, HttpBase, SparseBase, ZeroBase, type OverlayStore, type StoreIndex } from "../core/block.ts";
+import { DistroDisk } from "../core/distro.ts";
 import { decodeKwsparse, gunzipIfNeeded, type KwsparseImage } from "../core/kwsparse.ts";
 
 const BLOCK = 4096;
@@ -130,8 +131,16 @@ export class IdbStore implements OverlayStore {
 	async open(identity: string, { onMismatch = "refuse", write = true }: { onMismatch?: "clear" | "refuse"; write?: boolean } = {}): Promise<StoreIndex> {
 		const res = await this.#run<StoreIndex>(["blocks", "meta"], write ? "readwrite" : "readonly", async (tx) => {
 			const blocks = tx.objectStore("blocks"), meta = tx.objectStore("meta");
-			const [id, init, gen, uid0] = await Promise.all([reqP(meta.get("identity")), reqP(meta.get("initialized")),
+			let [id, init, gen, uid0] = await Promise.all([reqP(meta.get("identity")), reqP(meta.get("initialized")),
 				reqP(meta.get("gen")), reqP(meta.get("uid"))]);
+			// A reset that was cut off before its blocks were deleted (clear()):
+			// the disk is empty, and a writer finishes the job here.
+			if (await reqP(meta.get("reset"))) {
+				if (!write) return { keys: new Set(), initialized: false, gen: 0 };
+				blocks.clear();
+				meta.clear();
+				id = init = gen = uid0 = undefined;
+			}
 			if (id !== undefined && id !== identity) {
 				if (onMismatch !== "clear" || !write) return { keys: new Set(), initialized: !!init, mismatch: String(id) };
 				blocks.clear();
@@ -200,6 +209,7 @@ export class IdbStore implements OverlayStore {
 			meta.put(true, "initialized");
 			meta.put(uid, "uid");
 			meta.delete("gen");
+			meta.delete("reset");
 		});
 		return uid;
 	}
@@ -217,7 +227,14 @@ export class IdbStore implements OverlayStore {
 		return this.#run("blocks", "readonly", (tx) => reqP(tx.objectStore("blocks").count()));
 	}
 
+	/**
+	 * Forget everything. Deleting a large disk's blocks takes a while, and a
+	 * page that reloads meanwhile aborts the transaction, so a marker is
+	 * committed first (a small transaction): open() treats a marked store
+	 * as empty and finishes the deletion.
+	 */
 	async clear(): Promise<void> {
+		await this.#run("meta", "readwrite", (tx) => { tx.objectStore("meta").put(true, "reset"); });
 		await this.#run(["blocks", "meta"], "readwrite", (tx) => {
 			tx.objectStore("blocks").clear();
 			tx.objectStore("meta").clear();
@@ -266,6 +283,22 @@ export async function resetHttpDisk(name: string): Promise<void> {
 	} finally {
 		await s.close();
 	}
+}
+
+/**
+ * A distro image served over HTTP (relative to the page) as the read-only
+ * disk createKernel({ distro }) takes: read lazily with Range requests,
+ * after the prefetch its distro header asks for (`prefetch` overrides it,
+ * false turns it off; HttpBaseOptions.prefetch), which starts here;
+ * nothing kept in IndexedDB, every range checked against the image first
+ * seen (HttpBase strict). For a caller that needs the disk before
+ * booting (snapshotDiskMismatch(); the distro is the snapshot's first disk);
+ * createKernel({ distro: url }) opens it the same way. The disk's `stats`
+ * say what was fetched.
+ */
+export async function openDistroDisk(url: string, { chunkSize, prefetch, log }: { chunkSize?: number; prefetch?: number | false; log?: (msg: string) => void } = {}): Promise<DistroDisk> {
+	const abs = typeof location === "object" && location?.href ? new URL(url, location.href).href : url;
+	return DistroDisk.open(new BaseDisk(await HttpBase.open(abs, { chunkSize, prefetch, log, strict: true })), { name: abs, log });
 }
 
 // ---------------------------------------------------------------------------

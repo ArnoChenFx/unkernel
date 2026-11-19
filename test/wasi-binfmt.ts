@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Prototype check of WASI programs run by the guest on the host's wasm
-// engine (kernel/guest/kwwasi.c, js/core/wasi-exec.ts). Builds kwwasi and
-// the test programs in test/wasi/ with zig (aarch64-linux-musl and
-// wasm32-wasi), mounts them in the guest, copies kwwasi to /usr/bin,
-// registers it with the guest's binfmt_misc (an image built with kwwasi
-// does that at boot), and runs the programs by path.
+// engine (guest/src/kwwasi.c, js/core/wasi-exec.ts), on Alpine. Builds
+// kwwasi and the test programs in test/wasi/ with zig (aarch64-linux-musl
+// and wasm32-wasi), mounts them in the guest, copies kwwasi to /usr/bin,
+// registers it with the guest's binfmt_misc (the kw layer does that at
+// boot), and runs the programs by path.
 //
 //   node test/wasi-binfmt.ts [--worker] [--messages]
 //   --messages                      requests as messages and JSPI (the fallback),
 //                                   not through a SharedArrayBuffer
 //   UNKERNEL_TEST_KERNEL=path ...   another bundle instead of the bundled kernel
+//   UNKERNEL_TEST_DISTRO_DIR=dir    where alpine.erofs is (default vendor/build/distro)
 //   UNKERNEL_TEST_CPUS=n ...        CPUs for an SMP kernel (implies a worker)
 //
 // Exit 0 when every check passes. It checks argv[0], paths against the cwd
@@ -29,7 +30,7 @@
 // of its own on kwwasi's port checks kwwasi's side of the protocol's ends.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,13 +40,18 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const worker = process.argv.includes("--worker");
 const messages = process.argv.includes("--messages");
 const kernel = process.env.UNKERNEL_TEST_KERNEL ? path.resolve(process.env.UNKERNEL_TEST_KERNEL) : undefined;
+const distro = path.join(path.resolve(process.env.UNKERNEL_TEST_DISTRO_DIR ?? path.join(root, "vendor/build/distro")), "alpine.erofs");
+if (!existsSync(distro)) {
+	console.log(`FAIL: no ${distro} (kernel/build.sh distro alpine)`);
+	process.exit(1);
+}
 const cpus = Number(process.env.UNKERNEL_TEST_CPUS) || undefined;
 const zig = process.env.ZIG ?? "zig";
 
 const dir = mkdtempSync(path.join(tmpdir(), "kwwasi-"));
 const cc = (target: string, src: string, out: string, flags: string[] = []) =>
 	execFileSync(zig, ["cc", "-target", target, "-O2", "-s", ...(target.startsWith("aarch64") ? ["-mcpu=generic", "-static"] : []), ...flags, "-o", path.join(dir, out), src]);
-cc("aarch64-linux-musl", path.join(root, "kernel/guest/kwwasi.c"), "kwwasi");
+cc("aarch64-linux-musl", path.join(root, "guest/src/kwwasi.c"), "kwwasi");
 for (const t of ["hello", "cat", "ls", "loop", "trap", "calls", "put"]) cc("wasm32-wasi", path.join(root, "test/wasi", `${t}.c`), `${t}.wasm`);
 cc("wasm32-wasi", path.join(root, "test/wasi/p0.c"), "p0.wasm", ["-nostdlib", "-fno-builtin"]);
 // Two modules of the same size that print different things.
@@ -55,7 +61,7 @@ cc("aarch64-linux-musl", path.join(root, "test/wasi/loop.c"), "loop.a64");
 
 const mounts = () => ({ "/mnt/kw": { fs: nodeFs(dir), readOnly: true } });
 const hostLog = (m: string) => process.stderr.write(`${m}\n`);
-const vm = await createKernel({ kernel, worker, cpus, log: () => {}, mounts: mounts() });
+const vm = await createKernel({ kernel, distro, worker, cpus, log: () => {}, mounts: mounts() });
 const serve = (v: typeof vm, opts: { idleWorkers?: number } = {}) => serveWasiPrograms(v.vsock!, { log: hostLog, sharedMemory: !messages, ...opts });
 let wasi = serve(vm);
 assert.equal(wasi.shared, !messages);
@@ -425,7 +431,7 @@ async function snapshotCheck() {
 	console.log(`ok   snapshot with three programs running, in ${((performance.now() - t) / 1000).toFixed(2)} s`);
 	await until(() => old.stats.running === 0 && old.stats.workers === 0 && old.stats.channels === 0, 2000, "the stopped machine's program workers to end");
 	console.log(`ok   the stopped machine's program workers ended (stats ${JSON.stringify(old.stats)})`);
-	const vm2 = await createKernel({ kernel, worker, log: () => {}, ...(worker ? {} : { mounts: mounts() }), restore: snap });
+	const vm2 = await createKernel({ kernel, distro, worker, log: () => {}, ...(worker ? {} : { mounts: mounts() }), restore: snap });
 	try {
 		wasi = serve(vm2);
 		for (let i = 0; ; i++) {

@@ -6,6 +6,7 @@
 // results.
 //
 //   node test/9p-bench.ts [--worker] [--no-jit] [--node] [--quick]
+//   UNKERNEL_TEST_KERNEL=path ...   another bundle instead of the bundled kernel
 //
 // --node serves a temp directory through nodeFs() instead of a MemoryFs.
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -46,7 +47,7 @@ function makeFs(): Fs {
 }
 
 const t0 = performance.now();
-const vm = await createKernel({ worker, jit, log: () => {} });
+const vm = await createKernel({ kernel: process.env.UNKERNEL_TEST_KERNEL || undefined, worker, jit, log: () => {} });
 const sh = async (cmd: string) => {
 	const t = performance.now();
 	const r = await vm.exec("sh", ["-c", cmd]);

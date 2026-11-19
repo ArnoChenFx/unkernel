@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Unit tests for the kwtty client (core/tty.ts) without a kernel: a fake
 // Vsock whose connect() returns a connection made of in-memory web
-// streams, and a small stand-in for the guest server (kernel/guest/kwtty.c)
+// streams, and a small stand-in for the guest server (guest/src/kwtty.c)
 // that decodes the host's frames with its own code.
 //
 //   node --test test/tty.test.ts

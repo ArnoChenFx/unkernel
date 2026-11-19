@@ -21,6 +21,7 @@ import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStat
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
 import { NetStack, type NetBackend, type NetStats } from "./net.ts";
 import { buildDisks, buildNet, isNetSpec, type DeviceRegistry, type DiskSpec, type NetSpec, type SkippedDisk } from "./devices.ts";
+import { openDistro, type DistroInfo, type DistroSource } from "./distro.ts";
 import { ConsoleOutput } from "./output.ts";
 import type { KernelSnapshot } from "./snapshot.ts";
 import { checkWorkerOptions, createKernelInWorker, type WorkerKernel } from "./worker-host.ts";
@@ -65,8 +66,9 @@ export interface CreateKernelOptions {
 	restore?: KernelSnapshot;
 	/**
 	 * The kernel: a URL (a path or file: URL on Node), bytes, a Response or
-	 * a compiled WebAssembly.Module. Default: the bundled Alpine kernel
-	 * (unkernel-alpine.wasm next to the entry).
+	 * a compiled WebAssembly.Module. Default: the bundled kernel
+	 * (unkernel.wasm next to the entry: the kernel and the base initramfs,
+	 * which boots `distro`, or without one the base shell).
 	 */
 	kernel?: KernelSource;
 	/**
@@ -94,6 +96,25 @@ export interface CreateKernelOptions {
 	 * and closes at exit. Worker mode takes specs only.
 	 */
 	disks?: Array<BlockDevice | DiskSpec>;
+	/**
+	 * A distro image for the base initramfs of the bundled kernel
+	 * (unkernel.wasm, which mounts the disk labelled kwroot read-only under
+	 * the root overlay and runs its /sbin/init; without one it starts a
+	 * base shell: busybox, the kw tools, kwtty): an erofs or ext4 image, attached read-only as the first
+	 * disk (/dev/wda), before `disks` (whose indices, as in DiskState,
+	 * onDiskError and WorkerKernel.detachDisk(), stay those of `disks`). A
+	 * path or file: URL (Node), an http(s) URL served with Range support,
+	 * read lazily and never cached across sessions (browsers: relative to
+	 * the page), a disk spec (made read-only: { kind: "file", path } on
+	 * Node, { kind: "http", url }), or a BlockDevice (inline only; wrapped
+	 * read-only). The guest never writes it. In a snapshot it is the first
+	 * disk, identified by its content (DistroDisk). Needs an initramfs: the
+	 * bundled one by default, or `initrd`, unless `cmdline` is given. On
+	 * Node, fetchDistro("alpine") gives the path of a named one (from the
+	 * release of the package's version, downloaded once); in browsers, pass
+	 * the URL of an image you host.
+	 */
+	distro?: DistroSource;
 	/**
 	 * Network: a NetBackend (wrapped in a NetStack), a NetStack, any
 	 * NetDevice, or a spec ({ kind: "net", backend: { kind: "direct" } } on
@@ -286,6 +307,8 @@ export interface Platform {
 	absoluteUrl?: (src: string) => string | undefined;
 	/** The device kinds this platform builds from specs (devices.ts). */
 	devices?: DeviceRegistry;
+	/** A distro path or URL as a read-only disk spec (Node: a file or an http(s) URL; browsers: an absolute http(s) URL). */
+	distroSpec?: (src: string | URL) => DiskSpec;
 }
 
 /**
@@ -295,6 +318,8 @@ export interface Platform {
 export interface KernelHandle {
 	/** The command line it booted with. */
 	readonly cmdline: string;
+	/** The distro image (the `distro` option) as the host read it, or undefined. */
+	readonly distro: DistroInfo | undefined;
 	/** Settles when the kernel exits: halt (power off 0, halt 1, restart 2), panic 253, trap 254, fatal 255, or stop(). */
 	readonly exited: Promise<ExitResult>;
 	/** Console output as a stream: the first access gets everything since boot (the last 1 MiB); closes at exit. */
@@ -401,6 +426,8 @@ export class KernelInstance implements KernelHandle {
 	readonly cmdline: string;
 	/** The network device, if any. */
 	readonly net: NetDevice | undefined;
+	/** The distro image (the `distro` option) as the host read it, or undefined. */
+	distro: DistroInfo | undefined = undefined;
 	/** Disks whose spec was optional and could not be built, and why. */
 	skippedDisks: SkippedDisk[] = [];
 	/** Disks built from specs: the instance closes them at exit. */
@@ -739,9 +766,21 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	const initrd = initrdBytes === undefined ? bundled.initrd ?? null : initrdBytes;
 	const log = opts.log ?? ((m: string) => console.error(m));
 	const devCtx = { module, log, onDiskError: (i: number, e: unknown) => { try { opts.onDiskError?.(i, e); } catch {} } };
+	if (opts.distro !== undefined && !initrd && opts.cmdline === undefined && !opts.restore)
+		throw new BootError("boot", "distro: the kernel has no initramfs to mount it (use the bundled kernel, unkernel.wasm, or pass initrd or cmdline)");
+	const distro = opts.distro === undefined ? undefined : await openDistro(opts.distro, platform.devices, devCtx, platform.distroSpec);
 	const items = opts.disks ?? [];
-	const { disks, skipped } = await buildDisks(items, platform.devices, devCtx);
-	const owned = disks.filter((d) => !items.includes(d));
+	let built: Awaited<ReturnType<typeof buildDisks>>;
+	try {
+		built = await buildDisks(items, platform.devices, devCtx);
+	} catch (e) {
+		if (distro?.owned) distro.disk.close();
+		throw e;
+	}
+	const { skipped } = built;
+	const owned = built.disks.filter((d) => !items.includes(d));
+	if (distro?.owned) owned.push(distro.disk);
+	const disks = distro ? [distro.disk, ...built.disks] : built.disks;
 	const cmdline = opts.cmdline ?? (initrdBytes === undefined && bundled.initrd && bundled.cmdline ? bundled.cmdline
 		: disks.length && !initrd ? "console=hvc0 root=/dev/wda rw" : "console=hvc0 rdinit=/init");
 
@@ -796,6 +835,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	instance = new KernelInstance(kernel, module, cmdline, net, compileMs);
 	if (vsock) instance.attachVsock(vsock);
 	instance.skippedDisks = skipped;
+	instance.distro = distro?.disk.info;
 	instance.own(owned);
 	if (opts.consoleSize) kernel.setConsoleSize(opts.consoleSize.cols, opts.consoleSize.rows);
 	let rest = mounts;

@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The public createKernel() API on the bundled Alpine kernel, inline and
-// (where marked) also with `worker: true`, whose input and frames go through
-// shared memory on Node unless `shared: false` (marked "worker, messages").
+// The public createKernel() API on the bundled kernel (unkernel.wasm), inline
+// and (where marked) also with `worker: true`, whose input and frames go
+// through shared memory on Node unless `shared: false` (marked "worker,
+// messages"). Most tests boot it without a distro, into the base
+// shell (busybox and the kw tools); those marked "Alpine" boot the Alpine
+// image and skip when it is not built.
 //
 //   node --test test/api.test.ts                       # from source (js/node.ts)
 //   UNKERNEL_DIST=1 node --test test/api.test.ts       # the built package ("unkernel" -> dist/)
 //   UNKERNEL_TEST_WISP=1 ...                           # also the default Wisp server (internet)
 //   UNKERNEL_TEST_KERNEL=path ...                      # another bundle instead of the bundled kernel
+//   UNKERNEL_TEST_DISTRO_DIR=dir ...                   # where alpine.erofs is (default vendor/build/distro)
 //   UNKERNEL_TEST_CPUS=n ...                           # CPUs for an SMP kernel under test (snapshot tests skipped)
 //   UNKERNEL_TEST_CONCURRENCY=n ...                    # tests at once (default: the number of cores; 1 = in order)
 //
@@ -35,11 +39,17 @@ const kernelFile = testKernel ?? fileURLToPath(bundledKernelUrl);
 const testCpus = Number(process.env.UNKERNEL_TEST_CPUS) || undefined;
 const noSnapshots = (testCpus ?? 1) > 1 && "SMP: no snapshots";
 
-const PROMPT = /⇒/; // Alpine's shell prompt (kernel/guest/alpine.sh)
+/** The shell prompts: the base shell's (guest/base/initramfs/etc/profile), Alpine's (guest/distro/alpine/rootfs). */
+const PROMPT = /base\x1b\[0m \S* # |⇒/;
 const CONCURRENCY = Number(process.env.UNKERNEL_TEST_CONCURRENCY) || availableParallelism();
 
 /** Does the kernel under test have kwvsock (net/vmw_vsock/kwvsock.c) and kwshm (drivers/misc/kwshm.c)? */
 const kernelBytes = readFileSync(kernelFile);
+/** The Alpine image for the tests that need a distro (erofs if the kernel has it, else ext4), or a reason to skip them. */
+const distroDir = path.resolve(process.env.UNKERNEL_TEST_DISTRO_DIR ?? fileURLToPath(new URL("../vendor/build/distro/", import.meta.url)));
+const alpine = (kernelBytes.includes("cannot find valid erofs superblock") ? ["erofs", "ext4"] : ["ext4", "erofs"])
+	.map((f) => path.join(distroDir, `alpine.${f}`)).find((f) => existsSync(f));
+const noAlpine = !alpine && `no ${path.join(distroDir, "alpine.erofs")} (kernel/build.sh distro alpine)`;
 const kernelImports = WebAssembly.Module.imports(await WebAssembly.compile(kernelBytes));
 /** 9p adds no import; its client's version string is in the kernel only with NET_9P (kw_defconfig). */
 const kernelHas9p = kernelBytes.includes("9P2000.L");
@@ -114,7 +124,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			onOutput: (b) => router.write(b), consoleSize: { cols: 100, rows: 30 },
 		}));
 
-		test("boots the bundled Alpine without a network and runs a command", async () => {
+		test("boots the bundled kernel's base shell without a network and runs a command", async () => {
 			const { vm, s, waitFor } = k;
 			assert.equal(vm.transport, transport);
 			assert.equal("kernel" in vm, !worker, "the low-level kernel only inline");
@@ -127,7 +137,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.match(s.text, /Linux version/, "the stream starts at the first byte");
 			const at = s.text.length;
 			vm.write("uname -m; nproc; ls /sys/class/net | cat\n");
-			await waitFor(/aarch64[\s\S]*⇒/, at);
+			await waitFor(new RegExp(`aarch64[\\s\\S]*(?:${PROMPT.source})`), at);
 			const out = s.text.slice(at);
 			// stats().cpus: the CPUs the kernel got, which the guest sees (UNKERNEL_TEST_CPUS on an SMP kernel).
 			const cpus = vm.stats().cpus;
@@ -264,13 +274,13 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm.exited).code, 253);
 	});
 
-	for (const { worker, shared, name } of TRANSPORTS) test(`display, evdev and sound: glimmer --test draws a frame of the size offered, reads a key, plays PCM; mode changes reported (${name})`, async (t) => {
+	for (const { worker, shared, name } of TRANSPORTS) test(`display, evdev and sound: glimmer --test draws a frame of the size offered, reads a key, plays PCM; mode changes reported (Alpine, ${name})`, { skip: noAlpine }, async (t) => {
 		type Mode = { width: number; height: number; stride: number } | null;
 		const modes: Mode[] = [], inputs: string[] = [], events: string[] = [];
 		const chunks: Array<{ rate: number; channels: number; format: number; frames: number }> = [];
 		let size = { width: 320, height: 240 };
 		const vm = await boot(t, {
-			worker, shared, log: () => {},
+			worker, shared, log: () => {}, distro: alpine!, // glimmer comes with the distro images
 			display: () => size,
 			onDisplay: (m) => modes.push(m && { width: m.width, height: m.height, stride: m.stride }),
 			onInput: (st) => inputs.push(`${+st.keyboard}${+st.mouse}${+st.tablet}`),
@@ -334,8 +344,8 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.ok(st.sound && st.sound.frames === 66150, JSON.stringify(st.sound));
 	});
 
-	for (const shared of [true, false]) test(`worker mode with a busy guest (${shared ? "shared memory" : "messages"}): 150 KB of console input arrives whole and in order; readFrame() and keys while it runs`, async (t) => {
-		const vm = await boot(t, { worker: true, shared, log: () => {}, display: { width: 320, height: 240 } });
+	for (const shared of [true, false]) test(`worker mode with a busy guest (${shared ? "shared memory" : "messages"}): 150 KB of console input arrives whole and in order; readFrame() and keys while it runs (Alpine)`, { skip: noAlpine }, async (t) => {
+		const vm = await boot(t, { worker: true, shared, log: () => {}, distro: alpine!, display: { width: 320, height: 240 } });
 		assert.equal(vm.transport, shared ? "shared" : "messages");
 		const { s, waitFor } = screen(vm);
 		await waitFor(PROMPT);
@@ -434,116 +444,6 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.equal((await vm.exited).code, 0);
 			disk?.close();
 			if (vm instanceof sdk.WorkerKernel) assert.ok(vm.disks[0]!.flushSeq > 0 && vm.stats().block.flushes > 0, "the final snapshot has the flushes");
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-
-	test("data disk of another guest architecture: reset once with a message, keeping only /root, also after a cut-off reset; a disk of this one is kept (kernel/guest/kw-data.sh)", async (t) => {
-		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
-		try {
-			const module = await WebAssembly.compile(readFileSync(kernelFile));
-			const file = path.join(dir, "data.img");
-			await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
-			const RESET = /kw-data: RESET: Installed packages and system changes were reset \(this disk was written by the (\w+) guest, the guest is now (\w+)\)\.( \/root was kept\.)?\n/;
-			/** One boot (kw.root=initramfs with `plain`): run `cmd` at the prompt, power off; the console and the command's output. */
-			const run = async (cmd: string, plain = false) => {
-				const disk = new FileDisk(file);
-				const vm = await boot(t, { kernel: module, disks: [disk], log: () => {},
-					...(plain ? { cmdline: "console=hvc0 rdinit=/init kw.root=initramfs" } : {}) });
-				const { s, waitFor } = screen(vm);
-				await waitFor(PROMPT);
-				const at = s.text.length;
-				vm.write(`${cmd}; echo ran-$((6*7))\n`);
-				await waitFor(/ran-42/, at);
-				const clean = (x: string) => x.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "");
-				const out = clean(s.text.slice(at));
-				vm.write("poweroff\n");
-				assert.equal((await vm.exited).code, 0);
-				disk.close();
-				return { console: clean(s.text.slice(0, at)), out };
-			};
-			const list = "echo ls: $(ls -A /data | tr '\\n' ' '); echo arch: $(cat /data/.kw-arch 2>/dev/null)";
-			// Root's home as the merged root shows it: names, modes, owners, types, contents, the link's target.
-			const home = "echo B-$((40+2)); cd /root && find . ! -name .ash_history | sort | while read -r f; do stat -c '%n %a %u:%g %F' \"$f\"; done; " +
-				"cat sub/deep/f.txt .dotfile; readlink link; cd /; echo E-$((40+2))";
-			const homeOf = (out: string) => /B-42\n([^]*?)E-42/.exec(out)?.[1];
-			const pkgs = "echo pkgs: $(apk info 2>/dev/null | sort | tr '\\n' ' ')";
-			const pkgsOf = (out: string) => /^pkgs: (.*)$/m.exec(out)?.[1];
-			const gone = "for f in /etc/kw-test.conf /home/alice /usr/bin/kw-pkg /usr/lib/kw-pkg /data/mine; do [ -e $f ] && echo left: $f; done";
-
-			// A new disk is adopted and marked. On it: a home with a nested directory, a symlink, a dotfile (another
-			// owner) and modes; changes outside /root (/etc, /home, a package's files), a directory at the top of
-			// /data, and the apk database of the other architecture, with the marker removed.
-			let r = await run(`${list}; echo this: $(cat /etc/apk/arch); ${pkgs}; ` +
-				"mkdir -p /root/sub/deep && echo deep > /root/sub/deep/f.txt && chmod 750 /root/sub && echo dot > /root/.dotfile && chmod 600 /root/.dotfile && " +
-				"chown 1:1 /root/.dotfile && ln -s sub/deep/f.txt /root/link && echo run > /root/run.sh && chmod 755 /root/run.sh; " +
-				"echo etc > /etc/kw-test.conf; mkdir -p /home/alice /usr/lib/kw-pkg && echo a > /home/alice/a && echo bin > /usr/bin/kw-pkg && mkdir /data/mine; " +
-				`${home}; rm /data/.kw-arch; printf 'P:musl\\nV:1\\nA:%s\\n\\n' $OTHER > /lib/apk/db/installed; sync`
-					.replace("$OTHER", "$(case $(cat /etc/apk/arch) in riscv64) echo aarch64 ;; *) echo riscv64 ;; esac)"));
-			const arch = /this: (\w+)/.exec(r.out)?.[1]!, other = arch === "riscv64" ? "aarch64" : "riscv64";
-			assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`), "a new disk is marked at its first boot");
-			assert.doesNotMatch(r.console, /kw-data:/);
-			const image = pkgsOf(r.out), saved = homeOf(r.out);
-			assert.ok(image && /busybox/.test(image), r.out);
-			assert.ok(saved, r.out);
-			assert.match(saved, /^\. 700 0:0 directory\n\.\/\.dotfile 600 1:1 regular file\n\.\/link 777 0:0 symbolic link\n\.\/run\.sh 755 0:0 regular file\n\.\/sub 750 0:0 directory\n\.\/sub\/deep 755 0:0 directory\n\.\/sub\/deep\/f\.txt 644 0:0 regular file\ndeep\ndot\nsub\/deep\/f\.txt\n$/);
-			/** The checks after each reset: the message (with /root kept), only the overlay and the marker on /data, the same home. */
-			const resetKept = (r: { console: string; out: string }, what: string) => {
-				assert.deepEqual(RESET.exec(r.console)?.slice(1), [other, arch, " /root was kept."], `${what}: ${r.console.slice(-800)}`);
-				assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`), what);
-				assert.equal(homeOf(r.out), saved, `${what}: /root as it was`);
-			};
-
-			// kw.root=initramfs leaves it as it was and says so. Then cut a reset off after its first move (the
-			// overlay, home and all, set aside; /data/mine not yet).
-			r = await run(`${list}; mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && sync`, true);
-			assert.match(r.console, new RegExp(`kw-data: this disk was written by the ${other} guest, the guest is now ${arch}: installed packages and system changes are reset \\(/root is kept\\) at the next boot without kw\\.root=initramfs`));
-			assert.match(r.out, /ls: lost\+found mine overlay\narch:\n/);
-
-			// The next boot finishes the reset: /root is back, the rest is gone, apk has the image's packages.
-			r = await run(`${list}; ${home}; ${gone}; ${pkgs}; echo etc2 > /etc/kw-test.conf`);
-			resetKept(r, "cut after the first move");
-			assert.doesNotMatch(r.out, /^left: /m);
-			assert.equal(pkgsOf(r.out), image, "apk's database is the image's");
-
-			// Cut off after the home was moved back into a new upper layer, before the marker.
-			await run(`mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && mkdir -p /data/overlay/upper && ` +
-				"mv /data/.kw-reset/0/overlay/upper/root /data/overlay/upper/ && rm /data/.kw-arch && sync", true);
-			r = await run(`${list}; ${home}; ${gone}; mkdir -p /data/.kw-reset/0/x && echo ${other} > /data/.kw-reset/from && echo keep > /data/keep.txt && sync`);
-			resetKept(r, "cut after the home was back");
-			assert.doesNotMatch(r.out, /^left: /m, "/etc/kw-test.conf of the boot before is gone");
-
-			// Cut off after the marker (above): only the set-aside directory goes. Then one cut off after the new upper
-			// layer was made, before the home was moved into it.
-			r = await run(`${list}; ${home}; cat /data/keep.txt`);
-			assert.deepEqual(RESET.exec(r.console)?.slice(1), [other, arch, " /root was kept."]);
-			assert.match(r.out, new RegExp(`ls: \\.kw-arch keep\\.txt lost\\+found overlay\\narch: ${arch}\\n`));
-			assert.equal(homeOf(r.out), saved);
-			await run(`mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && mkdir -p /data/overlay/upper && rm /data/.kw-arch && sync`, true);
-			r = await run(`${list}; ${home}; echo ${other} > /data/.kw-arch; sync`);
-			resetKept(r, "cut before the home was back");
-
-			// A marker naming the other architecture resets, keeping /root.
-			r = await run(`${list}; ${home}; echo same > /etc/kw-same.conf; rm /data/.kw-arch; cp /bin/busybox /usr/bin/kw-elf; sync`);
-			resetKept(r, "marker of the other architecture");
-
-			// A disk of this architecture (here unmarked, with an ELF file of this one) keeps its changes. Then the
-			// home in the upper layer becomes a whiteout and an ELF file of the other architecture appears.
-			r = await run(`${list}; ${home}; cat /etc/kw-same.conf`);
-			assert.doesNotMatch(r.console, /kw-data:/);
-			assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`));
-			assert.equal(homeOf(r.out), saved);
-			assert.match(r.out, /\nsame\n/);
-			await run(`rm -rf /data/overlay/upper/root /data/.kw-arch && mknod /data/overlay/upper/root c 0 0 && ` +
-				`printf '\\177ELF\\2\\1\\1\\0\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\${other === "riscv64" ? "363" : "267"}\\0' > /data/overlay/upper/usr/bin/kw-elf; sync`, true);
-			r = await run(`${list}; ls -A /root | grep -v ash_history; echo root-$(stat -c %F /root)`);
-			const m = RESET.exec(r.console);
-			assert.deepEqual(m?.slice(1), [other, arch, undefined], "nothing to keep: no /root was kept");
-			assert.match(r.out, /\nroot-directory\n/, "/root is the image's again");
-			assert.doesNotMatch(r.out, /run\.sh|\.dotfile|sub/);
-			r = await run(list);
-			assert.doesNotMatch(r.console, /kw-data:/, "once");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -694,7 +594,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm.stop();
 	});
 
-	/** FNV-1a 32, as kernel/guest/kwshm.c prints it. */
+	/** FNV-1a 32, as guest/src/kwshm.c prints it. */
 	const fnv32 = (b: Uint8Array) => {
 		let h = 2166136261;
 		for (let i = 0; i < b.length; i++) h = Math.imul(h ^ b[i]!, 16777619);
@@ -1024,7 +924,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		});
 	});
 
-	// Host file systems (js/core/9p.ts, mounts.ts; kernel/guest/kw9p.c): 9p over vsock, mounted through kwtty.
+	// Host file systems (js/core/9p.ts, mounts.ts; guest/src/kw9p.c): 9p over vsock, mounted through kwtty.
 	for (const { worker, name } of MODES) describe(`host file systems over 9p, one kernel (${name})`,
 		{ concurrency: 1, skip: (!kernelHasVsock && "the kernel under test has no kwvsock") || (!kernelHas9p && "the kernel under test has no 9p") }, () => {
 		let reads = 0, bigReads = 0, closes = 0;
@@ -1158,15 +1058,15 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			mkdirSync(path.join(scratch, "sub"));
 			writeFileSync(path.join(scratch, "sub", "h.txt"), "host file\n");
 			writeFileSync(Buffer.concat([Buffer.from(path.join(scratch, "bad-")), Buffer.from([0xff])]), "not utf-8\n");
-			symlinkSync("/etc/hostname", path.join(scratch, "abs-link"));
+			symlinkSync("/tmp/kw-link-target", path.join(scratch, "abs-link"));
 			const m = await k.vm.mount("/work", nodeFs(scratch));
 			await assert.rejects(k.vm.mount("/work", { a: "b" }), (e: Error & { code?: string }) => e.name === "MountError" && e.code === "EBUSY");
 			await assert.rejects(k.vm.mount("/proc", { a: "b" }), (e: Error & { code?: string }) => e.code === "EBUSY" && /already a mount point/.test(e.message), "a guest mount point");
-			await assert.rejects(k.vm.mount("/etc/hostname", { a: "b" }), (e: Error & { code?: string }) => e.code === "ENOTDIR");
-			const r = await sh("cat /work/sub/h.txt; readlink /work/abs-link; cat /work/abs-link; ls /work; echo made > /work/sub/g.txt; mkdir /work/nd; ln -s sub/g.txt /work/gl; mv /work/sub/g.txt /work/nd/g.txt; fsync /work/nd || echo fsync of a directory failed; ls -i /work/sub | awk '{print $1}'; stat -c %i /work/sub/h.txt");
+			await assert.rejects(k.vm.mount("/etc/passwd", { a: "b" }), (e: Error & { code?: string }) => e.code === "ENOTDIR");
+			const r = await sh("echo guest-target > /tmp/kw-link-target; cat /work/sub/h.txt; readlink /work/abs-link; cat /work/abs-link; ls /work; echo made > /work/sub/g.txt; mkdir /work/nd; ln -s sub/g.txt /work/gl; mv /work/sub/g.txt /work/nd/g.txt; fsync /work/nd || echo fsync of a directory failed; ls -i /work/sub | awk '{print $1}'; stat -c %i /work/sub/h.txt");
 			assert.equal(r.code, 0, r.err);
 			const lines = r.out.split("\n");
-			assert.deepEqual(lines.slice(0, 3), ["host file", "/etc/hostname", (await sh("cat /etc/hostname")).out], "the guest resolves a symlink in its own tree");
+			assert.deepEqual(lines.slice(0, 3), ["host file", "/tmp/kw-link-target", "guest-target"], "the guest resolves a symlink in its own tree");
 			assert.deepEqual(lines.slice(3, 5), ["abs-link", "sub"], "the name that is not UTF-8 is left out");
 			assert.equal(lines.at(-2), lines.at(-1), "ls -i shows stat's inode number");
 			assert.equal(readFileSync(path.join(scratch, "nd", "g.txt"), "utf8"), "made\n");
@@ -1215,9 +1115,9 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		{ skip: (!kernelHasVsock && "the kernel under test has no kwvsock") || (!kernelHas9p && "the kernel under test has no 9p") }, async (t) => {
 		await assert.rejects(createKernel({ kernel: testKernel, vsock: false, mounts: { "/m": { a: "b" } } }), (e: Error & { code?: string }) => e.name === "MountError" && e.code === "ENODEV");
 		const logs: string[] = [];
-		const vm = await boot(t, { log: (m) => logs.push(m), mounts: { "/etc/hostname": { a: "b" }, "/good": { "g.txt": "good" } } });
+		const vm = await boot(t, { log: (m) => logs.push(m), mounts: { "/etc/passwd": { a: "b" }, "/good": { "g.txt": "good" } } });
 		await assert.rejects(vm.exec("true"), (e: Error & { code?: string }) => e.name === "MountError" && e.code === "ENOTDIR");
-		assert.ok(logs.some((l) => /mount \/etc\/hostname/.test(l)), "logged too");
+		assert.ok(logs.some((l) => /mount \/etc\/passwd/.test(l)), "logged too");
 		assert.equal((await vm.exec("cat", ["/good/g.txt"])).stdout, "good");
 	});
 
@@ -1239,7 +1139,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		return { st, waitFor, done };
 	};
 
-	// kwtty (kernel/guest/kwtty.c, js/core/tty.ts): terminal sessions over vsock, each with its own pty.
+	// kwtty (guest/src/kwtty.c, js/core/tty.ts): terminal sessions over vsock, each with its own pty.
 	for (const { worker, name } of MODES) describe(`terminal sessions over vsock (kwtty), one kernel (${name})`,
 		{ concurrency: 1, skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, () => {
 		const k = sharedKernel(() => ({ worker, log: () => {} })); // vsock is on by default
@@ -1399,44 +1299,6 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			await assert.rejects(k.vm.exec("/no/such/program"), (e: Error & { code?: string }) => e.code === "EREMOTE" && /exec \/no\/such\/program/.test(e.message));
 		});
 
-		test("PATH: ~/.local/bin, then /etc/profile's, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
-			const want = "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n";
-			assert.equal((await k.vm.exec("sh", ["-c", 'echo "$PATH"'])).stdout, want);
-			assert.equal((await k.vm.exec("sh", ["-lc", 'echo "$PATH"'])).stdout, want);
-		});
-
-		test("the page's stand-ins (web/src/shims.ts): written once, replaced only by a newer one, never over a program; without a network one exits 127 and installs nothing", async () => {
-			const texts = {
-				shim: readFileSync(new URL("../web/src/kw-shim.sh", import.meta.url), "utf8"),
-				pathSh: readFileSync(new URL("../kernel/guest/kw-path.sh", import.meta.url), "utf8"),
-			};
-			const write = async (t = texts) => {
-				const { args, input } = shimsExec(t);
-				const r = await k.vm.exec("/bin/sh", args, { input });
-				assert.equal(r.exitCode, 0, r.stderr);
-				return r.stdout;
-			};
-			const bin = "/root/.local/bin";
-			await k.vm.exec("rm", ["-rf", "/root/.local"]);
-			// The image has /etc/profile.d/kw-path.sh, so only the stand-ins are written.
-			assert.equal(await write(), SHIM_TOOLS.map((n) => `${bin}/${n}\n`).join(""));
-			assert.equal(await write(), "");
-			for (const n of SHIM_TOOLS) {
-				const r = await k.vm.exec("sh", ["-c", `head -n 2 ${bin}/${n}; test -x ${bin}/${n} && sh -n ${bin}/${n} && grep -c '^tool=${n}$' ${bin}/${n}`]);
-				assert.equal(r.stdout, "#!/bin/sh\n# kw-shim 1\n1\n", r.stderr);
-			}
-			// A program in place of a stand-in (a symlink here) stays; a newer stand-in replaces older ones.
-			await k.vm.exec("ln", ["-sf", "/bin/busybox", `${bin}/claude`]);
-			assert.equal(await write({ ...texts, shim: texts.shim.replace(/^# kw-shim \d+$/m, "# kw-shim 999") }), `${bin}/fx\n${bin}/opencode\n`);
-			assert.equal((await k.vm.exec("readlink", [`${bin}/claude`])).stdout, "/bin/busybox\n");
-			// No network in this suite: found through kwtty's PATH, the first call exits 127 and leaves only the stand-ins.
-			const r = await k.vm.exec("fx", ["--version"]);
-			assert.equal(r.exitCode, 127);
-			assert.match(r.stderr, /^fx: not installed yet, and installing it needs a network/);
-			assert.equal((await k.vm.exec("sh", ["-c", "ls -A /root/.local /root/.local/bin"])).stdout, "/root/.local:\nbin\n\n/root/.local/bin:\nclaude\nfx\nopencode\n");
-			await k.vm.exec("rm", ["-rf", "/root/.local"]);
-		});
-
 		test("exec(): binary output byte for byte, input through stdin then EOF, 300 KB each way", async () => {
 			const bin = await k.vm.exec("printf", ["\\000\\377\\r\\n\\200"], { encoding: "buffer" });
 			assert.deepEqual([...bin.stdout], [0, 255, 13, 10, 128]);
@@ -1586,6 +1448,63 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		});
 	});
 
+	// A distro root (guest/distro/alpine, the kw layer of guest/base/rootfs on top): what only a full userland has.
+	describe("Alpine, one kernel", { concurrency: 1, skip: noAlpine || (!kernelHasVsock && "the kernel under test has no kwvsock") }, () => {
+		const alp = sharedKernel(() => ({ distro: alpine!, log: () => {} }));
+
+		test("boots the Alpine image under the overlay root, with the kw layer on top", async () => {
+			const r = await alp.vm.exec("sh", ["-c", "cat /etc/alpine-release /usr/lib/kw-distro; apk --version; grep ' / ' /proc/self/mounts; command -v kwtty"]);
+			assert.equal(r.exitCode, 0, r.stderr);
+			assert.match(r.stdout, /^\d+\.\d+\.\d+\nalpine\napk-tools \S+/);
+			assert.match(r.stdout, /^overlay \/ overlay .*lowerdir=\/kw\/layer:\/kw\/distro/m);
+			assert.match(r.stdout, /\/usr\/bin\/kwtty$/m);
+			assert.equal(alp.vm.distro?.label, "kwroot");
+		});
+
+		test("PATH: ~/.local/bin, then /etc/profile's, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
+			const want = "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n";
+			assert.equal((await alp.vm.exec("sh", ["-c", 'echo "$PATH"'])).stdout, want);
+			assert.equal((await alp.vm.exec("sh", ["-lc", 'echo "$PATH"'])).stdout, want);
+		});
+
+		test("the page's stand-ins (web/src/shims.ts): written once, replaced only by a newer one, never over a program; without a network one exits 127 and installs nothing", async () => {
+			const texts = {
+				shim: readFileSync(new URL("../web/src/kw-shim.sh", import.meta.url), "utf8"),
+				pathSh: readFileSync(new URL("../guest/base/rootfs/etc/profile.d/kw-path.sh", import.meta.url), "utf8"),
+			};
+			const write = async (t = texts) => {
+				const { args, input } = shimsExec(t);
+				const r = await alp.vm.exec("/bin/sh", args, { input });
+				assert.equal(r.exitCode, 0, r.stderr);
+				return r.stdout;
+			};
+			const bin = "/root/.local/bin";
+			await alp.vm.exec("rm", ["-rf", "/root/.local"]);
+			// The image has /etc/profile.d/kw-path.sh, so only the stand-ins are written.
+			assert.equal(await write(), SHIM_TOOLS.map((n) => `${bin}/${n}\n`).join(""));
+			assert.equal(await write(), "");
+			for (const n of SHIM_TOOLS) {
+				const r = await alp.vm.exec("sh", ["-c", `head -n 2 ${bin}/${n}; test -x ${bin}/${n} && sh -n ${bin}/${n} && grep -c '^tool=${n}$' ${bin}/${n}`]);
+				assert.equal(r.stdout, "#!/bin/sh\n# kw-shim 1\n1\n", r.stderr);
+			}
+			// A program in place of a stand-in (a symlink here) stays; a newer stand-in replaces older ones.
+			await alp.vm.exec("ln", ["-sf", "/bin/busybox", `${bin}/claude`]);
+			assert.equal(await write({ ...texts, shim: texts.shim.replace(/^# kw-shim \d+$/m, "# kw-shim 999") }), `${bin}/fx\n${bin}/opencode\n`);
+			assert.equal((await alp.vm.exec("readlink", [`${bin}/claude`])).stdout, "/bin/busybox\n");
+			// No network in this suite: found through kwtty's PATH, the first call exits 127 and leaves only the stand-ins.
+			const r = await alp.vm.exec("fx", ["--version"]);
+			assert.equal(r.exitCode, 127);
+			assert.match(r.stderr, /^fx: not installed yet, and installing it needs a network/);
+			assert.equal((await alp.vm.exec("sh", ["-c", "ls -A /root/.local /root/.local/bin"])).stdout, "/root/.local:\nbin\n\n/root/.local/bin:\nclaude\nfx\nopencode\n");
+			await alp.vm.exec("rm", ["-rf", "/root/.local"]);
+		});
+
+		test("poweroff: exit code 0", async () => {
+			alp.vm.write("poweroff\n");
+			assert.equal((await alp.vm.exited).code, 0);
+		});
+	});
+
 	test("connect() and fetch() on an instance created with vsock: false: ENODEV", async (t) => {
 		const vm = await boot(t, { vsock: false, log: () => {}, cmdline: "console=hvc0 rdinit=/bin/true" });
 		const isNoDev = (e: Error & { code?: string }) => e.name === "PtyError" && e.code === "ENODEV";
@@ -1637,9 +1556,9 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await b.waitFor(new RegExp(`got-${sum}-1`));
 	});
 
-	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key", { skip: noSnapshots }, async (t) => {
+	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key (Alpine)", { skip: noSnapshots || noAlpine }, async (t) => {
 		const opts = (events: string[], chunks: number[], modes: Array<string | null>, inputs: string[]) => ({
-			log: () => {}, vsock: false, display: { width: 320, height: 240 },
+			log: () => {}, vsock: false, distro: alpine!, display: { width: 320, height: 240 },
 			onDisplay: (m: { width: number; height: number } | null) => modes.push(m && `${m.width}x${m.height}`),
 			onInput: (st: { keyboard: boolean; mouse: boolean; tablet: boolean }) => inputs.push(`${+st.keyboard}${+st.mouse}${+st.tablet}`),
 			sound: { onState: (_s: unknown, ev: string) => events.push(ev), onChunk: (c: { frames: number }) => { chunks.push(c.frames); return 0; } },

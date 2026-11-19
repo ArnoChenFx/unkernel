@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // kwtty: programs in the guest, over vsock, each on its own pty or on
-// pipes. The host client of the guest's `kwtty serve` (kernel/guest/kwtty.c,
+// pipes. The host client of the guest's `kwtty serve` (guest/src/kwtty.c,
 // started by inittab), which gives each connection root's login shell, or a
 // program, on a pty of its own, or with PIPES on stdin, stdout and stderr
 // pipes. On a pty the API follows zigpty / node-pty: spawn(file, args,
@@ -46,7 +46,7 @@
 
 import type { Vsock, VsockConnection } from "./vsock.ts";
 
-/** The guest server's vsock port (kernel/guest/kwtty.c KWTTY_PORT). Privileged, so no unprivileged guest program can take it. */
+/** The guest server's vsock port (guest/src/kwtty.c KWTTY_PORT). Privileged, so no unprivileged guest program can take it. */
 export const TTY_PORT = 1022;
 /** The protocol version this client speaks (OPEN's max_version). */
 export const TTY_VERSION = 1;

@@ -1,7 +1,7 @@
 {
   "name": "unkernel",
   "version": "0.2.0",
-  "description": "Linux on WebAssembly: boot an Alpine aarch64 userland in Node or the browser",
+  "description": "Linux on WebAssembly: boot Alpine, Debian or your own aarch64 Linux userland in Node or the browser",
   "license": "MIT AND GPL-2.0-only",
   "author": "Pooya Parsa <pooya@pi0.io>",
   "repository": {
@@ -29,7 +29,7 @@
       "types": "./dist/web.d.mts",
       "default": "./dist/web.mjs"
     },
-    "./alpine.wasm": "./dist/unkernel-alpine.wasm",
+    "./unkernel.wasm": "./dist/unkernel.wasm",
     "./package.json": "./package.json"
   },
   "types": "./dist/node.d.mts",
@@ -47,7 +47,7 @@
   "scripts": {
     "build": "obuild",
     "typecheck": "tsc -p .",
-    "test": "pnpm typecheck && pnpm test:block && pnpm test:net && pnpm test:tty && pnpm test:http && pnpm test:9p",
+    "test": "pnpm typecheck && pnpm test:block && pnpm test:net && pnpm test:tty && pnpm test:http && pnpm test:9p && pnpm test:distro",
     "test:block": "node --test test/block.test.ts",
     "test:net": "node --test test/net.test.ts",
     "test:tty": "node --test test/tty.test.ts",
@@ -56,6 +56,7 @@
     "test:kpatch": "node --test test/kpatch.test.ts",
     "test:wasi": "node test/wasi-node.ts",
     "test:api": "node --test test/api.test.ts",
+    "test:distro": "node --test test/distro.test.ts",
     "unkernel": "node js/cli.ts",
     "dev": "pnpm -C web dev",
     "build:web": "pnpm -C web build",

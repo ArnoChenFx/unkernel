@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Checks the display, input and sound self-test, `glimmer --test` (the
-// guest program kernel/guest/glimmer.c; its header documents the pattern,
+// guest program guest/src/glimmer.c; its header documents the pattern,
 // the test signal and the output lines).
 //
 //   node test/glimmer-check.mjs FRAME.ppm [--size WxH]
 //   node test/glimmer-check.mjs --wav SOUND.wav
-//   node test/glimmer-check.mjs --run [--kernel BUNDLE] [--initrd FILE] [--smp N] [--no-jit]
+//   node test/glimmer-check.mjs --run [--kernel BUNDLE] [--distro NAME|FILE|none] [--initrd FILE] [--smp N] [--no-jit]
 //        [--boot SECONDS] [--mode WxH] [--no-sound] [--worker[=shared|messages]] [--keep] [--verbose]
 //
 // With a frame (a PPM, as the CLI's {fb=FILE} writes it), it compares every
@@ -22,7 +22,8 @@
 // every sample against the formula (within 1 LSB).
 //
 // --run boots the CLI (node js/cli.ts --display --sound-wav FILE) on BUNDLE
-// (default: the CLI's own), waits --boot seconds for the shell (default 12,
+// (default: the CLI's own) with its default distro (Alpine; --distro picks
+// another, none the base shell), waits --boot seconds for the shell (default 12,
 // 45 with --no-jit), runs `glimmer --test 10` (with GLIMMER_MODE=WxH for
 // --mode), saves a frame, injects keys, mouse motion, buttons and wheel
 // clicks, absolute positions, a button and a wheel click on the tablet, and
@@ -34,8 +35,8 @@
 // test must say so and pass the rest. --worker runs the CLI with --worker
 // (the kernel in a worker thread: input and frames through shared memory,
 // PCM as messages); --worker=messages and --worker=shared pick the
-// transport, and the CLI must report that one. --initrd and --smp N go to
-// the CLI as they are (--smp needs an SMP kernel and implies --worker).
+// transport, and the CLI must report that one. --distro, --initrd and --smp N
+// go to the CLI as they are (--smp needs an SMP kernel and implies --worker).
 // Files go to a temp dir, removed unless
 // --keep. Exit status 0 when everything matches.
 import { spawn } from "node:child_process";
@@ -57,7 +58,7 @@ const parseSize = (s) => {
 	return m ? { w: Number(m[1]), h: Number(m[2]) } : undefined;
 };
 
-/** The pattern's colour (0xRRGGBB) at x, y for a w x h mode; kernel/guest/glimmer.c test_pixel(). */
+/** The pattern's colour (0xRRGGBB) at x, y for a w x h mode; guest/src/glimmer.c test_pixel(). */
 export function testPixel(x, y, w, h) {
 	const bars = [0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x000000];
 	const div = (a, b) => Math.floor(a / b);
@@ -115,7 +116,7 @@ const hex = (c) => `#${c.toString(16).padStart(6, "0")}`;
 
 // ---- the test signal --------------------------------------------------------
 
-/** The test signal: rate, and per second the frequency and which channels carry it; kernel/guest/glimmer.c test_signal(). */
+/** The test signal: rate, and per second the frequency and which channels carry it; guest/src/glimmer.c test_signal(). */
 export const SIGNAL = { rate: 22050, channels: 2, segments: [{ hz: 440, on: [1, 1] }, { hz: 660, on: [1, 0] }, { hz: 880, on: [0, 1] }] };
 
 /** The sample the guest writes at frame f on channel c (0.5 * sin, times 32767, rounded half away from zero). */
@@ -226,6 +227,7 @@ async function run() {
 	const cli = [path.join(root, "js/cli.ts"), "--display", "--no-net", "--timeout", String(boot + 60), "--input", input];
 	if (sound) cli.push("--sound-wav", wav);
 	if (opt("kernel")) cli.push("--kernel", opt("kernel"));
+	if (opt("distro")) cli.push("--distro", opt("distro"));
 	if (opt("initrd")) cli.push("--initrd", opt("initrd"));
 	if (opt("smp")) cli.push("--smp", opt("smp"));
 	if (!jit) cli.push("--no-jit");
@@ -331,6 +333,6 @@ if (flag("run")) {
 } else {
 	process.stdout.write("usage: node test/glimmer-check.mjs FRAME.ppm [--size WxH]\n" +
 		"       node test/glimmer-check.mjs --wav SOUND.wav\n" +
-		"       node test/glimmer-check.mjs --run [--kernel BUNDLE] [--initrd FILE] [--smp N] [--no-jit] [--boot S] [--mode WxH] [--no-sound] [--worker[=shared|messages]] [--keep] [--verbose]\n");
+		"       node test/glimmer-check.mjs --run [--kernel BUNDLE] [--distro NAME|FILE|none] [--initrd FILE] [--smp N] [--no-jit] [--boot S] [--mode WxH] [--no-sound] [--worker[=shared|messages]] [--keep] [--verbose]\n");
 	process.exit(2);
 }

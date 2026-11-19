@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // A 9P2000.L file server on vsock: host-defined file systems in the guest.
 //
-// The guest's kw9p (kernel/guest/kw9p.c) connects to host CID 2, port 564,
+// The guest's kw9p (guest/src/kw9p.c) connects to host CID 2, port 564,
 // and mounts 9p with trans=fd on that socket and `aname=NAME`, so the
 // kernel's 9p client talks to this server directly. One server listens per
 // VM; each mount is its own export, with an attach name add() makes up, and

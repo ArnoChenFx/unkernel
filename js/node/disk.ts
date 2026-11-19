@@ -3,7 +3,8 @@
 // kwblk backends that need Node (see core/block.ts for the protocol).
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
-import { CowDisk, F_FLUSH, FlushTracker, HttpBase, type BlockDevice, type DiskBase, type DiskSnapshotState } from "../core/block.ts";
+import { BaseDisk, CowDisk, F_FLUSH, FlushTracker, HttpBase, type BlockDevice, type DiskBase, type DiskSnapshotState } from "../core/block.ts";
+import { DistroDisk } from "../core/distro.ts";
 import { readKwsparse } from "../core/kwsparse.ts";
 
 /** Size rounded down to whole sectors (not `& ~511`: that is 32-bit and breaks at 2 GiB and above). */
@@ -162,17 +163,35 @@ export class FileBase implements DiskBase {
 export interface OpenDiskOptions {
 	/** Writes go to an in-memory overlay and are lost at exit. */
 	snapshot?: boolean;
+	/** The guest's writes fail (EROFS); takes precedence over snapshot. */
 	readOnly?: boolean;
 }
 
 /**
  * Open a disk: a file path, or an http(s) URL served with Range support
- * (lazily fetched, overlay in memory).
+ * (lazily fetched, overlay in memory; read-only: no overlay).
  */
 export async function openDisk(spec: string, { snapshot = false, readOnly = false }: OpenDiskOptions = {}): Promise<BlockDevice> {
-	if (/^https?:\/\//.test(spec)) return new CowDisk(await HttpBase.open(spec));
-	if (snapshot) return new CowDisk(new FileBase(spec));
+	if (/^https?:\/\//.test(spec)) return readOnly ? new BaseDisk(await HttpBase.open(spec, { strict: true })) : new CowDisk(await HttpBase.open(spec));
+	if (snapshot && !readOnly) return new CowDisk(new FileBase(spec));
 	return new FileDisk(spec, { readOnly });
+}
+
+/**
+ * A distro image (a path, or an http(s) URL served with Range support,
+ * prefetched as its distro header or `prefetch` says; a file ignores it) as
+ * the read-only disk createKernel({ distro }) takes, for a caller that
+ * needs the disk before booting (snapshotDiskMismatch(); the distro is the
+ * snapshot's first disk). createKernel({ distro: path }) opens it the same way.
+ */
+export async function openDistroDisk(src: string, { prefetch, log }: { prefetch?: number | false; log?: (msg: string) => void } = {}): Promise<DistroDisk> {
+	const dev = /^https?:\/\//.test(src) ? new BaseDisk(await HttpBase.open(src, { strict: true, prefetch, log })) : new FileDisk(src, { readOnly: true });
+	try {
+		return await DistroDisk.open(dev, { name: src, log });
+	} catch (e) {
+		if (dev instanceof FileDisk) dev.close();
+		throw e;
+	}
 }
 
 /**

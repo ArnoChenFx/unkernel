@@ -12,6 +12,7 @@
 // existing ones.
 
 import type { DiskSpec, DiskState, NetSpec, SkippedDisk } from "./devices.ts";
+import type { DistroInfo } from "./distro.ts";
 import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundEvent, SoundFormat, SoundState } from "./sound.ts";
 import type { ShmCall, ShmCallResult, ShmInfo } from "./shm.ts";
@@ -42,6 +43,8 @@ export interface WorkerBootSpec {
 	consoleSize?: { cols: number; rows: number };
 	/** Disk and network specs (devices.ts), built by the worker's registry. */
 	disks?: DiskSpec[];
+	/** The distro image as a read-only disk spec (CreateKernelOptions.distro), the first disk. */
+	distro?: DiskSpec;
 	net?: NetSpec;
 	/** Milliseconds between stats snapshots while running. */
 	statsIntervalMs: number;
@@ -140,7 +143,7 @@ export type FromWorker =
 	| { t: "output"; bytes: Uint8Array }
 	| { t: "log"; msg: string }
 	| { t: "progress"; p: BootProgress }
-	| { t: "started"; cmdline: string; memoryMiB: number; memory64: boolean; stats: InstanceStats; disks: DiskState[]; skipped: SkippedDisk[] }
+	| { t: "started"; cmdline: string; memoryMiB: number; memory64: boolean; stats: InstanceStats; disks: DiskState[]; skipped: SkippedDisk[]; distro?: DistroInfo }
 	| { t: "boot-error"; stage: string; message: string }
 	| { t: "stats"; stats: InstanceStats; disks: DiskState[] }
 	| { t: "synced"; id: number; ok: boolean }

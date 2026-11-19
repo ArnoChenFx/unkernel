@@ -28,5 +28,7 @@ export function webPlatform(defaultKernel: URL): Platform {
 		whyNoCpus: webCpuBlocker,
 		absoluteUrl: (src) => new URL(src, location.href).href,
 		devices: webDevices,
+		// A distro URL (relative to the page) as a read-only "http" spec: read lazily with Range requests, no IndexedDB.
+		distroSpec: (src) => ({ kind: "http", url: new URL(src, location.href).href, readOnly: true }),
 	};
 }

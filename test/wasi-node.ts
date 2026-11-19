@@ -8,11 +8,13 @@
 // stubs for no block device, no network device and no JIT (kwemu interprets).
 //
 //   node test/wasi-node.ts [--verbose]
+//   UNKERNEL_TEST_BASE_DIR=dir node test/wasi-node.ts   # base.cpio and base-test.cpio from dir (a KW_BASE_OUT;
+//                                                       # default vendor/build/initramfs)
 //   node test/wasi-node.ts --run KERNEL INITRD "CMDLINE" [MiB]
 //
-// Cases: kwtest on vmlinux32.wasm and on vmlinux (memory64), and Alpine on
-// vmlinux32.wasm with commands typed into a stdin pipe. The Alpine case
-// guards against uvwasi's zero-timeout poll_oneoff, which reports only the
+// Cases: kwtest on vmlinux32.wasm and on vmlinux (memory64), and the base's
+// base shell on vmlinux32.wasm with commands typed into a stdin pipe (there
+// is no block device here, so no distro). The shell case guards against uvwasi's zero-timeout poll_oneoff, which reports only the
 // clock event even when stdin is readable (kernel wasi.c, wasi_stdin_readable).
 // --run boots one kernel with the console on stdio; proc_exit's code
 // becomes the process exit code.
@@ -134,18 +136,19 @@ async function test(): Promise<void> {
 	const verbose = args.includes("--verbose");
 	const k32 = path.join(root, "vendor/build/kernel/vmlinux32.wasm");
 	const k64 = path.join(root, "vendor/build/kernel/vmlinux");
-	const alpineCpio = path.join(root, "vendor/build/initramfs/alpine.cpio");
-	const testCpio = path.join(root, "vendor/build/initramfs/alpine-test.cpio");
+	const baseDir = path.resolve(process.env.UNKERNEL_TEST_BASE_DIR ?? path.join(root, "vendor/build/initramfs"));
+	const baseCpio = path.join(baseDir, "base.cpio");
+	const testCpio = path.join(baseDir, "base-test.cpio");
 	const kwtest = { initrd: testCpio, cmdline: "console=hvc0 rdinit=/usr/bin/kwtest", expect: [/kwtest: 0 failure\(s\)/] };
 	const cases: Case[] = [
 		{ name: "kwtest vmlinux32.wasm", kernel: k32, ...kwtest },
 		{ name: "kwtest vmlinux (memory64)", kernel: k64, ...kwtest },
 		{
-			name: "alpine vmlinux32.wasm, stdin pipe", kernel: k32, initrd: alpineCpio, mib: 512,
+			name: "base shell vmlinux32.wasm, stdin pipe", kernel: k32, initrd: baseCpio, mib: 512,
 			cmdline: "console=hvc0 rdinit=/init",
 			// [wait for, then type]
-			script: [[/⇒/, "uname -a; apk --version\n"], [/apk-tools \S+/, "poweroff\n"]],
-			expect: [/Linux unkernel .* aarch64 Linux/, /apk-tools \S+, compiled for aarch64/, /reboot: Power down/],
+			script: [[/base\x1b\[0m \S* # /, "uname -a; busybox | head -1; echo done-$((6*7))\n"], [/done-42/, "poweroff\n"]],
+			expect: [/Linux unkernel .* aarch64 Linux/, /BusyBox v\S+/, /reboot: Power down/],
 		},
 	];
 

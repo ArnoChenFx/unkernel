@@ -13,7 +13,7 @@ import { directBackend, wispBackend } from "./net.ts";
 export const nodeDevices: DeviceRegistry = extendDevices(coreDevices, {
 	disks: {
 		file: (spec: FileDiskSpec, ctx: DeviceContext) =>
-			spec.snapshot ? new CowDisk(new FileBase(spec.path), { log: ctx.log }) : new FileDisk(spec.path, { readOnly: spec.readOnly }),
+			spec.snapshot && !spec.readOnly ? new CowDisk(new FileBase(spec.path), { log: ctx.log }) : new FileDisk(spec.path, { readOnly: spec.readOnly }),
 	},
 	backends: {
 		direct: () => directBackend(),

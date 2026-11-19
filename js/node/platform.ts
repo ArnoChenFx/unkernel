@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // createKernel()'s Node platform: file paths and file: URLs are read from
-// disk, disk and network specs are built by nodeDevices (devices.ts), and
+// disk (a distro path becomes a read-only "file" spec), disk and network
+// specs are built by nodeDevices (devices.ts), and
 // worker mode runs on worker_threads (worker.ts). The bundled
 // kernel's URL is passed in by the entry (node.ts) so that
 // `new URL(..., import.meta.url)` stays in the entry module itself (a shared
@@ -10,6 +11,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { DiskSpec } from "../core/devices.ts";
 import type { Platform } from "../core/instance.ts";
 import { BootError } from "../core/load.ts";
 import { nodeDevices } from "./devices.ts";
@@ -30,10 +32,19 @@ export function nodeReadFile(bundledPath?: string): NonNullable<Platform["readFi
 		if (path === undefined) return undefined;
 		return readFile(path).then((b) => new Uint8Array(b.buffer, b.byteOffset, b.byteLength), (e: NodeJS.ErrnoException) => {
 			const hint = e.code === "ENOENT" && path === bundledPath
-				? " (the bundled kernel is missing; in a source checkout, build it with kernel/build.sh bundle)" : "";
+				? " (the bundled kernel is missing; in a source checkout, build it with kernel/build.sh base)" : "";
 			throw new BootError("download", `cannot read ${path}: ${e.message}${hint}`, { cause: e });
 		});
 	};
+}
+
+/** A distro path, file: URL or http(s) URL as a read-only disk spec. */
+export function nodeDistroSpec(src: string | URL): DiskSpec {
+	const path = localPath(src);
+	if (path !== undefined) return { kind: "file", path, readOnly: true };
+	const url = String(src);
+	if (!/^https?:/i.test(url)) throw new BootError("boot", `distro: ${url}: not a file path or an http(s) URL`);
+	return { kind: "http", url, readOnly: true };
 }
 
 export function nodePlatform(bundledKernel: URL): Platform {
@@ -44,5 +55,6 @@ export function nodePlatform(bundledKernel: URL): Platform {
 		spawnCpu: spawnNodeCpu,
 		absoluteUrl: (src) => pathToFileURL(resolve(src)).href,
 		devices: nodeDevices,
+		distroSpec: nodeDistroSpec,
 	};
 }

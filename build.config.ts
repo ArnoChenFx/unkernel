@@ -5,9 +5,13 @@
 //   js/node.ts -> dist/node.mjs   Node entry ("unkernel" under the node condition, "unkernel/node")
 //   js/web.ts  -> dist/web.mjs    web entry ("unkernel" elsewhere, "unkernel/web")
 //   js/cli.ts  -> dist/cli.mjs    `npx unkernel`
-//   vendor/build/bundle/unkernel-alpine.wasm -> dist/unkernel-alpine.wasm
-//                                 (kernel/build.sh bundle; both entries find it
-//                                 with new URL("./unkernel-alpine.wasm", import.meta.url))
+//   vendor/build/bundle/unkernel.wasm -> dist/unkernel.wasm
+//                                 (kernel/build.sh base; UNKERNEL_BUNDLE=path takes
+//                                 another, e.g. a KW_BASE_OUT build; every entry finds it
+//                                 with new URL("./unkernel.wasm", import.meta.url));
+//                                 no distro images (the Node entry and the CLI
+//                                 download them: js/node/distro-fetch.ts, which
+//                                 finds package.json with new URL("..", import.meta.url))
 //   js/node/worker-entry.ts       the kernel worker (createKernel({ worker: true })) on
 //   js/web/web-worker-entry.ts    Node and in browsers, each bundled into one minified ES
 //                                 module and inlined as a string where js/node/worker.ts
@@ -30,7 +34,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { defineBuildConfig } from "obuild/config";
 
-const WASM = "vendor/build/bundle/unkernel-alpine.wasm";
+const WASM = process.env.UNKERNEL_BUNDLE || "vendor/build/bundle/unkernel.wasm";
 
 /**
  * Worker entries and the module that starts each one with
@@ -156,10 +160,10 @@ export default defineBuildConfig({
 	],
 	hooks: {
 		async start(ctx) {
-			const wasm = path.join(ctx.pkgDir, WASM);
+			const wasm = path.resolve(ctx.pkgDir, WASM);
 			const st = await stat(wasm).catch(() => null);
 			if (!st?.isFile())
-				throw new Error(`${WASM} is missing: build it first (kernel/build.sh all, or kernel/build.sh bundle once vmlinux32.wasm and the Alpine initramfs exist)`);
+				throw new Error(`${WASM} is missing: build it first (kernel/build.sh all, or kernel/build.sh base once vmlinux32.wasm exists)`);
 		},
 		async rolldownConfig(config, ctx) {
 			// dist/node.mjs, not dist/js/node.mjs.
@@ -184,7 +188,7 @@ export default defineBuildConfig({
 		},
 		async end(ctx) {
 			const dist = path.join(ctx.pkgDir, "dist");
-			await copyFile(path.join(ctx.pkgDir, WASM), path.join(dist, "unkernel-alpine.wasm"));
+			await copyFile(path.resolve(ctx.pkgDir, WASM), path.join(dist, "unkernel.wasm"));
 			// The files an entry loads (itself and its chunks) and its bare imports.
 			const reach = async (entry: string) => {
 				const files = new Map<string, string>(), bare: Array<[string, string]> = [];
@@ -222,22 +226,27 @@ export default defineBuildConfig({
 				for (const name of ["worker-entry", "cpu-entry", "wasi-entry"])
 					if (code.includes(name)) throw new Error(`dist/${f} refers to ${name}: a worker was not inlined`);
 			}
-			// The bundled-kernel URL must be resolved relative to the entry itself, not a shared chunk.
+			// The bundled-kernel URL and the package root (fetchDistro) must be resolved relative to
+			// the entry itself, not a shared chunk.
 			for (const entry of ["node.mjs", "web.mjs", "cli.mjs"]) {
-				if (!(await readFile(path.join(dist, entry), "utf8")).includes(`new URL("./unkernel-alpine.wasm", import.meta.url)`))
-					throw new Error(`dist/${entry} does not locate unkernel-alpine.wasm next to itself`);
+				const code = await readFile(path.join(dist, entry), "utf8");
+				if (!code.includes(`new URL("./unkernel.wasm", import.meta.url)`))
+					throw new Error(`dist/${entry} does not locate unkernel.wasm next to itself`);
+				if (entry !== "web.mjs" && !code.includes(`new URL("..", import.meta.url)`))
+					throw new Error(`dist/${entry} does not locate the package root (fetchDistro) from itself`);
 			}
 			const chunks = await readdir(path.join(dist, "_chunks")).catch(() => []);
 			for (const c of chunks.filter((f) => f.endsWith(".mjs"))) {
-				if ((await readFile(path.join(dist, "_chunks", c), "utf8")).includes("unkernel-alpine.wasm"))
-					throw new Error(`dist/_chunks/${c} refers to unkernel-alpine.wasm (would resolve inside _chunks/)`);
+				const code = await readFile(path.join(dist, "_chunks", c), "utf8");
+				if (code.includes(`new URL("./unkernel.wasm"`) || code.includes(`new URL("..", import.meta.url)`))
+					throw new Error(`dist/_chunks/${c} resolves unkernel.wasm or the package root itself (would resolve inside _chunks/)`);
 			}
 			// Every entry links (a broken chunk split shows up as a missing export).
 			for (const entry of ["node.mjs", "web.mjs"]) {
 				const mod = await import(`${pathToFileURL(path.join(dist, entry)).href}?check=${Date.now()}`);
 				if (typeof mod.createKernel !== "function") throw new Error(`dist/${entry} has no createKernel export`);
 			}
-			console.log(`unkernel: dist/unkernel-alpine.wasm copied; web entry is free of Node imports; kernel, CPU and WASI program workers inlined; entries link; ${chunks.length} shared chunk(s)`);
+			console.log(`unkernel: dist/unkernel.wasm copied; web entry is free of Node imports; kernel, CPU and WASI program workers inlined; entries link; ${chunks.length} shared chunk(s)`);
 		},
 	},
 });

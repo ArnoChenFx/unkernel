@@ -22,9 +22,13 @@
 //     lazily: memory holds only the blocks written since the last committed
 //     flush, plus the set of block numbers that have a record in the store.
 //   * HttpBase: read-only base fetched lazily with HTTP Range requests, in
-//     chunks, with an in-memory chunk cache.
+//     chunks, with an in-memory chunk cache; the start of the image can be
+//     fetched ahead in one streaming request (a distro image's header says
+//     how much, see distro.ts).
 //   * ZeroBase / SparseBase: an all-zero base (the data disk), or one made
 //     of a few non-zero blocks (a kwsparse image, see kwsparse.ts).
+//   * BaseDisk: a base read directly, read-only (a distro image over HTTP;
+//     distro.ts).
 //
 // Memory is never grown (initial == maximum), so views of it stay valid
 // across the asynchronous part of a request.
@@ -979,11 +983,73 @@ export class CowDisk implements BlockDevice {
 // ---------------------------------------------------------------------------
 // Read-only base fetched lazily with HTTP Range requests.
 
+/** The distro header in the first bytes of an image (format: distro.ts). */
+export interface DistroHeader {
+	/** The image's size when it was built (a header of another size is ignored). */
+	size: number;
+	/** Bytes from the start of the image that a boot reads (= size: the whole image; 0: no hint). */
+	prefetch: number;
+	/** The distro's name (/usr/lib/kw-distro) and image id (/usr/lib/kw-image). */
+	distro: string;
+	image: string;
+}
+
+const HEADER_MAGIC = "KWDISTRO";
+
+/** The total size in a 206 response's Content-Range. */
+const totalOf = (r: Response): number | undefined => {
+	const m = /\/(\d+)\s*$/.exec(r.headers.get("content-range") ?? "");
+	return m ? Number(m[1]) : undefined;
+};
+
+/** The distro header at offset 0 of an image, or null (none, another version, or another size than `size`). */
+export function readDistroHeader(head: Uint8Array, size?: number): DistroHeader | null {
+	if (head.length < 128) return null;
+	for (let i = 0; i < 8; i++) if (head[i] !== HEADER_MAGIC.charCodeAt(i)) return null;
+	const dv = new DataView(head.buffer, head.byteOffset, 128);
+	if (dv.getUint32(8, true) !== 1 || dv.getUint32(12, true) < 128) return null;
+	const n = Number(dv.getBigUint64(16, true)), prefetch = Number(dv.getBigUint64(24, true));
+	if (size !== undefined && n !== size) return null;
+	const str = (b: Uint8Array) => new TextDecoder().decode(b.subarray(0, b.indexOf(0) < 0 ? b.length : b.indexOf(0)));
+	return { size: n, prefetch: Math.min(prefetch, n), distro: str(head.subarray(32, 64)), image: str(head.subarray(64, 128)) };
+}
+
 export interface HttpBaseOptions {
 	/** Fetch granularity (power of two), default 256 KiB. */
 	chunkSize?: number;
 	/** Largest single Range request, default 4 MiB. */
 	maxRequest?: number;
+	/**
+	 * Every range must come from the image open() saw: the same total size
+	 * and, when open() got one, the same ETag (or Last-Modified). A range of
+	 * a changed image then fails (EIO in the guest) instead of mixing two
+	 * images' blocks. Default false.
+	 */
+	strict?: boolean;
+	/**
+	 * Fetch the first `prefetch` bytes right after open(), in one streaming
+	 * request (the image's size: one plain GET of the whole image, which
+	 * HTTP caches keep). Reads inside it wait for its bytes instead of
+	 * making their own requests; reads after it are lazy ranges, and so is
+	 * everything if it fails. Default: what the image's distro header says
+	 * (distro.ts), else nothing; false: nothing.
+	 */
+	prefetch?: number | false;
+	/** Host diagnostics (a failed prefetch); default console.warn. */
+	log?: (msg: string) => void;
+}
+
+/** What an HttpBase fetched (HttpBase.stats). */
+export interface HttpBaseStats {
+	/** Requests (open()'s probe included) and the bytes they brought. */
+	requests: number;
+	bytes: number;
+	/** Range requests made for reads (not the probe or the prefetch). */
+	lazyRequests: number;
+	/** The prefetch: its size (0: none), the bytes it brought, and how it went. */
+	prefetch: number;
+	prefetchBytes: number;
+	prefetchState: "none" | "running" | "done" | "failed";
 }
 
 export class HttpBase implements DiskBase {
@@ -994,23 +1060,55 @@ export class HttpBase implements DiskBase {
 	maxChunks = 0;
 	/** Chunk index -> data. */
 	chunks: Map<number, Uint8Array> = new Map();
-	/** Chunk index -> fetch in flight. */
+	/** Chunk index -> fetch in flight (a prefetched chunk: until its bytes arrived). */
 	pending: Map<number, Promise<void>> = new Map();
-	stats: { requests: number; bytes: number } = { requests: 0, bytes: 0 };
+	stats: HttpBaseStats = { requests: 0, bytes: 0, lazyRequests: 0, prefetch: 0, prefetchBytes: 0, prefetchState: "none" };
+	/** strict: the ETag or Last-Modified open() saw ("" if none), which every range must carry. */
+	validator: string | null = null;
+	/** The distro header of the image, if it has one. */
+	header: DistroHeader | null = null;
+	log: (msg: string) => void = (m) => console.warn(m);
 
-	static async open(url: string, { chunkSize = 256 * 1024, maxRequest = 4 * 1024 * 1024 }: HttpBaseOptions = {}): Promise<HttpBase> {
-		const r = await fetch(url, { headers: { range: "bytes=0-0" }, cache: "no-store" });
+	/**
+	 * Open the image: one Range request for its first chunk, which tells the
+	 * size, the validator and the distro header (and is kept). Then the
+	 * prefetch, if any, starts (see HttpBaseOptions.prefetch).
+	 */
+	static async open(url: string, { chunkSize = 256 * 1024, maxRequest = 4 * 1024 * 1024, strict = false, prefetch, log }: HttpBaseOptions = {}): Promise<HttpBase> {
+		// The one request that asks the server (a cached copy is revalidated):
+		// its validator is what every later, cached response is held to.
+		const r = await fetch(url, { headers: { range: `bytes=0-${chunkSize - 1}` }, cache: "no-cache" });
 		if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
 		const cr = r.headers.get("content-range");
-		await r.arrayBuffer();
 		const m = cr && /\/(\d+)\s*$/.exec(cr);
-		if (r.status !== 206 || !m) throw new Error(`${url}: server does not support Range requests`);
+		if (r.status !== 206 || !m) {
+			void r.body?.cancel().catch(() => {});
+			throw new Error(`${url}: server does not support Range requests`);
+		}
+		const head = new Uint8Array(await r.arrayBuffer());
 		const b = new HttpBase();
 		b.url = url;
 		b.size = Number(m[1]);
-		b.identity = `${url} ${b.size} ${r.headers.get("etag") ?? r.headers.get("last-modified") ?? ""}`;
+		if (log) b.log = log;
+		const validator = r.headers.get("etag") ?? r.headers.get("last-modified") ?? "";
+		b.identity = `${url} ${b.size} ${validator}`;
+		if (strict) b.validator = validator;
+		b.#seen = validator;
 		b.chunkSize = chunkSize;
 		b.maxChunks = Math.max(1, Math.floor(maxRequest / chunkSize));
+		b.stats.requests++;
+		b.stats.bytes += head.length;
+		if (head.length === Math.min(chunkSize, b.size)) {
+			let c0 = head;
+			if (c0.length < chunkSize) {
+				c0 = new Uint8Array(chunkSize);
+				c0.set(head);
+			}
+			b.chunks.set(0, c0);
+		}
+		b.header = readDistroHeader(head, b.size);
+		const n = prefetch === false ? 0 : Math.min(b.size, Math.max(0, prefetch ?? b.header?.prefetch ?? 0));
+		if (n > 0) b.#prefetch(n, validator);
 		return b;
 	}
 
@@ -1044,7 +1142,47 @@ export class HttpBase implements DiskBase {
 			return out;
 		};
 		if (!waits.length) return assemble();
-		return Promise.all(waits).then(assemble);
+		// A failed prefetch settles its chunks without data: read them again (lazily).
+		return Promise.all(waits).then(() => {
+			for (let c = c0; c <= c1; c++) if (!this.chunks.has(c)) return this.read(off, len);
+			return assemble();
+		});
+	}
+
+	/** Check a response against the image open() saw: its size (`total`, if known) and, if given, its validator. */
+	#check(r: Response, total: number | undefined, what: string, validator: string | null = this.validator): void {
+		const v = r.headers.get("etag") ?? r.headers.get("last-modified") ?? "";
+		if ((total === undefined || total === this.size) && !(validator && v && v !== validator)) return;
+		void r.body?.cancel().catch(() => {});
+		throw new Error(`${this.url}: ${what}: the image changed since it was opened (size ${total ?? "?"}, ${v || "no validator"}; opened as ${this.size}, ${validator || "no validator"})`);
+	}
+
+	/** The validator open() saw ("" if the server sends none). */
+	#seen = "";
+
+	/**
+	 * Fetch a part of the image, from the browser's HTTP cache if it has it,
+	 * without asking the server again: open() already did, and `ok` holds
+	 * the response to that validator (#check). A cached copy that fails (it
+	 * is of another build of the image) is fetched again from the server.
+	 * Without a validator nothing could tell a stale copy, so the cache
+	 * mode is the browser's default.
+	 */
+	async #get(headers: Record<string, string> | undefined, ok: (r: Response) => void): Promise<Response> {
+		const init: RequestInit = headers ? { headers } : {};
+		if (!this.#seen) {
+			const r = await fetch(this.url, init);
+			ok(r);
+			return r;
+		}
+		const cached = await fetch(this.url, { ...init, cache: "force-cache" });
+		try {
+			ok(cached);
+			return cached;
+		} catch {}
+		const r = await fetch(this.url, { ...init, cache: "reload" });
+		ok(r);
+		return r;
 	}
 
 	#fetchRun(c0: number, c1: number): Promise<void> {   // chunks [c0, c1)
@@ -1052,25 +1190,159 @@ export class HttpBase implements DiskBase {
 		const start = c0 * cs, end = Math.min(this.size, c1 * cs);
 		const p = (async () => {
 			this.stats.requests++;
-			const r = await fetch(this.url, { headers: { range: `bytes=${start}-${end - 1}` } });
-			if (r.status !== 206) throw new Error(`${this.url}: range ${start}-${end - 1}: HTTP ${r.status}`);
+			this.stats.lazyRequests++;
+			const r = await this.#get({ range: `bytes=${start}-${end - 1}` }, (r) => {
+				if (r.status !== 206) throw new Error(`${this.url}: range ${start}-${end - 1}: HTTP ${r.status}`);
+				if (this.validator !== null || this.#seen)
+					this.#check(r, totalOf(r) ?? -1, `range ${start}-${end - 1}`, this.validator ?? this.#seen);
+			});
 			const buf = new Uint8Array(await r.arrayBuffer());
 			if (buf.length !== end - start) throw new Error(`${this.url}: short range read`);
 			this.stats.bytes += buf.length;
 			for (let c = c0; c < c1; c++) {
 				const s = (c - c0) * cs;
-				let chunk = buf.subarray(s, Math.min(buf.length, s + cs));
-				if (chunk.length < cs) {   // last chunk: pad so block reads are uniform
-					const full = new Uint8Array(cs);
-					full.set(chunk);
-					chunk = full;
-				}
-				this.chunks.set(c, chunk);
+				this.#put(c, buf.subarray(s, Math.min(buf.length, s + cs)));
 			}
 		})();
 		for (let c = c0; c < c1; c++) this.pending.set(c, p);
-		const clear = () => { for (let c = c0; c < c1; c++) this.pending.delete(c); };
+		const clear = () => { for (let c = c0; c < c1; c++) if (this.pending.get(c) === p) this.pending.delete(c); };
 		p.then(clear, clear);
 		return p;
+	}
+
+	/** Keep chunk c (the last one padded, so block reads are uniform). */
+	#put(c: number, data: Uint8Array): void {
+		if (data.length < this.chunkSize) {
+			const full = new Uint8Array(this.chunkSize);
+			full.set(data);
+			data = full;
+		}
+		this.chunks.set(c, data);
+	}
+
+	/**
+	 * Fetch [0, n) in one request, streamed: each chunk is kept as soon as
+	 * its bytes are in, and reads of a chunk not in yet wait for it. n = size:
+	 * a plain GET (no Range header); else a Range request from the first
+	 * chunk open() does not have. Every response is checked like a lazy
+	 * range (size, and with strict the validator). A failure settles the
+	 * chunks that did not arrive without data, so their reads fall back to
+	 * lazy ranges.
+	 */
+	#prefetch(n: number, validator: string): void {
+		const cs = this.chunkSize, whole = n >= this.size;
+		const c1 = Math.ceil(Math.min(n, this.size) / cs);
+		let c0 = 0;
+		while (c0 < c1 && this.chunks.has(c0)) c0++;
+		if (c0 >= c1) return;
+		const settle = new Map<number, () => void>();
+		for (let c = c0; c < c1; c++) {
+			if (this.chunks.has(c) || this.pending.has(c)) continue;
+			const p = new Promise<void>((resolve) => settle.set(c, resolve));
+			this.pending.set(c, p);
+		}
+		const done = (c: number) => {
+			const s = settle.get(c);
+			if (!s) return;
+			settle.delete(c);
+			this.pending.delete(c);
+			s();
+		};
+		const start = whole ? 0 : c0 * cs, end = whole ? this.size : Math.min(this.size, c1 * cs);
+		this.stats.prefetch = end;
+		this.stats.prefetchState = "running";
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		void (async () => {
+			this.stats.requests++;
+			// Checked whether strict or not: a cached copy of another image must not mix in.
+			const r = await this.#get(whole ? undefined : { range: `bytes=${start}-${end - 1}` }, (r) => {
+				if (whole) {
+					if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
+					const len = r.headers.get("content-encoding") ? null : r.headers.get("content-length");
+					this.#check(r, len === null ? undefined : Number(len), "GET", validator);
+				} else {
+					if (r.status !== 206) throw new Error(`HTTP ${r.status}`);
+					this.#check(r, totalOf(r) ?? -1, `prefetch ${start}-${end - 1}`, validator);
+				}
+			});
+			if (!r.body) throw new Error("no response body");
+			reader = r.body.getReader();
+			let pos = start, cur = new Uint8Array(cs), fill = 0;
+			for (;;) {
+				const { done: eof, value } = await reader.read();
+				if (eof) break;
+				let o = 0;
+				while (o < value.length) {
+					if (pos + o >= end) throw new Error("longer than expected");
+					const k = Math.min(cs - fill, value.length - o, end - pos - o);
+					cur.set(value.subarray(o, o + k), fill);
+					fill += k;
+					o += k;
+					const at = pos + o;
+					if (fill === cs || at === end) {
+						const c = Math.floor((at - 1) / cs);
+						if (!this.chunks.has(c)) this.#put(c, fill === cs ? cur : cur.subarray(0, fill));
+						done(c);
+						cur = new Uint8Array(cs);
+						fill = 0;
+					}
+				}
+				pos += value.length;
+				this.stats.bytes += value.length;
+				this.stats.prefetchBytes += value.length;
+			}
+			if (pos !== end) throw new Error(`ended at ${pos} of ${end}`);
+			this.stats.prefetchState = "done";
+		})().catch((e) => {
+			void reader?.cancel().catch(() => {});
+			this.stats.prefetchState = "failed";
+			this.log(`[host] ${this.url}: prefetch failed (${(e as Error)?.message ?? e}); reading lazily`);
+		}).finally(() => {
+			for (const c of [...settle.keys()]) done(c);
+		});
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A read-only disk straight from a base (no overlay): a distro image.
+
+/**
+ * A read-only BlockDevice that reads a DiskBase (e.g. an HttpBase) with no
+ * overlay: the guest's writes fail with EROFS. In a snapshot it is the
+ * base's identity.
+ */
+export class BaseDisk implements BlockDevice {
+	base: DiskBase;
+	size: number;
+	readonly readOnly = true;
+	readonly flags = F_RO;
+
+	constructor(base: DiskBase) {
+		this.base = base;
+		this.size = Math.floor(base.size / 512) * 512;
+	}
+
+	/** The base's fetch counters (an HttpBase's, see HttpBaseStats), if it keeps any. */
+	get stats(): HttpBaseStats | undefined {
+		return (this.base as { stats?: HttpBaseStats }).stats;
+	}
+
+	read(off: number, views: Uint8Array[]): MaybePromise<void> {
+		const len = views.reduce((n, v) => n + v.length, 0);
+		const r = this.base.read(off, len);
+		return r instanceof Promise ? r.then((buf) => scatter(views, buf)) : scatter(views, r);
+	}
+
+	write(): never {
+		throw new Error("read-only disk");
+	}
+
+	snapshotState(): DiskSnapshotState {
+		if (!this.base.identity) throw new Error("its base image has no identity to check on restore");
+		return { name: this.base.identity, identity: `base ${this.base.identity}`, gen: 0 };
+	}
+
+	snapshotSeal(): { state: DiskSnapshotState; done: Promise<void> } {
+		return { state: this.snapshotState(), done: Promise.resolve() };
 	}
 }

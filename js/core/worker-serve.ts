@@ -225,6 +225,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				whyNoCpus: options.whyNoCpus,
 			}, {
 				disks: spec.disks,
+				distro: spec.distro,
 				net: spec.net,
 				onDiskError: (index, err) => {
 					const e = err as Error | undefined;
@@ -273,12 +274,12 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 		}
 		shared?.attach({ kernel: vm.kernel, write: (bytes) => vm.write(bytes), resize: (cols, rows) => vm.resize(cols, rows), evdev: vm.evdev });
 		const skippedAt = new Set(vm.skippedDisks.map((s) => s.index));
-		const built = vm.kernel.block.disks;
+		const built = vm.kernel.block.disks.slice(vm.distro ? 1 : 0); // the distro is not one of `disks`
 		byIndex = new Map(kinds.map((_, i) => i).filter((i) => !skippedAt.has(i)).map((i, n) => [i, built[n]!]));
 		// The owner keeps its own output stream; drain this one so it holds nothing.
 		void vm.output.pipeTo(new WritableStream()).catch(() => {});
 		const stats = (): InstanceStats => (spec.compileMs === undefined ? vm.stats() : { ...vm.stats(), compileMs: spec.compileMs });
-		post({ t: "started", cmdline: vm.cmdline, memoryMiB: vm.memoryMiB, memory64: vm.memory64, stats: stats(), disks: disks(), skipped: vm.skippedDisks });
+		post({ t: "started", cmdline: vm.cmdline, memoryMiB: vm.memoryMiB, memory64: vm.memory64, stats: stats(), disks: disks(), skipped: vm.skippedDisks, distro: vm.distro });
 		const timer = setInterval(() => post({ t: "stats", stats: stats(), disks: disks() }), spec.statsIntervalMs);
 		void vm.exited.then(async (res) => {
 			clearInterval(timer);

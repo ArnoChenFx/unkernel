@@ -13,6 +13,7 @@
 // web/worker.ts).
 
 import { isDiskSpec, isNetSpec, type DiskSpec, type DiskState, type NetSpec, type SkippedDisk } from "./devices.ts";
+import { distroSpecOf, readOnlySpec, type DistroInfo } from "./distro.ts";
 import type { DisplayFrame, DisplayMode, DisplayOption, DisplaySize } from "./display.ts";
 import type { Evdev, InputState } from "./input.ts";
 import type { SoundOption, SoundState } from "./sound.ts";
@@ -45,6 +46,9 @@ export function checkWorkerOptions(platform: Platform, opts: CreateKernelOptions
 	const objects = (opts.disks ?? []).map((d, i) => (isDiskSpec(d) ? -1 : i)).filter((i) => i >= 0);
 	if (objects.length)
 		throw new BootError("support", `createKernel({ worker: true }): disks[${objects.join("], disks[")}] ${objects.length > 1 ? "are BlockDevice objects, which" : "is a BlockDevice object, which"} cannot cross to the worker; ${SPEC_HINT}`);
+	const d = opts.distro;
+	if (d !== undefined && typeof d !== "string" && !(d instanceof URL) && !isDiskSpec(d))
+		throw new BootError("support", `createKernel({ worker: true }): distro is a BlockDevice object, which cannot cross to the worker; pass its path or URL, or a spec ({ kind: "file", path } on Node, { kind: "http", url })`);
 	if (opts.net && !isNetSpec(opts.net))
 		throw new BootError("support", `createKernel({ worker: true }): net is a NetDevice or NetBackend object, which cannot cross to the worker; ${NET_HINT}`);
 	if (typeof opts.vsock === "object" && opts.vsock.raw)
@@ -152,6 +156,8 @@ export interface WorkerKernelOptions {
 export class WorkerKernel implements KernelHandle {
 	/** The command line it booted with. */
 	cmdline = "";
+	/** The distro image (the `distro` option) as the worker read it, or undefined. */
+	distro: DistroInfo | undefined = undefined;
 	/** Memory actually allocated, in MiB. */
 	memoryMiB = 0;
 	memory64 = false;
@@ -288,6 +294,7 @@ export class WorkerKernel implements KernelHandle {
 			break;
 		case "started":
 			this.cmdline = m.cmdline;
+			this.distro = m.distro;
 			this.memoryMiB = m.memoryMiB;
 			this.memory64 = m.memory64;
 			this.#setStats(m.stats);
@@ -732,9 +739,13 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 		if (initrd instanceof WebAssembly.Module) throw new BootError("download", "initrd: a WebAssembly.Module is not an initramfs");
 		if (signal?.aborted) throw new BootError("download", "aborted", { cause: signal.reason });
 		const [disks, diskTransfer] = toWorkerDisks((opts.disks ?? []) as DiskSpec[], platform);
+		// The distro as a spec, made here (a relative URL against this page) and read-only.
+		const distro = opts.distro === undefined ? undefined
+			: toWorkerDisks([typeof opts.distro === "string" || opts.distro instanceof URL
+				? distroSpecOf(opts.distro, platform.distroSpec) : readOnlySpec(opts.distro as DiskSpec)], platform)[0][0];
 		const [restore, restoreTransfer] = toWorkerRestore(opts.restore, !!opts.transferRestore);
 		spec = {
-			kernel, initrd, disks, net: opts.net as NetSpec | undefined,
+			kernel, initrd, disks, distro, net: opts.net as NetSpec | undefined,
 			cmdline: opts.cmdline,
 			memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 512,
 			memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,

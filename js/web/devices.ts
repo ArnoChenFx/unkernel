@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The browser device kinds (core/devices.ts): the persistent "data" disk
 // in IndexedDB and "http" disks whose overlay is saved in IndexedDB
-// (`persist`). Used by the web platform on the page's thread and by the
-// kernel worker (web-worker-entry.ts); IndexedDB exists in both.
+// (`persist`; a readOnly one has no overlay). Used by the web platform on
+// the page's thread and by the kernel worker (web-worker-entry.ts);
+// IndexedDB exists in both.
 //
 // "data" behaves like the page's attachDataDisk() (web/src/data.ts) once
 // the caller has decided the mode: "persistent" opens the store (seeding
@@ -12,7 +13,7 @@
 // memory with a notice saying why; nothing is cleared. The one-tab lock is
 // the caller's: it passes mode "snapshot" when another tab holds it.
 
-import { CowDisk, HttpBase } from "../core/block.ts";
+import { BaseDisk, CowDisk, HttpBase } from "../core/block.ts";
 import { bundledBoot } from "../core/kernel.ts";
 import { coreDevices, extendDevices, type DataDiskSpec, type DeviceContext, type DeviceRegistry, type HttpDiskSpec } from "../core/devices.ts";
 import { IdbStore, openDataDisk } from "./disk.ts";
@@ -20,7 +21,9 @@ import { IdbStore, openDataDisk } from "./disk.ts";
 export const webDevices: DeviceRegistry = extendDevices(coreDevices, {
 	disks: {
 		async http(spec: HttpDiskSpec, ctx: DeviceContext) {
-			const base = await HttpBase.open(spec.url, { chunkSize: spec.chunkSize });
+			const opts = { chunkSize: spec.chunkSize, prefetch: spec.prefetch, log: ctx.log };
+			if (spec.readOnly) return new BaseDisk(await HttpBase.open(spec.url, { ...opts, strict: true }));
+			const base = await HttpBase.open(spec.url, opts);
 			const store = spec.persist && typeof indexedDB !== "undefined" ? new IdbStore(spec.persist, { log: ctx.log }) : null;
 			return new CowDisk(base, { store, log: ctx.log, onError: (e) => ctx.onDiskError(ctx.index, e) }).open({ onMismatch: "clear" });
 		},

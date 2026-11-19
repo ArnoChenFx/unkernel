@@ -16,14 +16,16 @@
 //                  in-memory overlay over it; the CLI's --disk, --data)
 //          "http"  an image served with HTTP Range support under an
 //                  overlay (in memory; in browsers saved in IndexedDB
-//                  under `persist`; the CLI's --disk URL, openHttpDisk())
+//                  under `persist`; the CLI's --disk URL, openHttpDisk()),
+//                  or with readOnly read straight from the server (a
+//                  distro image)
 //          "data"  the persistent data disk (browsers: IndexedDB, from the
 //                  kernel bundle's unkernel.datadisk template or bytes;
 //                  the page's /data, openDataDisk())
 //   net    a NetStack over a backend: "direct" (Node: host sockets, the
 //          CLI's default) or "wisp" (a Wisp server; everywhere)
 
-import { CowDisk, F_RO, HttpBase, type BlockDevice, type CowDiskStats } from "./block.ts";
+import { BaseDisk, CowDisk, F_RO, HttpBase, type BlockDevice, type CowDiskStats } from "./block.ts";
 import { BootError } from "./load.ts";
 import { NetStack, type NetBackend } from "./net.ts";
 import { wispBackend } from "./net-wisp.ts";
@@ -57,6 +59,10 @@ export interface HttpDiskSpec extends SpecCommon {
 	chunkSize?: number;
 	/** Browsers: keep the overlay in IndexedDB under this name (openHttpDisk's `name`); else it is in memory. */
 	persist?: string;
+	/** No overlay: the guest's writes fail (EROFS), and every range must come from the image first seen (HttpBase strict). `persist` is ignored. */
+	readOnly?: boolean;
+	/** Bytes to fetch ahead at open, in one streaming request (HttpBaseOptions.prefetch); default: what the image's distro header says; false: none. */
+	prefetch?: number | false;
 }
 
 /** The persistent data disk (browsers: IndexedDB; see js/web/disk.ts openDataDisk()). */
@@ -95,7 +101,7 @@ export interface DeviceContext {
 	log: (msg: string) => void;
 	/** A save of disk `index` failed (e.g. QuotaExceededError); the guest sees EIO for that flush. */
 	onDiskError: (index: number, error: unknown) => void;
-	/** The disk's index in the specs. */
+	/** The disk's index in the specs (-1: the distro image). */
 	index: number;
 }
 
@@ -108,7 +114,9 @@ export interface DeviceRegistry {
 export const coreDevices: DeviceRegistry = {
 	disks: {
 		async http(spec: HttpDiskSpec, ctx: DeviceContext) {
-			return new CowDisk(await HttpBase.open(spec.url, { chunkSize: spec.chunkSize }), { log: ctx.log });
+			const opts = { chunkSize: spec.chunkSize, prefetch: spec.prefetch, log: ctx.log };
+			if (spec.readOnly) return new BaseDisk(await HttpBase.open(spec.url, { ...opts, strict: true }));
+			return new CowDisk(await HttpBase.open(spec.url, opts), { log: ctx.log });
 		},
 	},
 	backends: {

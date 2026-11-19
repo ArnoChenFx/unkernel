@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // WASI programs (wasm32-wasi, preview 1 or 0) that the guest runs, executed by
 // the host's own wasm engine (prototype). The guest's binfmt_misc hands an
-// executable .wasm file to kwwasi (kernel/guest/kwwasi.c), which connects
+// executable .wasm file to kwwasi (guest/src/kwwasi.c), which connects
 // to vsock port 1021 and sends argv, the environment, its preopened
 // directory and the module (unless this side has it); kwwasi then does the
 // program's file calls with
@@ -50,7 +50,7 @@ import { sharedMemoryAvailable } from "./worker-shared.ts";
 
 export type { WasiFromProgram, WasiProgramEndpoint, WasiProgramPort, WasiToProgram } from "./wasi-program.ts";
 
-/** The host port kwwasi connects to (kernel/guest/kwwasi.c KWWASI_PORT). */
+/** The host port kwwasi connects to (guest/src/kwwasi.c KWWASI_PORT). */
 export const WASI_EXEC_PORT = 1021;
 
 export interface WasiExecOptions {

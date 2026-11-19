@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# A hook of /lib/lsb/init-functions (sourced after its functions, by sysv-rc's
+# rc and every init script): log_action_msg as init-functions defines it,
+# without the line rc prints at every boot with a service ("Using
+# makefile-style concurrent boot in runlevel 2."; kw-init runs rc).
+
+# unkernel: no concurrent-boot banner from rc.
+log_action_msg () {
+    case "$*" in
+    "Using makefile-style concurrent boot in runlevel "*) return 0 ;;
+    esac
+    log_action_msg_pre "$@"
+    echo "$@." || true
+    log_action_msg_post "$@"
+}

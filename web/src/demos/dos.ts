@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// DOS: FreeDOS 1.2 booting on a PC emulated by qemu-system-i386, a riscv64
+// DOS: FreeDOS 1.2 booting on a PC emulated by qemu-system-i386, an aarch64
 // program on the guest, drawn in the terminal by qemu's curses display
 // (VGA text mode; a program that switches to graphics shows nothing).
 // qemu-system-i386 and qemu-ui-curses are in community: about 25 MB to
@@ -16,7 +16,7 @@
 // costs seconds under two layers of emulation: as shipped, qemu took 6.5 s
 // to reach the FreeDOS kernel, 19 s more to the shell (the F5/F8 wait,
 // HIMEMX) and 45 s more for AUTOEXEC.BAT (CD-ROM drivers, LBACACHE, the
-// welcome text) (CLI, 2026-11-15). Only FDAPM APMDOS stays: it halts the
+// welcome text) (riscv64 guest, CLI, 2026-11-15). Only FDAPM APMDOS stays: it halts the
 // CPU while DOS waits for a key, so an idle prompt does not keep qemu, and
 // the tab, at full speed. qemu runs with -nodefaults (no CD-ROM for the
 // BIOS to probe, no parallel port) and 4 MB of memory. The
@@ -44,7 +44,7 @@
 import type { Demo } from "../launcher.ts";
 
 const DOS = String.raw`#!/bin/sh
-# FreeDOS on an emulated PC: qemu-system-i386 (a riscv64 program) boots the
+# FreeDOS on an emulated PC: qemu-system-i386 (an aarch64 program) boots the
 # FreeDOS 1.2 boot floppy, with its installer removed, to an A:\> prompt.
 set -e
 IMG=fdos12.img
@@ -81,7 +81,7 @@ FDAPM APMDOS >NUL
 alias halt=fdapm poweroff
 alias shutdown=fdapm poweroff
 cls
-echo FreeDOS 1.2, on a PC emulated by qemu-system-i386, a riscv64 program,
+echo FreeDOS 1.2, on a PC emulated by qemu-system-i386, an aarch64 program,
 echo on Linux compiled to WebAssembly, running in your browser.
 echo.
 echo Try DIR /W, VER, MEM, or EDIT NOTES.TXT (A: is writable and kept).
@@ -147,7 +147,7 @@ export default {
 	// Hidden: too slow for the launcher, even stripped (status.md).
 	hidden: true,
 	title: "FreeDOS",
-	desc: "FreeDOS 1.2 booting on a PC emulated by qemu-system-i386, inside the riscv64 Linux in your browser",
+	desc: "FreeDOS 1.2 booting on a PC emulated by qemu-system-i386, inside the aarch64 Linux in your browser",
 	// A floppy disk.
 	icon: { svg: '<path fill-rule="evenodd" d="M4 2h13l5 5v13a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm3 1.5v5.5h9V3.5Zm5.5 1h2v3.5h-2ZM5.5 13v7.5h13V13Z"/><path opacity=".55" d="M7.5 15h9v1.2h-9Zm0 2.5h6.5v1.2H7.5Z"/>' },
 	colors: ["#2563eb", "#0b1d4d"],

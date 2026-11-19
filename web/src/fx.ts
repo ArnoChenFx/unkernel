@@ -57,7 +57,7 @@ machine in the page's other terminal windows.
 - Each command runs in a fresh \`/bin/sh -lc\` and must finish within your
   tool's time limit (30 s at most). Start longer work in the background
   (\`nohup cmd > /tmp/cmd.log 2>&1 &\`) and check on it.
-- The CPU is emulated (an aarch64 interpreter, in the browser),
+- The CPU is emulated (an aarch64 interpreter with a JIT, in the browser),
   so builds and installs are slow. Prefer prebuilt packages.
 - Install software with \`apk add <package>\`; run \`/etc/kw-apk-enable\`
   first to enable the community repository. The network, when the page has

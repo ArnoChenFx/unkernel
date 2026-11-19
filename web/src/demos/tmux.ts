@@ -52,7 +52,7 @@ while :; do
 done
 `;
 
-const README = `tmux in unkernel: a terminal multiplexer, the riscv64 build from Alpine,
+const README = `tmux in unkernel: a terminal multiplexer, the aarch64 build from Alpine,
 running on Linux in this browser tab.
 
   Ctrl-B %   split left and right        Ctrl-B "   split top and bottom

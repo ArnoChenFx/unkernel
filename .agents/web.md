@@ -536,7 +536,9 @@ both files describe the rest at their top:
   4.5 MB download, 6.9 MB, first call 2.5 s, later ones 0.01 s; claude
   2.1.327 127 MB (`.zst`), 357 MB, 23 s, then `--version` 0.2 s, `--help`
   6 s; opencode 2.3.2 120 MB, 248 MB, 22 s, then `--version` 6 s (its own
-  startup). All three also run at 256 MiB. Without a data disk the root is
+  startup); rechecked the same day on a fresh data disk (fx 0.0.17, claude
+  2.1.327, opencode 2.3.2): first calls 2.2, 16.9 and 20.9 s, then 0.0,
+  0.1 and 4.3 s. All three also run at 256 MiB. Without a data disk the root is
   in RAM (230 MiB free at 512 MiB): fx installs, claude and opencode refuse
   with a message; at 1 GiB claude fits.
 - claude's own auto-updater is left on: it may download a newer version
@@ -614,6 +616,28 @@ reopens the last demo launched; Reboot keeps it. Closing that demo's
 window (or its shell exiting) removes `?demo=`; the kernel stopping does
 not.
 Failures are toasts. Checked by hand only.
+
+Every demo's run.sh, as the launcher writes it, was run on the aarch64
+guest through the Node SDK on 2026-11-18: a fresh data disk per demo, 512
+MiB, the files written with `vm.exec()` and run.sh in a pty session (the
+window's command without the wrapper), the host's network instead of Wisp,
+a display or sound card where the demo needs one, and the Ubuntu tarball
+pushed as `downloads` does (a scratch harness, not in the repository).
+Each reached its working state: the
+servers answered over `vm.fetch()` (nitro's echo POST, python's note
+POST), postgres's `select version()` said aarch64, glimmer and Doom drew
+frames, radio and speak played sound, sshfs mounted Rebex's server.
+Seconds from run.sh's start, the `apk add` step (indexes and packages
+over the host's network) first, then the time to the working state:
+htop 1.6/1.7, tmux 1.8/2.6, mc 2.6/3.0, Neovim 6.8/7.7 (community), Git
+2.8/4.9 (clone 1.6 s), sshfs 2.9/4.6 (mounted, tour done), nginx
+1.8/2.1, Node.js 5.3/10.5, Nitro 5.9/39.4 (upm install 16 s, `nitro dev`
+14 s), Python 4.3/6.2, PostgreSQL 5.7/19.6 (initdb and start 13 s),
+SQLite 1.7/2.9, Valkey 2.1/3.3, radio 1.7 (sound about 1 s after a
+station is picked), speak 2.4 (the introduction starts at once),
+asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
+(extracting the pushed tarball; 0.2 later, `apt-get update` 28 s in the
+chroot), Doom 22 (tcc install, downloads and a 6 s build; 0.2 later).
 
 `?showcase` (or `?demo=-`) runs `src/showcase.ts` once the guest is up: a
 fast, hands-off tour of the demos, leaving out the web servers (described at its top).

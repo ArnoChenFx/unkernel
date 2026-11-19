@@ -7,7 +7,7 @@
 // openssh-client and glib) and tree, about 4.3 MB to download, and mc
 // (about 1.7 MB more, since it shares glib) to browse the mount after.
 // httpdirfs, the other idea (an HTTP directory listing as a file system),
-// has no riscv64 build in Alpine v3.24, and rclone's http backend is a
+// is not in Alpine v3.24, and rclone's http backend is a
 // 37 MB download.
 //
 // The guest's TCP goes through the page's Wisp server, which lets port 22

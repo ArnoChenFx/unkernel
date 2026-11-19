@@ -592,14 +592,14 @@ for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
   sums the PCM chunks 300 ms after glimmer's "test sound done" and then
   misses the last one (65966 or 65919 of 66150 frames), while
   `test/glimmer-check.mjs --run` gets all 66150, sample exact (3 of 3).
-- **aarch64 image: not yet rerun.** The Ubuntu arm64 disk, x86_64, i386
-  and arm binaries through qemu-user (riscv64 works: a static riscv64
-  program installed qemu-riscv64 and its library root on first run, 60 s,
-  and then ran in 0.4 s, 2026-11-17), and the page. The page's fx,
-  claude and opencode stand-ins (web.md, Stand-ins) are checked through
-  the SDK only; in a browser, writing claude's 357 MB and opencode's
-  248 MB to the IndexedDB data disk has not been timed. The ubuntu and
-  sqlite demos are still written for riscv64.
+- **aarch64 page: not yet opened in a browser.** The launcher demos (web.md,
+  Launcher), the stand-ins (web.md, Stand-ins) and qemu-user are checked
+  through the Node SDK only (2026-11-18): static busybox binaries of
+  x86_64, riscv64, i386 and armv7 each installed their qemu and library
+  root on first run in 8-9 s and then ran in 0.2-0.3 s. In a browser,
+  writing claude's 357 MB and opencode's 248 MB to the IndexedDB data disk
+  has not been timed, and every demo's first run there waits on Wisp
+  instead of the host's network.
 - **GNU ld binaries exec slower.** Alpine links everything with GNU ld,
   whose one R+X segment for code and read-only data cost about 0.5 ms per
   exec under riscv64 kwemu against lld's layout; on aarch64 about 0.07

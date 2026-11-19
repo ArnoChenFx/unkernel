@@ -17,7 +17,7 @@
 // archive VFS: Enter on it browses it like a directory.
 import type { Demo } from "../launcher.ts";
 
-const README = `Midnight Commander in unkernel: the riscv64 build of mc from Alpine,
+const README = `Midnight Commander in unkernel: the aarch64 build of mc from Alpine,
 running on Linux, compiled to WebAssembly, in this browser tab.
 
 The left panel is this directory, the right one is /proc: the kernel's
@@ -63,8 +63,8 @@ const UNKERNEL = `unkernel, layer by layer
 
   your browser      runs one WebAssembly module
   the kernel        Linux, built for arch/wasm with an MMU
-  user space        unmodified riscv64 Alpine Linux binaries
-  kwemu             the RISC-V emulator inside the kernel, with a JIT
+  user space        unmodified aarch64 Alpine Linux binaries
+  kwemu             the aarch64 CPU inside the kernel, with a JIT
                     that turns hot guest code into WebAssembly
 
 mc, the shell and everything in /proc come from that stack. Nothing

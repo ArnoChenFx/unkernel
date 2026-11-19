@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Speak: the guest talks through its sound card. eSpeak 1.48 (Alpine's
-// riscv64 espeak from main) is a formant synthesizer: no recorded voices,
+// aarch64 espeak from main) is a formant synthesizer: no recorded voices,
 // about 70 languages in its 1.2 MB package. With portaudio, alsa-lib and
 // the JACK client library it pulls in, the download is about 4.9 MB, all
 // from main, so community stays off.
@@ -20,7 +20,8 @@
 // they go to /tmp/speak.log, shown only when espeak fails, and
 // JACK_NO_START_SERVER keeps the JACK client from trying to start one. That
 // probing is most of espeak's start-up: a sentence plays about 0.45 s
-// after espeak starts (CLI, 2026-11-15). Text goes in on stdin, so a line
+// after espeak starts (riscv64 guest, CLI, 2026-11-15; on aarch64 a
+// one-word espeak call, playback included, takes about 1.0 s, 2026-11-18). Text goes in on stdin, so a line
 // that starts with a dash is not taken as an option.
 //
 // The INT trap (a handler, reset in children) makes Ctrl-C cut espeak off
@@ -29,7 +30,7 @@
 import type { Demo } from "../launcher.ts";
 
 const SPEAK = String.raw`#!/bin/sh
-# The machine speaks: eSpeak, a speech synthesizer, running on riscv64 Linux
+# The machine speaks: eSpeak, a speech synthesizer, running on aarch64 Linux
 # in the browser and playing through the guest's sound card.
 export JACK_NO_START_SERVER=1
 LOG=/tmp/speak.log
@@ -65,8 +66,8 @@ intro() {
 	procs=$(ls -d /proc/[0-9]* | wc -l)
 
 	say "Hello! I am Linux $kver, running in your browser."
-	whisper "(psst: on an emulated RISC-V processor, inside WebAssembly)" \
-		"psst. on an emulated risk five processor, inside WebAssembly."
+	whisper "(psst: on an emulated Arm processor, inside WebAssembly)" \
+		"psst. on an emulated arm processor, inside WebAssembly."
 	say "I have been up for $up, with $procs processes running."
 }
 

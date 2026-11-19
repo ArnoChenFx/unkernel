@@ -4,7 +4,7 @@
 // replacement, cloned with git, toured, then browsed with tig. Its whole
 // history, 163 commits since 2010, is about 224 KB packed (2026-11-15), so
 // the clone takes a moment even over the page's Wisp connection. git and
-// tig are Alpine's riscv64 packages from main (about 6.6 MB to download
+// tig are Alpine's aarch64 packages from main (about 6.6 MB to download
 // with their libraries); git talks HTTPS to GitHub with its own libcurl,
 // not the image's curl shim.
 //

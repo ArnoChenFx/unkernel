@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Python: Alpine's riscv64 python3 (main, 3.14, about 8.5 MB to download, a
+// Python: Alpine's aarch64 python3 (main, 3.14, about 8.5 MB to download, a
 // little more with the libraries it pulls in) serving a notes wall on port
 // 8000 from the standard library alone: http.server, sqlite3 and html, so no
 // pip and no virtualenv.
@@ -61,7 +61,7 @@ else:
 MAX_NAME, MAX_MESSAGE, MAX_BODY, SHOWN = 40, 280, 16384, 100
 SEED = [
     ("unkernel", "Welcome! This wall is a Python program: http.server and sqlite3 "
-     "from the standard library, on riscv64 Linux, in your browser tab."),
+     "from the standard library, on aarch64 Linux, in your browser tab."),
     ("app.py", "Leave a note below. It goes into SQLite, and the page you get back "
      "after the redirect lists it here, newest first."),
 ]
@@ -309,7 +309,7 @@ PAGE = string.Template("""<!doctype html>
     </div>
     <span class="pill">$count</span>
   </div>
-  <p>This page comes from <code>app.py</code>: <code>http.server</code>, <code>sqlite3</code> and <code>html</code> from the standard library, no pip. Python is Alpine's riscv64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Notes are stored in SQLite; times are the guest's clock.</p>
+  <p>This page comes from <code>app.py</code>: <code>http.server</code>, <code>sqlite3</code> and <code>html</code> from the standard library, no pip. Python is Alpine's aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Notes are stored in SQLite; times are the guest's clock.</p>
 
   <form method="post" action="./">
     <textarea name="message" maxlength="$max_message" placeholder="Leave a note..." required></textarea>

@@ -315,7 +315,7 @@ vim.keymap.set("n", "<Esc>", "<Cmd>nohlsearch<CR>")
 
 const README = `# Neovim on unkernel
 
-Neovim 0.12, the riscv64 build from Alpine, on Linux compiled to
+Neovim 0.12, the aarch64 build from Alpine, on Linux compiled to
 WebAssembly, in this browser tab. The setup is one file with no plugins:
 config/nvim/init.lua (Space s opens it).
 
@@ -333,7 +333,7 @@ Open hello.c or the config: the highlighting is tree-sitter's.
 const HELLO = `#include <stdio.h>
 #include <sys/utsname.h>
 
-/* Compiled for riscv64, run by the kernel in this tab. */
+/* Compiled for aarch64, run by the kernel in this tab. */
 int main(void)
 {
 	struct utsname u;

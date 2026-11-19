@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Node.js: Alpine's riscv64 nodejs (main, about 25 MB) serving a live
+// Node.js: Alpine's aarch64 nodejs (main, about 25 MB) serving a live
 // dashboard on port 3000 with node:http alone, so no npm install.
 //
 // The page polls api/stats every 2 s with fetch: the preview relays plain
@@ -54,7 +54,7 @@ function stats() {
 		release: os.release(),
 		hostname: os.hostname(),
 		cpus: cpus.length,
-		cpuModel: cpus[0] && cpus[0].model !== "unknown" ? cpus[0].model : "", // unknown on riscv64
+		cpuModel: cpus[0] && cpus[0].model !== "unknown" ? cpus[0].model : "", // unknown where /proc/cpuinfo names no model (as here)
 		loadavg: os.loadavg(),
 		totalmem: os.totalmem(),
 		freemem: os.freemem(),
@@ -75,7 +75,7 @@ function stats() {
 
 function bench() {
 	// SHA-256 through OpenSSL for 300 ms, then a sieve in plain JavaScript,
-	// which V8 compiles to riscv64 code.
+	// which V8 compiles to arm64 code.
 	const buf = crypto.randomBytes(64 * 1024);
 	let bytes = 0;
 	const t0 = performance.now();
@@ -189,7 +189,7 @@ const PAGE = `<!doctype html>
 		</div>
 		<span class="live" id="live"><i></i><span id="livetext">waiting</span></span>
 	</header>
-	<p>This page comes from <code>node:http</code> in <code>server.mjs</code>. Node is Alpine's riscv64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Every number below is the guest's own, polled every 2 seconds.</p>
+	<p>This page comes from <code>node:http</code> in <code>server.mjs</code>. Node is Alpine's aarch64 build, unmodified, on a Linux kernel compiled to WebAssembly, in your browser. Every number below is the guest's own, polled every 2 seconds.</p>
 
 	<div class="hero">
 		<div><span>process.version</span><b id="h-version">-</b></div>
@@ -248,7 +248,7 @@ const PAGE = `<!doctype html>
 		</section>
 		<section>
 			<h2>Benchmark</h2>
-			<p style="margin-top:0">SHA-256 through Node's OpenSSL for 300 ms, then a sieve of Eratosthenes in plain JavaScript, which V8 compiles to riscv64 code for the emulator to run.</p>
+			<p style="margin-top:0">SHA-256 through Node's OpenSSL for 300 ms, then a sieve of Eratosthenes in plain JavaScript, which V8 compiles to arm64 code for the emulated CPU to run.</p>
 			<button id="bench">Run</button>
 			<dl style="margin-top:.75rem">
 				<dt>sha256</dt><dd id="sha">-</dd>

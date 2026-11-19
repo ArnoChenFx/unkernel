@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Valkey: the BSD-licensed, Redis-compatible key/value server, Alpine's
-// riscv64 valkey and valkey-cli from main (about 1.7 MB to download; the
+// aarch64 valkey and valkey-cli from main (about 1.7 MB to download; the
 // libssl3 and libcrypto3 they link are already in the image). Alpine's redis
 // (about 2.1 MB, AGPL/SSPL) works the same way but is in community, and
 // enabling community makes every later apk command in the guest about 2 s
@@ -150,7 +150,7 @@ cmd() {
 }
 section() { printf '\n\033[1m── %s\033[0m\n' "$1"; }
 
-section "The server: INFO server, on riscv64 Linux in your browser"
+section "The server: INFO server, on aarch64 Linux in your browser"
 printf "$P %s\n" "INFO server   (some of its lines)"
 valkey-cli INFO server | tr -d '\r' |
 	grep -E '^(valkey_version|os|arch_bits|process_id|tcp_port|uptime_in_seconds|multiplexing_api|config_file):'

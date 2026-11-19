@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Radio: SomaFM's listener-supported internet radio played by mpg123 on the
-// guest's sound card. Alpine's riscv64 mpg123 from main pulls in
+// guest's sound card. Alpine's aarch64 mpg123 from main pulls in
 // mpg123-libs and alsa-lib (about 0.8 MB to download). It has the ALSA and
 // OSS output modules built in (no separate subpackage), and both play on
 // kwsnd; radio.sh uses ALSA, the card's own interface (OSS is the kernel's
@@ -10,8 +10,10 @@
 // SomaFM's MP3 streams are 128 kbit/s, 44.1 kHz stereo; everything lower is
 // AAC, which mpg123 does not decode. That is cheap enough as it is: under
 // the JIT, mpg123 takes about 5% of the guest's CPU and the whole emulator
-// about 6% of a host core (CLI over Wisp, 2026-11-15), so there is no --mono or -2
-// downsampling, and no underruns over Wisp in the runs measured. Each
+// about 6% of a host core (riscv64 guest, CLI over Wisp, 2026-11-15), so there
+// is no --mono or -2 downsampling; on the aarch64 guest Groove Salad
+// started about 1 s after it was picked and played with no underrun (CLI,
+// 2026-11-18). Each
 // station is SomaFM's plain-http playlist (somafm.com/nossl/<id>.pls), the
 // link SomaFM asks players to use since it does not change. radio.sh fetches
 // it with wget, since mpg123 -@ exits 0 when the playlist cannot be had, and

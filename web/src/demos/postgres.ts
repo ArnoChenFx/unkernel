@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// PostgreSQL: Alpine's riscv64 postgresql18 (main, about 13 MB to download
+// PostgreSQL: Alpine's aarch64 postgresql18 (main, about 13 MB to download
 // with what it pulls in), a real server in the tab: a small seeded database,
 // a few showcase queries, then an interactive psql. No ports: there is no
 // HTTP UI, psql is the interface.

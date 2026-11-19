@@ -86,7 +86,7 @@ export default defineHandler(() => {
 const RUNTIME = `import os from "node:os";
 import { defineHandler } from "nitro";
 
-// The guest's own numbers: Node on riscv64 Linux, compiled to WebAssembly.
+// The guest's own numbers: Node on aarch64 Linux, compiled to WebAssembly.
 export default defineHandler(() => {
   return {
     node: process.version,
@@ -207,7 +207,7 @@ const PAGE = `<!doctype html>
 </nav>
 <main>
 	<h1>Nitro, running in your browser.</h1>
-	<p class="lead">A standalone Nitro v3 server. <code>nitro dev</code> runs the ES modules in <code>server/</code> with no build step, on Alpine's riscv64 Node, on a Linux kernel compiled to WebAssembly.</p>
+	<p class="lead">A standalone Nitro v3 server. <code>nitro dev</code> runs the ES modules in <code>server/</code> with no build step, on Alpine's aarch64 Node, on a Linux kernel compiled to WebAssembly.</p>
 	<div class="mono" id="who">connecting...</div>
 
 	<div class="card stats">

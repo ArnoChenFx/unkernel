@@ -19,7 +19,7 @@ export default {
 	colors: ["#38bdf8", "#1e3a8a"],
 	community: true,
 	files: {
-		"README": "asciiquarium: an aquarium animation in perl (Term::Animation), the riscv64\n" +
+		"README": "asciiquarium: an aquarium animation in perl (Term::Animation), the aarch64\n" +
 			"build from Alpine, running on Linux in this browser tab.\n\n" +
 			"  q quits   p pauses   r redraws (new fish, and the window's new size)\n\n" +
 			"Ctrl-C quits too.\n",

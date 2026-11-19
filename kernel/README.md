@@ -827,8 +827,9 @@ from source). Everything is self-hosted except the Wisp fallback.
   `?simulate=nojspi|oom|lowmem` (documented in `web/src/config.ts`).
 * **Launcher:** ❯ at the left of the status line (or ⌘K on Apple devices,
   Ctrl-Shift-O, Ctrl-A o) opens a full-page grid of demos: glimmer, tmux,
-  htop, Midnight Commander, Neovim, sshfs over FUSE, nginx, Node.js, Python,
-  PostgreSQL, SQLite, Valkey, internet radio, asciiquarium and Doom. Each
+  htop, Midnight Commander, Neovim, Git, Ubuntu in a chroot, sshfs over
+  FUSE, nginx, Node.js, Nitro, Python, PostgreSQL, SQLite, Valkey, internet
+  radio, speech, asciiquarium and Doom. Each
   runs in a new terminal window: the page writes its files into the guest,
   installs its Alpine packages with apk and runs its commands
   (`web/src/demos/`, one file each); web servers open in the preview. The

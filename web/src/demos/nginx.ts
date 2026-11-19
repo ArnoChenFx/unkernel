@@ -43,7 +43,7 @@ const PAGE = `<!doctype html>
 <body>
 <main>
 	<h1>Hello from nginx</h1>
-	<p>This page is served by nginx, running on Linux in this browser tab. The kernel is WebAssembly, nginx is the riscv64 binary from Alpine, and this request went from the page to the guest over vsock.</p>
+	<p>This page is served by nginx, running on Linux in this browser tab. The kernel is WebAssembly, nginx is the aarch64 binary from Alpine, and this request went from the page to the guest over vsock.</p>
 	<dl>
 		<dt>nginx</dt><dd><!--# echo var="nginx_version" --></dd>
 		<dt>Guest time</dt><dd><!--# echo var="date_local" --></dd>

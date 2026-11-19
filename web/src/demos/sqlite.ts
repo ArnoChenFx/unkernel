@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// SQLite: Alpine's riscv64 sqlite (the sqlite3 shell, main, about 1.4 MB to
+// SQLite: Alpine's aarch64 sqlite (the sqlite3 shell, main, about 1.4 MB to
 // download with readline and ncurses), querying the running guest itself:
 // SQL over the live Linux in the browser, where the postgres demo has a seeded
 // dataset. No server and no ports: sqlite3 is the interface.
@@ -9,7 +9,7 @@
 // installed packages from apk's database (/lib/apk/db/installed: P:, V:, T:,
 // L:, o:, I:, D:, p:, i: and R: lines, records separated by blank lines;
 // /etc/apk/world), the processes (/proc/<pid>/status and cmdline), the mounts
-// (/proc/mounts) and a few facts (uname, /proc/cpuinfo's ISA string,
+// (/proc/mounts) and a few facts (uname, /proc/cpuinfo's feature list,
 // /proc/meminfo). busybox awk turns each into INSERT statements, quoting with
 // a q variable since the programs sit in single quotes. The snapshot tables
 // are dropped and made again, so a rerun sees packages installed meanwhile;
@@ -18,7 +18,7 @@
 // reboots), with a system.db symlink to it in the demo's directory, else
 // system.db there itself.
 //
-// Dependencies are kept as written (so:libc.musl-riscv64.so.1, cmd:sh,
+// Dependencies are kept as written (so:libc.musl-aarch64.so.1, cmd:sh,
 // /bin/sh), and the needs view resolves them through provides (each package's
 // own name plus its p: names) to package-to-package edges. tree.sql walks
 // them down from a package; apk-del.sql works out what apk del would remove:
@@ -139,7 +139,7 @@ facts() {
 		printf 'kernel\t%s\n' "$(uname -sr)"
 		printf 'machine\t%s\n' "$(uname -m)"
 		awk -F': *' '{ k = $1; sub(/[ \t]+$/, "", k) }
-			(k == "isa" || k == "mmu") && !(k in seen) { seen[k] = 1; print toupper(k) "\t" $2 }' /proc/cpuinfo
+			k == "Features" && !(k in seen) { seen[k] = 1; print "features\t" $2 }' /proc/cpuinfo
 		awk '/^MemTotal:/ { print "memory\t" int($2 / 1024) " MiB" }' /proc/meminfo
 		awk '{ printf "uptime\t%d min %d s\n", $1 / 60, $1 % 60 }' /proc/uptime
 		printf 'database\t%s\n' "$db"
@@ -292,23 +292,20 @@ const SHOWCASE = String.raw`-- Queries over the snapshot snapshot.sh just took, 
 
 .print
 .print '── This system: the system table'
-SELECT fact, value FROM system WHERE fact <> 'ISA' ORDER BY rowid;
+SELECT fact, value FROM system WHERE fact <> 'features' ORDER BY rowid;
 
 .print
-.print "── The CPU's ISA string from /proc/cpuinfo, split into extensions by a recursive CTE"
+.print "── The CPU's features from /proc/cpuinfo, split into a list by a recursive CTE"
 WITH RECURSIVE split(i, ext, rest) AS (
-	SELECT 0, NULL, (SELECT value FROM system WHERE fact = 'ISA') || '_'
+	SELECT 0, NULL, (SELECT value FROM system WHERE fact = 'features') || ' '
 	UNION ALL
-	SELECT i + 1, substr(rest, 1, instr(rest, '_') - 1), substr(rest, instr(rest, '_') + 1) FROM split WHERE rest <> ''
+	SELECT i + 1, substr(rest, 1, instr(rest, ' ') - 1), substr(rest, instr(rest, ' ') + 1) FROM split WHERE rest <> ''
 )
 SELECT CASE
-		WHEN ext GLOB 'rv*' THEN 'base and single letters'
-		WHEN ext GLOB 'zi*' THEN 'CSRs, counters, cache ops, hints'
-		WHEN ext GLOB 'zb*' THEN 'bit manipulation'
-		WHEN ext GLOB 'zk*' THEN 'scalar crypto'
-		WHEN ext GLOB 'za*' THEN 'atomics'
-		WHEN ext GLOB 'z[fd]*' THEN 'floating point'
-		WHEN ext GLOB 'zc*' THEN 'compressed'
+		WHEN ext IN ('fp', 'asimd') THEN 'floating point and SIMD'
+		WHEN ext IN ('aes', 'pmull', 'sha1', 'sha2', 'sha3', 'sha512') THEN 'crypto'
+		WHEN ext = 'crc32' THEN 'checksums'
+		WHEN ext = 'atomics' THEN 'atomics (LSE)'
 		ELSE 'other'
 	END AS kind,
 	count(*) AS n, group_concat(ext, ' ' ORDER BY i) AS extensions

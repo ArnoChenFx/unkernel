@@ -5,7 +5,9 @@
 # without arguments) to /etc/apk/repositories, unless they are there already.
 # It runs no `apk update`: that would fetch every index again, while the next
 # apk command fetches only the indexes that are missing or older than 4 h.
+# Another user than root runs it through `sudo -n`.
 
+[ "$(id -u)" = 0 ] || exec sudo -n /etc/kw-apk-enable "$@"
 f=/etc/apk/repositories
 [ $# -gt 0 ] || set -- $(grep -v '^[[:space:]]*#' /etc/kw-apk-lazy 2>/dev/null)
 for r; do

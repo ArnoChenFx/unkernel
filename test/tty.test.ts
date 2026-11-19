@@ -238,7 +238,7 @@ test("handshake: OPEN carries the version, the size, TERM and ENV options; OPENE
 	const tlv = (tag: number, v: string) => [tag, ...le16(v.length), ...enc.encode(v)];
 	assert.deepEqual([...open!.payload], [
 		...le16(1), ...le16(30), ...le16(100), ...le16(800), ...le16(600),
-		...tlv(1, "vt100"), ...tlv(2, "LANG=C.UTF-8"), ...tlv(2, "FOO=a=b"),
+		...tlv(1, "vt100"), ...tlv(2, "LANG=C.UTF-8"), ...tlv(2, "FOO=a=b"), ...tlv(7, ""),
 	]);
 	// OPENED split over two chunks.
 	const o = OPENED(1234, 7);
@@ -256,12 +256,13 @@ test("handshake: OPEN carries the version, the size, TERM and ENV options; OPENE
 	const c2 = await g.next();
 	const [open2] = await c2.waitFrames(1);
 	assert.equal(g.calls[0]!.port, 5555);
-	assert.deepEqual([...open2!.payload], [...le16(1), ...le16(1), ...le16(2), 0, 0, 0, 0, ...tlv(1, "xterm-256color")]);
+	assert.deepEqual([...open2!.payload], [...le16(1), ...le16(1), ...le16(2), 0, 0, 0, 0, ...tlv(1, "xterm-256color"), ...tlv(7, "")]);
 	c2.send(OPENED(1, 0));
 	await (await p2).close();
 
 	// Values the guest would refuse fail before connecting.
-	const bads: Array<Partial<PtyOptions>> = [{ term: "" }, { term: "x".repeat(65) }, { term: "a\tb" }, { env: { "A=B": "c" } }, { env: { "": "c" } }, { env: { A: "b\0" } }, { rows: 70000 }, { cols: -1 }, { xpixel: 1.5 }];
+	const bads: Array<Partial<PtyOptions>> = [{ term: "" }, { term: "x".repeat(65) }, { term: "a\tb" }, { env: { "A=B": "c" } }, { env: { "": "c" } }, { env: { A: "b\0" } }, { rows: 70000 }, { cols: -1 }, { xpixel: 1.5 },
+		{ user: "" }, { user: "a:b" }, { user: "x".repeat(65) }, { user: -1 }, { user: 1.5 }];
 	for (const bad of bads)
 		assert.throws(() => encodeTtyOpen({ rows: 24, cols: 80, ...bad }), RangeError, JSON.stringify(bad));
 	await assert.rejects(spawnPty(g.vsock, undefined, [], { rows: 24, cols: 80, env: { BIG: "x".repeat(70000) } }), RangeError);
@@ -331,7 +332,7 @@ test("spawn(file, args, { cwd }): critical ARG and CWD options after TERM and EN
 	assert.deepEqual([...open!.payload], [
 		...le16(1), ...le16(24), ...le16(80), 0, 0, 0, 0,
 		...tlv(1, "xterm-256color"), ...tlv(2, "A=1"),
-		...tlv(0x83, "ls"), ...tlv(0x83, "-l"), ...tlv(0x83, ""), ...tlv(0x83, "a b"), ...tlv(0x84, "/tmp"),
+		...tlv(0x83, "ls"), ...tlv(0x83, "-l"), ...tlv(0x83, ""), ...tlv(0x83, "a b"), ...tlv(0x84, "/tmp"), ...tlv(7, ""),
 	]);
 	c.send(OPENED(9, 1));
 	const s = await p;
@@ -617,9 +618,16 @@ test("spawn(file, args, { pty: false }): a critical PIPES option and no TERM; DA
 	const tlv = (tag: number, v: string) => [tag, ...le16(enc.encode(v).length), ...enc.encode(v)];
 	assert.deepEqual([...open!.payload], [
 		...le16(1), 0, 0, 0, 0, 0, 0, 0, 0,
-		...tlv(2, "A=1"), ...tlv(0x83, "sh"), ...tlv(0x83, "-c"), ...tlv(0x83, "x"), ...tlv(0x84, "/"), 0x85, 0, 0,
+		...tlv(2, "A=1"), ...tlv(0x83, "sh"), ...tlv(0x83, "-c"), ...tlv(0x83, "x"), ...tlv(0x84, "/"), 0x85, 0, 0, ...tlv(7, ""),
 	]);
-	assert.deepEqual([...encodeTtyOpen({ rows: 0, cols: 0, pipes: true, term: "dumb" }).subarray(10)], [...tlv(1, "dumb"), 0x85, 0, 0], "TERM only when given");
+	assert.deepEqual([...encodeTtyOpen({ rows: 0, cols: 0, pipes: true, term: "dumb" }).subarray(10)], [...tlv(1, "dumb"), 0x85, 0, 0, ...tlv(7, "")], "TERM only when given");
+	// USER: empty for the default user; root (by name or uid 0) not critical, as an old guest's sessions are root's; another user critical.
+	const user = (u: string | number) => [...encodeTtyOpen({ rows: 0, cols: 0, pipes: true, user: u }).subarray(10)];
+	assert.deepEqual(user("root"), [0x85, 0, 0, ...tlv(7, "root")]);
+	assert.deepEqual(user(0), [0x85, 0, 0, ...tlv(7, "0")]);
+	assert.deepEqual(user("user"), [0x85, 0, 0, ...tlv(0x87, "user")]);
+	assert.deepEqual(user(1000), [0x85, 0, 0, ...tlv(0x87, "1000")]);
+	assert.deepEqual([...encodeTtyOpen({ rows: 0, cols: 0, connect: 80, user: "x" }).subarray(10)], [0x86, 2, 0, 80, 0], "no USER with CONNECT");
 	c.send(OPENED(77, 0xffffffff, 1, 1));
 	const s = await p;
 	assert.equal(s.pid, 77);

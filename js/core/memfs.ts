@@ -19,7 +19,7 @@
 // old size). An open file keeps its node after the path is renamed or
 // removed.
 
-import { FsError, type FsAttr, type FsDirEntry, type FsFile, type Fs, type FsOpenFlags, type FsSetAttr, type FsStatFs } from "./fs.ts";
+import { FS_DEFAULT_OWNER, FsError, type FsAttr, type FsDirEntry, type FsFile, type Fs, type FsOpenFlags, type FsSetAttr, type FsStatFs } from "./fs.ts";
 
 /** A file's content in a tree: text (UTF-8), bytes, or a function evaluated once per open. */
 export type FsTreeFile = string | Uint8Array | (() => string | Uint8Array);
@@ -78,7 +78,7 @@ export class MemoryFs implements Fs {
 	/** A file system with `tree`'s files (see FsTree), or empty. */
 	constructor(tree?: FsTree) {
 		const now = Date.now();
-		this.#root = { ino: 1, type: "dir", mode: 0o755, uid: 0, gid: 0, atimeMs: now, mtimeMs: now, ctimeMs: now, version: 1, nlink: 2, children: new Map() };
+		this.#root = { ino: 1, type: "dir", mode: 0o755, uid: FS_DEFAULT_OWNER, gid: FS_DEFAULT_OWNER, atimeMs: now, mtimeMs: now, ctimeMs: now, version: 1, nlink: 2, children: new Map() };
 		if (tree) this.#fill("", tree);
 	}
 
@@ -136,7 +136,7 @@ export class MemoryFs implements Fs {
 
 	#node(type: MemNode["type"], mode: number, extra: Partial<MemNode> = {}): MemNode {
 		const now = Date.now();
-		return { ino: this.#nextIno++, type, mode, uid: 0, gid: 0, atimeMs: now, mtimeMs: now, ctimeMs: now, version: 1, nlink: type === "dir" ? 2 : 1, ...extra };
+		return { ino: this.#nextIno++, type, mode, uid: FS_DEFAULT_OWNER, gid: FS_DEFAULT_OWNER, atimeMs: now, mtimeMs: now, ctimeMs: now, version: 1, nlink: type === "dir" ? 2 : 1, ...extra };
 	}
 
 	#touchDir(dir: MemNode): void {

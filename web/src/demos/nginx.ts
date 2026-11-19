@@ -8,8 +8,12 @@
 // also listens on [::]:80, and the guest has no IPv6, so nginx would refuse
 // to start. site.sh replaces it with site.conf, which has no such line.
 // Debian's package does not start nginx (the image's policy-rc.d). The files live in
-// /srv/nginx, not under ~, since nginx's workers (user nginx) cannot read
-// /root. The access log follows in the window; Ctrl-C stops that, not nginx.
+// /srv/nginx, not under ~, since nginx's workers (user nginx or www-data)
+// need not be able to read the home directory; the launcher makes
+// /srv/nginx the session user's, so the page and site.conf can be edited
+// without sudo. Installing the site, starting nginx (port 80, its logs and
+// pid file) and reading its log need root: those steps run with sudo. The
+// access log follows in the window; Ctrl-C stops that, not nginx.
 import type { Demo } from "../launcher.ts";
 
 const SITE = `# The unkernel nginx demo: replaces the distro's default site, which also
@@ -65,7 +69,7 @@ const PAGE = `<!doctype html>
 		<dt>Guest time</dt><dd><!--# echo var="date_local" --></dd>
 		<dt>Your request</dt><dd><code><!--# echo var="request_method" --> <!--# echo var="request_uri" --></code></dd>
 	</dl>
-	<p>Edit <code>/srv/nginx/www/index.html</code> in the terminal and reload this preview. The config is <code>/srv/nginx/site.conf</code>: <code>./site.sh &amp;&amp; nginx -s reload</code> applies changes.</p>
+	<p>Edit <code>/srv/nginx/www/index.html</code> in the terminal and reload this preview. The config is <code>/srv/nginx/site.conf</code>: <code>sudo ./site.sh &amp;&amp; sudo nginx -s reload</code> applies changes.</p>
 </main>
 </body>
 </html>
@@ -87,11 +91,11 @@ export default {
 	},
 	packages: { alpine: ["nginx"], debian: ["nginx"] },
 	commands: [
-		"./site.sh",
-		"mkdir -p /run/nginx",
-		"nginx -t -q",
-		"nginx -s reload 2>/dev/null || nginx",
-		"tail -n 0 -f /var/log/nginx/access.log",
+		"$SUDO ./site.sh",
+		"$SUDO mkdir -p /run/nginx",
+		"$SUDO nginx -t -q",
+		"$SUDO nginx -s reload 2>/dev/null || $SUDO nginx",
+		"$SUDO tail -n 0 -f /var/log/nginx/access.log",
 	],
 	ports: [80],
 } satisfies Demo;

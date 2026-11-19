@@ -7,6 +7,11 @@
 # command, with the whole command line as arguments, so running "$@" here
 # is running the command; its status is the line's. 127 when nothing
 # provides it. Interactive shells only; KW_AUTO_APT=0 turns it off.
+#
+# For a user other than root, with sudo: apt and apt-get typed at the
+# prompt run as `sudo apt ...` (aliases: only the first word of a line is
+# one, so `sudo apt` stays as typed, and `\apt` or `command apt` is the
+# real one; completion keys on the typed name). Scripts get no aliases.
 
 # unkernel: install missing commands.
 case $- in *i*)
@@ -18,4 +23,7 @@ command_not_found_handle() {
 	/usr/local/sbin/kw-apt-install "$1" || return 127
 	"$@"
 }
+if [ "${EUID:-$(id -u)}" != 0 ] && command -v sudo >/dev/null; then
+	alias apt='sudo apt' apt-get='sudo apt-get'
+fi
 ;; esac

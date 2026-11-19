@@ -32,11 +32,13 @@
 // - It runs once per boot and asks only for what is missing or older than
 //   MAX_AGE_S in the guest. A push never replaces a guest copy at least as
 //   new as its own (apk fetched it meanwhile), and is a rename, so an apk
-//   that is reading the old file keeps its open copy. Failures are logged
-//   and otherwise ignored.
+//   that is reading the old file keeps its open copy. The guest's state is
+//   read as the session's user; the push writes /var/cache/apk, so it runs
+//   as root (sudo.ts). Failures are logged and otherwise ignored.
 
 import { backendConnect } from "./download.ts";
 import { DEFAULT_WISP_SERVERS, fetchOver, wispBackend, type GuestConnect, type KernelHandle } from "./sdk.ts";
+import { execAsRoot } from "./sudo.ts";
 
 /** Get an index again when the guest's copy is older than this (apk's own limit is 4 h). */
 const MAX_AGE_S = 3 * 3600;
@@ -58,7 +60,7 @@ for f in /var/cache/apk/APKINDEX.*.tar.gz; do [ -e "$f" ] && echo "file \${f##*/
 true`;
 
 // Installs stdin as /var/cache/apk/$1 with mtime $2 (at most now), unless the
-// guest's copy is at least that new.
+// guest's copy is at least that new. Run as root.
 const PUSH_SH = `set -e
 f=/var/cache/apk/$1 t=/var/cache/apk/.$1.kw m=$2 n=$(date +%s)
 [ "$m" -le "$n" ] || m=$n
@@ -194,7 +196,7 @@ export async function prefetchApkIndexes(vm: KernelHandle, opts: { servers: stri
 		const pushed: Source[] = [];
 		for (const ix of got) {
 			if (!ix) continue;
-			const r = await vm.exec("/bin/sh", ["-c", PUSH_SH, "sh", ix.name, String(ix.validated)], { input: ix.bytes });
+			const r = await execAsRoot(vm, PUSH_SH, [ix.name, String(ix.validated)], { input: ix.bytes });
 			if (r.exitCode !== 0) throw new Error(`pushing ${ix.name}: ${r.stderr.trim() || `exit ${r.exitCode}`}`);
 			if (r.stdout.trim() === "pushed") { pushed.push(ix.source); bytes += ix.bytes.length; }
 		}

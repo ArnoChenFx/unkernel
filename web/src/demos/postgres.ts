@@ -17,9 +17,12 @@
 // only, since the guest has no IPv6. Trust auth is safe because nothing
 // outside the guest can connect. The kernel has SysV IPC, POSIX shared memory
 // on /dev/shm (tmpfs) and Unix sockets, so the default shared memory
-// settings work. Postgres refuses to run as root, so the server runs as the
+// settings work. start.sh runs as root (sudo ./start.sh: the cluster
+// directory, /run/postgresql and the log are postgres's), but postgres
+// refuses to run as root, so the server runs as the
 // postgres user (created by the package) through su-exec (Alpine) or
-// runuser (Debian); /run/postgresql
+// runuser (Debian); seed.sh and psql run as the session's user, connecting
+// as the database user postgres (trust auth); /run/postgresql
 // (the socket) is on tmpfs and is made on every run. A postmaster.pid left
 // by a reboot can name a PID that something else now has, which postgres
 // takes for a running server, so start.sh removes it unless that PID is a
@@ -30,7 +33,8 @@
 // which start.sh and seed.sh put first on PATH (psql in /usr/bin is
 // Debian's pg_wrapper, which works without a cluster of its own), and the
 // package would create and start a cluster of its own (17/main) at install:
-// createcluster.d/kw-demo.conf, written before the install, turns that off.
+// createcluster.d/kw-demo.conf, written before the install (as root: the
+// launcher writes a file the user cannot write with sudo), turns that off.
 //
 // seed.sh creates the demo database and its tables (planets and space
 // missions, with a JSONB column) only once, in one transaction. The file
@@ -40,8 +44,8 @@ import type { Demo } from "../launcher.ts";
 
 const START = String.raw`#!/bin/sh
 # Starts the demo's PostgreSQL server: creates the cluster the first time
-# (initdb), then starts the server unless it already runs. Run it as root:
-# the server itself runs as the postgres user.
+# (initdb), then starts the server unless it already runs. Run it as root
+# (sudo ./start.sh): the server itself runs as the postgres user.
 set -e
 if grep -qs ' /data ' /proc/mounts; then
 	PGDATA=/data/postgres
@@ -285,7 +289,7 @@ export default {
 	},
 	packages: { alpine: ["postgresql18", "su-exec"], debian: ["postgresql"] },
 	commands: [
-		"./start.sh",
+		"$SUDO ./start.sh",
 		"./seed.sh",
 		"psql -U postgres -X -q -P pager=off -f showcase.sql demo",
 		"PSQLRC=psqlrc psql -U postgres demo",

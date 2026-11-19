@@ -13,7 +13,7 @@
 
 real=/usr/bin/bwrap
 [ -x "$real" ] || {
-	echo "bwrap: bubblewrap is not installed (apk add bubblewrap)" >&2
+	echo "bwrap: bubblewrap is not installed (sudo apk add bubblewrap)" >&2
 	exit 127
 }
 skip=

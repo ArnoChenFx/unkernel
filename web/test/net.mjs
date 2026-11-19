@@ -11,8 +11,9 @@
 // with --dev against the Vite dev server. The page is opened from
 // http://127.0.0.1, an origin the default Wisp server accepts, with
 // ?distro=alpine (apk and wget are Alpine's; the default image is debian).
+// The console runs as the distro's user, so apk runs through sudo.
 //   wisp      the default Wisp server (wss://wisp.pi0.io:6680/): DHCP, DNS,
-//             apk update + apk add, http and https wget, a large download
+//             sudo apk update + apk add, http and https wget, a large download
 //             (throughput), and an unresolvable name failing.
 //   nonet     ?wisp=0: the guest boots without a network device, and wget
 //             fails fast instead of hanging.
@@ -53,10 +54,10 @@ if (only.includes("wisp")) await attempt("wisp", async () => {
 	await withPage({}, async ({ run, hostLog }) => {
 		let r = await run("ip -4 -o addr show eth0 | awk '{print $4}'; cat /etc/resolv.conf");
 		check("dhcp", /10\.0\.2\.15\/24/.test(r.out) && /nameserver 10\.0\.2\.3/.test(r.out), r.out.replace(/\n/g, " | "));
-		r = await run("apk update 2>&1 | tail -1", 300000);
+		r = await run("sudo apk update 2>&1 | tail -1", 300000);
 		check("apk update", r.rc === 0 && /OK: \d+ distinct packages/.test(r.out), `${r.out} (${r.secs.toFixed(1)} s)`);
 		check("wisp server chosen", /wisp connected: \S+/.test(await hostLog()), (await hostLog()).match(/wisp connected: [^\n]*/)?.[0] ?? "no log line");
-		r = await run("apk add tree >/dev/null && tree -L 1 /etc/apk | tail -1", 300000);
+		r = await run("sudo apk add tree >/dev/null && tree -L 1 /etc/apk | tail -1", 300000);
 		check("apk add tree", r.rc === 0 && /directories/.test(r.out), `${r.out} (${r.secs.toFixed(1)} s)`);
 		r = await run("wget -q -O- http://example.com | grep -o '<title>[^<]*'");
 		check("wget http", r.rc === 0 && /Example Domain/.test(r.out), r.out);

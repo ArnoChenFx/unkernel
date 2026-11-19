@@ -15,6 +15,9 @@
 // host key is accepted on first use into known_hosts in the demo's
 // directory, so a key change on Rebex's side does not break the demo.
 //
+// mount.sh runs as root (sudo ./mount.sh): /mnt is root's, and a root
+// mount does not depend on how the image sets up /dev/fuse and fusermount3
+// for users. allow_other lets the session's user (tour.sh, mc) read it.
 // mount.sh is idempotent: a live mount is kept, and a stale one (its sshfs
 // gone, e.g. after a snapshot restore reset the connection) is unmounted
 // first. sshfs forks into the background once the mount is up, so the
@@ -40,8 +43,9 @@ read only.
 
 const MOUNT_SH = String.raw`#!/bin/sh
 # Mounts Rebex's public SFTP test server at /mnt/rebex with sshfs, unless it
-# is mounted already. sshfs forks into the background once the mount is up;
-# fusermount3 -u /mnt/rebex unmounts it and stops it.
+# is mounted already. Run it as root (sudo ./mount.sh); allow_other lets
+# other users read the mount. sshfs forks into the background once the
+# mount is up; sudo umount /mnt/rebex unmounts it and stops it.
 set -e
 cd "$(dirname "$0")"
 MNT=/mnt/rebex
@@ -56,7 +60,7 @@ fi
 mkdir -p "$MNT"
 echo "Connecting to test.rebex.net:22 as demo..."
 echo password | sshfs demo@test.rebex.net:/ "$MNT" \
-	-o password_stdin,ro,reconnect \
+	-o password_stdin,ro,reconnect,allow_other \
 	-o ServerAliveInterval=15,ServerAliveCountMax=3 \
 	-o StrictHostKeyChecking=accept-new,UserKnownHostsFile="$PWD/known_hosts"
 grep " $MNT " /proc/mounts
@@ -93,7 +97,7 @@ cat <<'EOF'
   cd /mnt/rebex                 and look around with ls, cat, od
   mc /mnt/rebex                 Midnight Commander on the mount (F3 views, F10 quits)
   cp -r /mnt/rebex/pub /tmp     copy it to the guest
-  fusermount3 -u /mnt/rebex     unmount (./run.sh mounts it again)
+  sudo umount /mnt/rebex        unmount (./run.sh mounts it again)
 EOF
 `;
 
@@ -113,7 +117,7 @@ export default {
 	packages: { alpine: ["sshfs", "tree", "mc"], debian: ["sshfs", "tree", "mc"] },
 	commands: [
 		"cat ABOUT",
-		"./mount.sh",
+		"$SUDO ./mount.sh",
 		"./tour.sh",
 	],
 } satisfies Demo;

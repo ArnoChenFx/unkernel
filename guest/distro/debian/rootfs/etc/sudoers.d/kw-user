@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /etc/sudoers.d/kw-user of the Debian image (the build makes it 0440): the
+# image's user ("user": the console's and kwtty sessions' default) runs
+# anything as anyone without a password, also without a terminal (sudo -n).
+
+# unkernel: the image's user is its administrator.
+user ALL=(ALL:ALL) NOPASSWD: ALL

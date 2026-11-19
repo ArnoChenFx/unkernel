@@ -24,11 +24,12 @@ etc/profile
 etc/profile.d/kw-apt.sh
 etc/profile.d/kw-prompt.sh
 etc/resolv.conf
-root/.bashrc
-root/.profile
+home/user/.bashrc
+home/user/.profile
 usr/bin/bash
 usr/bin/cat
 usr/bin/dash
+usr/bin/dircolors
 usr/bin/id
 usr/bin/ls
 usr/bin/run-parts

@@ -4,15 +4,21 @@
 # on PATH, for the commands the host provides (links to kwcmd, there only
 # while the host has commands), then ~/.local/bin,
 # for per-user programs (pip --user, npm prefixes, the fx, claude
-# and opencode installers' place), and /usr/lib/kw/bin last, for the
-# shims that install fx, claude, opencode, node and bun on first use
-# (/usr/lib/kw/shim),
+# and opencode installers' place), the sbin directories when the distro
+# leaves them out for users (Debian's /etc/profile: poweroff, reboot and
+# the like must not be "not found", which would install a package), and
+# /usr/lib/kw/bin last, for the shims that install fx, claude, opencode,
+# node and bun on first use (/usr/lib/kw/shim),
 # so anything else of those names wins. A distro's /etc/profile sets a
 # fixed PATH, and profile.d runs after it (and on Alpine after kw-home.sh,
 # which sets HOME for the console). kwtty gives programs it starts directly
-# the same PATH (kwtty.c).
+# the same PATH (kwtty.c). Interactive shells that are not login shells
+# read this through /usr/lib/kw/shrc (`sudo -s` resets PATH); _kw_sh tells
+# shrc that this shell has read the kw-*.sh files.
 
+_kw_sh=1
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH=$HOME/.local/bin:$PATH ;; esac
 case ":$PATH:" in *":/run/kw/bin:"*) ;; *) PATH=/run/kw/bin:$PATH ;; esac
+case ":$PATH:" in *":/usr/sbin:"*) ;; *) PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin ;; esac
 case ":$PATH:" in *":/usr/lib/kw/bin:"*) ;; *) PATH=$PATH:/usr/lib/kw/bin ;; esac
 export PATH

@@ -9,16 +9,22 @@
 # (tools/commands.py), has one "NAME PACKAGE" line per command in /usr/bin,
 # /usr/sbin, /bin and /sbin of main. The image's package lists are baked in
 # and age: when the install fails (a version gone from the mirror), the
-# lists are fetched again and the install retried once.
+# lists are fetched again and the install retried once. apt runs as root:
+# directly, or through `sudo -n` (the image's user has it without a
+# password); a user without either gets "command not found".
 
 # unkernel: install the package that provides a command.
 cmd=$1
 notfound() { echo "bash: $cmd: command not found" >&2; exit 127; }
 case $cmd in ''|*[!A-Za-z0-9._+-]*) notfound ;; esac
-[ "$EUID" = 0 ] || notfound
 awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null || notfound
 line=$(grep -m1 "^${cmd//./\\.} " /usr/lib/kw-commands 2>/dev/null) || notfound
 pkg=${line#* }
+sudo=()
+if [ "$EUID" != 0 ]; then
+	sudo -n true 2>/dev/null || notfound
+	sudo=(sudo -n)
+fi
 gray= reset=
 [ -t 2 ] && gray=$'\033[90m' reset=$'\033[0m'
 trap 'printf %s "$reset" >&2; exit 130' INT TERM
@@ -26,14 +32,14 @@ trap 'printf %s "$reset" >&2; exit 130' INT TERM
 pre="$cmd: not found, "
 say() { printf '%s%s%s%s\n' "$gray" "$pre" "$1" "$reset" >&2; pre=; }
 # Not on the terminal's input: dpkg would eat what was typed ahead.
-install() { apt-get install -y -q --no-install-recommends "$pkg" </dev/null >&2; }
-say "apt-get install $pkg"
+install() { "${sudo[@]}" apt-get install -y -q --no-install-recommends "$pkg" </dev/null >&2; }
+say "${sudo:+sudo }apt-get install $pkg"
 printf %s "$gray" >&2
 if ! install; then
 	printf %s "$reset" >&2
 	say "fetching the package lists"
 	printf %s "$gray" >&2
-	apt-get update -q </dev/null >&2 && install
+	"${sudo[@]}" apt-get update -q </dev/null >&2 && install
 fi
 printf %s "$reset" >&2
 command -v "$cmd" >/dev/null || notfound

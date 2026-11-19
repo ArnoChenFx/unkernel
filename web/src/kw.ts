@@ -55,7 +55,7 @@ export interface WindowsApi {
 	/**
 	 * Open a window (the lowest free number) and switch to it unless
 	 * select is false; name labels it in the status line (default "sh"),
-	 * and file and args run in place of root's login shell. Resolves once its shell runs; rejects with why it
+	 * and file and args run in place of the login shell. Resolves once its shell runs; rejects with why it
 	 * could not (the window then stays, showing that, until closed).
 	 */
 	open(opts?: { select?: boolean; name?: string; file?: string; args?: string[] }): Promise<WindowInfo>;

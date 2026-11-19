@@ -17,10 +17,9 @@
 // awk (busybox's or Debian's mawk) turns each into INSERT statements, quoting with
 // a q variable since the programs sit in single quotes. The snapshot tables
 // are dropped and made again, so a rerun sees packages installed meanwhile;
-// the runs table is kept and gets a row per run. The database lives in
-// /data/sqlite-demo/system.db when the data disk is mounted (the runs survive
-// reboots), with a system.db symlink to it in the demo's directory, else
-// system.db there itself.
+// the runs table is kept and gets a row per run. The database is system.db
+// in the demo's directory, which the data disk keeps (and the runs with it)
+// when it keeps the root's changes (upper=data in /run/kw-base).
 //
 // Dependencies are kept as written (so:libc.musl-aarch64.so.1, cmd:sh,
 // /bin/sh), and the needs view resolves them through provides (each package's
@@ -48,14 +47,10 @@ const SNAPSHOT = String.raw`#!/bin/sh
 # from sqlite3 (.shell ./snapshot.sh). snapshot.sql keeps the SQL it ran.
 set -e
 cd "$(dirname "$0")"
-if grep -qs ' /data ' /proc/mounts; then
-	mkdir -p /data/sqlite-demo
-	ln -sfn /data/sqlite-demo/system.db system.db
-	db=/data/sqlite-demo/system.db
+db=$PWD/system.db
+if grep -qsx upper=data /run/kw-base; then
 	where="on the data disk: the runs table survives reboots"
 else
-	[ ! -L system.db ] || rm system.db
-	db=$PWD/system.db
 	where="no data disk: lost at reboot"
 fi
 

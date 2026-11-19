@@ -10,9 +10,14 @@
 # gcompat for glibc binaries (/lib64/ld-linux-x86-64.so.2 etc. on top of
 # musl), checked with that architecture's keys from alpine-keys. qemu-ARCH
 # is in community, so it enables that repository first (kw-apk-enable). One
-# install at a time, because apk locks its database. Without root or a
-# network it runs with what is there, and fails only without qemu.
+# install at a time, because apk locks its database. Another user than
+# root installs through `sudo -n` (kw-qemu --kw-install BINARY: only the
+# install, as root; the image's user has sudo without a password). Without
+# root (or sudo) or a network it runs with what is there, and fails only
+# without qemu.
 
+install=
+[ "$1" = --kw-install ] && { install=1; shift; }
 case $(od -An -tx1 -j18 -N1 "$1" 2>/dev/null) in
 *3e) arch=x86_64 apkarch=x86_64 ;;
 *f3) arch=riscv64 apkarch=riscv64 ;;
@@ -22,8 +27,9 @@ case $(od -An -tx1 -j18 -N1 "$1" 2>/dev/null) in
 esac
 q=/usr/bin/qemu-$arch r=/usr/gnemul/qemu-$arch
 need() { [ ! -x $q ] || [ ! -e $r/.kw-ready ]; }
-if need && [ "$(id -u)" = 0 ] &&
-	awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null; then
+if need && [ "$(id -u)" != 0 ]; then
+	sudo -n true 2>/dev/null && sudo -n /etc/kw-qemu --kw-install "$1"
+elif need && awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null; then
 	exec 9>/run/kw-qemu.lock && flock 9
 	if need; then
 		gray= reset=
@@ -49,8 +55,9 @@ if need && [ "$(id -u)" = 0 ] &&
 	fi
 	exec 9>&-
 fi
+[ -z "$install" ] || exit 0
 if [ ! -x $q ]; then
-	echo "$1: $arch binary, needs qemu-$arch (apk add qemu-$arch)" >&2
+	echo "$1: $arch binary, needs qemu-$arch (sudo apk add qemu-$arch)" >&2
 	exit 126
 fi
 f=$1 a0=$2

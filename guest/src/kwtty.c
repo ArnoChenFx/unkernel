@@ -9,10 +9,20 @@
  *                        only root can bind it); without a vsock device
  *                        (no kwvsock) it sleeps forever, so respawn does
  *                        not loop
+ *   kwtty login          the console's login shell (init runs it on the
+ *                        console, its controlling terminal): the user
+ *                        kw.user=NAME on the kernel command line names, else
+ *                        the default user; the terminal is given to that
+ *                        user, as login(1) does
  *
- * Each connection is one session: its own pty with its own size, and root's
- * login shell on it, or the program OPEN names (no authentication: only the
- * host can connect). With the PIPES option there is no pty: the program's
+ * The default user is the account "user" when /etc/passwd has it (the
+ * distro images), else root (the base shell). A session or the console
+ * runs as its user with that user's supplementary groups (/etc/group),
+ * HOME, USER, LOGNAME, SHELL and a login shell's PATH, in its home.
+ *
+ * Each connection is one session: its own pty with its own size, and a
+ * user's login shell on it, or the program OPEN names (no authentication:
+ * only the host can connect). With the PIPES option there is no pty: the program's
  * stdin, stdout and stderr are pipes, and it runs in a session of its own.
  * With the CONNECT option there is no program: kwtty connects to a TCP
  * port on 127.0.0.1 and, after OPENED, relays raw bytes both ways.
@@ -27,12 +37,17 @@
  *                            (default xterm-256color), 2 ENV (one KEY=VALUE,
  *                            repeatable, over the defaults), 3 ARG (one
  *                            argument, repeatable: the first is the program,
- *                            looked up in PATH; none: root's login shell),
- *                            4 CWD (default root's home), 5 PIPES (empty:
- *                            pipes instead of a pty; the size is ignored,
- *                            and TERM is set only when given), 6 CONNECT
- *                            (u16 TCP port: connect to 127.0.0.1:port
- *                            before OPENED; the other options are ignored)
+ *                            looked up in PATH; none: the user's login
+ *                            shell), 4 CWD (default the user's home), 5
+ *                            PIPES (empty: pipes instead of a pty; the size
+ *                            is ignored, and TERM is set only when given), 6
+ *                            CONNECT (u16 TCP port: connect to
+ *                            127.0.0.1:port before OPENED; the other options
+ *                            are ignored), 7 USER (the user to run as: a
+ *                            name, or a uid in decimal; empty: the default
+ *                            user; without USER the session is root's, as
+ *                            before the option, so a host that does not
+ *                            know it keeps its sessions)
  *                  2 DATA    bytes for the pty, or stdin (zero length: no-op)
  *                  3 RESIZE  u16 rows, cols, xpixel, ypixel (pty only)
  *                  6 SIGNAL  a signal name without "SIG" ("INT", "TERM"),
@@ -40,7 +55,7 @@
  *                  7 EOF     with PIPES: close the program's stdin; ignored
  *                            on a pty
  *   guest -> host  1 OPENED  u16 version, u32 features (bit 0: PIPES, EOF
- *                            and STDERR; bit 1: CONNECT), u32 program pid
+ *                            and STDERR; bit 1: CONNECT; bit 2: USER), u32 program pid
  *                            (0 with CONNECT), u32 pts number (0xffffffff
  *                            with PIPES or CONNECT)
  *                  2 DATA    bytes from the pty, or stdout
@@ -65,6 +80,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <poll.h>
 #include <pty.h>
 #include <pwd.h>
@@ -76,6 +92,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -106,10 +123,18 @@
 #define TAG_CWD		4
 #define TAG_PIPES	5
 #define TAG_CONNECT	6
+#define TAG_USER	7
 #define TAG_CRITICAL	0x80
 #define FEAT_PIPES	0x01		/* OPENED: PIPES, EOF and STDERR */
 #define FEAT_CONNECT	0x02		/* OPENED: CONNECT */
+#define FEAT_USER	0x04		/* OPENED: USER */
+#define FEATURES	(FEAT_PIPES | FEAT_CONNECT | FEAT_USER)
 #define NO_PTS		0xffffffffU
+/* The account sessions and the console run as unless asked otherwise. */
+#define DEFAULT_USER	"user"
+/* A login shell's PATH (kw-path.sh), for programs started directly: the
+ * host's commands (kwcmd), ~/.local/bin, the system's, the kw shims. */
+#define PATH_FMT	"PATH=/run/kw/bin:%s/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin"
 
 #define HDR		4
 #define OUT_MAX		16384		/* pty output per DATA frame */
@@ -234,6 +259,7 @@ struct open_req {
 	int has_term;			/* TERM was given */
 	int connect;			/* CONNECT: relay to a TCP port */
 	unsigned int port;		/* its port */
+	char *user;			/* USER: a name or uid ("": the default user); NULL: root */
 };
 
 /* Parses OPEN's payload; NULL, or what is wrong with it. */
@@ -311,12 +337,97 @@ static const char *parse_open(const unsigned char *p, size_t len, struct open_re
 			o->connect = 1;
 			o->port = get16(v);
 			break;
+		case TAG_USER:
+			if (vlen > 64 || memchr(v, 0, vlen))
+				return "USER is longer than 64 bytes or has a NUL";
+			free(o->user);
+			o->user = strndup((const char *)v, vlen);
+			if (!o->user)
+				return "out of memory";
+			break;
 		default:
 			if (tag & TAG_CRITICAL)
 				return "unknown critical OPEN option";
 		}
 	}
 	return NULL;
+}
+
+/* The account a session or the console runs as (its passwd entry, copied). */
+struct account {
+	char *name, *home, *shell;
+	uid_t uid;
+	gid_t gid;
+};
+
+static int copy_account(const struct passwd *pw, struct account *a)
+{
+	a->name = strdup(pw->pw_name && *pw->pw_name ? pw->pw_name : "root");
+	a->home = strdup(pw->pw_dir && *pw->pw_dir ? pw->pw_dir : "/");
+	a->shell = strdup(pw->pw_shell && *pw->pw_shell ? pw->pw_shell : "/bin/sh");
+	a->uid = pw->pw_uid;
+	a->gid = pw->pw_gid;
+	return a->name && a->home && a->shell ? 0 : -1;
+}
+
+/*
+ * spec: NULL root, "" the default user (DEFAULT_USER if it exists, else
+ * root), a name, or a uid in decimal. -1 when there is no such account
+ * (root without a passwd entry is still root, as before).
+ */
+static int find_account(const char *spec, struct account *a)
+{
+	struct passwd *pw = NULL, root = {
+		.pw_name = "root", .pw_dir = "/", .pw_shell = "/bin/sh",
+	};
+	const char *s;
+
+	if (spec && !*spec)
+		pw = getpwnam(DEFAULT_USER);
+	else if (spec) {
+		for (s = spec; *s >= '0' && *s <= '9'; s++)
+			;
+		if (*s || s - spec > 9)
+			pw = getpwnam(spec);
+		else
+			pw = getpwuid(atoi(spec));
+		if (!pw && strcmp(spec, "root") && strcmp(spec, "0"))
+			return -1;
+	}
+	if (!pw)
+		pw = getpwuid(0);
+	return copy_account(pw ? pw : &root, a);
+}
+
+/*
+ * In the child, before exec: give the terminal on fd 0 (if it is one) to
+ * the account, as login(1) does (owner, group tty, 0620), then take the
+ * account's groups and ids. 0, or -errno.
+ */
+static int become(const struct account *a)
+{
+	struct group *tty;
+
+	if (isatty(0)) {
+		tty = getgrnam("tty");
+		if (fchown(0, a->uid, tty ? tty->gr_gid : a->gid) || fchmod(0, 0620))
+			return -errno;
+	}
+	if (initgroups(a->name, a->gid) || setgid(a->gid) || setuid(a->uid))
+		return -errno;
+	return 0;
+}
+
+/* The environment for the account: HOME, USER, LOGNAME, SHELL, PATH. */
+static int account_env(const struct account *a, char *d[5])
+{
+	if (asprintf(&d[0], "HOME=%s", a->home) < 0 ||
+	    asprintf(&d[1], "USER=%s", a->name) < 0 ||
+	    asprintf(&d[2], "LOGNAME=%s", a->name) < 0 ||
+	    asprintf(&d[3], "SHELL=%s", a->shell) < 0 ||
+	    asprintf(&d[4], PATH_FMT, strcmp(a->home, "/") ? a->home : "") < 0)
+		return -1;
+	return 0;
 }
 
 /* Adds KEY=VALUE to env, replacing an earlier KEY. */
@@ -335,12 +446,19 @@ static void env_set(char **env, int *n, char *kv)
 
 /* The program, in the child: the pty or the pipes are its stdio already. */
 static void __attribute__((noreturn))
-shell_child(int ep, const char *file, char **argv, char **env)
+shell_child(int ep, const struct account *a, const char *file, char **argv, char **env)
 {
 	struct sigaction sa = { .sa_handler = SIG_DFL };
 	struct termios t;
 	sigset_t none;
 	int e;
+
+	/* A negative number on the error pipe: becoming the account failed. */
+	e = become(a);
+	if (e) {
+		write(ep, &e, sizeof(e));
+		_exit(127);
+	}
 
 	for (int i = 1; i < _NSIG; i++)
 		sigaction(i, &sa, NULL);
@@ -896,10 +1014,10 @@ out:
 
 static void __attribute__((noreturn)) session(int s)
 {
-	const char *home = "/", *user = "root", *shell = "/bin/sh", *base, *file;
+	const char *base, *file;
 	unsigned char h[HDR], *p, opened[14];
 	struct open_req o = { 0 };
-	struct passwd *pw;
+	struct account a;
 	char **env, *argv[2], **args = argv;
 	const char *bad;
 	int ep[2], e, n, nenv = 0;
@@ -932,7 +1050,7 @@ static void __attribute__((noreturn)) session(int s)
 		int t = tcp_connect(s, o.port);
 
 		put16(opened, KWTTY_VERSION);
-		put32(opened + 2, FEAT_PIPES | FEAT_CONNECT);
+		put32(opened + 2, FEATURES);
 		put32(opened + 6, 0);
 		put32(opened + 10, NO_PTS);
 		h[0] = T_OPENED;
@@ -943,50 +1061,39 @@ static void __attribute__((noreturn)) session(int s)
 		relay(s, t);
 	}
 
-	pw = getpwuid(0);
-	if (pw && pw->pw_dir && *pw->pw_dir)
-		home = pw->pw_dir;
-	if (pw && pw->pw_name && *pw->pw_name)
-		user = pw->pw_name;
-	if (pw && pw->pw_shell && *pw->pw_shell)
-		shell = pw->pw_shell;
+	if (find_account(o.user, &a))
+		refuse(s, "no user %s", o.user);
 	env = calloc(6 + o.nenv + 1, sizeof(*env));
-	base = strrchr(shell, '/');
-	if (!env || asprintf(&argv[0], "-%s", base ? base + 1 : shell) < 0)
+	base = strrchr(a.shell, '/');
+	if (!env || asprintf(&argv[0], "-%s", base ? base + 1 : a.shell) < 0)
 		refuse(s, "out of memory");
 	argv[1] = NULL;
 	{
-		char *d[6];
+		char *d[5], *term;
 
 		/* PATH: a login shell's (/etc/profile, then kw-path.sh), so that
 		 * programs started directly find the host's commands in
 		 * /run/kw/bin (kwcmd), /usr/local/bin, ~/.local/bin and the shims
 		 * in /usr/lib/kw/bin. */
-		if (asprintf(&d[0], "HOME=%s", home) < 0 ||
-		    asprintf(&d[1], "USER=%s", user) < 0 ||
-		    asprintf(&d[2], "LOGNAME=%s", user) < 0 ||
-		    asprintf(&d[3], "SHELL=%s", shell) < 0 ||
-		    asprintf(&d[4], "TERM=%s", o.term) < 0 ||
-		    asprintf(&d[5], "PATH=/run/kw/bin:%s/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin",
-			     strcmp(home, "/") ? home : "") < 0)
+		if (account_env(&a, d) || asprintf(&term, "TERM=%s", o.term) < 0)
 			refuse(s, "out of memory");
-		for (int i = 0; i < 4; i++)
+		for (int i = 0; i < 5; i++)
 			env_set(env, &nenv, d[i]);
-		env_set(env, &nenv, d[5]);
 		/* Programs on pipes get TERM only when the host gives it. */
 		if (!o.pipes || o.has_term)
-			env_set(env, &nenv, d[4]);
+			env_set(env, &nenv, term);
 	}
 	for (int i = 0; i < o.nenv; i++)
 		env_set(env, &nenv, o.env[i]);
-	file = shell;
+	file = a.shell;
 	if (o.nargv) {
 		file = o.argv[0];
 		args = o.argv;
 	}
-	/* The session's own directory, which the program inherits. */
-	if (o.cwd ? chdir(o.cwd) : chdir(home) && chdir("/"))
-		refuse(s, "chdir %s: %s", o.cwd ? o.cwd : home, strerror(errno));
+	/* The session's own directory, which the program inherits (chosen
+	 * as root: a directory the account may not search is still its cwd). */
+	if (o.cwd ? chdir(o.cwd) : chdir(a.home) && chdir("/"))
+		refuse(s, "chdir %s: %s", o.cwd ? o.cwd : a.home, strerror(errno));
 
 	if (pipe2(ep, O_CLOEXEC))
 		refuse(s, "pipe: %s", strerror(errno));
@@ -1004,7 +1111,7 @@ static void __attribute__((noreturn)) session(int s)
 			setsid();
 			if (dup2(pin[0], 0) < 0 || dup2(pout[1], 1) < 0 || dup2(perr[1], 2) < 0)
 				_exit(127);
-			shell_child(ep[1], file, args, env);
+			shell_child(ep[1], &a, file, args, env);
 		}
 		close(pin[0]);
 		close(pout[1]);
@@ -1020,7 +1127,7 @@ static void __attribute__((noreturn)) session(int s)
 		if (x.pid < 0)
 			refuse(s, "forkpty: %s", strerror(errno));
 		if (!x.pid)
-			shell_child(ep[1], file, args, env);
+			shell_child(ep[1], &a, file, args, env);
 		x.ifd = x.ofd[0] = x.m;
 		x.ofd[1] = -1;
 	}
@@ -1031,6 +1138,8 @@ static void __attribute__((noreturn)) session(int s)
 	close(ep[0]);
 	if (r == sizeof(e)) {
 		waitpid(x.pid, NULL, 0);
+		if (e < 0)
+			refuse(s, "cannot become %s: %s", a.name, strerror(-e));
 		refuse(s, "exec %s: %s", file, strerror(e));
 	}
 	x.s = s;
@@ -1049,7 +1158,7 @@ static void __attribute__((noreturn)) session(int s)
 		if (x.ofd[i] >= 0)
 			fcntl(x.ofd[i], F_SETFL, fcntl(x.ofd[i], F_GETFL) | O_NONBLOCK);
 	put16(opened, KWTTY_VERSION);
-	put32(opened + 2, FEAT_PIPES | FEAT_CONNECT);
+	put32(opened + 2, FEATURES);
 	put32(opened + 6, x.pid);
 	put32(opened + 10, pts);
 	queue(T_OPENED, opened, sizeof(opened));
@@ -1058,8 +1167,64 @@ static void __attribute__((noreturn)) session(int s)
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: kwtty serve [PORT]\n");
+	fprintf(stderr, "usage: kwtty serve [PORT] | kwtty login\n");
 	return 2;
+}
+
+/*
+ * kwtty login: on the console (fds 0-2, the controlling terminal), the
+ * login shell of kw.user=NAME (kernel command line), else of the default
+ * user. An unknown kw.user is reported and the default user taken. The
+ * environment is the account's (HOME, USER, LOGNAME, SHELL, PATH) and
+ * TERM, as login(1) leaves it; the shell starts in the home. On failure it
+ * waits a second before exiting, so init does not respawn it in a loop.
+ */
+static int login(void)
+{
+	char cmdline[4096], *spec = "", *t, *d[5], *env[7], *argv[2];
+	const char *base, *term = getenv("TERM");
+	struct account a;
+	ssize_t n = -1;
+	int fd, e, ne = 0;
+
+	fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		n = read(fd, cmdline, sizeof(cmdline) - 1);
+		close(fd);
+	}
+	cmdline[n > 0 ? n : 0] = 0;
+	for (t = strtok(cmdline, " \n"); t; t = strtok(NULL, " \n"))
+		if (!strncmp(t, "kw.user=", 8))
+			spec = t + 8;
+	if (find_account(spec, &a)) {
+		fprintf(stderr, "kwtty login: no user %s (kw.user), so the default user\n", spec);
+		if (find_account("", &a))
+			goto fail;
+	}
+	e = become(&a);
+	if (e) {
+		fprintf(stderr, "kwtty login: cannot become %s: %s\n", a.name, strerror(-e));
+		goto fail;
+	}
+	if (account_env(&a, d))
+		goto fail;
+	for (int i = 0; i < 5; i++)
+		env[ne++] = d[i];
+	if (term && *term && asprintf(&env[ne], "TERM=%s", term) >= 0)
+		ne++;
+	env[ne] = NULL;
+	if (chdir(a.home) && chdir("/"))
+		goto fail;
+	base = strrchr(a.shell, '/');
+	if (asprintf(&argv[0], "-%s", base ? base + 1 : a.shell) < 0)
+		goto fail;
+	argv[1] = NULL;
+	environ = env;
+	execv(a.shell, argv);
+	fprintf(stderr, "kwtty login: exec %s: %s\n", a.shell, strerror(errno));
+fail:
+	sleep(1);
+	return 1;
 }
 
 int main(int argc, char **argv)
@@ -1071,6 +1236,8 @@ int main(int argc, char **argv)
 	unsigned int cid = VMADDR_CID_ANY;
 	int fd, l;
 
+	if (argc == 2 && !strcmp(argv[1], "login"))
+		return login();
 	if (argc < 2 || argc > 3 || strcmp(argv[1], "serve"))
 		return usage();
 	if (argc == 3) {
@@ -1119,7 +1286,7 @@ int main(int argc, char **argv)
 				usleep(100000);	/* EMFILE, ENOMEM: do not spin */
 			continue;
 		}
-		/* Only the host: the shell is root, without authentication. */
+		/* Only the host: a session may be root's, without authentication. */
 		if (peer.svm_cid != VMADDR_CID_HOST) {
 			close(c);
 			continue;

@@ -205,13 +205,13 @@ class MountHandle implements Mount {
 	}
 }
 
-/** @internal Run `cmd` in the guest with a deadline over the whole run (exec()'s own covers only reaching kwtty); it is killed when it runs out. */
+/** @internal Run `cmd` in the guest as root (mount, umount, kwcmd sync: /run/kw/bin) with a deadline over the whole run (exec()'s own covers only reaching kwtty); it is killed when it runs out. */
 export async function guestRun(vsock: Vsock, file: string, args: string[], timeout: number): Promise<ExecResult<string>> {
 	const ac = new AbortController();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([
-			execSubprocess(vsock, file, args, { timeout, signal: ac.signal }),
+			execSubprocess(vsock, file, args, { timeout, signal: ac.signal, user: "root" }),
 			new Promise<never>((_, rej) => (timer = setTimeout(() => {
 				ac.abort();
 				rej(new PtyError("ETIMEDOUT", `${file} did not finish within ${timeout} ms (it was killed)`));

@@ -25,7 +25,8 @@ kernel/build.sh distro [NAME...]     # the same as guest/build.sh distro
 | Path | What |
 | --- | --- |
 | `build.sh` | the driver; it finds the distros as `distro/*/build.sh` |
-| `lib/` | bash, sourced only: `env.sh` (paths, `cc_guest`; sources `kernel/tools/env.sh`), `stage.sh` (`distro_unpack`, `install_tree`), `image.sh` (`distro_images`: the erofs and ext4 images) |
+| `lib/` | bash, sourced only: `env.sh` (paths, `cc_guest`; sources `kernel/tools/env.sh`), `stage.sh` (`distro_unpack`, `install_tree`, `install_common`, `install_user`, `install_readme`), `image.sh` (`distro_images`: the erofs and ext4 images) |
+| `common/` | what every distro image has from a source of its own: `README` (the user's `/home/user/README`, rendered per distro by `install_readme`: `@KEY@` values, `@if DISTRO` ... `@end` blocks) |
 | `tools/` | host tools: `mkcpio.py` (cpio archives), `mktree.py` (an image's tar stream and id), `erofs-utils.sh` (pinned mkfs.erofs, with `erofs-utils-patches/`), `erofs-trace.py` (the files a traced boot read), `distros-json.mjs` (the index), `vm-run.ts` (run a command in an image at build time); `pins.sh` (erofs-utils, lz4, zstd) |
 | `src/` | the guest programs in the base's kw layer: `kwtty`, `kw9p`, `kwvsock`, `kwshm`, `kwwasi`, `kwcmd`; `glimmer`, which every distro image gets (`install_common`, `lib/stage.sh`); `src/test/`: `kwtest`, `kwbench`, `abitest` (base-test.cpio) |
 | `base/` | `build.sh`, `pins.sh` (static busybox), `initramfs/` (the cpio root: `/init`, the base shell), `rootfs/` (the kw layer, `/kw/layer`: on top of every distro's root) |
@@ -120,10 +121,17 @@ UNKERNEL_TEST_KERNEL=/tmp/b/unkernel.wasm UNKERNEL_TEST_DISTRO_DIR=/tmp/d pnpm t
 3. `distro/NAME/rootfs/`: at least an executable `/sbin/init` (or what it
    links to). The base has mounted `/dev`, `/proc`, `/sys`, `/run`, `/tmp`
    and `/data`; init runs `/usr/lib/kw/rc`, `/usr/lib/kw/welcome` and
-   `/usr/lib/kw/net`, keeps a root shell on hvc0 and `/usr/bin/kwtty
-   serve` running, and at poweroff stops every process and runs
-   `/usr/lib/kw/shutdown` before reboot(2) (Debian's `kw-init` is a
-   small example). The image must not carry the kw layer's files.
+   `/usr/lib/kw/net`, keeps `/usr/bin/kwtty login` on hvc0 (the console's
+   shell, as the image's user) and `/usr/bin/kwtty serve` running, and at
+   poweroff stops every process and runs `/usr/lib/kw/shutdown` before
+   reboot(2) (Debian's `kw-init` is a small example; `poweroff` must work
+   for the user, through `sudo -n`). The build gives the image sudo (or a
+   `sudo` command) without a password for the user, `install_user` (the
+   account, in the distro's audio, video and input groups) and
+   `install_readme` (its values for `guest/common/README`), passes
+   `"${user_owner[@]}"` to `distro_images`, and makes the distro's
+   interactive non-login shells source `/usr/lib/kw/shrc`. The image must
+   not carry the kw layer's files.
 4. `guest/build.sh distro NAME`, then boot it with `node js/cli.ts --distro
    NAME`; `test/distro.test.ts` lists the distros it runs. Once a release
    carries it (distros.json lists every image built), `fetchDistro("NAME")`

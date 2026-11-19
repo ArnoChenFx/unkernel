@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/shrc (the kw layer, every distro): the kw setup of
+# /etc/profile.d/kw-*.sh (PATH, TERM, the prompt, command not found) for
+# interactive shells that are not login shells, which do not read
+# /etc/profile: a shell typed at the prompt, `sudo -s`, `su`. A distro
+# sources it from its shells' interactive startup file: Debian's
+# /etc/bash.bashrc (one line the build appends), Alpine's busybox ash
+# through ENV (kw-prompt.sh exports it; doas sets it for `sudo -s`). Each
+# shell reads the kw-*.sh files once: a login shell has read them from
+# /etc/profile (bash reads bash.bashrc before profile.d, so it is told by
+# login_shell; ash reads ENV after them, so by _kw_sh, which kw-path.sh
+# sets and nothing exports).
+
+if [ -z "${_kw_sh-}" ] && ! { [ -n "${BASH_VERSION-}" ] && shopt -q login_shell; }; then
+	for _kw in /etc/profile.d/kw-*.sh; do
+		[ -r "$_kw" ] && . "$_kw"
+	done
+	unset _kw
+fi

@@ -1,0 +1,73 @@
+Welcome to unkernel
+===================
+
+This is a Linux 7.3 kernel compiled to WebAssembly, running in a web
+page or in Node.js on your machine; nothing runs on a server. The kernel
+is native wasm, and the programs are unmodified aarch64 Linux binaries,
+run by kwemu, an aarch64 CPU that is linked into the kernel.
+
+User space is @NAME@ (@USERLAND@).
+You are "user", and this is your home directory. sudo works without a
+password: "sudo -i" gives a root shell.
+
+Things to try
+-------------
+
+  @PKG@ htop
+                    Install packages from @MIRROR@ mirrors. Typed
+                    in a shell it runs through sudo for you.
+  htop              Or just type the command: if it is missing, the
+                    package that provides it is installed for you
+                    (@AUTO@=0 turns that off).
+  claude, opencode, fx, node, bun
+                    Installed into ~/.local/bin the first time you run
+                    one (claude and opencode are 250-360 MB, so they
+                    need the data disk or plenty of memory).
+  glimmer           A tiny game, with graphics and sound.
+  python3 -m http.server 8000
+                    A guest web server (on the web page it opens in the
+                    preview, Ctrl-A p).
+@if alpine
+
+x86_64, riscv64, i386 and arm binaries also run, through qemu-user
+(installed the first time one starts). "kw-arch x86_64 CMD" makes
+uname report x86_64, for installers that pick their download by it.
+@end
+
+Your changes
+------------
+
+The root file system is an overlay over the read-only @NAME@ image.
+With a data disk (the web page keeps one in your browser; the CLI takes
+--data FILE) your changes are kept on it and survive a reload or a
+reboot; without one they live in memory until power-off. If a change
+stops the system from booting, that boot runs in safe mode instead:
+your changes stay on the data disk in /data/distros/@DISTRO@/upper,
+where you can fix them, and every boot tries them again ("kw-overlay
+status" says more, "sudo kw-overlay discard" sets them aside and starts
+over from the image).
+
+On the web page
+---------------
+
+  Ctrl-A ?          All the keyboard shortcuts (on a Mac, Cmd-A works
+                    as well as Ctrl-A).
+  Ctrl-A n          Another terminal window, up to 9. Ctrl-A 1-9
+                    switches between them.
+  Ctrl-Shift-O      The demo launcher (Cmd-K on a Mac, or the arrow at
+                    the left of the status line).
+
+The status icon opens options, diagnostics, and export or reset of the
+disk kept in your browser (IndexedDB). Open the page with ?data=0 for a
+fresh system every time.
+
+Limits
+------
+
+- Programs run on an emulated CPU: system calls are fast, but heavy
+  computation is several times slower than native.
+- No IPv6, and no inbound connections from the internet. On the web
+  page the network reaches out through a Wisp proxy.
+- No strace or gdb (no ptrace register sets), no seccomp.
+
+Source, docs and the JavaScript SDK: @REPO@

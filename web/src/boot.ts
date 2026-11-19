@@ -15,8 +15,8 @@
 // kernel runs reloads once on one CPU (bootUpOnce()). The kernel is the
 // base bundle, with the distro image ?distro= picks (config.ts) attached
 // read-only by URL (createKernel({ distro }); inline it is opened here
-// first, for the resume check), and the Alpine-only parts (apk index
-// prefetch, /root/README) run only on Alpine.
+// first, for the resume check), and the Alpine-only part (the apk index
+// prefetch) runs only on Alpine.
 import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
@@ -29,7 +29,6 @@ import { showcaseFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { openCommand } from "./open.ts";
 import { attachPreview, closePreview, openPreview, previewSupported, previewUrl } from "./preview.ts";
-import { writeReadme } from "./readme.ts";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
@@ -126,7 +125,7 @@ export function start(): void {
 	const distroRef = distro ? { name: distro.name, url: distro.url } : null;
 	/** Inline: the distro image, opened ahead (the snapshot's first disk, for the resume check). */
 	let distroDisk: DistroDisk | null = null;
-	/** Only Alpine has apk and the texts the page writes (apk.ts, readme.ts). */
+	/** Only Alpine has apk and the index the page pushes (apk.ts). */
 	const alpine = cfg.guest === "alpine";
 
 	// --- display and input (kwfb, kwinput; ?display=0 turns them off): display.ts --------------
@@ -363,8 +362,6 @@ export function start(): void {
 	void guestReady.then(showcaseFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
 	if (cfg.net && alpine) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
-	// Intro notes in /root/README, once per data disk (readme.ts); written for Alpine.
-	if (alpine) void guestReady.then((vm) => writeReadme(vm, (m) => ui.log(m, "h"), { upper: `/data/distros/${cfg.guest}/upper` }), () => {});
 	// What the base booted (/run/kw-base: the image id, the upper layer), for the
 	// Environment rows, About and diagnostics.
 	void guestReady.then(showBase, () => {});

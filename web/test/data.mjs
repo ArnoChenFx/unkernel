@@ -32,6 +32,9 @@
 //      marker is gone; import the exported file (KW.importData): it is back.
 //   5. ?data=0: no data disk.
 // The other steps mount the disk at /mnt/kwdata and run sync themselves.
+// The console runs as the distro's user: the steps that need root (mount,
+// findfs, dmesg, writes to /mnt/kwdata, /etc, /proc/sys and the upper layer)
+// use sudo.
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -47,7 +50,7 @@ const check = (name, ok, detail = "") => {
 	console.log(`${ok ? "ok  " : "FAIL"} ${name}${detail ? `: ${detail}` : ""}`);
 };
 
-const MOUNT = "mkdir -p /mnt/kwdata; mountpoint -q /mnt/kwdata || mount LABEL=kwdata /mnt/kwdata";
+const MOUNT = "sudo mkdir -p /mnt/kwdata; mountpoint -q /mnt/kwdata || sudo mount LABEL=kwdata /mnt/kwdata";
 const ROOT = "awk '$2 == \"/\" { t = $3 } END { print t }' /proc/mounts";
 /** The upper layer this boot uses (data, tmpfs or none) and why, from the base (guest/base/initramfs/init). */
 const BASE = "sed -n 's/^upper=//p; s/^why=//p' /run/kw-base";
@@ -81,10 +84,10 @@ try {
 		JSON.stringify(info && { stored: info.stored, size: info.size }));
 	const panel = await panelText(a);
 	check("panel shows the data disk", /Saved in this browser/.test(panel), panel);
-	let r = await a.run(`dmesg -n 1; findfs LABEL=kwdata; ${MOUNT} && grep ' /mnt/kwdata ' /proc/mounts`);
+	let r = await a.run(`sudo dmesg -n 1; sudo findfs LABEL=kwdata; ${MOUNT} && grep ' /mnt/kwdata ' /proc/mounts`);
 	check("the guest finds and mounts LABEL=kwdata", r.rc === 0 && /ext4/.test(r.out), r.out.replace(/\n/g, " | "));
 	const marker = `marker-${Date.now()}`;
-	r = await a.run(`echo ${marker} > /mnt/kwdata/marker.txt; dd if=/dev/urandom of=/mnt/kwdata/big bs=1M count=${mb} 2>/dev/null; ` +
+	r = await a.run(`echo ${marker} | sudo tee /mnt/kwdata/marker.txt >/dev/null; sudo dd if=/dev/urandom of=/mnt/kwdata/big bs=1M count=${mb} 2>/dev/null; ` +
 		"md5sum /mnt/kwdata/big | cut -d' ' -f1; sync", 300000);
 	const md5 = r.out.split("\n").map((l) => l.trim()).find((l) => /^[0-9a-f]{32}$/.test(l));
 	check(`write a marker and ${mb} MiB, sync`, r.rc === 0 && !!md5, md5);
@@ -95,8 +98,8 @@ try {
 	check("the guest mounts /data itself, / is the overlay", /\/data ext4/.test(r.out) && /\/ overlay/.test(r.out), r.out);
 	// With the guest's writeback and journal commits slowed down, only the
 	// sync request (IRQ 4) gets this file onto the disk before the reload.
-	r = await a.run("echo 360000 > /proc/sys/vm/dirty_expire_centisecs; echo 360000 > /proc/sys/vm/dirty_writeback_centisecs; " +
-		`mount -o remount,commit=600 /data && echo ${marker} > /root/unsynced.txt`);
+	r = await a.run("echo 360000 | sudo tee /proc/sys/vm/dirty_expire_centisecs /proc/sys/vm/dirty_writeback_centisecs >/dev/null; " +
+		`sudo mount -o remount,commit=600 /data && echo ${marker} > ~/unsynced.txt`);
 	const synced = await a.evaluate("KW.sync({ timeout: 5000 })");
 	check("KW.sync() (the SDK's sync()) is confirmed by the kernel", r.rc === 0 && synced === true, String(synced));
 
@@ -107,9 +110,9 @@ try {
 		`${info.stored} stored, ${info.mem} in memory, ${info.stats.storeBlocksRead} blocks read so far`);
 	r = await a.run(`${MOUNT} && cat /mnt/kwdata/marker.txt && md5sum /mnt/kwdata/big | cut -d' ' -f1`);
 	check("marker and file survive the reload", r.out.includes(marker) && r.out.includes(md5), r.out.replace(/\n/g, " | "));
-	r = await a.run("cat /root/unsynced.txt");
+	r = await a.run("cat ~/unsynced.txt");
 	check("a file written without a guest sync survives (KW.sync)", r.out.includes(marker), r.out);
-	r = await a.run(`${ROOT}; echo ${marker} > /etc/kw-overlay-test; sync; cat /data/distros/alpine/upper/etc/kw-overlay-test`);
+	r = await a.run(`${ROOT}; echo ${marker} | sudo tee /etc/kw-overlay-test >/dev/null; sync; sudo cat /data/distros/alpine/upper/etc/kw-overlay-test`);
 	check("overlay: / is the overlay, /etc/kw-overlay-test lands in /data/distros/alpine/upper", r.rc === 0 && /^overlay$/m.test(r.out) && r.out.includes(marker),
 		r.out.replace(/\n/g, " | "));
 	await a.evaluate("KW.sync({ timeout: 2000 })");
@@ -127,7 +130,7 @@ try {
 	check("after safe mode: the changes on the data disk again", /^data$/m.test(r.out) && r.out.includes(marker), r.out.replace(/\n/g, " | "));
 
 	console.log("== 2b. a broken root: safe mode for that boot, the changes back once repaired");
-	r = await a.run("rm /sbin/init; sync");
+	r = await a.run("sudo rm /sbin/init; sync");
 	await a.evaluate("KW.sync({ timeout: 2000 })");
 	await load(a, home);
 	const scr = await a.screen();
@@ -135,7 +138,7 @@ try {
 		scr.split("\n").filter((l) => /kw-overlay|SAFE/.test(l)).join(" | "));
 	const note = await a.evaluate("(() => { const n = document.getElementById('data-safe-note'); return n.hidden ? '' : n.textContent; })()");
 	check("the page explains safe mode", /\/sbin\/init is missing/.test(note) && note.includes("/data/distros/alpine/upper") && /each boot tries them again/.test(note), note);
-	r = await a.run(`${BASE}; cat /data/distros/alpine/upper/etc/kw-overlay-test; rm /data/distros/alpine/upper/sbin/init; sync`);
+	r = await a.run(`${BASE}; sudo cat /data/distros/alpine/upper/etc/kw-overlay-test; sudo rm /data/distros/alpine/upper/sbin/init; sync`);
 	check("safe mode: a tmpfs upper, the changes kept on /data", /^tmpfs$/m.test(r.out) && /^safe mode: /m.test(r.out) && r.out.includes(marker),
 		r.out.replace(/\n/g, " | "));
 	await a.evaluate("KW.sync({ timeout: 2000 })");
@@ -146,7 +149,7 @@ try {
 	if (await a.evaluate("!!document.getElementById('opt-distro-debian')")) {
 		console.log("== 2c. another distro keeps its own changes");
 		await load(a, `${base}?distro=debian`);
-		r = await a.run(`cat /usr/lib/kw-distro; ${BASE}; cat /etc/kw-overlay-test 2>&1 | head -1; echo deb-${marker} > /etc/kw-overlay-test-debian; sync`);
+		r = await a.run(`cat /usr/lib/kw-distro; ${BASE}; cat /etc/kw-overlay-test 2>&1 | head -1; echo deb-${marker} | sudo tee /etc/kw-overlay-test-debian >/dev/null; sync`);
 		check("debian: its own upper, Alpine's change not there", /^debian$/m.test(r.out) && /^data$/m.test(r.out) && !r.out.includes(`\n${marker}`), r.out.replace(/\n/g, " | "));
 		await a.evaluate("KW.sync({ timeout: 2000 })");
 		await load(a, `${base}?distro=debian`);
@@ -165,7 +168,7 @@ try {
 		check("second tab: not persistent, with a notice", info && !info.persistent && /another tab/.test(await b.screen()), info?.notice);
 		const chk = await panelText(b);
 		check("second tab: the panel says so", /In memory only: open in another tab/.test(chk), chk);
-		r = await b.run(`${MOUNT} && cat /mnt/kwdata/marker.txt && echo tab2 > /mnt/kwdata/tab2.txt && sync`);
+		r = await b.run(`${MOUNT} && cat /mnt/kwdata/marker.txt && echo tab2 | sudo tee /mnt/kwdata/tab2.txt >/dev/null && sync`);
 		check("second tab: sees the saved files (a copy)", r.out.includes(marker), r.out.replace(/\n/g, " | "));
 		r = await b.run("cat /etc/kw-overlay-test");
 		check("second tab: overlay root with the saved changes", r.out.includes(marker), r.out);
@@ -205,7 +208,7 @@ try {
 	console.log("== 5. ?data=0");
 	await load(a, `${home}&data=0`);
 	info = await diskInfo(a);
-	r = await a.run("findfs LABEL=kwdata || echo none");
+	r = await a.run("sudo findfs LABEL=kwdata || echo none");
 	check("?data=0: no data disk", info === null && /none/.test(r.out), r.out);
 } catch (e) {
 	check("exception", false, e.stack ?? e.message);

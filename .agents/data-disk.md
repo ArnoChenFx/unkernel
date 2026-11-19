@@ -70,7 +70,8 @@ missing).
   mounted it stops every process, then `/usr/lib/kw/data-stop` remounts
   `/` and `/data` read-only on a data upper (else unmounts `/data`), so
   ext4 is clean (`e2fsck -fn`).
-- Tested by `test/distro.test.ts` on both distros: changes persist; a
+- Tested by `test/distro.test.ts` on both distros: changes (in the user's
+  home) persist; a
   deleted `/bin/sh` falls back with the SAFE MODE line, its repair from
   the safe boot works at the next boot; `kw.root=initramfs`; discard at
   the next boot and at once; an image id change prints the line once and

@@ -11,37 +11,42 @@
 // patch -p1: keep their trailing whitespace, and escape \, ` and ${ as
 // template literals need.
 //
-// The script goes to /usr/local/bin (in the login PATH, so `fbdoom` works
-// in any terminal afterwards), the patches to /usr/share/unkernel/fbdoom,
-// where it looks for them. It installs tcc itself (apk, enabling community
-// first, or apt-get), so the demo needs neither `packages` nor `community`.
-// The first
+// The script goes to ~/.local/bin (on the login PATH, so `fbdoom` works
+// in any terminal afterwards), the patches to ~/.local/share/unkernel/fbdoom,
+// where it looks for them (../share/unkernel/fbdoom from the script's own
+// directory): everything is the session user's, and only the package
+// manager runs with sudo (SUDO_SH, sudo.ts). It installs tcc itself (apk,
+// enabling community first, or apt-get), so the demo needs neither
+// `packages` nor `community`. The first
 // run downloads tcc and Freedoom and compiles; the game and the WAD go to
-// /data/fbdoom with the data disk (kept), else /var/lib/fbdoom (gone at
-// power off). A patch removed or renamed upstream stays behind in the
-// guest's patch directory from an earlier launch.
+// ~/.local/share/fbdoom, kept with the rest of the home directory when the
+// data disk keeps the root's changes. A patch removed or renamed upstream
+// stays behind in the guest's patch directory from an earlier launch.
 import type { Demo, DemoFile } from "../launcher.ts";
+import { SUDO_SH } from "../sudo.ts";
 
 const FBDOOM_SH = `#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # fbdoom [fbDOOM options]: Doom on /dev/fb0 (the page's display, or the
 # CLI's --display), with sound effects on /dev/dsp; installed as
-# /usr/bin/fbdoom.
+# ~/.local/bin/fbdoom, with its patches in ../share/unkernel/fbdoom from
+# there.
 #
 # The first run builds the game here, in the guest, then starts it; later
 # runs start at once:
-# - installs a C compiler with apk (Alpine) or apt-get (Debian): tcc by
+# - installs a C compiler with apk (Alpine) or apt-get (Debian), through
+#   sudo unless it runs as root: tcc by
 #   default, about 8 MiB to download; FBDOOM_CC=gcc or clang works too, if
 #   slower to get,
 # - downloads fbDOOM's source at a pinned commit (github.com/maximevince/
 #   fbDOOM, GPL-2.0-or-later), checks its sha256, applies the patches in
-#   /usr/share/unkernel/fbdoom (web/src/demos/doom.ts) and compiles it,
+#   the patch directory (web/src/demos/doom.ts) and compiles it,
 # - downloads the Freedoom 0.13.0 release zip (BSD-3-Clause), of which
 #   freedoom1.wad (Phase 1) and its COPYING.txt are kept.
-# Everything goes to /data/fbdoom when the persistent data disk is mounted
-# (kept across boots, safe mode, kw-overlay discard and image updates), else to
-# /var/lib/fbdoom (gone at power off); FBDOOM_DIR overrides the place.
+# Everything goes to DIR, ~/.local/share/fbdoom (FBDOOM_DIR overrides the
+# place): in the home directory, kept across boots and image updates when
+# the data disk keeps the root's changes, else gone at power off.
 # The compiler goes wherever the package manager installs (with the data
 # disk: the overlay root, so it persists too). Settings and saves are in
 # DIR/.fbdoom/.
@@ -61,7 +66,7 @@ const FBDOOM_SH = `#!/bin/sh
 src_commit=e52885ff8a4cba99586c33b09339a9a56a69c041
 src_url=https://github.com/maximevince/fbDOOM/archive/$src_commit.tar.gz
 src_sha256=216901bd4afeb0d37fd0100e986c909d8b4300d9c4eb9feeabe569b1e8b0551e
-patch_dir=/usr/share/unkernel/fbdoom
+patch_dir=$(dirname "$(dirname "$(readlink -f "$0")")")/share/unkernel/fbdoom
 wad_url=https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip
 wad_sha256=3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59
 wad_zip_dir=freedoom-0.13.0
@@ -75,7 +80,8 @@ clang) cc_flags="-O2 -std=gnu99" cc_kib=307200 cc_mib=108 ;;
 *) echo "fbdoom: FBDOOM_CC must be tcc, gcc or clang" >&2; exit 2 ;;
 esac
 # The packages: Alpine's (apk) or Debian's (apt-get; libc6-dev brings the
-# kernel's headers, linux-libc-dev).
+# kernel's headers, linux-libc-dev), installed and removed as root.
+${SUDO_SH}
 if command -v apk >/dev/null; then
 	pm=apk
 	case $cc in
@@ -84,7 +90,7 @@ if command -v apk >/dev/null; then
 	clang) cc_pkgs="clang21 linux-headers patch" ;;
 	esac
 	pkg_installed() { apk info -e "$1" >/dev/null 2>&1; }
-	pkg_remove() { apk del -q --no-progress "$@"; }
+	pkg_remove() { $SUDO apk del -q --no-progress "$@"; }
 else
 	pm=apt-get
 	case $cc in
@@ -93,7 +99,7 @@ else
 	clang) cc_pkgs="clang libc6-dev patch" ;;
 	esac
 	pkg_installed() { [ "$(dpkg-query -W -f='\${db:Status-Status}' "$1" 2>/dev/null)" = installed ]; }
-	pkg_remove() { apt-get remove -y -q "$@" </dev/null >/dev/null; }
+	pkg_remove() { $SUDO apt-get remove -y -q "$@" </dev/null >/dev/null; }
 fi
 
 gray=$(printf '\\033[90m') reset=$(printf '\\033[0m')
@@ -106,16 +112,10 @@ die() {
 	exit 1
 }
 
-if [ -n "$FBDOOM_DIR" ]; then
-	dir=$FBDOOM_DIR
-	keep=
-elif mountpoint -q /data 2>/dev/null && [ -w /data ]; then
-	dir=/data/fbdoom
-	keep=
-else
-	dir=/var/lib/fbdoom
+dir=\${FBDOOM_DIR:-\${XDG_DATA_HOME:-$HOME/.local/share}/fbdoom}
+keep=
+[ -n "$FBDOOM_DIR" ] || grep -qsx upper=data /run/kw-base ||
 	keep=" (no data disk: kept only until power off)"
-fi
 
 case $1 in
 --remove)
@@ -129,6 +129,7 @@ case $1 in
 esac
 
 [ -c /dev/fb0 ] || die "no /dev/fb0: the host gives this system no display (CLI: --display)"
+[ -w /dev/fb0 ] || die "cannot write /dev/fb0 as $(id -un): this system gives the user no access to the display"
 
 # Each part is (re)made when it is missing or this script names another
 # version of it: the game by the source, the patches and the compiler.
@@ -221,16 +222,16 @@ if [ -n "$get_bin$get_wad" ]; then
 			next "installing the compiler:$missing (about $cc_mib MiB to download)"
 			if [ $pm = apk ]; then
 				# tcc is in community, which the image leaves off until needed.
-				[ $cc != tcc ] || [ ! -x /etc/kw-apk-enable ] || /etc/kw-apk-enable
+				[ $cc != tcc ] || [ ! -x /etc/kw-apk-enable ] || $SUDO /etc/kw-apk-enable
 				if ! ls /var/cache/apk/APKINDEX.*.tar.gz >/dev/null 2>&1; then
-					apk update -q --no-progress || die "apk update failed (network?)"
+					$SUDO apk update -q --no-progress || die "apk update failed (network?)"
 				fi
-				apk add -q --no-progress $missing || die "apk add$missing failed"
+				$SUDO apk add -q --no-progress $missing || die "apk add$missing failed"
 			else
 				# The image's package lists are baked in and age: when a version
 				# is gone from the mirror, fetch them again and retry once.
-				inst() { apt-get install -y -q --no-install-recommends $missing </dev/null; }
-				inst || { apt-get update -q </dev/null && inst; } || die "apt-get install$missing failed"
+				inst() { $SUDO apt-get install -y -q --no-install-recommends $missing </dev/null; }
+				inst || { $SUDO apt-get update -q </dev/null && inst; } || die "apt-get install$missing failed"
 			fi
 			# Remember what was added for this, for --remove-compiler.
 			echo $missing $(cat .compiler-added 2>/dev/null) | tr ' ' '\\n' | sort -u | tr '\\n' ' ' > .compiler-added
@@ -1284,7 +1285,8 @@ keyboard input through evdev and sound effects on /dev/dsp.
 The first run builds the game here, in the guest: it installs tcc
 (about 8 MiB), downloads fbDOOM's source and Freedoom (about 24 MiB) and
 compiles 81 files, which takes under a minute, mostly the downloads. Later
-runs start at once. With the data disk the game is kept in /data/fbdoom.
+runs start at once. The game is kept in ~/.local/share/fbdoom (with the
+data disk, across reboots too); the compiler is installed with sudo.
 
   arrows  move            Ctrl   fire           Space  open doors
   Alt     strafe          Shift  run            Tab    map
@@ -1292,7 +1294,7 @@ runs start at once. With the data disk the game is kept in /data/fbdoom.
 
 The status line's fb item switches between the game and this shell.
 Arguments go to fbDOOM (fbdoom -warp 1 1 -skill 3); the script is
-/usr/local/bin/fbdoom. fbdoom --remove deletes the game and the saves,
+~/.local/bin/fbdoom. fbdoom --remove deletes the game and the saves,
 fbdoom --remove-compiler removes tcc.
 `;
 
@@ -1305,9 +1307,9 @@ export default {
 	colors: ["#dc2626", "#451a03"],
 	needs: { display: true, net: true },
 	files: {
-		"/usr/local/bin/fbdoom": { content: FBDOOM_SH, mode: 0o755 },
+		"~/.local/bin/fbdoom": { content: FBDOOM_SH, mode: 0o755 },
 		...Object.fromEntries(Object.entries(PATCHES).map(([name, text]): [string, DemoFile] =>
-			[`/usr/share/unkernel/fbdoom/${name}`, { content: text }])),
+			[`~/.local/share/unkernel/fbdoom/${name}`, { content: text }])),
 		"README": README,
 	},
 	commands: ["cat README", "fbdoom"],

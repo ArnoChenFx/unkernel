@@ -356,7 +356,10 @@ const { stdout: sum } = await vm.exec("sha256sum", [], { input: "hello" });
 
 `exec()` runs a program on pipes and resolves with `{ stdout, stderr,
 exitCode, signal }`, also for a non-zero exit. Pass `encoding: "buffer"`
-for bytes, and `cwd` or `env` as you would to `child_process`.
+for bytes, and `cwd` or `env` as you would to `child_process`. On the
+distro images programs run as the user `user` (uid 1000, in
+`/home/user`), who has `sudo` without a password; pass `user: "root"` (or
+another name or uid) to run as someone else. The base shell is root's.
 
 ```js
 const sh = await vm.spawn();                     // a login shell on its own pty

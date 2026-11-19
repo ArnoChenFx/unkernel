@@ -13,11 +13,14 @@
 // "127.0.0.1 -::1" and logs to syslog. Here the server binds 127.0.0.1 only
 // (the guest has no IPv6, and the compiled-in default is "* -::*"), keeps
 // protected mode and daemonizes (a new session, so closing the window or
-// Ctrl-C leaves it running; ./run.sh reconnects). With the data disk mounted
-// it keeps its data in /data/valkey, an append-only file (fsync every second)
-// plus RDB snapshots, so it survives reboots; without one it runs in memory
-// (no AOF, no snapshots). It runs as root, like the rest of the demo: it
-// listens on loopback only, and nothing outside the guest can reach it.
+// Ctrl-C leaves it running; ./run.sh reconnects). It runs as the session's
+// user, like the rest of the demo (port 6379 needs no privilege), with its
+// pid file, log and data in the demo's directory. When the root's changes
+// are kept on the data disk (upper=data in /run/kw-base), that directory is
+// too, so it keeps its data there as an append-only file (fsync every
+// second) plus RDB snapshots, which survive reboots; otherwise it runs in
+// memory (no AOF, no snapshots). It listens on loopback only, and nothing
+// outside the guest can reach it.
 //
 // seed.sh loads seed.txt once, in one MULTI/EXEC, so a run cut off halfway
 // leaves nothing behind and the marker key demo:seeded is set only with the
@@ -27,8 +30,9 @@
 // queue rotating), which shows what persists.
 import type { Demo } from "../launcher.ts";
 
-const CONF = `# The unkernel Valkey demo's server settings. start.sh adds dir and the
-# persistence settings, which depend on whether the data disk is mounted.
+const CONF = `# The unkernel Valkey demo's server settings. start.sh adds dir, pidfile,
+# logfile and the persistence settings, which depend on whether the data
+# disk keeps this directory.
 # Loopback only: the guest has no IPv6, so no ::1 (the built-in default is
 # "* -::*").
 bind 127.0.0.1
@@ -36,8 +40,6 @@ port 6379
 protected-mode yes
 # Fork into a new session: closing the window leaves the server running.
 daemonize yes
-pidfile /run/valkey-demo.pid
-logfile /var/log/valkey-demo.log
 # A small cap, so a runaway experiment cannot take the guest's memory.
 maxmemory 64mb
 maxmemory-policy noeviction
@@ -46,27 +48,26 @@ appendfsync everysec
 
 const START = String.raw`#!/bin/sh
 # Starts the demo's Valkey server unless it already answers. Its data lives
-# in /data/valkey when the data disk is mounted, else in memory only.
+# in ./data when the data disk keeps the root's changes (and so this
+# directory), else in memory only.
 set -e
 cd "$(dirname "$0")"
-LOG=/var/log/valkey-demo.log
+DIR=$PWD/data PID=$PWD/valkey.pid LOG=$PWD/valkey.log
 ping() { [ "$(valkey-cli PING 2>/dev/null)" = PONG ]; }
 
 if ping; then
 	echo "Valkey already answers on 127.0.0.1:6379: $(valkey-cli CONFIG GET dir | tail -n 1)."
 	exit 0
 fi
-if grep -qs ' /data ' /proc/mounts; then
-	DIR=/data/valkey
+if grep -qsx upper=data /run/kw-base; then
 	set -- --appendonly yes
 	echo "Starting Valkey with its data in $DIR (on the data disk, kept across reboots)."
 else
-	DIR=/var/lib/valkey
 	set -- --appendonly no --save ""
 	echo "Starting Valkey in memory (no data disk: lost at reboot)."
 fi
 mkdir -p "$DIR"
-valkey-server "$PWD/valkey.conf" --dir "$DIR" "$@"
+valkey-server "$PWD/valkey.conf" --dir "$DIR" --pidfile "$PID" --logfile "$LOG" "$@"
 # The daemon answers once it has loaded its data (LOADING until then).
 i=0
 until ping; do
@@ -78,7 +79,7 @@ until ping; do
 	fi
 	sleep 1
 done
-echo "Valkey is up (PID $(cat /run/valkey-demo.pid))."
+echo "Valkey is up (PID $(cat "$PID"))."
 `;
 
 const SEED_SH = String.raw`#!/bin/sh

@@ -15,7 +15,7 @@ overlay root are in data-disk.md.
 `vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
 rdinit=/init`, the data disk template, the SMP patch) and copies that to
 `web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
-1661 KiB (930 KiB gzipped), bundle 9.8 MiB (2026-11-19).
+1668 KiB (934 KiB gzipped), bundle 9.8 MiB (2026-11-19).
 
 - Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
   with its own Alpine release), every applet linked in `/bin` (names from
@@ -35,7 +35,7 @@ rdinit=/init`, the data disk template, the SMP patch) and copies that to
   tree>`).
 - `kw.root=base`, no image labelled kwroot (`createKernel()` without
   `distro`, the CLI's `--distro none`), or an image that does not mount or
-  boot: the base shell on the base itself (busybox init, a shell on hvc0
+  boot: the base shell on the base itself (busybox init, a root shell on hvc0
   with the prompt `base DIR #`, `kwtty serve`, the layer's rc and net),
   with `/data` mounted when there is one; `kw-overlay status NAME` works
   there. Most of `test/api.test.ts` runs on it.
@@ -54,7 +54,23 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   so the base shell has none.
 - `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
   hostname (`/etc/hostname` unless empty or `localhost`, else
-  `unkernel`), binfmt_misc and the WASI format (kwwasi).
+  `unkernel`), binfmt_misc and the WASI format (kwwasi), the console
+  user's devices as udev's rules give them (no udev: `/dev/fb*` to video,
+  `/dev/input/*` to input, `/dev/dsp*`, `/dev/snd/*` to audio, 0660, by
+  group name; `/dev/fuse` 0666; the drivers make them at boot, none
+  later).
+- The image's user: every distro image has `user` (uid and gid 1000,
+  `/home/user` mode 700, `install_user` in guest/lib/stage.sh; bash on
+  Debian, `/bin/sh` on Alpine) in audio, video, input and users, plus sudo
+  (Debian) or wheel (Alpine), with sudo without a password and without a
+  tty (Debian's sudo, `/etc/sudoers.d/kw-user`; Alpine's doas with
+  doas-sudo-shim as `sudo`, `/etc/doas.d/kw-user.conf`). kwtty's console
+  (`kwtty login`) and sessions run as it (Guest tools, below); the base
+  shell, which has no such account, stays root's. `poweroff`, `halt` and
+  `reboot` in `/usr/local/sbin` go through `sudo -n` for another user than
+  root. Its home has the README (`guest/common/README`, rendered per distro
+  by `install_readme`: `@KEY@` values and `@if DISTRO` blocks; root's
+  home and the base shell have none).
 - `/usr/lib/kw/welcome`: `Welcome to PRETTY_NAME on unkernel (aarch64)`,
   then `/run/kw-overlay.msg` in yellow on a terminal.
 - `/usr/lib/kw/net`: lo, and eth0 by DHCP with busybox udhcpc (lease
@@ -65,10 +81,23 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/lib/kw/shim` and `/usr/lib/kw/bin/{fx,claude,opencode,node,npm,npx,bun,bunx}`
   (Shims, below).
 - `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`
-  (`/run/kw/bin`, then `~/.local/bin` first on PATH, `/usr/lib/kw/bin` last, below), `/etc/profile.d/kw-term.sh`
+  (`/run/kw/bin`, then `~/.local/bin` first on PATH, the sbin directories
+  where the distro leaves them out for users (Debian), `/usr/lib/kw/bin`
+  last, below), `/etc/profile.d/kw-term.sh`
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
   `/usr/share/licenses/unkernel` (the GPL notice for these files).
+- `/usr/lib/kw/shrc`: the `/etc/profile.d/kw-*.sh` files (PATH, TERM, the
+  prompt, command not found, the package manager through sudo) for
+  interactive shells that are not login
+  shells, which do not read `/etc/profile` (a shell typed at the prompt,
+  `sudo -s`, `su`): Debian's `/etc/bash.bashrc` sources it (a line the
+  build appends), Alpine's busybox ash reads it as `ENV` (exported by
+  kw-prompt.sh; doas sets it for `sudo -s`). Once per shell: a bash login
+  shell (bash.bashrc runs before profile.d) skips it, and kw-path.sh sets
+  the unexported `_kw_sh`, which ash's ENV (read after profile.d) checks.
+  Before, only login shells had them, so a nested shell lost the prompt,
+  the handler and, after `sudo -s`, PATH.
 
 ## Shims (fx, claude, opencode, node, bun)
 
@@ -78,8 +107,8 @@ its first call and runs it (described at its top). Every distro has them, the pa
 the CLI alike; `test/distro.test.ts` checks them on each image (no
 network).
 
-- PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for login shells, kwtty
-  for programs it starts), and the install goes to `~/.local/bin`, which
+- PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for every interactive
+  shell, kwtty for programs it starts), and the install goes to `~/.local/bin`, which
   comes before the distro's, so later calls start the program directly and anything
   else of those names (a user's own install) wins. A shell that ran the
   shim keeps it hashed until `hash -r`, which costs one busybox `sh`
@@ -115,7 +144,8 @@ network).
   unofficial-builds.nodejs.org (the project's own builder,
   linux-arm64-musl). The musl build links `libgcc_s.so.1`, the glibc one
   `libatomic.so.1`; when one is missing the shim installs its package
-  first, as root, with apk (`libgcc`) or apt-get (`libatomic1`); Debian's
+  first, as root (directly, or with `sudo -n`), with apk (`libgcc`) or
+  apt-get (`libatomic1`); Debian's
   image has libatomic1 (DEBIAN_PACKAGES), Alpine's has no libgcc. The
   `.tar.gz` (63 MB for 26.13.1, against 33 MB `.tar.xz`), unpacked with
   pigz on Alpine; about 230 MB unpacked. Node CLI, 1 GiB, no data disk,
@@ -189,18 +219,24 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
 
 - **Alpine** (`distro/alpine/`): the minirootfs as Alpine builds it
   (stock busybox, zlib, openssl and apk-tools), busybox init with `etc/inittab` (the layer's rc,
-  welcome and net, `/etc/kw-binfmt.sh` for qemu-user, a shell on hvc0,
+  welcome and net, `/etc/kw-binfmt.sh` for qemu-user, `kwtty login` on hvc0,
   `kwtty serve`, the layer's shutdown), and what "In the Alpine image"
   below lists. OpenSSL's engines, `legacy.so` and `*.dist` stay (the image
   is paged in on demand, not RAM-resident). An `apk add` cut off
-  mid-install needs no cleanup (data-disk.md). The build adds no
-  packages and boots no VM; what else a program needs comes from apk on
-  first use (the shim's libgcc, above).
+  mid-install needs no cleanup (data-disk.md). The build adds doas and
+  doas-sudo-shim (pinned in `pins.sh`, from main: 21 KB to download
+  against 0.75 MB for the real sudo, which is in community), installed by
+  the image's apk in a boot of the tree on the base bundle
+  (`guest/tools/vm-run.ts`; the changes to the overlay's upper layer are
+  copied back into the tree, and `/etc/apk/world` keeps plain names);
+  without the bundle or node the image has no doas and no user. What else
+  a program needs comes from apk on first use (the shim's libgcc, above).
 - **Debian** (`distro/debian/`): debian:trixie-slim (pinned in
   `pins.sh`), Debian's own builds in full. `/sbin/init` ->
   `/usr/local/sbin/kw-init`, a bash PID 1: the layer's rc, welcome and
-  net, a login shell on hvc0 and `kwtty serve` (respawned);
-  `poweroff`/`halt`/`reboot` in `/usr/local/sbin` signal it, and it stops
+  net, the console's login shell on hvc0 (`kwtty login`) and `kwtty
+  serve` (respawned); `poweroff`/`halt`/`reboot` in `/usr/local/sbin`
+  signal it (through `sudo -n` for the user), and it stops
   everything, runs the layer's shutdown and calls reboot(2) through the
   base's busybox. apt: `90kw` (no recommends, pdiffs or pty), debconf
   Noninteractive, the package lists of the image's date baked in
@@ -219,7 +255,16 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   `/usr/local/sbin/kw-apt-install`, which looks the name up in
   `/usr/lib/kw-commands` (`NAME PACKAGE` per command of main, made at
   build time from the snapshot's Contents files by `tools/commands.py`)
-  and runs `apt-get install --no-install-recommends`.
+  and runs `apt-get install --no-install-recommends` (as the user through
+  `sudo -n`). kw-apt.sh also makes `apt` and `apt-get` typed by a user
+  other than root, where sudo exists, `sudo apt ...` (aliases, interactive
+  shells only: `\apt` and `command apt` are the real one, `sudo apt` stays
+  as typed, scripts are untouched); kw-apk.sh does the same for `apk`
+  where `/lib/apk/db` is not writable. `/usr/lib/kw-commands` leaves out every command the image
+  has, `/usr/local` included (else `poweroff` would map to finit-sysv).
+  The user's `~/.bashrc` (from `/etc/skel`, whose two prompt lines the
+  build makes no-ops) leaves the prompt to kw-prompt.sh; the build adds
+  the group input (gid 101), which udev's package would.
 
 ## Data disk template (`kernel/build.sh datadisk`)
 
@@ -248,8 +293,10 @@ The files are in `guest/distro/alpine/rootfs/`.
   `/etc/apk/repositories` when something needs it, for good (packages
   installed with `apk add -X URL` would not be upgraded later). The page
   pushes index files into apk's cache (web.md, apk index prefetch).
-- **Command not found**: in an interactive root shell with a default
+- **Command not found**: in an interactive shell with a default
   route, a missing command is installed with `apk add cmd:NAME` and run
+  (as root: kw-apk-install runs itself again through `sudo -n` for the
+  user)
   (`/etc/profile.d/kw-apk.sh`, a busybox ash `command_not_found_handle`,
   and `/etc/kw-apk-install`). ash passes only the command name, so the
   arguments come from the history line, and only for a simple line (after
@@ -267,7 +314,7 @@ The files are in `guest/distro/alpine/rootfs/`.
   kw layer): Alpine's
   `/etc/profile` sets a fixed PATH; this prepends `/run/kw/bin` (the
   host's commands, kwcmd) and `$HOME/.local/bin` and
-  appends `/usr/lib/kw/bin` (the shims) for every login shell, and
+  appends `/usr/lib/kw/bin` (the shims) for every interactive shell, and
   kwtty gives programs it starts directly the same PATH. Per-user installs
   go there (`pip install --user`, the fx and claude installers, the
   shims).
@@ -291,7 +338,8 @@ The files are in `guest/distro/alpine/rootfs/`.
   runs them on the host's wasm engine (js.md, WASI programs); the kw
   layer's rc registers it. **Guest only: never run kw-binfmt.sh on the
   host.**
-  The first time an architecture is needed (as root, with a network, under
+  The first time an architecture is needed (as root, through `sudo -n` for
+  the user (`kw-qemu --kw-install`), with a network, under
   a lock so parallel execs do not race apk) kw-qemu enables community and
   installs `qemu-ARCH` and a library root at qemu's default prefix
   `/usr/gnemul/qemu-ARCH`: musl, libgcc, libstdc++ and gcompat (glibc's
@@ -335,12 +383,21 @@ within what kwemu implements: check it with the coverage classifier
 
 - `kwvsock connect PORT [CID]` and `kwvsock listen PORT` pipe stdin and
   stdout over a vsock connection.
+- `kwtty login` (the distros' inits, on hvc0): the console's login shell,
+  as the user `kw.user=NAME` on the kernel command line names (the CLI's
+  `--user`), else the default user (below), with the terminal given to it,
+  its groups, environment and home.
 - `kwtty serve [PORT]` (from inittab) serves sessions to the host on vsock
   port 1022 (privileged, so no unprivileged program can take it; only CID
   2 may connect, since there is no authentication). Each connection gets
-  its own pty, size and resizes, and root's login shell or the program the
-  host names (argv, working directory, environment), and a hangup when the
-  host closes. The environment starts with HOME, USER, LOGNAME, SHELL, TERM
+  its own pty, size and resizes, and a user's login shell or the program
+  the host names (argv, working directory, environment), and a hangup when
+  the host closes. The user is OPEN's USER (a name or uid; empty: the
+  default user, `user` where `/etc/passwd` has it, else root; no USER:
+  root, as a host from before it expects); the program gets its groups
+  (initgroups), the pty (owner, group tty, 0620, as login(1) does), and
+  its home as the working directory. The environment starts with HOME,
+  USER, LOGNAME, SHELL, TERM
   (on a pty, or when the host sets it) and a login shell's PATH. With PIPES
   the program gets stdin, stdout and stderr pipes instead, in a session of
   its own (a hangup goes to its process group), and EOF closes its stdin.

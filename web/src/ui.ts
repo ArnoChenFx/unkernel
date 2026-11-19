@@ -122,7 +122,7 @@ export function createUi(cfg: Config) {
 		panelOpen: false, tab: "status", toast: null,
 		dataStatus: "Not attached yet.", disk: null,
 		safeNote: cfg.root === "initramfs" && cfg.distro
-			? `Safe mode: the root is the plain ${imageName} (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in ${upperDir}. kw-overlay status explains, kw-overlay discard starts over from the image.`
+			? `Safe mode: the root is the plain ${imageName} (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in ${upperDir}. kw-overlay status explains, sudo kw-overlay discard starts over from the image.`
 			: null,
 		distro: cfg.distro ? { name: cfg.distro.name, image: cfg.distro.imageId ?? "", url: cfg.distro.url } : null,
 		ctrl: false, keysOn: false, pasteOpen: false, ask: null, prefix: false,
@@ -310,7 +310,7 @@ export function createUi(cfg: Config) {
 		safeMode(reason: string) {
 			$.set({
 				safeNote: `Safe mode: ${reason}. This boot runs the plain ${imageName}; your changes to the root are kept, unused, in ${upperDir}. ` +
-					"Fix them there and reboot: each boot tries them again (kw-overlay status explains, kw-overlay discard sets them aside and starts over from the image).",
+					"Fix them there (with sudo) and reboot: each boot tries them again (kw-overlay status explains, sudo kw-overlay discard sets them aside and starts over from the image).",
 			});
 			ui.check("overlay", "Root", "warn", "safe mode", reason);
 			ui.toast(`Safe mode: ${reason}. Your root changes are kept but unused this boot; fix them and reboot.`);

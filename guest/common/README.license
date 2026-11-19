@@ -1,0 +1,6 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+
+guest/common/README: the README in the user's home (/home/user/README) of
+every distro image, rendered per distro at build time by install_readme
+(guest/lib/stage.sh): @KEY@ placeholders and @if DISTRO ... @end blocks.

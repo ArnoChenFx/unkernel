@@ -6,9 +6,10 @@
 # layer's runtime (/usr/lib/kw/, from the base) does the rest: rc (mounts,
 # hostname, binfmt), welcome, net (DHCP), and at the end, after this has
 # stopped every process, shutdown (leave /data clean). In between it
-# respawns a root login shell on hvc0 and kwtty serve, until poweroff, halt
-# or reboot (/usr/local/sbin) signal it (SIGUSR1, SIGUSR2); then reboot(2)
-# through the base's busybox.
+# respawns the console's login shell on hvc0 (kwtty login: the user "user",
+# or kw.user= on the kernel command line) and kwtty serve, until poweroff,
+# halt or reboot (/usr/local/sbin) signal it (SIGUSR1, SIGUSR2); then
+# reboot(2) through the base's busybox.
 
 # unkernel: PID 1 of the Debian image.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
@@ -27,9 +28,11 @@ trap 'action=reboot' USR2
 export HOME=/root
 cd /root
 declare -A role started
-# A root login shell in a session of its own with hvc0 as its controlling
-# terminal (job control, ^C), respawned like busybox init's "respawn".
-console() { setsid -c bash -l <>/dev/hvc0 >&0 2>&0 & role[$!]=console; started[$!]=$SECONDS; }
+# The console's login shell (kwtty login: the user's, with its groups and
+# environment, in its home) in a session of its own with hvc0 as its
+# controlling terminal (job control, ^C), respawned like busybox init's
+# "respawn".
+console() { setsid -c /usr/bin/kwtty login <>/dev/hvc0 >&0 2>&0 & role[$!]=console; started[$!]=$SECONDS; }
 # kwtty sleeps in pause() when there is no vsock device, so it is not
 # respawned in a loop.
 kwtty() { /usr/bin/kwtty serve </dev/null & role[$!]=kwtty; started[$!]=$SECONDS; }

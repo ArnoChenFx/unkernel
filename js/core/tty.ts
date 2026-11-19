@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // kwtty: programs in the guest, over vsock, each on its own pty or on
 // pipes. The host client of the guest's `kwtty serve` (guest/src/kwtty.c,
-// started by inittab), which gives each connection root's login shell, or a
-// program, on a pty of its own, or with PIPES on stdin, stdout and stderr
+// started by inittab), which gives each connection a user's login shell, or
+// a program, on a pty of its own, or with PIPES on stdin, stdout and stderr
 // pipes. On a pty the API follows zigpty / node-pty: spawn(file, args,
 // options) gives a Pty. With `pty: false` it gives a Subprocess (web
 // streams for stdin, stdout and stderr), and exec() collects its output.
@@ -20,13 +20,18 @@
 // critical), u16 length, value: TERM 1, ENV 2 "KEY=VALUE", ARG 3 (one per
 // argument, the program first; none: a login shell), CWD 4, PIPES 5 (empty:
 // pipes instead of a pty), CONNECT 6 (u16 TCP port: the guest connects to
-// 127.0.0.1:port before OPENED; other options are ignored); the host marks
-// ARG, CWD, PIPES and CONNECT critical), DATA
+// 127.0.0.1:port before OPENED; other options are ignored), USER 7 (the
+// user to run as: a name or a decimal uid, empty for the guest's default
+// user; without it the guest runs root's session, as before USER); the host
+// marks ARG, CWD, PIPES, CONNECT and a USER other than "", "root" and "0"
+// critical, and always sends USER (empty unless `user` is given), so an old
+// guest, whose sessions are root's, refuses only a request for another
+// user), DATA
 // (2: at most 4096 bytes from the host, for the pty or stdin; zero length is
 // a no-op), RESIZE (3: u16 rows, cols, xpixel, ypixel), SIGNAL (6, critical:
 // a signal name without "SIG", for the program), EOF (7: with PIPES, close
 // the program's stdin). Guest -> host: OPENED (1: u16 version, u32 features
-// (bit 0: PIPES, EOF and STDERR; bit 1: CONNECT), u32 pid (0 with CONNECT),
+// (bit 0: PIPES, EOF and STDERR; bit 1: CONNECT; bit 2: USER), u32 pid (0 with CONNECT),
 // u32 pts (0xffffffff with PIPES or CONNECT)), DATA (2: the pty, or
 // stdout), EXIT (4: u8 how (0 exited, 1 signal), u8 code, u8 core_dumped),
 // ERROR (5: a UTF-8 message, then the guest closes), STDERR (8: with
@@ -78,10 +83,13 @@ export const TTY_OPT_ARG = 3;
 export const TTY_OPT_CWD = 4;
 export const TTY_OPT_PIPES = 5;
 export const TTY_OPT_CONNECT = 6;
+export const TTY_OPT_USER = 7;
 /** OPENED feature bit: the guest has PIPES, EOF and STDERR. */
 export const TTY_FEATURE_PIPES = 1;
 /** OPENED feature bit: the guest has CONNECT (connectGuest()). */
 export const TTY_FEATURE_CONNECT = 2;
+/** OPENED feature bit: the guest has USER (SpawnOptions.user). */
+export const TTY_FEATURE_USER = 4;
 
 /** The signals kill() can send (kwtty.c has the same list). */
 export const TTY_SIGNALS = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
@@ -139,8 +147,17 @@ export interface PtySize {
 
 /** What spawn() on a pty, spawn() on pipes and exec() take. */
 export interface SpawnOptions {
-	/** The program's working directory. Default root's home. */
+	/** The program's working directory. Default the user's home. */
 	cwd?: string;
+	/**
+	 * The guest user to run as: a name, or a uid. Default the guest's default
+	 * user: `user` (uid 1000) on the distro images, root on the base shell.
+	 * "root" or 0 for root. The program gets that user's groups, HOME, USER,
+	 * LOGNAME, SHELL and PATH. A user the guest does not have is a PtyError
+	 * EREMOTE ("no user NAME"), and so is a user other than root on a guest
+	 * from before this option (its sessions are root's).
+	 */
+	user?: string | number;
 	/** Extra environment, applied after the defaults (HOME, USER, LOGNAME, SHELL, PATH, and TERM on a pty), so it may override them. */
 	env?: Record<string, string>;
 	/** The guest server's port. Default TTY_PORT (1022). */
@@ -319,11 +336,12 @@ export function encodeTtyResize(s: PtySize): Uint8Array {
 
 /**
  * OPEN's payload: max_version, the size, then TERM, one ENV option per
- * entry, ARG options (`file`, then `args`), CWD, PIPES and CONNECT. With
- * `pipes` or `connect`, TERM goes only when `term` is given. Throws a RangeError for values the
- * guest would refuse.
+ * entry, ARG options (`file`, then `args`), CWD, PIPES, CONNECT and USER
+ * (always but with `connect`: empty for the default user). With `pipes` or
+ * `connect`, TERM goes only when `term` is given. Throws a RangeError for
+ * values the guest would refuse.
  */
-export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<string, string>; cwd?: string; file?: string; args?: readonly string[]; pipes?: boolean; connect?: number }): Uint8Array {
+export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<string, string>; cwd?: string; file?: string; args?: readonly string[]; pipes?: boolean; connect?: number; user?: string | number }): Uint8Array {
 	const enc = new TextEncoder();
 	const parts: Uint8Array[] = [];
 	const head = new Uint8Array(2);
@@ -363,6 +381,12 @@ export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<stri
 		const port = opts.connect;
 		if (!Number.isInteger(port) || port < 1 || port > 0xffff) throw new RangeError(`kwtty: TCP port ${port} is not an integer from 1 to 65535`);
 		opt(TTY_OPT_CONNECT | TTY_OPT_CRITICAL, Uint8Array.of(port & 0xff, port >> 8));
+	} else {
+		const u = opts.user === undefined ? "" : String(opts.user);
+		if (typeof opts.user === "number" ? !Number.isInteger(opts.user) || opts.user < 0 || opts.user > 0xffffffff : !/^[^\0:\n]{0,64}$/.test(u) || (opts.user !== undefined && !u))
+			throw new RangeError(`kwtty: user ${JSON.stringify(opts.user)} is not a uid or a name of 1 to 64 characters without ":", newline or NUL`);
+		// A guest from before USER runs every session as root: it may ignore a request for root or for its default.
+		opt(TTY_OPT_USER | (u === "" || u === "root" || u === "0" ? 0 : TTY_OPT_CRITICAL), enc.encode(u));
 	}
 	let n = 0;
 	for (const p of parts) n += p.length;
@@ -836,7 +860,7 @@ async function openSession(vsock: Vsock, payload: Uint8Array, opts: SpawnOptions
 }
 
 /**
- * Run `file` with `args` on a new pty in the guest (no file: root's login
+ * Run `file` with `args` on a new pty in the guest (no file: the user's login
  * shell; a file without "/" is looked up in PATH): connect to the guest's
  * kwtty server (retrying while it is not up yet), send OPEN, and wait for
  * OPENED. Rejects with a PtyError (ETIMEDOUT, EREMOTE with the guest's
@@ -851,7 +875,7 @@ export async function spawnPty(vsock: Vsock, file?: string, args: readonly strin
 
 /**
  * Run `file` with `args` in the guest on pipes (stdin, stdout and stderr;
- * no file: root's login shell, reading stdin), as spawnPty() otherwise. A
+ * no file: the user's login shell, reading stdin), as spawnPty() otherwise. A
  * guest without PIPES (a kernel from before them) refuses it: EREMOTE.
  */
 export async function spawnSubprocess(vsock: Vsock, file?: string, args: readonly string[] = [], opts: SpawnOptions = {}): Promise<Subprocess> {

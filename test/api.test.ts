@@ -1556,7 +1556,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 
 	// A distro root (guest/distro/alpine, the kw layer of guest/base/rootfs on top): what only a full userland has.
 	describe("Alpine, one kernel", { concurrency: 1, skip: noAlpine || (!kernelHasVsock && "the kernel under test has no kwvsock") }, () => {
-		const alp = sharedKernel(() => ({ distro: alpine!, log: () => {} }));
+		const alp = sharedKernel(() => ({ distro: alpine!, log: () => {}, commands: { whoru: (c) => `uid ${c.uid}\n` } }));
 
 		test("boots the Alpine image under the overlay root, with the kw layer on top", async () => {
 			const r = await alp.vm.exec("sh", ["-c", "cat /etc/alpine-release /usr/lib/kw-distro; apk --version; grep ' / ' /proc/self/mounts; command -v kwtty"]);
@@ -1568,9 +1568,17 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		});
 
 		test("PATH: the host's commands, ~/.local/bin, then /etc/profile's, then the shims, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
-			const want = "/run/kw/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin\n";
+			const want = "/run/kw/bin:/home/user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/kw/bin\n";
 			assert.equal((await alp.vm.exec("sh", ["-c", 'echo "$PATH"'])).stdout, want);
 			assert.equal((await alp.vm.exec("sh", ["-lc", 'echo "$PATH"'])).stdout, want);
+		});
+
+		test("as the image's user (uid 1000): host commands linked by root and run by the user, a host mount the user can write", async () => {
+			assert.equal((await alp.vm.exec("sh", ["-c", "id -u; ls -l /run/kw/bin/whoru | cut -c1; whoru"])).stdout, "1000\nl\nuid 1000\n");
+			const m = await alp.vm.mount("/mnt/host", new MemoryFs({ "a.txt": "host\n" }));
+			const r = await alp.vm.exec("sh", ["-c", "stat -c '%U %u' /mnt/host /mnt/host/a.txt; echo guest > /mnt/host/b.txt; mkdir /mnt/host/d; cat /mnt/host/b.txt"]);
+			assert.equal(r.stdout, "user 1000\nuser 1000\nguest\n", r.stderr);
+			await m.unmount();
 		});
 
 		test("poweroff: exit code 0", async () => {

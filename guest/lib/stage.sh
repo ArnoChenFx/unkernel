@@ -12,6 +12,15 @@
 #   install_common DEST      what every distro image has and the base's kw
 #                            layer (RAM-resident) leaves out: the game and
 #                            display self-test, /usr/bin/glimmer
+#   install_user DEST SHELL GROUP...
+#                            the image's user (kwtty's default): "user",
+#                            uid and gid 1000, home /home/user (mode 700,
+#                            /etc/skel's files), in the GROUPs
+#   install_readme DEST DISTRO KEY=VALUE...
+#                            /home/user/README from guest/common/README for
+#                            DISTRO (after install_user)
+# The user's home goes into the image owned by 1000:1000: pass
+# "${user_owner[@]}" to distro_images (mktree.py --owner).
 #
 # A mirror tree holds files at their installed path and name. Each starts
 # with the repository's header (SPDX line, copyright, what the file is): a
@@ -75,4 +84,65 @@ install_tree() {
 install_common() {
 	"${cc_guest[@]}" -o "$1/usr/bin/glimmer" "$guest/src/glimmer.c"
 	chmod 755 "$1/usr/bin/glimmer"
+}
+
+# install_user DEST SHELL GROUP...: passwd, group, shadow (and gshadow,
+# subuid, subgid where the image has them) get "user" (uid and gid 1000,
+# SHELL, no password: "*", so only root, sudo or kwtty start its
+# sessions), a member of each GROUP. Lines are appended as adduser would,
+# with root's password-change day (a fixed date, so the build is
+# reproducible). Fails if the name, uid or gid is taken or a GROUP is
+# missing. The home is /home/user (mode 700) with /etc/skel's files.
+user_owner=(--owner home/user=1000:1000)
+install_user() {
+	local dest=$1 shell=$2 g lastchg
+	shift 2
+	if grep -q '^user:' "$dest/etc/passwd" "$dest/etc/group" ||
+		awk -F: '$3 == 1000 { f = 1 } END { exit !f }' "$dest/etc/passwd" "$dest/etc/group"; then
+		echo "install_user: the name user or the id 1000 is taken in $dest" >&2
+		return 1
+	fi
+	echo "user:x:1000:1000::/home/user:$shell" >> "$dest/etc/passwd"
+	echo "user:x:1000:" >> "$dest/etc/group"
+	lastchg=$(awk -F: '$1 == "root" { print $3 }' "$dest/etc/shadow")
+	echo "user:*:$lastchg:0:99999:7:::" >> "$dest/etc/shadow"
+	[ ! -f "$dest/etc/gshadow" ] || echo "user:!::" >> "$dest/etc/gshadow"
+	for g in subuid subgid; do
+		[ ! -f "$dest/etc/$g" ] || echo "user:100000:65536" >> "$dest/etc/$g"
+	done
+	for g; do
+		grep -q "^$g:" "$dest/etc/group" || { echo "install_user: no group $g in $dest" >&2; return 1; }
+		for f in group gshadow; do
+			[ -f "$dest/etc/$f" ] || continue
+			awk -F: -v OFS=: -v g="$g" '$1 == g { $4 = $4 == "" ? "user" : $4 ",user" } { print }' \
+				"$dest/etc/$f" > "$dest/etc/$f.kw"
+			cat "$dest/etc/$f.kw" > "$dest/etc/$f"
+			rm "$dest/etc/$f.kw"
+		done
+	done
+	mkdir -p "$dest/home/user"
+	[ ! -d "$dest/etc/skel" ] || cp -a "$dest/etc/skel/." "$dest/home/user/"
+	chmod 700 "$dest/home/user"
+}
+
+# install_readme DEST DISTRO KEY=VALUE...: /home/user/README (mode 644)
+# from the one text of every distro, guest/common/README: @KEY@ becomes
+# VALUE, and the lines between "@if NAME" and "@end" stay only for DISTRO
+# NAME. Fails on a KEY the text has and the call does not give.
+install_readme() {
+	local dest=$1 distro=$2 out
+	shift 2
+	out="$dest/home/user/README"
+	awk -v distro="$distro" '
+		BEGIN { for (i = 2; i < ARGC; i++) { k = ARGV[i]; sub(/=.*/, "", k); v = substr(ARGV[i], length(k) + 2); val["@" k "@"] = v; ARGV[i] = "" } }
+		/^@if / { skip = $2 != distro; next }
+		/^@end$/ { skip = 0; next }
+		skip { next }
+		{
+			for (k in val) while ((i = index($0, k))) $0 = substr($0, 1, i - 1) val[k] substr($0, i + length(k))
+			if ($0 ~ /@[A-Z_]+@/) { print "install_readme: no value for " $0 > "/dev/stderr"; bad = 1 }
+			print
+		}
+		END { exit bad }' "$guest/common/README" "$@" > "$out"
+	chmod 644 "$out"
 }

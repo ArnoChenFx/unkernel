@@ -8,8 +8,8 @@
 //   node vm-run.ts KERNEL IMAGE [--mem MiB] [--net] [--data FILE] [--timeout s]
 //                  [--shell PROGRAM] [--get GUESTFILE=HOSTFILE]... [--trace FILE] SCRIPT
 //
-// SCRIPT runs as `sh -c SCRIPT` (or PROGRAM -c SCRIPT) through the base's
-// kwtty, with no network unless --net; its output is passed on, and a
+// SCRIPT runs as `sh -c SCRIPT` (or PROGRAM -c SCRIPT) as root through the
+// base's kwtty, with no network unless --net; its output is passed on, and a
 // non-zero exit fails the run.
 // Then each --get copies a guest file out, binary-safe (exec's stdout as
 // bytes), checked against the size and SHA-256 the guest reports. The VM is
@@ -87,17 +87,17 @@ try {
 			timer = setTimeout(() => no(new Error("no shell prompt on the console")), ms);
 		})]).finally(() => clearTimeout(timer));
 	}
-	const r = await vm.exec(shell, ["-c", script], { timeout: ms });
+	const r = await vm.exec(shell, ["-c", script], { timeout: ms, user: "root" });
 	process.stdout.write(r.stdout);
 	process.stderr.write(r.stderr);
 	if (r.exitCode !== 0) throw new Error(`script: exit ${r.exitCode ?? `signal ${r.signal}`}`);
 	if (trace) writeFileSync(trace, reads!.join("\n") + "\n");
 	for (const [g, h] of gets) {
 		const q = `'${g.replaceAll("'", "'\\''")}'`;
-		const sum = (await vm.exec("sh", ["-c", `stat -c %s ${q} && sha256sum < ${q}`], { timeout: ms }));
+		const sum = (await vm.exec("sh", ["-c", `stat -c %s ${q} && sha256sum < ${q}`], { timeout: ms, user: "root" }));
 		if (sum.exitCode !== 0) throw new Error(`${g}: ${sum.stderr.trim()}`);
 		const [size, hash] = sum.stdout.trim().split(/\s+/);
-		const r = await vm.exec("cat", [g], { timeout: ms, encoding: "buffer", maxBuffer: 1 << 30 });
+		const r = await vm.exec("cat", [g], { timeout: ms, encoding: "buffer", maxBuffer: 1 << 30, user: "root" });
 		if (r.exitCode !== 0) throw new Error(`cat ${g}: exit ${r.exitCode}`);
 		const got = createHash("sha256").update(r.stdout).digest("hex");
 		if (r.stdout.length !== Number(size) || got !== hash)

@@ -50,7 +50,9 @@
 # busybox wget, Debian curl). The download streams straight into its final
 # directory (no copy in /tmp); free space is checked first. One install at a
 # time per tool (flock); an interrupted one leaves nothing behind. Exit 127
-# when it cannot install.
+# when it cannot install. The packages a download needs first (zstd, pigz,
+# a library) are installed as root: directly, or with `sudo -n` (the
+# distro images' user has it without a password).
 tool=${0##*/}
 # name: what gets installed (node for node, npm and npx; bun for bunx).
 case $tool in
@@ -60,7 +62,8 @@ bun|bunx) name=bun ;;
 *) echo "kw shim: no shim for '$tool'" >&2; exit 127 ;;
 esac
 
-[ "${HOME:-/}" = / ] && [ "$(id -u)" = 0 ] && HOME=/root
+# A HOME of / (a shell started by init): the account's home.
+[ "${HOME:-/}" = / ] && HOME=$(awk -F: -v id="$(id -u)" '$3 == id { print $6; exit }' /etc/passwd) && [ -n "$HOME" ] || HOME=${HOME:-/}
 bin=$HOME/.local/bin
 link=$bin/$tool
 # installed: ~/.local/bin/TOOL is a program, not a shim that an earlier
@@ -82,12 +85,24 @@ elif command -v curl >/dev/null; then
 else
 	die "not installed yet, and installing it needs wget or curl (this machine has neither)"
 fi
+# asroot COMMAND...: as root, directly or through sudo -n; fails when
+# neither works (a user without sudo rights).
+if [ "$(id -u)" = 0 ]; then
+	asroot() { "$@"; }
+	sudo=
+elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+	asroot() { sudo -n "$@"; }
+	sudo="sudo "
+else
+	asroot() { return 1; }
+	sudo="sudo "
+fi
 # pkg CMD: CMD is there, or apk installs it now (as root, on Alpine).
 pkg() {
 	command -v "$1" >/dev/null && return
-	[ "$(id -u)" = 0 ] && command -v apk >/dev/null || return 1
-	say "apk add $1"
-	apk add -q --no-progress "$1" >/dev/null 2>&1
+	command -v apk >/dev/null || return 1
+	say "${sudo}apk add $1"
+	asroot apk add -q --no-progress "$1" >/dev/null 2>&1
 	command -v "$1" >/dev/null
 }
 # needlib SONAME APK DEB: the shared library SONAME is there, or the
@@ -95,15 +110,15 @@ pkg() {
 haslib() { for d in /lib /usr/lib /lib/*-linux-gnu /usr/lib/*-linux-gnu; do [ -e "$d/$1" ] && return; done; return 1; }
 needlib() {
 	haslib "$1" && return
-	[ "$(id -u)" = 0 ] || die "needs $1; as root: apk add $2 (Alpine) or apt-get install $3 (Debian)"
+	asroot true || die "needs $1, which takes root to install: sudo apk add $2 (Alpine) or sudo apt-get install $3 (Debian)"
 	if command -v apk >/dev/null; then
-		say "apk add $2 ($name needs $1)"
-		apk add -q --no-progress "$2" >/dev/null 2>&1
+		say "${sudo}apk add $2 ($name needs $1)"
+		asroot apk add -q --no-progress "$2" >/dev/null 2>&1
 	elif command -v apt-get >/dev/null; then
-		say "apt-get install $3 ($name needs $1)"
+		say "${sudo}apt-get install $3 ($name needs $1)"
 		deb=$3
-		aptget() { apt-get install -y -q --no-install-recommends "$deb" </dev/null >/dev/null 2>&1; }
-		aptget || { apt-get update -q </dev/null >/dev/null 2>&1 && aptget; }  # the image's lists may be stale
+		aptget() { asroot apt-get install -y -q --no-install-recommends "$deb" </dev/null >/dev/null 2>&1; }
+		aptget || { asroot apt-get update -q </dev/null >/dev/null 2>&1 && aptget; }  # the image's lists may be stale
 	fi
 	haslib "$1" || die "needs $1, and installing it failed (apk add $2, or apt-get install $3)"
 }
@@ -147,7 +162,7 @@ claude)
 	# 10 s, zstd 7 s, measured under kwemu on Alpine, 2026-11-18), and its
 	# frame checksum covers the program. zstd is a 1 MB package on Alpine;
 	# Debian's image has it.
-	pkg zstd || die "not installed yet, and installing it needs zstd (as root: apk add zstd)"
+	pkg zstd || die "not installed yet, and installing it needs zstd (sudo apk add zstd)"
 	url=$B/$ver/linux-$plat$libc/claude.zst
 	dir=$HOME/.local/share/claude/versions file=$ver size=400000000
 	unpack() { zstd -dcq; } ;;

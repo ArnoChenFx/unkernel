@@ -6,13 +6,15 @@ built without root privileges from an unprivileged extraction (STAGE) and
 the distro's upstream tarball.
 
     mktree.py STAGE UPSTREAM.tar.gz OUT.tar --id PREFIX [--debugfs FILE]
-              [--keep-mtime DIR]...
+              [--keep-mtime DIR]... [--owner PATH=UID:GID]...
     mktree.py --first LIST IN.tar OUT.tar
 
 Every file, directory and symlink under STAGE becomes one entry, in path
 order (parents first):
   - owner and permission bits (setuid, setgid, sticky included): the
-    upstream tarball's for paths it has, else root:root and STAGE's bits;
+    upstream tarball's for paths it has, else root:root (or the owner of
+    the nearest --owner PATH it is in or under: a user's home) and
+    STAGE's bits;
   - hard links: files that share an inode in STAGE (tar -x keeps the
     tarball's) become link entries to the first path;
   - device nodes and FIFOs of the upstream tarball, which an unprivileged
@@ -100,6 +102,7 @@ def main():
     debugfs = None
     prefix = None
     keep = []
+    owners = {}
     pos = []
     while args:
         a = args.pop(0)
@@ -109,6 +112,10 @@ def main():
             prefix = args.pop(0)
         elif a == "--keep-mtime":
             keep.append(norm(args.pop(0)))
+        elif a == "--owner":
+            path, _, ids = args.pop(0).rpartition("=")
+            uid, _, gid = ids.partition(":")
+            owners[norm(path)] = (int(uid), int(gid))
         else:
             pos.append(a)
     if len(pos) != 3 or not prefix:
@@ -133,6 +140,9 @@ def main():
             i.mtime = u.mtime if int(st.st_mtime) == u.mtime else epoch
         else:
             i.mode, i.uid, i.gid = stat.S_IMODE(st.st_mode), 0, 0
+            o = max((k for k in owners if p == k or p.startswith(k + "/")), key=len, default=None)
+            if o is not None:
+                i.uid, i.gid = owners[o]
             kept = any(p.startswith(k + "/") for k in keep) and not stat.S_ISDIR(st.st_mode)
             i.mtime = int(st.st_mtime) if kept else epoch
         i.uname = i.gname = ""

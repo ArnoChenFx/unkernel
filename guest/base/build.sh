@@ -19,7 +19,8 @@
 #                           small): usr/bin/{kwtty,kw9p,kwvsock,kwshm,
 #                           kwwasi,kwcmd} (guest/src/), usr/sbin/kw-overlay,
 #                           usr/lib/kw/ (rc, welcome, net, udhcpc, shutdown,
-#                           data-stop: the runtime a distro's init calls;
+#                           data-stop: the runtime a distro's init calls; shrc: the kw-*.sh profile files for
+#                           interactive shells that are not login shells;
 #                           shim and bin/: fx, claude, opencode, node,
 #                           npm, npx, bun, bunx on first use),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh}, the X.Org

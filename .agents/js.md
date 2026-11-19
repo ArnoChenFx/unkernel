@@ -722,7 +722,7 @@ parts that are easy to get wrong.
 
 - The host client of kwtty (`guest/src/kwtty.c`, `/usr/bin/kwtty
   serve`, respawned by inittab), which gives each connection its own pty
-  and runs root's login shell, or a program, on it, or with PIPES runs it
+  and runs a user's login shell, or a program, on it, or with PIPES runs it
   on stdin, stdout and stderr pipes. On a pty the API follows zigpty /
   node-pty (`spawn(file, args, options)`, `resize(cols, rows)`,
   `kill(signal)`, `pid`, `cols`, `rows`, `exitCode`); keep it that way.
@@ -738,6 +738,16 @@ parts that are easy to get wrong.
   critical, and the host marks every option an old guest must not ignore
   critical, so a new feature can come within version 1 with a feature bit
   (as PIPES and CONNECT did).
+- The user (USER, OPENED feature bit 2 `TTY_FEATURE_USER`;
+  `SpawnOptions.user`, a name or uid): the host always sends USER, empty
+  for the guest's default (`user`, uid 1000, on the distro images; root
+  on the base shell), and marks it critical only for a user other than
+  root, so a guest from before USER (whose sessions are root's) refuses
+  only that; a guest that gets no USER (a host from before it) runs root's
+  session, as before. The SDK's own programs run as root (`guestRun()`:
+  kw9p, umount, `kwcmd sync`, which links into `/run/kw/bin`), so do
+  `guest/tools/vm-run.ts`'s build steps. The console is not a kwtty session:
+  its user is `kw.user=` on the command line (the CLI's `--user`).
 - Connections into the guest (CONNECT, OPENED feature bit 1
   `TTY_FEATURE_CONNECT`): `vm.connect(port, { timeout, signal, ttyPort })`
   on both handles (waits for createKernel's `mounts`, as spawn() does;
@@ -898,7 +908,10 @@ parts that are easy to get wrong.
 - nodeFs(dir) (Node only): `node:fs/promises`; lstat, never follows
   symlinks (they are listed and read as links; the guest resolves them in
   its own tree), opens with O_NOFOLLOW and O_NONBLOCK and only regular
-  files, one FileHandle per open fid, owners shown as root and chown
+  files, one FileHandle per open fid, owners shown as uid and gid 1000
+  (`FS_DEFAULT_OWNER`, the server's answer for a backend that reports
+  none, MemoryFs's too until chowned: the distro images' user may then
+  write; root may anyway) and chown
   ignored, setattr on a symlink changes only its times. CLI: `--mount
   HOSTDIR:GUESTPATH[:ro]`, repeatable.
 - Cache mode (the only one): `cache=readahead` (CACHE_FILE) with

@@ -17,7 +17,7 @@ settings, kept in localStorage, documented at its top), `store.ts` (the UI state
 drive, plus `nextSettings()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
-it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
+it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `download.ts` (files the page fetches for the guest), `sudo.ts` (root in the guest: `SUDO_SH`, `execAsRoot()`), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
 `preview.ts` (the guest preview's page side), `open.ts` (the guest's
@@ -335,7 +335,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   user space runs, boot.ts reads `/run/kw-base` (guest/base/initramfs/init)
   for the Distro and Root rows, About (the image id) and diagnostics'
   config line (`distro=`, `image=`). Where a feature or text is Alpine's
-  (apk, wget, the README), it is gated on `cfg.guest === "alpine"` (Rules,
+  (apk, wget), it is gated on `cfg.guest === "alpine"` (Rules,
   Launcher). Failures: an image that does not open (404, a
   server without Range, not erofs/ext4) is `ui.fail` (kind `distro`, with
   a hint); a read that fails later (the image changed or the server
@@ -354,7 +354,7 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 - apk index prefetch (`apk.ts`, described at its top): on the alpine
   image only. Once user space
   runs, the page pushes the guest's missing or stale APKINDEX files into
-  `/var/cache/apk` through `vm.exec()`, so apk skips its own index download.
+  `/var/cache/apk` through `vm.exec()` (as root: `execAsRoot()`, sudo.ts), so apk skips its own index download.
   That covers the enabled repositories and the lazy ones in
   `/etc/kw-apk-lazy` (community), which kw-apk-install reads before it
   enables one (kernel/guest.md). It fetches them as plain http over its own Wisp connection (the mirrors
@@ -362,13 +362,9 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   them in the Cache API (`kw-apk-index-v1`), revalidated after 1 h. The
   pushed file's mtime is the time the mirror last confirmed it. Off with
   `?net=0`.
-- `/root/README` (intro notes, about Alpine; not written on another
-  distro) comes from the page, not the image:
-  `readme.ts` writes it through `vm.exec()` once user space runs. A stamp
-  (`/var/lib/kw-readme`, the sha256 of the copy written) keeps it from
-  overwriting a README the user edited or bringing back one they deleted;
-  an unedited copy is replaced when the text changes. Keep its shortcuts
-  and claims in step with the page.
+- `~/README` (intro notes) comes from the image, not the page
+  (kernel/guest.md); its section on the page names the page's shortcuts
+  and options: keep them in step with the page.
 - The safe-mode explanation comes from watching the console for
   `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md): the base's check
   of the root with the data disk's changes failed, so this boot runs the
@@ -654,8 +650,8 @@ has no Options control.
   minutes. Checked by hand only, plus a Node harness of the
   relay against a fake `vm.fetch`. No browser test.
 - Trying it by hand: the image's busybox has no httpd. In a terminal
-  window, run `apk add busybox-extras`, then `mkdir -p /tmp/www && echo hi >
-  /tmp/www/index.html && httpd -f -p 8000 -h /tmp/www`. Or run `apk add
+  window, run `sudo apk add busybox-extras`, then `mkdir -p /tmp/www && echo hi >
+  /tmp/www/index.html && httpd -f -p 8000 -h /tmp/www`. Or run `sudo apk add
   python3`, then `cd /tmp/www && python3 -m http.server 8000`. Then Ctrl-A
   p, and "Go" after changing the port.
 
@@ -687,7 +683,15 @@ names for that distro, `{ alpine, debian }`, not yet installed: on Alpine
 `/etc/kw-apk-enable` when the demo sets `community`, then `apk add`; on
 Debian `apt-get install`, again after `apt-get update` when the baked lists
 name a version the mirror dropped; then the `commands`, each printed
-before it runs, under `set -e`). A demo runs only on the distros its
+before it runs, under `set -e`). The files, run.sh and the window are the
+session's user's (`user` on the distros): run.sh starts with `SUDO_SH`
+(`sudo.ts`) and runs the package manager, and the commands a demo writes
+as `$SUDO cmd` (nginx's server, PostgreSQL's `start.sh`, Ubuntu's
+chroot, sshfs's mount), with sudo, printed as `sudo cmd`; where it runs as
+root (the base shell, which has no sudo) both are plain. A demo directory
+outside the user's reach (nginx's `/srv/nginx`) is made and handed to the
+user with sudo, and a file the user cannot write (PostgreSQL's
+`createcluster.d` file under `/etc`) is written with sudo. A demo runs only on the distros its
 `packages` name; its scripts handle what else differs (Doom's and
 Ubuntu's, with no `packages`, run on both). A new terminal
 window named after the demo runs `sh -lc` with a wrapper in place of the
@@ -698,7 +702,8 @@ because the login discards input typed ahead of its prompt. The preview opens on
 guest answers http on the first of its `ports`. The distros' nginx default
 site also listens on `[::]:80`, which fails in the guest (no IPv6), so the
 nginx demo replaces it. A demo's files are text in its own file: Doom (`web/src/demos/doom.ts`) carries the `fbdoom` script (fbDOOM built in
-the guest with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound; the
+the guest with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound,
+installed in `~/.local/bin` and building into `~/.local/share/fbdoom`; the
 first run took 22 s to the first frame, a later one 0.2 s, 2026-11-18) and
 its patches to fbDOOM as template literals, and these GPL-2.0-or-later texts keep their license
 (the script's SPDX header) inside the MIT bundle. Files with absolute paths land outside the demo directory, and

@@ -8,6 +8,11 @@
 # exit status is 127 either way (ash sets it after the hook). Interactive
 # shells only; KW_AUTO_APK=0 turns it off.
 #
+# For a user who cannot write apk's database (not root), with sudo: apk
+# typed at the prompt runs as `sudo apk ...` (an alias: only the first word
+# of a line is one, so `sudo apk` stays as typed, and `\apk` or `command
+# apk` is the real one). Scripts get no aliases.
+#
 # The hook must not fork subshells: in busybox 1.37 a $(...) or pipeline
 # child forked inside command_not_found_handle does not exit at its end but
 # unwinds into the interactive loop, which then reads the next lines with
@@ -34,4 +39,7 @@ command_not_found_handle() {
 	echo "$cmd: installed, run the command again" >&2
 	return 127
 }
+if [ ! -w /lib/apk/db ] && command -v sudo >/dev/null; then
+	alias apk='sudo apk'
+fi
 ;; esac

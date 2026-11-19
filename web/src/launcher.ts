@@ -16,7 +16,13 @@
 //    asks, then `apk add`; Debian: `apt-get install`, once more after
 //    `apt-get update` when the image's baked package lists name a version
 //    the mirror no longer has), then the commands, each printed before it
-//    runs, under set -e;
+//    runs, under set -e. vm.exec() and the window run as the distro's user
+//    (sudo.ts): the directory is made the user's (with sudo when it is
+//    outside the user's reach, nginx's /srv/nginx), a file the user cannot
+//    write (an absolute path under /etc) is written with sudo, and run.sh
+//    runs the package manager, and the commands written `$SUDO cmd`, with
+//    sudo (SUDO_SH), printing them as `sudo cmd`, so what it shows is what
+//    to type; as root (the base shell) without it;
 // 1b. gets the demo's downloads on the page (download.ts: plain http over
 //    Wisp, checked against their SHA-256, kept in the browser's cache) and
 //    pushes each into the guest, unless its `unless` test passes in dir or
@@ -24,7 +30,7 @@
 //    the demo's script must check the file and fetch it itself when missing;
 // 2. opens a terminal window named after the demo (windows.ts) running
 //    WRAP_SH in place of the login shell: it runs `cd <dir> && ./run.sh`
-//    and then execs root's login shell, so the window stays to edit run.sh
+//    and then execs the login shell, so the window stays to edit run.sh
 //    and run it again. Ctrl-C stops run.sh, not the wrapper. (Typing the
 //    command into a fresh shell lost the start of the line: the login reads
 //    or flushes input typed ahead of its prompt.)
@@ -45,6 +51,7 @@ import { KW } from "./kw.ts";
 import { selectWindow } from "./shortcuts.ts";
 import { ui$ } from "./store.ts";
 import type { KernelHandle } from "./sdk.ts";
+import { SUDO_SH } from "./sudo.ts";
 
 export interface DemoFile {
 	content: string;
@@ -52,7 +59,7 @@ export interface DemoFile {
 	mode?: number;
 }
 
-/** A demo's files, by path relative to its dir (or absolute). */
+/** A demo's files, by path relative to its dir, to the home directory (starting with ~/), or absolute. */
 export type DemoFiles = Record<string, string | DemoFile>;
 
 /** A tile's pictogram: SVG elements (paths, shapes) as static markup from this repository. */
@@ -93,7 +100,8 @@ export interface Demo {
 	/** The working directory in the guest. Default ~/demos/<id>. */
 	dir?: string;
 	/**
-	 * Files to write, by path relative to dir (or absolute), or a function
+	 * Files to write, by path relative to dir, to ~ (~/...) or absolute
+	 * (written with sudo when the user cannot write it), or a function
 	 * that loads them when the demo launches (a dynamic import), which keeps
 	 * their text out of the page's main chunk.
 	 */
@@ -112,7 +120,11 @@ export interface Demo {
 	 * all enabled indexes and community's makes that ~2 s slower.
 	 */
 	community?: boolean;
-	/** Shell commands run in order in dir (run.sh, set -e); the last may run in the foreground. */
+	/**
+	 * Shell commands run in order in dir (run.sh, set -e); the last may run in
+	 * the foreground. A step that needs root is written `$SUDO cmd` (sudo.ts),
+	 * and printed as `sudo cmd`.
+	 */
 	commands: string[];
 	/** Ports the demo serves http on: the preview opens on the first once it answers. */
 	ports?: number[];
@@ -156,18 +168,44 @@ export function unavailable(d: Demo): string | null {
 /** Single-quoted for sh. */
 const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
-// Writes stdin to $1 with mode $2, making its directory.
+// Makes the demo's directory $1 (relative to ~, or absolute) and gives it to
+// the user: one outside the user's reach (/srv/nginx), or one that is root's
+// (made by a launcher of the days when sessions ran as root), is made and
+// handed over with sudo, so the user can edit its files.
+const DIR_SH = `cd ~
+mkdir -p "$1" 2>/dev/null && [ "$(stat -c %u "$1")" = "$(id -u)" ] && exit 0
+${SUDO_SH}
+S=\${SUDO:+$SUDO -n}
+$S mkdir -p "$1" && $S chown -R "$(id -u):$(id -g)" "$1"`;
+
+// Writes stdin to $1 (relative to ~, or absolute) with mode $2, making its
+// directory; as root (sudo) when the user cannot write it there (a file
+// under /etc), so such a file stays root's.
 const WRITE_SH = `set -e
-case "$1" in */*) mkdir -p "\${1%/*}";; esac
-cat > "$1"
-chmod "$2" "$1"`;
+cd ~
+case "$1" in */*) d=\${1%/*};; *) d=.;; esac
+S=
+if ! { mkdir -p "$d" 2>/dev/null && [ -w "$d" ] && { [ ! -e "$1" ] || [ -w "$1" ]; }; }; then
+	${SUDO_SH}
+	S=\${SUDO:+$SUDO -n}
+fi
+$S mkdir -p "$d"
+$S tee "$1" >/dev/null
+$S chmod "$2" "$1"`;
+
+/** A path in a demo: relative to its dir, else to ~ (~/...), else absolute. */
+const demoPath = (dir: string, rel: string) => (rel.startsWith("/") || rel.startsWith("~/") ? rel : `${dir}/${rel}`);
+/** As $1 of a script that runs `cd ~` first: no ~/. */
+const fromHome = (path: string) => path.replace(/^~\//, "");
 
 async function writeFiles(vm: KernelHandle, dir: string, files: DemoFiles) {
+	// sh expands the ~ in dir; paths are passed as $1 so they are not split.
+	const d = await vm.exec("/bin/sh", ["-c", DIR_SH, "sh", dir === "~" ? "." : fromHome(dir)]);
+	if (d.exitCode !== 0) throw new Error(`making ${dir} failed: ${(d.stderr || d.stdout).trim() || `exit ${d.exitCode}`}`);
 	for (const [rel, f] of Object.entries(files)) {
 		const { content, mode = 0o644 } = typeof f === "string" ? { content: f } : f;
-		const path = rel.startsWith("/") ? rel : `${dir}/${rel}`;
-		// sh expands the ~ in dir; the path is passed as $1 so it is not split.
-		const r = await vm.exec("/bin/sh", ["-c", `cd ~ && ${WRITE_SH}`, "sh", path.replace(/^~\//, ""), mode.toString(8)], { input: content });
+		const path = demoPath(dir, rel);
+		const r = await vm.exec("/bin/sh", ["-c", WRITE_SH, "sh", fromHome(path), mode.toString(8)], { input: content });
 		if (r.exitCode !== 0) throw new Error(`writing ${path} failed: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`);
 	}
 }
@@ -184,10 +222,10 @@ echo need`;
 async function pushDownloads(vm: KernelHandle, d: Demo, dir: string): Promise<void> {
 	const ui = KW.ui!;
 	for (const f of d.downloads ?? []) {
-		const path = f.path.startsWith("/") ? f.path : `${dir}/${f.path}`;
+		const path = demoPath(dir, f.path);
 		const name = f.url.replace(/[?#].*$/, "").split("/").pop() || f.url;
 		try {
-			const need = await vm.exec("/bin/sh", ["-c", NEED_SH, "sh", dir.replace(/^~\/?/, "") || ".", path.replace(/^~\//, ""), String(f.size ?? -1), f.unless ?? ""]);
+			const need = await vm.exec("/bin/sh", ["-c", NEED_SH, "sh", dir.replace(/^~\/?/, "") || ".", fromHome(path), String(f.size ?? -1), f.unless ?? ""]);
 			if (need.stdout.trim() !== "need") continue;
 			const t0 = performance.now();
 			const got = await getFile(f, {
@@ -209,27 +247,38 @@ async function pushDownloads(vm: KernelHandle, d: Demo, dir: string): Promise<vo
 	}
 }
 
+/**
+ * A step as run.sh prints it after its dim "$ ", as one sh word: each
+ * `$SUDO ` prints as "sudo " where run.sh uses sudo, else as nothing.
+ */
+function shownWord(shown: string): string {
+	const parts = shown.split("$SUDO ");
+	return parts.map((p) => (p || parts.length === 1 ? q(p) : "")).join('"${SUDO:+sudo }"');
+}
+
 /** run.sh for this boot's distro: the packages, then the commands, each printed (dim, after a $) before it runs. */
 export function runScript(d: Demo): string {
-	const step = (shown: string, cmd = shown) => `printf '\\033[90m$ %s\\033[0m\\n' ${q(shown)}\n${cmd}\n`;
+	const step = (shown: string, cmd = shown) => `printf '\\033[90m$ %s\\033[0m\\n' ${shownWord(shown)}\n${cmd}\n`;
 	const pkgs = demoPackages(d);
 	const pk = pkgs.map(q).join(" ");
 	let install = "";
 	if (pk && KW.config.guest === "alpine") {
-		install = (d.community ? step("/etc/kw-apk-enable   # community") : "") +
-			step(`apk add ${pkgs.join(" ")}`, `apk info -e ${pk} >/dev/null 2>&1 || apk add ${pk}`);
+		install = (d.community ? step("$SUDO /etc/kw-apk-enable   # community") : "") +
+			step(`$SUDO apk add ${pkgs.join(" ")}`, `apk info -e ${pk} >/dev/null 2>&1 || $SUDO apk add ${pk}`);
 	} else if (pk) {
 		// stdin from /dev/null: dpkg would eat what was typed ahead. The image's
 		// package lists are baked in and age: when a version is gone from the
 		// mirror, the install fails, and runs again after apt-get update.
-		const get = `apt-get install -y -q --no-install-recommends ${pk} </dev/null`;
-		install = step(`apt-get install ${pkgs.join(" ")}`,
+		const get = `$SUDO apt-get install -y -q --no-install-recommends ${pk} </dev/null`;
+		install = step(`$SUDO apt-get install ${pkgs.join(" ")}`,
 			`[ "$(dpkg-query -W -f='\${db:Status-Status}\\n' ${pk} 2>/dev/null | grep -cx installed)" = ${pkgs.length} ] ||\n` +
-			`	${get} || { apt-get update -q </dev/null && ${get}; }`);
+			`	${get} || { $SUDO apt-get update -q </dev/null && ${get}; }`);
 	}
 	return `#!/bin/sh
 # The ${d.title} demo, written by the unkernel launcher for ${KW.config.guest}. Edit it and run it again.
 set -e
+# Root for the steps written $SUDO: sudo, unless this runs as root already.
+${SUDO_SH}
 cd "$(dirname "$0")"
 ${install}${d.commands.map((c) => step(c)).join("")}`;
 }

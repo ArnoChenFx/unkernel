@@ -38,6 +38,7 @@ export interface FsAttr {
 	/** Permission bits (default 0o644 files, 0o755 directories, 0o777 links). */
 	mode?: number;
 	size?: number;
+	/** The owner (default FS_DEFAULT_OWNER). */
 	uid?: number;
 	gid?: number;
 	nlink?: number;
@@ -56,6 +57,14 @@ export interface FsAttr {
 	 */
 	version?: number;
 }
+
+/**
+ * The uid and gid the guest sees for a file whose backend reports none
+ * (nodeFs; MemoryFs's files until chowned): 1000, the distro images'
+ * user, so that the guest's default user may write where the permission
+ * bits let the owner. Root may anyway; the base shell shows the number.
+ */
+export const FS_DEFAULT_OWNER = 1000;
 
 export interface FsDirEntry {
 	name: string;

@@ -39,7 +39,7 @@
 //   unlinked or replaced by the guest while open answers ESTALE.
 
 import type { MaybePromise } from "./block.ts";
-import { ERRNO, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, type FsFileType, type FsSetAttr } from "./fs.ts";
+import { ERRNO, FS_DEFAULT_OWNER, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, type FsFileType, type FsSetAttr } from "./fs.ts";
 import type { MountStats } from "./mounts.ts";
 import { saveVsockConnection, type Vsock, type VsockConnection, type VsockConnSnapshot, type VsockListener } from "./vsock.ts";
 
@@ -1040,7 +1040,7 @@ class Session {
 			const perm = a.mode ?? (a.type === "dir" ? 0o755 : a.type === "symlink" ? 0o777 : 0o644);
 			const fmt = a.type === "dir" ? S_IFDIR : a.type === "symlink" ? S_IFLNK : S_IFREG;
 			const w = new Writer(HDR + 153).u64(P9_STATS_BASIC).qid(qidOf(f.path, a)).u32(fmt | (perm & 0o7777))
-				.u32(a.uid ?? 0).u32(a.gid ?? 0).u64(a.nlink ?? (a.type === "dir" ? 2 : 1)).u64(0).u64(size).u64(4096)
+				.u32(a.uid ?? FS_DEFAULT_OWNER).u32(a.gid ?? FS_DEFAULT_OWNER).u64(a.nlink ?? (a.type === "dir" ? 2 : 1)).u64(0).u64(size).u64(4096)
 				.u64(Math.ceil(size / 512));
 			const m = a.mtimeMs ?? Date.now();
 			for (const t of [a.atimeMs ?? m, m, a.ctimeMs ?? m, 0]) {

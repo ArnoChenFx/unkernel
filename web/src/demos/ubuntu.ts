@@ -4,6 +4,9 @@
 // coreutils; no init system), fetched at run time from cdimage.ubuntu.com
 // (the URL and SHA-256 below are this demo's own pin), and run in a chroot
 // on the guest (Alpine or Debian). Nothing from Ubuntu is in the page.
+// ubuntu.sh runs as root (sudo ./ubuntu.sh; the base shell is root
+// already): unpacking a root file system with its owners, mounting and
+// chroot need it.
 //
 // The page fetches the tarball (35 MB; `downloads`, download.ts) and pushes
 // it into the demo's directory, unless the tree is there already. ubuntu.sh
@@ -21,7 +24,8 @@
 //
 // Each run enters a private mount namespace (unshare -m, all mounts private),
 // mounts proc, sysfs, /dev (rbind, so /dev/pts too), tmpfs on /run and
-// /tmp, and the guest's /root on Ubuntu's /root, so both share one home
+// /tmp, and the guest's /root (root's home, not the session user's) on
+// Ubuntu's /root, so the two roots share one home
 // (kept with the data disk, under the overlay root, like the tree itself;
 // Ubuntu's .bashrc is copied in when there is none, and on Alpine a
 // ~/.bash_profile that sources it, which Alpine's sh never reads; Debian's
@@ -48,7 +52,10 @@ const OURS_SH = '[ "$(od -An -tx1 -j18 -N2 "$R/usr/bin/bash" 2>/dev/null | tr -d
 const UBUNTU_SH = String.raw`#!/bin/sh
 # Ubuntu Base 26.10 arm64 from cdimage.ubuntu.com, in a chroot on this
 # guest (Alpine or Debian). Written by the unkernel launcher's Ubuntu demo.
+# Run it as root (sudo ./ubuntu.sh): it unpacks a root file system, mounts
+# and chroots.
 set -e
+[ "$(id -u)" = 0 ] || { echo "ubuntu.sh: run it as root: sudo ./ubuntu.sh" >&2; exit 1; }
 NAME=${NAME}
 URL=${TARBALL_URL}
 SHA256=${SHA256}
@@ -118,7 +125,7 @@ fi
 
 . "$R/etc/os-release"
 printf "\n$B%s$N\n" "$PRETTY_NAME (arm64, from cdimage.ubuntu.com) in a chroot on the $GUEST guest"
-printf "$D%s$N\n" "Root: $R, $WHERE; home: /root, shared with $GUEST." \
+printf "$D%s$N\n" "Root: $R, $WHERE; home: /root, shared with $GUEST's root." \
 	"Try: cat /etc/os-release; ldd --version; apt-get update && apt-get install -y htop" \
 	"(apt-get update reads about 20 MB of indexes). exit returns to $GUEST."
 
@@ -149,5 +156,5 @@ export default {
 	needs: { net: true },
 	files: { "ubuntu.sh": { content: UBUNTU_SH, mode: 0o755 } },
 	downloads: [{ url: TARBALL_URL, sha256: SHA256, size: SIZE, path: NAME, unless: `${ROOT_SH}; ${OURS_SH}` }],
-	commands: ["./ubuntu.sh"],
+	commands: ["$SUDO ./ubuntu.sh"],
 } satisfies Demo;

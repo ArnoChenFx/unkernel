@@ -35,7 +35,7 @@ const bundledKernelUrl = new URL("./unkernel.wasm", import.meta.url);
 const fetchDistro = distroFetcher(new URL("..", import.meta.url));
 
 const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--distro alpine|debian|none|FILE|URL]
-       [--initrd none|NAME|file.cpio[.gz]] [--append "cmdline"]
+       [--initrd none|NAME|file.cpio[.gz]] [--append "cmdline"] [--user NAME]
        [--mem MiB] [--timeout seconds] [--input "text"] [--input-delay seconds]
        [--size COLSxROWS] [--stats]
        [--disk image.ext4[:ro]|URL[:ro]]... [--snapshot]
@@ -65,6 +65,11 @@ of the package's version (checked against its distros.json) and kept in
 UNKERNEL_RELEASE_URL the release). With --initrd, --append or --disk there is
 no default distro (add --distro to have one), and --restore uses the image the
 snapshot names.
+
+The distro images' console and the SDK's sessions run as the user "user" (uid
+1000, home /home/user), who has sudo without a password; --user NAME makes the
+console NAME's (root: --user root), appending kw.user=NAME to the command line.
+The base shell is root's.
 
 --kernel (or a positional path) replaces the kernel: a bundle, or a plain build
 (vendor/build/kernel/vmlinux32.wasm, or the wasm64 reference build
@@ -150,7 +155,8 @@ the guest has no vsock transport (connect() fails with ENODEV).
 the SDK serves it over 9p on vsock and the guest's kw9p mounts it once kwtty
 answers (it needs vsock). :ro makes it read-only. Each guest write(2) reaches
 the host as it happens; host changes show in the guest within 1 s. Files show
-as root's; symlinks stay symlinks and are never followed on the host.
+as uid and gid 1000's (the distro images' user); symlinks stay symlinks and are
+never followed on the host.
 
 --forward HOSTPORT:GUESTPORT listens on the host's 127.0.0.1:HOSTPORT and
 connects each connection to the guest's 127.0.0.1:GUESTPORT (repeatable), e.g.
@@ -297,8 +303,11 @@ if (initrdOpt === "bundled" && !useBundle && !existsSync(path.join(root, "vendor
 const initrdName = initrdOpt === "bundled" ? "base" : initrdOpt;
 const initrdPath = useBundle ? "bundled" : initrdName === "none" || /[/.]/.test(initrdName) ? initrdName
 	: path.join(root, "vendor/build/initramfs", `${initrdName}.cpio`);
-const cmdline = appendArg ?? (useBundle && bundled.cmdline ? bundled.cmdline
-	: (diskSpecs.length || distroOpt) && initrdPath === "none" ? `console=hvc0 root=/dev/wda ${distroOpt ? "ro" : "rw"}` : "console=hvc0 rdinit=/init");
+// --user NAME: the console's user (kw.user=, read by kwtty login on the distro images).
+const userArg = opt("user");
+const cmdline = (appendArg ?? (useBundle && bundled.cmdline ? bundled.cmdline
+	: (diskSpecs.length || distroOpt) && initrdPath === "none" ? `console=hvc0 root=/dev/wda ${distroOpt ? "ro" : "rw"}` : "console=hvc0 rdinit=/init"))
+	+ (userArg ? ` kw.user=${userArg}` : "");
 let initrd: Uint8Array | null | undefined;
 try {
 	initrd = useBundle ? undefined : initrdPath === "none" ? null : new Uint8Array(readFileSync(initrdPath));

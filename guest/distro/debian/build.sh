@@ -30,6 +30,16 @@
 #   /usr/lib/kw-commands      "NAME PACKAGE" per command of main, for
 #                             kw-apt-install (command not found:
 #                             etc/profile.d/kw-apt.sh; tools/commands.py)
+#   user                      the default user of the console and kwtty
+#                             sessions (uid 1000, bash, /home/user with
+#                             /etc/skel's files and the README), in sudo,
+#                             audio, video, input (a group the build adds:
+#                             udev would) and users; sudo without a password
+#                             (/etc/sudoers.d/kw-user). /etc/skel/.bashrc
+#                             leaves the prompt to kw-prompt.sh, and
+#                             /etc/bash.bashrc sources /usr/lib/kw/shrc, so
+#                             that every interactive shell gets the kw
+#                             profile files, not only login shells
 #
 # The tree is the tarball's in full: glibc's gconv modules (19 MiB, which an
 # initramfs would keep resident) and dpkg's and debconf's -old backups stay. An image is paged in on demand, so
@@ -173,6 +183,7 @@ printf '127.0.0.1\tlocalhost\n127.0.1.1\tunkernel\n::1\tlocalhost ip6-localhost 
 [ -L "$stage/sbin" ] && [ ! -e "$stage/usr/sbin/init" ] && [ ! -L "$stage/usr/sbin/init" ] ||
 	{ echo "debian: expected /sbin -> usr/sbin and no /usr/sbin/init" >&2; exit 1; }
 install_tree "$here/rootfs" "$stage"
+chmod 440 "$stage/etc/sudoers.d/kw-user"
 install_common "$stage"
 
 # --- in the image: apt's source cache, the baked packages ----------------------------
@@ -278,13 +289,48 @@ else
 	rm -f "$distro_out/$gen".{erofs,tar,id,uris,sums,pkgs.tar,gone}
 fi
 
-# The command map without the commands the image has.
+# --- the user -------------------------------------------------------------------
+# After the packages, whose scripts may add system users and groups. The
+# group input, which udev's package would add (the kw layer's rc gives it
+# the input devices), then the account (guest/lib/stage.sh). The user's
+# ~/.bashrc (from /etc/skel) would set Debian's prompt over kw-prompt.sh's
+# in every shell: the two exact lines become no-ops, so that a change
+# upstream fails the build.
+grep -q '^input:' "$stage/etc/group" || {
+	! awk -F: '$3 == 101 { f = 1 } END { exit !f }' "$stage/etc/group" ||
+		{ echo "debian: gid 101 is taken: pick another for the input group" >&2; exit 1; }
+	echo "input:x:101:" >> "$stage/etc/group"
+	echo "input:!::" >> "$stage/etc/gshadow"
+}
+python3 -I - "$stage/etc/skel/.bashrc" <<'EOF'
+import sys
+f = sys.argv[1]
+lines = open(f).read().split("\n")
+ps1 = ["    PS1='${debian_chroot:+($debian_chroot)}\\[\\033[01;32m\\]\\u@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '",
+       "    PS1='${debian_chroot:+($debian_chroot)}\\u@\\h:\\w\\$ '"]
+for l in ps1:
+    if lines.count(l) != 1:
+        sys.exit(f"debian: {f}: expected the line {l!r} once (upstream changed it?)")
+lines = ["    :  # unkernel: the prompt is /etc/profile.d/kw-prompt.sh's" if l in ps1 else l for l in lines]
+open(f, "w").write("\n".join(lines))
+EOF
+printf '\n%s\n%s\n' '# unkernel: the kw profile files in interactive shells that are not login shells too' \
+	'[ -r /usr/lib/kw/shrc ] && . /usr/lib/kw/shrc' >> "$stage/etc/bash.bashrc"
+# Without sudo (no bundle or node: no packages) every session stays root's.
+if [ -x "$stage/usr/bin/sudo" ]; then
+	install_user "$stage" /bin/bash sudo audio video input users
+	install_readme "$stage" debian NAME=Debian USERLAND="glibc, GNU coreutils, bash" PKG="apt install" \
+		MIRROR="Debian's" AUTO=KW_AUTO_APT DISTRO=debian REPO=https://github.com/pithings/unkernel
+fi
+
+# The command map without the commands the image has (/usr/local: the
+# kw-init's poweroff, halt and reboot).
 awk 'NR == FNR { have[$0]; next } !($1 in have)' \
-	<(find "$stage/usr/bin" "$stage/usr/sbin" -maxdepth 1 ! -type d -printf '%f\n') \
+	<(find "$stage/usr/bin" "$stage/usr/sbin" "$stage/usr/local/bin" "$stage/usr/local/sbin" -maxdepth 1 ! -type d -printf '%f\n') \
 	"$stage/usr/lib/kw-commands" > "$stage/usr/lib/kw-commands.new"
 mv "$stage/usr/lib/kw-commands.new" "$stage/usr/lib/kw-commands"
 
-distro_images debian "$stage" "$DEBIAN_TARBALL" "debian-$DEBIAN_VERSION" "${mktree_opts[@]}"
+distro_images debian "$stage" "$DEBIAN_TARBALL" "debian-$DEBIAN_VERSION" "${mktree_opts[@]}" "${user_owner[@]}"
 # apt in each final image takes the cache as it is: a new one would have
 # been written to the upper layer, with a new mtime.
 if [ -f "$stage/var/cache/apt/srcpkgcache.bin" ]; then

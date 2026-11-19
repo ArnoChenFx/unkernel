@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# poweroff for every user: busybox's /sbin/poweroff signals init, which only root
+# may: another user goes through sudo -n (the image's user has it without
+# a password).
+
+# unkernel: poweroff for the image's user too.
+[ "$(id -u)" = 0 ] && exec /sbin/poweroff "$@"
+exec sudo -n /sbin/poweroff "$@"

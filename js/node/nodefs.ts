@@ -16,8 +16,9 @@
 // the guest's walk and its next request (that request could then reach
 // outside `dir`; Node has no openat2 RESOLVE_BENEATH).
 //
-// Owners: every file shows uid and gid 0 (the guest's root), and chown is
-// accepted and ignored, since host and guest ids mean different users.
+// Owners: every file shows uid and gid 1000 (FS_DEFAULT_OWNER: the distro
+// images' user, the guest's default), and chown is accepted and ignored,
+// since host and guest ids mean different users.
 // Permission bits, sizes, times, hard link counts and inode numbers
 // (st_dev, st_ino, in readdir too) are the host's. Names that are not
 // UTF-8 are left out of listings (the guest could not name them).
@@ -39,8 +40,6 @@ function attrOf(st: BigStats): FsAttr {
 		type: st.isDirectory() ? "dir" : st.isSymbolicLink() ? "symlink" : "file",
 		mode: Number(st.mode) & 0o7777,
 		size: Number(st.size),
-		uid: 0,
-		gid: 0,
 		nlink: Number(st.nlink),
 		atimeMs: Number(st.atimeNs) / 1e6,
 		mtimeMs: Number(st.mtimeNs) / 1e6,

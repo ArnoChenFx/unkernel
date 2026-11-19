@@ -56,11 +56,15 @@ async function dataDisk(name: string): Promise<string> {
 }
 
 type Vm = Awaited<ReturnType<typeof createKernel>>;
-const sh = async (vm: Vm, cmd: string) => {
-	const r = await vm.exec("sh", ["-c", cmd], EXEC);
+/** A command in a session of the default user (the image's), or of `user`. */
+const sh = async (vm: Vm, cmd: string, user?: string) => {
+	const r = await vm.exec("sh", ["-c", cmd], { ...EXEC, user });
 	assert.equal(r.exitCode, 0, `${cmd}: exit ${r.exitCode}, ${r.stderr}`);
 	return r.stdout.trim();
 };
+const asRoot = (vm: Vm, cmd: string) => sh(vm, cmd, "root");
+/** The user's home on the image, and in an upper layer. */
+const HOME = "/home/user";
 /** Power off cleanly (the data disk's file systems are written back) and wait for the exit. */
 const poweroff = async (vm: Vm) => {
 	vm.write("\npoweroff\n");
@@ -102,10 +106,10 @@ for (const name of ["alpine", "debian"]) {
 			const r = await vm.exec("fx", ["--version"], EXEC);
 			assert.equal(r.exitCode, 127);
 			assert.match(r.stderr, /^fx: not installed yet, and installing it needs a network/);
-			assert.equal(await sh(vm, "[ -e /root/.local/bin ] && echo yes || echo no"), "no");
+			assert.equal(await sh(vm, "[ -e ~/.local/bin ] && echo yes || echo no"), "no");
 			// Anything else of the name wins: a program in ~/.local/bin (where an install goes).
-			await sh(vm, "mkdir -p /root/.local/bin && ln -s /bin/true /root/.local/bin/fx");
-			assert.equal(await sh(vm, "command -v fx"), "/root/.local/bin/fx");
+			await sh(vm, "mkdir -p ~/.local/bin && ln -s /bin/true ~/.local/bin/fx");
+			assert.equal(await sh(vm, "command -v fx"), `${HOME}/.local/bin/fx`);
 			await poweroff(vm);
 		});
 
@@ -113,11 +117,11 @@ for (const name of ["alpine", "debian"]) {
 			const data = await dataDisk(name);
 			const token = `kw-${Math.random().toString(36).slice(2)}`;
 			const vm1 = await boot(t, { distro: img!.file, disks: [{ kind: "file", path: data }] });
-			await sh(vm1, `echo ${token} > /root/persist && sync`);
+			await sh(vm1, `echo ${token} > ~/persist && sync`);
 			await poweroff(vm1);
 			const vm2 = await boot(t, { distro: img!.file, disks: [{ kind: "file", path: data }] });
-			assert.equal(await sh(vm2, "cat /root/persist"), token);
-			assert.equal(await sh(vm2, `cat /data/distros/${name}/upper/root/persist`), token);
+			assert.equal(await sh(vm2, "cat ~/persist"), token);
+			assert.equal(await sh(vm2, `cat /data/distros/${name}/upper${HOME}/persist`), token);
 			await poweroff(vm2);
 		});
 
@@ -135,59 +139,59 @@ for (const name of ["alpine", "debian"]) {
 		test("a root on the data disk that cannot boot (/bin/sh deleted) falls back to safe mode, and the next boot checks again", async (t) => {
 			const data = await dataDisk(`${name}-safe`);
 			const b1 = await bootData(t, data);
-			await sh(b1.vm, "echo kept > /root/kept");
-			const r = await b1.vm.exec("rm", ["/bin/sh"], EXEC);
+			await sh(b1.vm, "echo kept > ~/kept");
+			const r = await b1.vm.exec("rm", ["/bin/sh"], { ...EXEC, user: "root" });
 			assert.equal(r.exitCode, 0, r.stderr);
 			await b1.vm.exec("sync", [], EXEC);
 			b1.vm.stop({ reason: "test: /bin/sh is gone, so no clean poweroff" });
 			const b2 = await bootData(t, data);
 			assert.match(b2.out(), /kw-overlay: SAFE MODE: \/bin\/sh is missing/);
 			assert.match(await sh(b2.vm, "cat /run/kw-base"), /^upper=tmpfs$/m);
-			assert.equal(await sh(b2.vm, "cat /root/kept 2>/dev/null || echo gone"), "gone");
-			assert.equal(await sh(b2.vm, `cat ${st}/upper/root/kept`), "kept");
+			assert.equal(await sh(b2.vm, "cat ~/kept 2>/dev/null || echo gone"), "gone");
+			assert.equal(await sh(b2.vm, `cat ${st}/upper${HOME}/kept`), "kept");
 			assert.match(await sh(b2.vm, "kw-overlay status"), /SAFE MODE/);
 			// The repair: remove the whiteout of /bin/sh (on Debian /bin is usr/bin).
-			await sh(b2.vm, `rm -f ${st}/upper/bin/sh ${st}/upper/usr/bin/sh`);
+			await asRoot(b2.vm, `rm -f ${st}/upper/bin/sh ${st}/upper/usr/bin/sh`);
 			await poweroff(b2.vm);
 			const b3 = await bootData(t, data);
 			assert.doesNotMatch(b3.out(), /SAFE MODE/);
 			assert.match(await sh(b3.vm, "cat /run/kw-base"), /^upper=data$/m);
-			assert.equal(await sh(b3.vm, "cat /root/kept"), "kept");
+			assert.equal(await sh(b3.vm, "cat ~/kept"), "kept");
 			await poweroff(b3.vm);
 		});
 
 		test("kw.root=initramfs boots the plain image on a tmpfs upper, the data upper unmounted", async (t) => {
 			const data = await dataDisk(`${name}-initramfs`);
 			const b1 = await bootData(t, data);
-			await sh(b1.vm, "echo kept > /root/kept");
+			await sh(b1.vm, "echo kept > ~/kept");
 			await poweroff(b1.vm);
 			const b2 = await bootData(t, data, "kw.root=initramfs");
 			assert.match(b2.out(), /kw-overlay: kw\.root=initramfs: the plain image this time/);
 			assert.match(await sh(b2.vm, "cat /run/kw-base"), /^upper=tmpfs$/m);
-			assert.equal(await sh(b2.vm, "cat /root/kept 2>/dev/null || echo gone"), "gone");
-			assert.equal(await sh(b2.vm, `cat ${st}/upper/root/kept`), "kept");
+			assert.equal(await sh(b2.vm, "cat ~/kept 2>/dev/null || echo gone"), "gone");
+			assert.equal(await sh(b2.vm, `cat ${st}/upper${HOME}/kept`), "kept");
 			await poweroff(b2.vm);
 		});
 
 		test("kw-overlay discard: at the next boot on the data upper, at once when it is not mounted", async (t) => {
 			const data = await dataDisk(`${name}-discard`);
 			const b1 = await bootData(t, data);
-			await sh(b1.vm, "echo one > /root/one");
-			assert.match(await sh(b1.vm, "kw-overlay discard"), /at the next boot/);
-			assert.equal(await sh(b1.vm, "cat /root/one"), "one", "still there this boot");
+			await sh(b1.vm, "echo one > ~/one");
+			assert.match(await sh(b1.vm, "sudo -n kw-overlay discard"), /at the next boot/);
+			assert.equal(await sh(b1.vm, "cat ~/one"), "one", "still there this boot");
 			await poweroff(b1.vm);
 			const b2 = await bootData(t, data);
 			assert.match(b2.out(), /kw-overlay: starting over from the image; the previous changes are in \/data\/distros\/\w+\/discarded-/);
-			assert.equal(await sh(b2.vm, "cat /root/one 2>/dev/null || echo gone"), "gone");
-			assert.equal(await sh(b2.vm, `cat ${st}/discarded-*/upper/root/one`), "one");
-			await sh(b2.vm, "echo two > /root/two");
+			assert.equal(await sh(b2.vm, "cat ~/one 2>/dev/null || echo gone"), "gone");
+			assert.equal(await sh(b2.vm, `cat ${st}/discarded-*/upper${HOME}/one`), "one");
+			await sh(b2.vm, "echo two > ~/two");
 			await poweroff(b2.vm);
 			const b3 = await bootData(t, data, "kw.root=initramfs");
-			assert.match(await sh(b3.vm, "kw-overlay discard"), /your changes are now in/);
+			assert.match(await sh(b3.vm, "sudo -n kw-overlay discard"), /your changes are now in/);
 			assert.equal(await sh(b3.vm, `ls ${st}/upper 2>/dev/null | wc -l; ls -d ${st}/discarded-* | wc -l`), "0\n2");
 			await poweroff(b3.vm);
 			const b4 = await bootData(t, data);
-			assert.equal(await sh(b4.vm, "cat /root/two 2>/dev/null || echo gone"), "gone");
+			assert.equal(await sh(b4.vm, "cat ~/two 2>/dev/null || echo gone"), "gone");
 			await poweroff(b4.vm);
 		});
 
@@ -196,7 +200,7 @@ for (const name of ["alpine", "debian"]) {
 			const b1 = await bootData(t, data);
 			const id = await sh(b1.vm, "cat /usr/lib/kw-image");
 			assert.equal(await sh(b1.vm, `cat ${st}/lower`), id);
-			await sh(b1.vm, `echo ${name}-0-older > ${st}/lower`);
+			await asRoot(b1.vm, `echo ${name}-0-older > ${st}/lower`);
 			await poweroff(b1.vm);
 			const b2 = await bootData(t, data);
 			const lines = b2.out().split(/\r?\n/).filter((l) => l.includes("image updated"));
@@ -215,15 +219,15 @@ for (const name of ["alpine", "debian"]) {
 			if (!other) return t.skip("no alpine image");
 			const data = await dataDisk("shared");
 			const vm1 = await boot(t, { distro: other.file, disks: [{ kind: "file", path: data }] });
-			await sh(vm1, "echo alpine > /root/who");
+			await sh(vm1, "echo alpine > ~/who");
 			await poweroff(vm1);
 			const vm2 = await boot(t, { distro: img!.file, disks: [{ kind: "file", path: data }] });
-			assert.equal(await sh(vm2, "cat /root/who 2>/dev/null || echo none"), "none");
-			await sh(vm2, "echo debian > /root/who");
-			assert.equal(await sh(vm2, "cat /data/distros/alpine/upper/root/who"), "alpine");
+			assert.equal(await sh(vm2, "cat ~/who 2>/dev/null || echo none"), "none");
+			await sh(vm2, "echo debian > ~/who");
+			assert.equal(await sh(vm2, `cat /data/distros/alpine/upper${HOME}/who`), "alpine");
 			await poweroff(vm2);
 			const vm3 = await boot(t, { distro: other.file, disks: [{ kind: "file", path: data }] });
-			assert.equal(await sh(vm3, "cat /root/who"), "alpine");
+			assert.equal(await sh(vm3, "cat ~/who"), "alpine");
 			await poweroff(vm3);
 		});
 
@@ -255,6 +259,127 @@ for (const name of ["alpine", "debian"]) {
 			vm2.write("echo resumed-$((6*8))\n");
 			await until(/resumed-48/);
 			await poweroff(vm2);
+		});
+
+		const pm = name === "alpine" ? "apk add" : "apt install";
+		const userShell = name === "alpine" ? "/bin/sh" : "/bin/bash";
+
+		test("the image's user: sessions and the console run as user (uid 1000, its groups, in /home/user), sudo -n works without a tty, root on request", async (t) => {
+			const vm = await boot(t, { distro: img!.file });
+			let out = "";
+			const dec = new TextDecoder();
+			vm.onOutput((b) => { out += dec.decode(b, { stream: true }); });
+			const [uid, gid, groups, cwd, env, p] = (await sh(vm, 'id -u; id -g; id -Gn; pwd; echo "$HOME $USER $LOGNAME $SHELL"; echo "$PATH"')).split("\n");
+			assert.deepEqual([uid, gid, cwd, env], ["1000", "1000", HOME, `${HOME} user user ${userShell}`]);
+			for (const g of ["audio", "video", "input", name === "alpine" ? "wheel" : "sudo"]) assert.ok(groups!.split(" ").includes(g), `${g} in ${groups}`);
+			assert.match(p!, new RegExp(`^/run/kw/bin:${HOME}/\\.local/bin:.*:/usr/sbin:.*:/usr/lib/kw/bin$`));
+			assert.equal(await sh(vm, "sudo -n true && sudo -n id -u && sudo -n sh -c 'echo $(id -u) $HOME' </dev/null"), "0\n0 /root");
+			assert.equal(await sh(vm, "id -u; pwd; echo $HOME", "root"), "0\n/root\n/root");
+			assert.equal(await sh(vm, "sudo -n id -u", "root"), "0", "sudo in a root session too");
+			assert.equal((await vm.exec("id", ["-un"], { ...EXEC, user: 0 })).stdout.trim(), "root");
+			assert.equal((await vm.exec("id", ["-un"], { ...EXEC, user: "user" })).stdout.trim(), "user");
+			await assert.rejects(vm.exec("true", [], { ...EXEC, user: "nosuchuser" }), /no user nosuchuser/);
+			// Readable as the user: the boot's description, the README (owned by the user, naming this distro's package manager).
+			assert.match(await sh(vm, "cat /run/kw-base"), /^name=/m);
+			assert.equal(await sh(vm, "stat -c '%U:%G %a' ~/README /home/user"), "user:user 644\nuser:user 700");
+			assert.match(await sh(vm, "cat ~/README"), new RegExp(`\\n  ${pm} htop\\n.*\\n.*runs through sudo`));
+			assert.equal(await sh(vm, "ls -a /root 2>/dev/null | grep -c README || true"), "0");
+			vm.write("\necho \"con-$(id -un)-$(pwd)-$((6*7))\"\n");
+			for (let i = 0; i < 600 && !/con-\w+-\S+-42/.test(out); i++) await new Promise((r) => setTimeout(r, 100));
+			assert.match(out, new RegExp(`con-user-${HOME}-42`));
+			await poweroff(vm);   // as the user: poweroff goes through sudo
+			const vm2 = await boot(t, { distro: img!.file, cmdline: `${bundled!.cmdline} kw.user=root` });
+			out = "";
+			vm2.onOutput((b) => { out += dec.decode(b, { stream: true }); });
+			vm2.write("\necho \"con-$(id -un)-$(pwd)-$((6*7))\"\n");
+			for (let i = 0; i < 600 && !/con-\w+-\S+-42/.test(out); i++) await new Promise((r) => setTimeout(r, 100));
+			assert.match(out, /con-root-\/root-42/, "kw.user=root: a root console");
+			await poweroff(vm2);
+		});
+
+		test("every interactive shell gets the kw profile (prompt, command not found, PATH): the login shell, a nested shell, sudo -s, sudo -i", async (t) => {
+			const vm = await boot(t, { distro: img!.file });
+			const pty = await vm.spawn(undefined, [], { cols: 200, rows: 50 });
+			let out = "";
+			const dec = new TextDecoder();
+			void (async () => { for await (const b of pty.output) out += dec.decode(b, { stream: true }); })().catch(() => {});
+			let n = 0;
+			// Sent again every 5 s: a sudo that is ending may have taken the line (its relay reads what is typed).
+			const probe = async () => {
+				const m = `M${++n}`;
+				const at = out.length;
+				const re = new RegExp(`${m} (\\d+) <([^>\\n]*)> (\\S*) :(\\S*):`);
+				for (let i = 0; i < 600 && !re.test(out.slice(at)); i++) {
+					if (i % 50 === 0) await pty.write(`echo "${m} $(id -u) <$PS1> $(command -v command_not_found_handle) :$PATH:"\n`);
+					await new Promise((r) => setTimeout(r, 100));
+				}
+				const r = re.exec(out.slice(at));
+				assert.ok(r, `${m}: no answer; output:\n${out.slice(-2000)}`);
+				return { uid: r[1]!, ps1: r[2]!, handler: r[3]!, path: r[4]!.split(":") };
+			};
+			const check = (r: Awaited<ReturnType<typeof probe>>, uid: string, home: string, what: string) => {
+				assert.equal(r.uid, uid, what);
+				assert.match(r.ps1, /⇒/, `${what}: the kw prompt`);
+				assert.equal(r.handler, "command_not_found_handle", `${what}: the command not found handler`);
+				for (const d of ["/run/kw/bin", `${home}/.local/bin`, "/usr/sbin", "/usr/lib/kw/bin"]) assert.ok(r.path.includes(d), `${what}: ${d} on PATH ${r.path.join(":")}`);
+			};
+			check(await probe(), "1000", HOME, "the login shell");
+			await pty.write(`${name === "alpine" ? "sh" : "bash"}\n`);
+			check(await probe(), "1000", HOME, "a nested shell");
+			// One step at a time: an exiting sudo's relay may take what is typed behind its shell's exit.
+			for (const [cmd, uid, home, what] of [["exit", "1000", HOME, "back in the login shell"], ["sudo -s", "0", "/root", "sudo -s"],
+				["exit", "1000", HOME, "back in the login shell"], ["sudo -i", "0", "/root", "sudo -i"], ["exit", "1000", HOME, "back in the login shell"]]) {
+				await pty.write(`${cmd}\n`);
+				check(await probe(), uid!, home!, what!);
+			}
+			await pty.close();
+			await poweroff(vm);
+		});
+
+		test(`${name === "alpine" ? "apk" : "apt and apt-get"} typed in an interactive shell run through sudo for the user; \\${name === "alpine" ? "apk" : "apt"} is the real one`, async (t) => {
+			const vm = await boot(t, { distro: img!.file });
+			// A package to install offline: Debian's from a .deb the user builds, Alpine's a virtual one.
+			const install = name === "alpine" ? "apk add --no-network -t kw-test busybox" : "apt install -y -q /tmp/kw-test.deb";
+			if (name === "debian") await sh(vm, "mkdir -p /tmp/kwt/DEBIAN && printf 'Package: kw-test\\nVersion: 1\\nArchitecture: all\\nMaintainer: t <t@t>\\nDescription: t\\n' > /tmp/kwt/DEBIAN/control && dpkg-deb --root-owner-group -b /tmp/kwt /tmp/kw-test.deb >/dev/null");
+			const real = name === "alpine" ? "\\apk add --no-network -t kw-test2 busybox" : "\\apt-get install -y -q /tmp/kw-test.deb";
+			const pty = await vm.spawn(undefined, [], { cols: 200, rows: 50 });
+			let out = "";
+			const dec = new TextDecoder();
+			void (async () => { for await (const b of pty.output) out += dec.decode(b, { stream: true }); })().catch(() => {});
+			const run = async (line: string, m: string) => {
+				await pty.write(`${line}; echo "${m} $?"\n`);
+				const re = new RegExp(`${m} (\\d+)`);
+				for (let i = 0; i < 1800 && !re.test(out); i++) await new Promise((r) => setTimeout(r, 100));
+				return re.exec(out)?.[1];
+			};
+			assert.equal(await run(install, "R1"), "0", out.slice(-2000));
+			assert.notEqual(await run(real, "R2"), "0", "the real command, without sudo, cannot install");
+			assert.equal(await run("sudo -n true", "R3"), "0");
+			await pty.close();
+			assert.equal(await sh(vm, name === "alpine" ? "apk info -e kw-test" : "dpkg-query -W -f '${Status}' kw-test"), name === "alpine" ? "kw-test" : "install ok installed");
+			// Scripts have no alias.
+			assert.notEqual((await vm.exec("sh", ["-c", name === "alpine" ? "apk add --no-network -t kw-test3 busybox" : "apt-get install -y -q /tmp/kw-test.deb"], EXEC)).exitCode, 0);
+			await poweroff(vm);
+		});
+
+		test("command not found and the shims install packages as the user, through sudo (offline: they get as far as the package manager)", async (t) => {
+			const vm = await boot(t, { distro: img!.file });
+			// A default route, so that the tools see "a network" and go on to install; a name server
+			// that refuses at once, so that their downloads fail fast.
+			await asRoot(vm, "ip route add default dev lo && echo nameserver 127.0.0.1 > /etc/resolv.conf");
+			const cnf = name === "alpine" ? "/etc/kw-apk-install" : "/usr/local/sbin/kw-apt-install";
+			// rg: in neither image (Debian's has htop).
+			const r = await vm.exec(cnf, ["rg"], EXEC);
+			assert.equal(r.exitCode, 127, r.stderr);
+			// As root (through sudo): Alpine fetches its index first, Debian runs apt-get.
+			assert.match(r.stderr, name === "alpine" ? /rg: not found, fetching the apk index/ : /rg: not found, sudo apt-get install ripgrep/);
+			if (name === "alpine") {
+				// A fixed version, so that the shim goes on to the library before any download.
+				const s = await vm.exec("node", ["--version"], { ...EXEC, env: { KW_NODE_VERSION: "24.0.0" } });
+				assert.equal(s.exitCode, 127);
+				assert.match(s.stderr, /node: sudo apk add libgcc \(node needs libgcc_s\.so\.1\)/);
+			}
+			await poweroff(vm);
 		});
 
 		test("the image file is unchanged", () => {

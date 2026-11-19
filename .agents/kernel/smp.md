@@ -1,7 +1,7 @@
 # SMP kernel
 
 The `CONFIG_SMP` build of the same tree: `make kw_defconfig kw_smp.config`
-(`arch/wasm/configs/kw_smp.config`: SMP, `NR_CPUS` 8), linked with
+(`arch/wasm/configs/kw_smp.config`: SMP, `NR_CPUS` 16), linked with
 `--shared-memory`, with kwemu built by `zig build -Dkwemu-atomics=true`.
 `kernel/build.sh smp` builds it into `vendor/build/kernel-smp` (kernel.md,
 Two kernels). Every SMP piece is `#ifdef CONFIG_SMP` or compiles away, so

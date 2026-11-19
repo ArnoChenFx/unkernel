@@ -1,4 +1,4 @@
-From 9a4a5b07a3aa4754ac228150f3ccd9b82935c201 Mon Sep 17 00:00:00 2001
+From db103f3fc30ead9996fc8894b2b6987525a5bd18 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -101,7 +101,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  delete mode 100644 arch/wasm/kernel/sys_riscv.c
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
-index 4efdda2c2cc..82abf807255 100644
+index e8846e18f69..b0ba1f1be7a 100644
 --- a/arch/wasm/Kconfig
 +++ b/arch/wasm/Kconfig
 @@ -5,16 +5,19 @@ menu "Wasm-specific options"

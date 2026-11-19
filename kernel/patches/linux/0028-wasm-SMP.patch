@@ -1,10 +1,10 @@
-From 006dafd216672138ae50a3a69ee3057a5f6fe090 Mon Sep 17 00:00:00 2001
+From 21b8a8f2fe2fda5330fc0d88f30c7b55632daaa4 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
 
 A second build of the same arch (kw_smp.config: CONFIG_SMP, NR_CPUS
-8), which always links with a shared memory. Each CPU is an instance
+16), which always links with a shared memory. Each CPU is an instance
 of the kernel module in its own host thread on that memory; current,
 __stack_pointer, the interrupt flag (kw_irq_flags) and the address of
 the CPU's word of pending interrupts (kw_irq_word) are wasm globals of
@@ -105,7 +105,7 @@ kw_emu.h follows kwemu's ABI 7 (several harts on one memory).
  create mode 100644 arch/wasm/kernel/smp.c
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
-index 1ed6743adce..4efdda2c2cc 100644
+index 1ed6743adce..e8846e18f69 100644
 --- a/arch/wasm/Kconfig
 +++ b/arch/wasm/Kconfig
 @@ -36,6 +36,9 @@ config WASM
@@ -155,7 +155,7 @@ index 1ed6743adce..4efdda2c2cc 100644
 -	int
 +	int "Maximum number of CPUs (2-32)" if SMP
 +	range 2 32 if SMP
-+	default 8 if SMP
++	default 16 if SMP
  	default 1
  
  config GENERIC_CSUM
@@ -177,14 +177,14 @@ index 34e941e06b6..49049055794 100644
  # atomic.h, cmpxchg.h and barrier.h become real atomic instructions.
 diff --git a/arch/wasm/configs/kw_smp.config b/arch/wasm/configs/kw_smp.config
 new file mode 100644
-index 00000000000..69e9db0c132
+index 00000000000..749e2d12a01
 --- /dev/null
 +++ b/arch/wasm/configs/kw_smp.config
 @@ -0,0 +1,4 @@
 +# unkernel SMP build: merged over kw_defconfig (make kw_defconfig kw_smp.config).
 +# One wasm instance per CPU on a shared memory; see arch/wasm/Kconfig, SMP.
 +CONFIG_SMP=y
-+CONFIG_NR_CPUS=8
++CONFIG_NR_CPUS=16
 diff --git a/arch/wasm/include/asm/entry-common.h b/arch/wasm/include/asm/entry-common.h
 index 185b2ff8246..ea8e4a240f7 100644
 --- a/arch/wasm/include/asm/entry-common.h

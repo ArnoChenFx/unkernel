@@ -3006,7 +3006,11 @@ static struct {
 	volatile long deadline, midpoint;
 } mv;
 
-/* Threads started on CPU 0 widen their affinity and spin: they must spread. */
+/*
+ * Threads started on CPU 0 widen their affinity and spin: they must spread.
+ * Two per CPU, up to NR_CPUS's limit (32).
+ */
+#define MV_SPREAD_MAX 32
 struct mv_spread {
 	pthread_t th;
 	unsigned long seen;
@@ -3043,11 +3047,11 @@ static void *mv_spread_fn(void *arg)
 
 static void mv_spread_check(void)
 {
-	int n = mv.online * 2 > 8 ? 8 : mv.online * 2, i, made = 0, bad = 0, moves = 0, rounds = 0;
+	int n = mv.online * 2 > MV_SPREAD_MAX ? MV_SPREAD_MAX : mv.online * 2, i, made = 0, bad = 0, moves = 0, rounds = 0;
 	unsigned long seen = 0, last = 0;
-	struct mv_spread s[8];
-	char per[64] = "", *q = per;
-	int count[8] = { 0 };
+	struct mv_spread s[MV_SPREAD_MAX];
+	char per[4 * MV_SPREAD_MAX] = "", *q = per;
+	int count[MV_SPREAD_MAX] = { 0 };
 
 	memset(s, 0, sizeof(s));
 	mv.go = 0;
@@ -3063,7 +3067,7 @@ static void mv_spread_check(void)
 	for (i = 0; i < n; i++) {
 		pthread_join(s[i].th, NULL);
 		seen |= s[i].seen;
-		if (s[i].last >= 0 && s[i].last < 8) {
+		if (s[i].last >= 0 && s[i].last < MV_SPREAD_MAX) {
 			last |= 1UL << s[i].last;
 			count[s[i].last]++;
 		}
@@ -3071,7 +3075,7 @@ static void mv_spread_check(void)
 		moves += s[i].moves;
 		rounds += s[i].rounds;
 	}
-	for (i = 0; i < mv.online && i < 8; i++)
+	for (i = 0; i < mv.online && i < MV_SPREAD_MAX; i++)
 		q += snprintf(q, per + sizeof(per) - q, "%s%d", i ? "/" : "", count[i]);
 	CHECK(made == n && !bad && seen == mv.all && last == mv.all && moves > 0,
 	      "move: spread: %d threads started on CPU 0 ran on CPUs %#lx, %s per CPU after 1.2 s, %d CPU changes in %d fphot rounds (%d bad)",

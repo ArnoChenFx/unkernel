@@ -5,14 +5,23 @@
 # base shell) runs at poweroff and reboot, before reboot(2): with /data
 # mounted, stop every process but init and this script first, so that
 # nothing keeps /data busy (busybox init would only do that after this),
-# then leave /data clean (data-stop) and sync.
+# then leave /data clean (data-stop) and sync. When the image's poweroff,
+# reboot or halt left its name in /run/kw-shutdown (Alpine's, in
+# /usr/local/sbin), it stops every process in any case and ends with that
+# reboot(2) itself: busybox init would pause 1 s after its SIGTERM to every
+# process and 1 s more before reboot(2).
 
 PATH=/run/kw-lower/bin
-if mountpoint -q /data; then
+action=$(cat /run/kw-shutdown 2>/dev/null)
+case $action in poweroff|reboot|halt) ;; *) action= ;; esac
+data=
+mountpoint -q /data && data=1
+if [ -n "$data$action" ]; then
 	kill -TERM -1 2>/dev/null
 	sleep 0.2
 	kill -KILL -1 2>/dev/null
-	/usr/lib/kw/data-stop
 fi
+[ -z "$data" ] || /usr/lib/kw/data-stop
 sync
+[ -z "$action" ] || exec busybox "$action" -f
 exit 0

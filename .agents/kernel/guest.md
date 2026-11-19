@@ -77,7 +77,11 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   script `/usr/lib/kw/udhcpc`, which writes `/etc/resolv.conf` only when
   it changes) on every distro.
 - `/usr/lib/kw/shutdown`: with `/data` mounted, stop every process, then
-  `/usr/lib/kw/data-stop` (data-disk.md); then sync.
+  `/usr/lib/kw/data-stop` (data-disk.md); then sync. When
+  `/run/kw-shutdown` names the action (Alpine's `poweroff`, `reboot` and
+  `halt` in `/usr/local/sbin` write it before they signal busybox init),
+  it stops every process in any case and ends with that reboot(2) itself,
+  skipping busybox init's two 1 s pauses.
 - `/usr/lib/kw/shim` and `/usr/lib/kw/bin/{fx,claude,opencode,node,npm,npx,bun,bunx}`
   (Shims, below).
 - `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`

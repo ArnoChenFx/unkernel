@@ -3,8 +3,11 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # poweroff for every user: busybox's /sbin/poweroff signals init, which only root
 # may: another user goes through sudo -n (the image's user has it without
-# a password).
+# a password). It leaves its name in /run/kw-shutdown first, so that
+# /usr/lib/kw/shutdown, which init runs, powers off without busybox init's
+# pauses.
 
 # unkernel: poweroff for the image's user too.
-[ "$(id -u)" = 0 ] && exec /sbin/poweroff "$@"
-exec sudo -n /sbin/poweroff "$@"
+[ "$(id -u)" = 0 ] || exec sudo -n /usr/local/sbin/poweroff "$@"
+echo poweroff > /run/kw-shutdown
+/sbin/poweroff "$@" || { r=$?; rm -f /run/kw-shutdown; exit $r; }

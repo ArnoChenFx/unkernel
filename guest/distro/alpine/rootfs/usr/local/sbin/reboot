@@ -3,8 +3,11 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # reboot for every user: busybox's /sbin/reboot signals init, which only root
 # may: another user goes through sudo -n (the image's user has it without
-# a password).
+# a password). It leaves its name in /run/kw-shutdown first, so that
+# /usr/lib/kw/shutdown, which init runs, reboots without busybox init's
+# pauses.
 
 # unkernel: reboot for the image's user too.
-[ "$(id -u)" = 0 ] && exec /sbin/reboot "$@"
-exec sudo -n /sbin/reboot "$@"
+[ "$(id -u)" = 0 ] || exec sudo -n /usr/local/sbin/reboot "$@"
+echo reboot > /run/kw-shutdown
+/sbin/reboot "$@" || { r=$?; rm -f /run/kw-shutdown; exit $r; }

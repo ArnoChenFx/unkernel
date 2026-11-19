@@ -77,7 +77,7 @@ if names != sorted(names):
     sys.exit("busybox: the applet names are not sorted")
 print("\n".join(names))
 EOF
-for a in sh mount umount pivot_root chroot dd tr init sed awk mountpoint udhcpc ip du sysctl hostname kill sleep head printf uname poweroff reboot; do
+for a in sh mount umount pivot_root chroot dd tr init sed awk mountpoint udhcpc ip du sysctl hostname kill sleep head printf uname poweroff reboot halt; do
 	grep -qx "$a" "$out/base-applets" || { echo "base: busybox has no $a applet" >&2; exit 1; }
 done
 while read -r a; do ln -s busybox "$stage/bin/$a"; done < "$out/base-applets"

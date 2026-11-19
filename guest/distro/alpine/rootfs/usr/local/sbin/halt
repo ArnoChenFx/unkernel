@@ -3,8 +3,11 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # halt for every user: busybox's /sbin/halt signals init, which only root
 # may: another user goes through sudo -n (the image's user has it without
-# a password).
+# a password). It leaves its name in /run/kw-shutdown first, so that
+# /usr/lib/kw/shutdown, which init runs, halts without busybox init's
+# pauses.
 
 # unkernel: halt for the image's user too.
-[ "$(id -u)" = 0 ] && exec /sbin/halt "$@"
-exec sudo -n /sbin/halt "$@"
+[ "$(id -u)" = 0 ] || exec sudo -n /usr/local/sbin/halt "$@"
+echo halt > /run/kw-shutdown
+/sbin/halt "$@" || { r=$?; rm -f /run/kw-shutdown; exit $r; }

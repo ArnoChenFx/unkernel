@@ -7,10 +7,11 @@
 # index distros.json), smoke-test it, build and pack the npm package (the
 # base bundle, no distro image), and for a release publish it to npm
 # (trusted publishing, with provenance) and publish a GitHub release (a
-# normal one, marked latest) with the npm tarball, unkernel.wasm,
-# distros.json and the images it names attached. The SDK's fetchDistro()
-# and the page's build (web/scripts/kernel.ts) download those assets by
-# the tag v<version>, the version stamped into package.json.
+# normal one, marked latest, its notes a compare link from the previous
+# v* tag) with the npm tarball, unkernel.wasm, distros.json and the images
+# it names attached. The SDK's fetchDistro() and the page's build
+# (web/scripts/kernel.ts) download those assets by the tag v<version>, the
+# version stamped into package.json.
 #
 # Runs:
 #   - by hand from main (Actions > Release > Run workflow): a release with
@@ -424,6 +425,15 @@ jobs:
       contents: write # the tag and the GitHub release
       id-token: write # npm trusted publishing (OIDC, no token) and provenance
     steps:
+      # History and tags only (no blobs), to find the previous tag for the
+      # release notes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+          filter: tree:0
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release
@@ -482,5 +492,13 @@ jobs:
             echo "release $TAG exists"
             exit 0
           fi
+          # The notes: the diff from the previous v* tag on main's history (an
+          # existing release keeps its notes, which may have been edited).
+          if prev="$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null)"; then
+            notes="**Full Changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$prev...$TAG"
+          else
+            notes="**Full Changelog**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commits/$TAG"
+          fi
+          echo "$notes"
           gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
-            --latest --verify-tag --generate-notes --title "$TAG"
+            --latest --verify-tag --notes "$notes" --title "$TAG"

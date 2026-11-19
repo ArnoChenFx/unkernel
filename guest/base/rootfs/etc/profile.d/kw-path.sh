@@ -8,7 +8,7 @@
 # leaves them out for users (Debian's /etc/profile: poweroff, reboot and
 # the like must not be "not found", which would install a package), and
 # /usr/lib/kw/bin last, for the shims that install fx, claude, opencode,
-# node and bun on first use (/usr/lib/kw/shim),
+# node, bun and uv on first use (/usr/lib/kw/shim),
 # so anything else of those names wins. A distro's /etc/profile sets a
 # fixed PATH, and profile.d runs after it (and on Alpine after kw-home.sh,
 # which sets HOME for the console). kwtty gives programs it starts directly

@@ -19,7 +19,7 @@ Things to try
   htop              Or just type the command: if it is missing, the
                     package that provides it is installed for you
                     (@AUTO@=0 turns that off).
-  claude, opencode, fx, node, bun
+  claude, opencode, fx, node, bun, uv
                     Installed into ~/.local/bin the first time you run
                     one (claude and opencode are 250-360 MB, so they
                     need the data disk or plenty of memory).

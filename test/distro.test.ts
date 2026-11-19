@@ -95,9 +95,9 @@ for (const name of ["alpine", "debian"]) {
 			await poweroff(vm);
 		});
 
-		test("the kw layer's shims: fx, claude, opencode, node, npm, npx, bun and bunx last on PATH; without a network the first call exits 127 and installs nothing", async (t) => {
+		test("the kw layer's shims: fx, claude, opencode, node, npm, npx, bun, bunx, uv and uvx last on PATH; without a network the first call exits 127 and installs nothing", async (t) => {
 			const vm = await boot(t, { distro: img!.file });
-			const tools = ["fx", "claude", "opencode", "node", "npm", "npx", "bun", "bunx"];
+			const tools = ["fx", "claude", "opencode", "node", "npm", "npx", "bun", "bunx", "uv", "uvx"];
 			const which = `for n in ${tools.join(" ")}; do command -v $n; done`;
 			const want = tools.map((n) => `/usr/lib/kw/bin/${n}`).join("\n");
 			assert.equal(await sh(vm, which), want, "kwtty's PATH");

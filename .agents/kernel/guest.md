@@ -99,10 +99,10 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   Before, only login shells had them, so a nested shell lost the prompt,
   the handler and, after `sudo -s`, PATH.
 
-## Shims (fx, claude, opencode, node, bun)
+## Shims (fx, claude, opencode, node, bun, uv)
 
 The kw layer's `/usr/lib/kw/bin/fx`, `claude`, `opencode`, `node`, `npm`,
-`npx`, `bun` and `bunx` link to `/usr/lib/kw/shim`, which installs the real program on
+`npx`, `bun`, `bunx`, `uv` and `uvx` link to `/usr/lib/kw/shim`, which installs the real program on
 its first call and runs it (described at its top). Every distro has them, the page and
 the CLI alike; `test/distro.test.ts` checks them on each image (no
 network).
@@ -164,6 +164,13 @@ network).
   About 50 MB download, 100 MB unpacked (1.4.5). Node CLI, Alpine, 1 GiB,
   no data disk, 2026-11-19, bun 1.4.5: first call 9.7 s (libstdc++ and
   pigz included), then `bun -e` 0.06 s.
+- uv and uvx install uv's release tarball from releases.astral.sh (the
+  first host of astral.sh/uv/install.sh, whose `APP_VERSION` names the
+  newest release; `KW_UV_VERSION` pins one), the two programs straight
+  into `~/.local/bin` as that installer puts them. The musl build on
+  Alpine, the glibc one elsewhere; neither needs a library the images
+  lack. No install receipt, so `uv self update` declines. The installer
+  run in the guest itself works too and wins on PATH.
 - On Alpine it installs zstd (for claude) and pigz (unpacking 3x faster;
   it works without) with apk when it can; Debian's image has zstd, and
   GNU gzip unpacks opencode. Downloads use libcrypto's own choice of code

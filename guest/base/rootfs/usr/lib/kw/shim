@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # /usr/lib/kw/shim (the kw layer): the shim for fx, claude, opencode,
-# node and bun; the comment below is what the image carries.
+# node, bun and uv; the comment below is what the image carries.
 
-# fx, claude, opencode, node (node, npm, npx) and bun (bun, bunx) on first
-# use, on every distro (unkernel's kw layer). /usr/lib/kw/bin/{fx,claude,
-# opencode,node,npm,npx,bun,bunx} link here, and kw-path.sh (and
+# fx, claude, opencode, node (node, npm, npx), bun (bun, bunx) and uv (uv,
+# uvx) on first use, on every distro (unkernel's kw layer).
+# /usr/lib/kw/bin/{fx,claude,opencode,node,npm,npx,bun,bunx,uv,uvx} link here, and kw-path.sh (and
 # kwtty) put that directory last on PATH, after ~/.local/bin and the
 # distro's own. The first call downloads the real program for this machine,
 # checks it, puts it at ~/.local/bin/TOOL and runs it with the same
@@ -41,6 +41,12 @@
 #             laid out as bun.sh/install does: ~/.bun/bin/bun, symlinked
 #             from ~/.local/bin/bun and ~/.local/bin/bunx. The musl build
 #             needs libstdc++ (installed with apk).
+#   uv        https://releases.astral.sh/github/uv/releases/download/VERSION/uv-ARCH-unknown-linux-LIBC.tar.gz
+#             (the first of astral.sh/uv/install.sh's two hosts), VERSION
+#             that installer's APP_VERSION (or KW_UV_VERSION=X.Y.Z); uv and
+#             uvx straight into ~/.local/bin, as the installer puts them. No
+#             install receipt, so `uv self update` declines: rerun the
+#             installer, or delete ~/.local/bin/uv and uvx.
 # Nothing is checked against a published checksum: each would come from the
 # same host as the file, over the same TLS (verified on both distros), and
 # gzip's CRC or zstd's frame checksum catches a damaged stream. The result
@@ -59,6 +65,7 @@ case $tool in
 fx|claude|opencode) name=$tool ;;
 node|npm|npx) name=node ;;
 bun|bunx) name=bun ;;
+uv|uvx) name=uv ;;
 *) echo "kw shim: no shim for '$tool'" >&2; exit 127 ;;
 esac
 
@@ -142,9 +149,10 @@ installed && run "$@"  # another call installed it while this one waited
 # url, dir (final directory), file (final name in dir), size (bytes, for the
 # space check; an upper bound where nothing tells it), top (a tree: unpack()
 # extracts into the directory $part, and $part/$top becomes $dir/$file;
-# links: its programs for ~/.local/bin, or the names in ~/.local/bin for
-# $dir/$file, $tool when empty)
-top= links=
+# its programs are in $part/$top/$tbin; with $dir = ~/.local/bin, each of
+# links is moved there instead; links: its programs for ~/.local/bin, or the
+# names in ~/.local/bin for $dir/$file, $tool when empty)
+top= links= tbin=bin/
 case $name in
 fx)
 	ver=${KW_FX_VERSION:-latest}
@@ -230,6 +238,17 @@ bun)
 	# The musl build links libstdc++ (not in Alpine's image), the glibc one
 	# only glibc.
 	[ -z "$libc" ] || needlib libstdc++.so.6 libstdc++ libstdc++6 ;;
+uv)
+	ver=${KW_UV_VERSION:-}
+	if [ -z "$ver" ]; then
+		ver=$(get https://astral.sh/uv/install.sh | sed -n 's/^APP_VERSION="\([^"]*\)"$/\1/p') || die "cannot reach astral.sh"
+	fi
+	case $ver in [0-9]*.[0-9]*.[0-9]*) ;; *) die "unexpected version '$ver'" ;; esac
+	if [ -n "$libc" ]; then top=uv-$fxarch-unknown-linux-musl; else top=uv-$fxarch-unknown-linux-gnu; fi
+	url=https://releases.astral.sh/github/uv/releases/download/$ver/$top.tar.gz
+	# 33 MB unpacked for the glibc build of 0.13.9, 36 MB for the musl one.
+	dir=$bin file=uv size=48000000 links="uvx uv" tbin=
+	unpack() { tar -xzof - -C "$part"; } ;;
 esac
 
 # --- space ---------------------------------------------------------------------
@@ -255,7 +274,7 @@ opencode|bun)
 	if pkg pigz; then
 		unpack() { pigz -dc | { tar -xOf - "package/bin/$name" && cat >/dev/null; }; }
 	fi ;;
-node)
+node|uv)
 	if pkg pigz; then
 		unpack() { pigz -dc | tar -xof - -C "$part"; }
 	fi ;;
@@ -286,11 +305,16 @@ rc=$?
 pp=
 [ $rc = 0 ] || die "download failed: $url"
 elf=$part
-[ -z "$top" ] || elf=$part/$top/bin/$name
+[ -z "$top" ] || elf=$part/$top/$tbin$name
 [ "$(head -c 4 "$elf" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ] || die "$url: not an ELF program; not installed"
 # lnk TARGET NAME: ~/.local/bin/NAME -> TARGET, replaced in one rename.
 lnk() { ln -sfn "$1" "$bin/.$2.kw-link.$$" && mv -f "$bin/.$2.kw-link.$$" "$bin/$2" || die "cannot link $bin/$2"; }
-if [ -n "$top" ]; then
+if [ -n "$top" ] && [ "$dir" = "$bin" ]; then
+	# uv last: a cut between the two leaves uv missing, and its next call
+	# installs both again.
+	for n in $links; do mv -f "$part/$top/$tbin$n" "$bin/$n" || die "cannot move $n into $bin"; done
+	rm -rf "$part"
+elif [ -n "$top" ]; then
 	rm -rf "$dir/$file"  # a partial tree of the same version (moved, then killed)
 	mv "$part/$top" "$dir/$file" || die "cannot move it into $dir"
 	rm -rf "$part"
@@ -301,5 +325,11 @@ else
 	for n in ${links:-$tool}; do [ "$dir/$file" = "$bin/$n" ] || lnk "$dir/$file" "$n"; done
 fi
 trap - EXIT INT HUP TERM
-if [ -n "$top" ]; then say "installed $dir/$file, linked from $bin"; else say "installed $link"; fi
+if [ -z "$top" ]; then
+	say "installed $link"
+elif [ "$dir" = "$bin" ]; then
+	say "installed $links in $bin"
+else
+	say "installed $dir/$file, linked from $bin"
+fi
 run "$@"

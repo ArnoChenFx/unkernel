@@ -233,6 +233,8 @@ to `run`. `cpu.jit.cur` names the member a region left from.
 
 ### Invariants (what the tests check)
 
+- Compiled code must leave exactly the state the interpreter would:
+  registers, flags, memory, faults and `icount`.
 - Budget and `icount` are exact: `run` charges the entered member in full,
   every further member is charged before it runs and only if `jl` covers
   it, and a side exit refunds the rest of the member it leaves. A budget

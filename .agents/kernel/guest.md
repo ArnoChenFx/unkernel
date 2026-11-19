@@ -20,7 +20,8 @@ are written by `tools/mkcpio.py` (no root needed).
 - Programs from `kernel/guest/*.c`, built static with `zig cc -target
   aarch64-linux-musl -mcpu=generic` (ARMv8.0): `glimmer`, `kwvsock`,
   `kwshm`, `kwtty`, `kw9p`, `kwwasi`, and the test programs `kwtest`, `kwbench` and
-  `abitest` (tests.md).
+  `abitest` (tests.md). New code must stay within what kwemu implements:
+  check it with the coverage classifier (a64/isa.md).
 - The test programs come as a second cpio archive after the image's, which
   the kernel unpacks after the first. With `KW_RELEASE=1` (the release
   workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release
@@ -112,7 +113,7 @@ and goes on with a warning without mke2fs.
   four ELF types (flag P, `CONFIG_BINFMT_MISC`) with the interpreter
   `/etc/kw-qemu`, and WASI `.wasm` programs with `/usr/bin/kwwasi`, which
   runs them on the host's wasm engine (js.md, WASI programs). **Guest only:
-  never run it on the host (AGENTS.md).**
+  never run it on the host.**
   The first time an architecture is needed (as root, with a network, under
   a lock so parallel execs do not race apk) kw-qemu enables community and
   installs `qemu-ARCH` and a library root at qemu's default prefix
@@ -130,6 +131,18 @@ and goes on with a warning without mke2fs.
   are faked (shims in `/usr/lib/kw-arch`, first on PATH), not `uname()`.
 - **Data disk**: `/etc/kw-data.sh` mounts a `kwdata` disk at `/data` and
   starts the overlay root (data-disk.md).
+- **Known upstream crash, not ours**: `time nosuchcmd` prints status 127
+  and then segfaults at address 0 (exit 139; checked 2026-11-19, busybox
+  1.37.0-r31, musl 1.2.6-r3). busybox `time`'s vfork child calls `exit()`
+  when exec fails. musl's `exit()` stores the caller's tid in a static
+  `exit_lock` to catch re-entry, and the child shares the parent's memory
+  and thread pointer. When the parent then calls `exit()` it finds its
+  own tid there and hits `a_crash()` (`strb wzr, [x0]` at
+  `ld-musl-aarch64.so.1` `exit+0x78`). The fix belongs in busybox (the
+  child should call `_exit`). If a vfork child crashes or exits oddly,
+  rule this out before suspecting `CLONE_VM` in kwemu or arch/wasm.
+  `qemu-aarch64` does not reproduce it, because qemu-user runs vfork as a
+  plain fork.
 
 ## Guest tools (`kernel/guest/*.c`)
 

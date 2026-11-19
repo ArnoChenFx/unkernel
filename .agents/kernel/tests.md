@@ -1,7 +1,6 @@
 # Kernel tests
 
-Quick checks per change are in AGENTS.md (Tests), the full matrix in
-testing.md. To add a kernel check: a `CHECK(...)` in
+Quick checks per change and the full matrix are in testing.md. To add a kernel check: a `CHECK(...)` in
 `kernel/guest/kwtest.c`.
 
 ## kwtest (`kernel/guest/kwtest.c`)

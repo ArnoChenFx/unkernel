@@ -718,6 +718,14 @@ Open:
 
 ## Open issues
 
+- **aarch64: the release workflow has not run its build path yet.** New
+  in CI are the arm64 patch series (a new kernel tree and build: every
+  kernel cache misses), the package rebuild with Bootlin's aarch64 gcc
+  (alpine-opt.sh downloads 163 MB; 79 s on 16 cores locally, 2026-11-18),
+  the aarch64 minirootfs, the guest programs from `zig cc`, and abitest.
+  Before the first aarch64 release it needs one smoke run (`release`
+  unchecked), which shows its time on a hosted runner and whether
+  kwtest's timing checks hold there with the A64 JIT.
 - **aarch64: FMA, AdvSIMD FP and system instructions are calls of the
   interpreter in compiled code.** The A64 JIT (a64/jit.md)
   translates every ALU, memory and branch op, the frequent FP moves,

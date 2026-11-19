@@ -2,19 +2,13 @@
 
 unkernel runs Linux 7.3, compiled to a single wasm module (`arch/wasm` with an
 MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
-Linux ELF (ARMv8.0-A with FP and AdvSIMD, plus AES, PMULL, SHA1, SHA2,
-CRC32, LSE, SHA512 and SHA3), run by kwemu, a software CPU in Zig linked
-into the kernel: a reference interpreter, a decoded-op tier and a wasm
-JIT. README.md is the overview, and kernel/README.md maps the kernel
-directory and its build steps.
-
-kwemu's guest CPU is AArch64 (src/a64, .agents/a64.md: a decoded-op tier
-over a reference interpreter, and a JIT that compiles hot blocks to
-wasm), on an ISA-neutral MMU, block cache and JIT core (src/emu,
-.agents/kwemu.md); its contract with the kernel is `include/kw_emu.h`
-(ABI 2). The kernel presents the arm64 user ABI (kernel.md, arm64 user
-ABI), and the guest image is Alpine's aarch64 minirootfs
-(.agents/kernel/guest.md).
+Linux ELF (ARMv8.0-A with FP, AdvSIMD and the crypto, CRC32 and LSE
+extensions; a64/isa.md), run by kwemu, a software CPU in Zig linked
+into the kernel: the AArch64 front end (src/a64: a reference interpreter, a
+decoded-op tier and a wasm JIT) on an ISA-neutral MMU, block cache and JIT
+core (src/emu). Its contract with the kernel is `include/kw_emu.h` (ABI 2).
+The guest image is Alpine's aarch64 minirootfs. README.md is the overview,
+and kernel/README.md maps the kernel directory and its build steps.
 
 `.agents/` has one file per area. Read the one for the area you change:
 
@@ -28,98 +22,38 @@ ABI), and the guest image is Alpine's aarch64 minirootfs
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
 | [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
-| [.agents/testing.md](.agents/testing.md) | the full test matrix, for releases or when asked |
-| [.agents/status.md](.agents/status.md) | roadmap, open issues, work not yet in the image |
+| [.agents/testing.md](.agents/testing.md) | quick checks per area, CLI exit codes, the full matrix, release CI |
+| [.agents/status.md](.agents/status.md) | roadmap and open issues; read only for planning, or when asked |
 
-## Host safety rules (read first)
-
-A binfmt_misc handler with a truncated magic can match every 64-bit ELF
-and stop exec on the whole host until a reboot. So:
-
-- Never register binfmt_misc handlers. Never write under `/proc` or `/sys`.
-  Do not use `mount`, `chroot`, `unshare` or `sysctl`, and do not change
-  services.
-- No `sudo` and no package installs.
-- Run binaries of another architecture (the aarch64 guests and test
-  programs, or any other) on the host only through an explicit emulator
-  (`qemu-aarch64 ./bin`). Never run the guest's `/etc/kw-binfmt.sh`, or
-  any part of it, on the host.
-- Do not start anything on port 8080: that is `pnpm dev`'s port.
-- Repeat these rules in every subagent brief.
-
-## Layout
-
-The parts that `ls` does not make obvious:
-
-- `src/` is kwemu, with its contract in `include/kw_emu.h`. `test/guest/` holds
-  its test guests.
-- `kernel/build.sh` runs every kernel-side step (`toolchain binaryen kernel
-  smp lower alpine disk datadisk bundle all`, plus `ubuntu` and the
-  profiling variant `stats`). One tree gives two kernels, UP (`kernel`)
-  and SMP (`smp`); the bundle carries the UP kernel and a patch to the SMP
-  one (kernel.md, Two kernels). `KSRC`, `KOUT`, `KOUT_SMP` and `KW_BUILD`
-  point it at another tree and output root. Linux patches are in
-  `kernel/patches/linux/`, wasm-ld patches in `kernel/patches/llvm/`.
-- `vendor/` (gitignored) holds the kernel tree
-  `vendor/src/linux-wasm-kernel` (branch `kw-arm64-user`), `vendor/src/llvm22`,
-  the toolchain and all build outputs. Those branches exist only there, so
-  `kernel/patches/` is their only durable record.
-- The page's kernel is the gitignored `web/kernel/unkernel-alpine.wasm`.
-  `kernel/build.sh bundle` copies its output there, and `pnpm dev` runs
-  that file as it is (its copy in `web/kernel/page/`, without an SMP
-  patch section). A page build (`pnpm build:web`, a deploy) replaces it
-  with the newest GitHub release's bundle (`web/scripts/kernel.ts`, web.md).
-
-## Building
+## Building and testing
 
 ```sh
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
-zig build test              # A64 unit tests (native, wasm64 + JIT), A64 guests (native, wasm64, + JIT) against qemu-aarch64
-kernel/build.sh kernel      # the UP kernel: kwemu with the JIT, vmlinux, lower, refresh the bundle
-kernel/build.sh smp         # the SMP kernel (kwemu with atomics); the bundle then gets the SMP patch
-pnpm install                # SDK and page dev dependencies
+zig build test              # A64 unit tests and guests against qemu-aarch64
+kernel/build.sh kernel      # the UP kernel, refreshes the bundle (smp: the SMP kernel)
 node js/cli.ts              # boot Alpine from the bundle; --help lists options
 ```
 
-CLI exit codes: 0 = power off, 1 = halt or boot failure, 2 = restart,
-124 = `--timeout`, 253 = panic, 254 = wasm trap, 255 = fatal.
+Run the quick check for what you changed (testing.md, Quick checks); the
+full matrix is for releases or when asked. Do not run the browser tests
+(`web/test/`) unless asked.
+
+`vendor/` (gitignored) holds the kernel tree `vendor/src/linux-wasm-kernel`
+(branch `kw-arm64-user`), `vendor/src/llvm22`, the toolchain and all build
+outputs; `kernel/patches/` is the only durable record of those branches.
 
 ## Easy to break
 
-Details are in the area files.
+These cut across areas; each area file lists its own invariants.
 
-- `include/kw_emu.h` is copied into the kernel by build.sh. Bump
-  `KW_ABI_VERSION` on any layout or semantic change (kernel.md).
-- Only `wasm_switch_to`, `poll_oneoff`, `sched_yield` and `proc_exit` may
-  suspend under JSPI (kernel.md).
-- Every kernel thread needs a `kw_park_point()` in its loop, or parking
-  (and so snapshots) fails with EBUSY naming it (kernel.md, Parking).
-- JIT output must match the interpreter exactly (kwemu.md, Invariants; a64/jit.md).
-- SMP kernels: a task moves to another CPU only where its JSPI stack
-  (that CPU thread's) can be dropped and it can start on a fresh one: a
-  user task on its way to user mode, a kernel thread at a restart point.
-  Host imports other than clocks, randomness, console output and task
-  switching answer on CPU 0 alone, and a kernel thread that is bound to
-  another CPU after it ran needs a restart point (kernel.md, SMP).
-- `kw_defconfig` is maintained by hand. Kconfig drops options silently, so
-  check `$KOUT/.config` after a change.
-- `js/core` stays universal: no `node:` imports, no unguarded DOM APIs
-  (js.md).
-- The image's busybox, zlib, openssl and apk-tools are rebuilt from
-  pinned aports commits (`kernel/guest/alpine-opt.sh`; `KW_ALPINE_OPT=0`
-  keeps Alpine's builds), without FP or AdvSIMD code in hot paths;
-  libcrypto picks its crypto-extension code from AT_HWCAP, which the JIT
-  compiles where the host has wasm SIMD. An Alpine update needs new pins
-  there; `alpine.sh` stops until they match (guest-packages.md).
-- Guest C programs in the image (`kernel/guest/*.c`) are built for the
-  generic ARMv8.0 CPU. Check new code with the coverage classifier
-  (a64/isa.md, Coverage tool): it lists what kwemu rejects (later architecture
-  features: SVE, SM3, SM4, ...).
-- Overlay root and data disk rules are in data-disk.md. Never use
-  `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
-  The one sanctioned discard is the guest's reset of a disk written by
-  another guest architecture, which deletes all but root's home
-  (data-disk.md, Guest architecture).
+- Bump `KW_ABI_VERSION` on any layout or semantic change to
+  `include/kw_emu.h` (kernel.md).
+- `kw_defconfig` is maintained by hand and Kconfig drops options silently:
+  check `$KOUT/.config` after changing it.
+- Never use `switch_root` in the guest's init: it empties rootfs, the
+  overlay's lower layer (data-disk.md).
+- Never clear the IndexedDB store `kwdisk:kwdata-v1` in code or tests: it
+  is the user's persistent disk (data-disk.md).
 
 ## Changing things
 
@@ -129,59 +63,21 @@ Details are in the area files.
 - **wasm-ld**: commit in `vendor/src/llvm22`, run `kernel/build.sh
   toolchain`, and re-export (toolchain.md).
 - **Guest image**: `kernel/build.sh alpine` or `kernel/build.sh disk`.
-- **Page**: a kernel or guest change reaches the deployed page with the
-  next release (`.github/workflows/release.yml`, run by hand). `pnpm dev`
-  runs it as soon as `kernel/build.sh` has rebuilt the bundle. A page
-  build refuses a release whose kwemu ABI is not `include/kw_emu.h`'s, so
-  after an ABI bump cut a release before deploying (web.md).
-
-## Tests
-
-Run the quick check for what you changed. The full matrix in
-.agents/testing.md is for releases, or when the user asks for it.
-
-| Change | Quick check |
-| --- | --- |
-| Emulator (`src/`, `test/guest/`, `include/`) | `zig build test` |
-| Kernel, `kw_emu.h`, JIT | `kernel/build.sh kernel`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"` (`kwtest: 0 failure(s)`, exit 0); for JIT changes, again with `--no-jit` |
-| Guest image, anything user space sees | `pnpm test:api`; optional: `node js/cli.ts --timeout 120 --input '{8}uname -a; apk --version\n{2}poweroff\n'` |
-| Display, input, sound (kwfb, kwinput, kwsnd) | `pnpm test:api`; optional: `node test/glimmer-check.mjs --run` |
-| Block, ext4, data disk | `pnpm test:block` |
-| SDK (`js/`) | `pnpm typecheck`; `pnpm test:api` |
-| Host file systems (9p, `kw9p`) | `pnpm test:9p`; `pnpm test:api` (after a kw9p change, `kernel/build.sh alpine` first) |
-| Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh alpine` first) |
-| Network | `pnpm test:net` |
-| SMP (`CONFIG_SMP`, `js/core/cpu.ts`; kernel.md, SMP), or any kernel change that SMP code sees | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--smp 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd alpine-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
-| Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |
-| Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
-
-The optional checks boot the same bundle as `pnpm test:api`, which already
-runs shell commands and `glimmer --test` inline and in worker mode. Run them
-when the change touches what only they cover. The Alpine boot adds `apk` and
-the CLI's `--input`. `glimmer-check` compares the whole frame pixel for
-pixel and the sound sample for sample, and checks the mouse and tablet
-events and the CLI's `--display`, `--sound-wav` and `--worker`. Both are
-still part of the full matrix.
-
-Do not run the browser tests (`web/test/`) unless asked. The page is
-tested by hand with `pnpm dev`.
-
-To add a test: for the emulator, a unit test in `src/a64/tests.zig` or a
-guest in `test/guest/a64/` plus entries in `build.zig` (`a64_guests`) and
-`test/a64-test.mjs`; for the kernel, a `CHECK(...)` in
-`kernel/guest/kwtest.c`.
+- **Page**: kernel and guest changes reach the deployed page with the next
+  release (`.github/workflows/release.yml`, which the maintainer runs
+  by hand; web.md).
 
 ## Conventions
 
+- When asked to commit, commit on `main` rather than a new branch, unless
+  told otherwise.
 - Commit messages are imperative sentences, optionally prefixed with an
-  area (`web: `, `CLI: `). Kernel patches use kernel style (`wasm: ...`);
-  a fix is folded into the patch it belongs to, a new piece is a new patch
-  (kernel.md). Do not add
-  `Signed-off-by` lines; only a human author can certify one.
-- Every new file gets an SPDX header and a copyright line. Project code is
-  GPL-2.0-or-later, the JavaScript (`js/`, `web/`, SDK tests) is MIT, and
-  kernel patches are GPL-2.0-only. Never copy code from linux-wasm's GPL
-  runtime into `js/`.
-- When a change makes something here or in `.agents/` wrong, fix it in the
-  same commit. The docs describe the current state: no change history and
-  no commit hashes. Date measurements (absolute dates).
+  area (`web: `); kernel patches use kernel style (kernel.md). No
+  `Signed-off-by` lines.
+- New files get an SPDX header and a copyright line: GPL-2.0-or-later,
+  except MIT for JavaScript (`js/`, `web/`, SDK tests) and GPL-2.0-only
+  for kernel patches.
+- If a change contradicts a statement in a doc, fix that statement in the
+  same commit. Do not audit the docs or document new details unless asked.
+  Docs describe the current state (no history, no commit hashes); date
+  measurements.

@@ -51,4 +51,4 @@ node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot    # Ubuntu, chan
 node js/cli.ts --data /tmp/kwdata.img                             # with the data disk at /data
 ```
 
-Which tests to run for a change: AGENTS.md (Tests) and .agents/testing.md.
+Which tests to run for a change: .agents/testing.md.

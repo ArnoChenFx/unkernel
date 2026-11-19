@@ -18,6 +18,10 @@
 //   js/web/web-cpu-entry.ts       the same in browsers, inlined as a Blob URL where
 //                                 js/web/cpu.ts starts it: in the web entry and inside
 //                                 the web kernel worker (WORKERS)
+//   js/node/wasi-entry.ts         a guest WASI program's worker (serveWasiPrograms()), on
+//   js/web/web-wasi-entry.ts      Node and in browsers, inlined where js/node/wasi.ts and
+//                                 js/web/wasi.ts start it, in the Node entries and the web
+//                                 entry (WORKERS)
 
 import { realpathSync } from "node:fs";
 import { copyFile, readFile, readdir, stat } from "node:fs/promises";
@@ -50,6 +54,8 @@ interface WorkerSpec {
 const WORKERS: WorkerSpec[] = [
 	{ name: "cpu", starter: "js/node/cpu.ts", entry: "js/node/cpu-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"] },
 	{ name: "node", starter: "js/node/worker.ts", entry: "js/node/worker-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"], nested: ["cpu"] },
+	{ name: "wasi", starter: "js/node/wasi.ts", entry: "js/node/wasi-entry.ts", platform: "node", wrap: (s: string) => s, entries: ["node.mjs", "cli.mjs"] },
+	{ name: "webwasi", starter: "js/web/wasi.ts", entry: "js/web/web-wasi-entry.ts", platform: "browser", wrap: (s: string) => `inlineWasiUrl(${s})`, entries: ["web.mjs"] },
 	{ name: "webcpu", starter: "js/web/cpu.ts", entry: "js/web/web-cpu-entry.ts", platform: "browser", wrap: (s: string) => `inlineCpuUrl(${s})`, entries: ["web.mjs"] },
 	{ name: "web", starter: "js/web/worker.ts", entry: "js/web/web-worker-entry.ts", platform: "browser", wrap: (s: string) => `inlineWorkerUrl(${s})`, entries: ["web.mjs"], nested: ["webcpu"] },
 ];
@@ -213,7 +219,7 @@ export default defineBuildConfig({
 			}
 			for (const f of [...(await readdir(dist)), ...(await readdir(path.join(dist, "_chunks")).catch(() => [])).map((c) => `_chunks/${c}`)]) {
 				const code = f.endsWith(".mjs") ? await readFile(path.join(dist, f), "utf8") : "";
-				for (const name of ["worker-entry", "cpu-entry"])
+				for (const name of ["worker-entry", "cpu-entry", "wasi-entry"])
 					if (code.includes(name)) throw new Error(`dist/${f} refers to ${name}: a worker was not inlined`);
 			}
 			// The bundled-kernel URL must be resolved relative to the entry itself, not a shared chunk.
@@ -231,7 +237,7 @@ export default defineBuildConfig({
 				const mod = await import(`${pathToFileURL(path.join(dist, entry)).href}?check=${Date.now()}`);
 				if (typeof mod.createKernel !== "function") throw new Error(`dist/${entry} has no createKernel export`);
 			}
-			console.log(`unkernel: dist/unkernel-alpine.wasm copied; web entry is free of Node imports; kernel and CPU workers inlined; entries link; ${chunks.length} shared chunk(s)`);
+			console.log(`unkernel: dist/unkernel-alpine.wasm copied; web entry is free of Node imports; kernel, CPU and WASI program workers inlined; entries link; ${chunks.length} shared chunk(s)`);
 		},
 	},
 });

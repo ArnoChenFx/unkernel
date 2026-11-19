@@ -23,6 +23,7 @@ export * from "./core/index.ts";
 export { FileBase, FileDisk, createImageFromKwsparse, openDisk } from "./node/disk.ts";
 export type { OpenDiskOptions } from "./node/disk.ts";
 export { nodeFs } from "./node/nodefs.ts";
+export { serveWasiPrograms } from "./node/wasi.ts";
 // wispBackend here sends Origin: http://localhost by default (it shadows the core export).
 export { NODE_WISP_HEADERS, directBackend, wispBackend } from "./node/net.ts";
 

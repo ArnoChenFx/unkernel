@@ -22,6 +22,154 @@ enough on the page. qemu's TCG keeps writing new code, which kwemu
 interprets or recompiles. Alpine has qemu-system-i386 and qemu-ui-curses
 for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
 
+WASI programs on the host's engine (prototype, branch `wasi-binfmt`;
+js.md, WASI programs): `kernel/guest/kwwasi.c` is a binfmt_misc
+interpreter for `\0asm\1\0\0\0` that sends argv, environment, the preopen
+and the module's identity over vsock port 1021 (the module only when the
+host has not compiled it for that identity) and then does the program's
+file I/O in the guest as that process. `serveWasiPrograms(vm.vsock)` (CLI
+`--wasi`) compiles each module once (js.md, Modules) and runs each program in a
+worker of its own, started by the owner of `vm.vsock`; its WASI file calls
+round-trip to the owner, which talks to kwwasi: through a SharedArrayBuffer
+per program (the worker blocks in `Atomics.wait`, the owner wakes on
+`Atomics.waitAsync`) where one can be used (Node, isolated pages), else as
+messages to and from JSPI Suspending imports. A kill of kwwasi
+(Ctrl-C, SIGKILL, SIGPIPE) or the machine's end terminates the worker at
+once, mid computation too; a worker whose program ended by itself is kept
+idle for the next one (two at most). Programs are left out of snapshots:
+they do not block one, and after a restore kwwasi exits 126 ("lost the
+connection to the host"), also while it waits for stdin. alpine.sh builds
+kwwasi and kw-binfmt.sh registers it, but no image with them has been
+built yet; `node test/wasi-binfmt.ts [--worker] [--messages]` brings
+kwwasi in through a mount and registers it by hand. It passes inline, in
+a worker and with `UNKERNEL_TEST_CPUS=2`, on the shared path and with
+`--messages` (2026-11-19, aarch64; the snapshot part with one CPU only, since an
+SMP kernel has no KW_PARK), and the built CLI (`pnpm build`,
+`dist/cli.mjs --wasi`, inline and `--smp 2`) ran programs on the shared
+path (a Ctrl-C through it was tried on the message path only). Preview 0
+modules (`wasi_unstable`) run adapted (js.md): wasienv's Lua 5.4 shell
+(`@antonz/lua-wasi`) runs scripts, file I/O with seeks, stdin and its
+REPL; its SQLite 3.44.2 shell (`@antonz/sqlite-wasi`) runs SQL given as
+arguments, but SQL on stdin does nothing, also under Node's own
+`node:wasi`: it is built with SQLITE_SHELL_FIDDLE, whose shell never reads
+stdin (2026-11-18).
+Measured 2026-11-18 (Node 24.22, V8 13.6, 16 cores) with the riscv64
+guest of that day, where not said otherwise; not measured again on
+aarch64, apart from the test's own figures (2026-11-19, inline: 1e9
+rounds 6.5 s cold and 1.8 s cached as wasm, 3.5 s as aarch64 in the
+guest; 52 µs per 16-byte pread; a 16 MiB copy 0.09 s):
+- A `sleep 0.5` beside a computing program takes 0.50 s and a console
+  write 3 ms, as with nothing beside them, in every mode. A killed
+  program's worker has exited within 3 ms of the guest seeing kwwasi
+  exit. Two 3e8-round loops at a time take 0.58 s, one alone 0.53 s.
+- 1e9 rounds of an xorshift loop: 6.5 s as wasm on its first run, 1.8 s
+  on later runs (a new worker each time; the posted module shares the
+  tiered-up code), 2.9 s as riscv64 in that guest. The first run is
+  Liftoff code all along: `_start` is called once and V8 13.6 has no
+  on-stack replacement for wasm (no flag for it), so the TurboFan code
+  that dynamic tiering makes serves only later calls. Outside the guest,
+  3e8 rounds take 1.95 s on the first call and 0.53 s on the second, and
+  0.58 s on the first with `--no-liftoff`; workers and JSPI make no
+  difference. A process-wide `--no-liftoff` would also slow the kernel's
+  own compile, and there is no per-module choice in the JS API.
+- A hello world starts in 4.9 ms (median, exec() to exit; message path,
+  and 20 of them take 0.06-0.07 s on either path) with an idle worker,
+  against 4.4 ms with the program on the vsock thread; with a new
+  worker each it takes about 41 ms from source (a bare Node worker starts
+  in about 20 ms).
+- One small request, after kwwasi's one recv() and one send() per frame
+  and the host's single copies (2026-11-18, evening; 3000 one-byte writes,
+  one-byte reads, 16-byte preads, stats or fstats per run, timed by the
+  program; medians of 6 runs, before and after alternating in one boot,
+  host load 1.6-2.8): on the shared path 37-55 µs inline (before 45-60),
+  86-101 µs in worker mode (97-117) and 95-129 µs with 2 CPUs (112-191,
+  noisier), on the message path inline 85-105 µs (88-122). Writes to
+  /dev/null and regular files and reads of /dev/zero and regular files
+  gained most (9-12 µs inline): no fcntl() and poll() before them any
+  more. The program's thread to kwwasi and back stays most of it: kwwasi's
+  syscall itself is 1.3-2.4 µs, a native program in the guest makes the same one
+  in 0.5-1.1 µs. Earlier (2026-11-18, before these changes, timestamped on
+  the message path): a small request inline was 21-32 µs worker to owner,
+  39-57 µs vsock and kwwasi, 21-32 µs back. Without the 200 µs spin the
+  shared path took 68-74 µs inline (Atomics.wait's wakeup); spins of 50,
+  100 and 200 µs did about equally well inline, worker mode needed 200.
+- Throughput through kwwasi (same runs; 32 MiB in 64 KiB or 1 MiB reads
+  and writes of a tmpfs file): shared path inline 470/753 MB/s reading
+  (64 KiB/1 MiB; before 322/564) and 454/740 MB/s writing (before
+  302/627); worker mode 400/759 and 393/695 (before 320/649 and 273/573);
+  2 CPUs 335/579 and 341/425 (before 278/485 and 231/424); message path
+  inline 388/891 and 359/818 (before 312/737 and 282/654). A scratch
+  kwwasi that copied payloads to coalesce its sends made 64 KiB requests
+  2x slower (measured earlier that day): copies under emulation cost more
+  than the syscalls they save.
+- Start to exit (`fork`+`exec`+`wait` in the guest, same runs): nop.wasm
+  920-960 µs median (min about 650) inline and in worker mode, hello.wasm
+  1.5-1.7 ms, unchanged by these changes. The shared path does not start
+  slower than the message path: alternated in one boot, nop.wasm took
+  970-1146 µs against 877-1217 µs inline (2026-11-18); an earlier gap
+  (598 against 1055 µs) compared different boots. The floor is mostly the
+  guest's process start and exit, the vsock connect (160-215 µs, measured
+  earlier that day) and the "start" and "exit" messages between the owner
+  and the program's worker (a growable SharedArrayBuffer costs 3 µs to
+  make).
+- Module identity (2026-11-18, inline, modules on a 9p mount, start to
+  exit through the guest shell): a hello world with a 100 MiB custom
+  section took 0.71 s on its first run and 0.31-0.34 s on later ones when
+  every run sent it, against 0.63 s and 0.01 s now; four started at once,
+  1.46 s cold and 1.07 s warm before (guest MemAvailable fell from 490 to
+  75 MiB during them: kwwasi held each module whole), 0.80 s cold (one
+  sent) and 0.09 s warm now (MemAvailable 486 MiB throughout). CPython
+  3.15.2 (32 MiB) `-c pass`: 0.31 s first, 0.14-0.15 s later, before; 0.37
+  s and 0.06-0.07 s now. A copy made less than 2 s before it runs is sent
+  each time (0.14-0.16 s).
+- Bare round trips between a Node worker and its main thread (2026-11-18):
+  messages both ways 37 µs (55 µs with 64 KiB), a message there and the
+  reply in a SharedArrayBuffer with Atomics.wait 25 µs, both ways through
+  one with Atomics.waitAsync on the main thread 19 µs (39 µs with 64 KiB).
+  A thread asleep in Atomics.wait takes tens of µs to wake; spinning
+  avoids that.
+Open:
+- Browsers: `js/web/wasi.ts` and its entry are written and the build
+  inlines them, but no browser has run them.
+- The shared path's spin keeps the program's thread busy up to 200 µs per
+  request it waits on; not measured on a phone or a host with few cores.
+- A busy guest stalls every request (2026-11-18): one write beside a
+  native busy loop (`rvbench spin`) took 35.7 ms inline and 20.1 ms in
+  worker mode, against 37-87 µs alone, the same before and after the
+  changes above; with 2 CPUs 0.1-0.13 ms (the loop on the other CPU), 20
+  ms in an occasional run. The host's packets
+  reach a busy kernel only when its thread runs the event loop: inline the
+  owner is the kernel's thread, so the program's request (a waitAsync
+  task or a message) waits for the kernel to suspend; in worker mode the
+  owner's packets go to the kernel's worker as messages, handled only
+  while it is suspended, and the guest's packets leave from a microtask
+  (worker-serve.ts) unless 64 KiB wait. A busy kernel suspends every 20 ms
+  (kernel.md, IRQs and time). Nothing in kwwasi or the WASI host can reach
+  it, and no existing wake or flush is per connection. A fix is generic:
+  in worker mode, vsock packets through the shared transport's rings
+  (worker-shared.ts, worker-serve.ts, worker-host.ts), drained by
+  `Kernel.poller` at each slice end as console input and evdev are, and
+  the guest's packets out from the import into a ring the owner waits on;
+  inline, a synchronous path from a program's channel to the guest and
+  back inside the kernel's slice-end clock import (the web streams resolve
+  in microtasks, which do not run inside an import): a synchronous
+  connection API in vsock.ts and a poller hook beside the console ring's.
+  Either changes how every vsock connection's packets cross (9p mounts,
+  kwtty and exec(), connect() and --forward, snapshots' "packets in
+  flight"), so it is not done here.
+- Worker mode and SMP add 45-50 µs to each small request against inline
+  (above): the request packet goes to the kernel's worker as a message,
+  the reply comes back as one, and an idle kernel worker is woken by a
+  "kick" message. The same shared-ring transport would remove the
+  messages; it is generic, as above.
+- A snapshot taken while a program streams data can still be refused
+  ("vsock packets in flight"), as for any vsock traffic (not tried).
+- wasi-libc's cwd is always "/" (`getcwd()`), so relative and absolute
+  paths reach kwwasi alike and it guesses by what exists (js.md, Paths and
+  the cwd; `KWWASI_CWD` overrides); the preopen replaces an inherited
+  descriptor 3. poll_oneoff's fd events come from a guest poll(); no
+  sockets, no `proc_raise`, no signals to the program.
+
 ## Roadmap
 
 1. **JIT**: bigger regions (most remaining exits leave full ones), exits

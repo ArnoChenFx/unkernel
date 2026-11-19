@@ -21,6 +21,7 @@ export { DATA_DISK_NAME, DATA_DISK_VERSION, IdbStore, dataDiskStore, importDataD
 export type { DataDiskNameOptions, HttpDiskOptions, IdbStoreOptions, OpenDataDiskOptions } from "./web/disk.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, isMobile } from "./web/memory.ts";
 export { webCpuBlocker } from "./web/cpu.ts";
+export { serveWasiPrograms } from "./web/wasi.ts";
 
 /**
  * The bundled kernel: vmlinux32.wasm with the Alpine root file system and

@@ -48,7 +48,11 @@ parts that are easy to get wrong.
   the others), and that no dist file mentions `worker-entry` or
   `cpu-entry`. Each CPU worker is inlined into its platform's kernel
   worker bundle too (`nested` in WORKERS), since in worker mode that
-  worker starts the CPUs.
+  worker starts the CPUs. The WASI program workers (`js/node/wasi-entry.ts`
+  started by `js/node/wasi.ts`, `js/web/web-wasi-entry.ts` started by
+  `js/web/wasi.ts`; WASI programs, below) are inlined the same way, into
+  the Node entries and the web entry, and no dist file may mention
+  `wasi-entry`.
 - Test the built package with `node dist/cli.mjs` and
   `UNKERNEL_DIST=1 node --test test/api.test.ts`, which imports the package
   by its own name.
@@ -355,7 +359,7 @@ parts that are easy to get wrong.
   (`worker.format: "es"`); for the dist the plugin replaces it with
   `inlineWorkerUrl(code)`, a Blob URL revoked at the first message. Each
   `WORKERS` entry has its own mark (`/*unkernel-worker:node*/`, `:web*/`,
-  `:cpu*/`, `:webcpu*/`).
+  `:cpu*/`, `:webcpu*/`, `:wasi*/`, `:webwasi*/`).
   Vite's `?worker&inline` is not usable: plain Node cannot load it.
 - A worker's WebSocket sends the page's origin, so the Wisp allow list
   works as inline; Node workers send `NODE_WISP_HEADERS`.
@@ -539,6 +543,126 @@ parts that are easy to get wrong.
   (dev server and build); the dist inlines it as a Blob URL
   (`inlineCpuUrl()`, revoked at the first message). The page (web.md,
   Several CPUs) is the only browser user so far.
+
+## WASI programs (prototype; `js/core/wasi-exec.ts`, `wasi-program.ts`)
+
+- The guest's executable wasm32-wasi files run on the host's engine:
+  binfmt_misc hands them to kwwasi (`kernel/guest/kwwasi.c`, whose top
+  describes the protocol; a change goes in kwwasi.c and both files), which
+  connects to vsock port 1021, sends argv, environment, the preopen and
+  the module's identity (the module itself only when asked), and then does
+  the program's file calls in the guest as that process. The program's
+  argv[0] is the caller's, except one without a slash (found through
+  $PATH): then it is the path exec ran (a symlink's own name), so CPython
+  finds its stdlib from $PATH and a multicall program (uutils) still sees
+  the name it was called by. `serveWasiPrograms(vm.vsock, opts)` (exported
+  by `js/node.ts` from `js/node/wasi.ts`, by `js/web.ts` from
+  `js/web/wasi.ts`; core's `serveWasiProgramsWith()` takes the spawner)
+  listens there; the CLI's `--wasi` calls it.
+- The owner (`wasi-exec.ts`) is wherever `vm.vsock`'s VsockHost runs: the
+  kernel's thread inline, the owner's thread in worker mode and with
+  several CPUs. It parses START, gets the module (below), checks its
+  imports and gives each running program a worker of its own, started by
+  the owner, not by the kernel worker, since the connection is the owner's
+  (one thread boundary per request, not two).
+  The worker (`wasi-program.ts`, `serveWasiProgram()`) gets the compiled
+  `WebAssembly.Module` in its "start" message, so V8 compiles once and its
+  tiered-up code serves every later run.
+- Modules (`ModuleCache`): compiled ones are kept by the SHA-256 of their
+  bytes (16 and 512 MiB of module files at most by default,
+  `moduleCache`, least recently used first; the newest stays even when
+  larger), and START's identity of the file (size, dev, ino, mtime and
+  ctime, from kwwasi's fstat of the file it opened) maps to one of them
+  (256 identities at most). The host answers MODULE 0 (it has it) or 1:
+  kwwasi then sends the file in 256 KiB DATA frames, reading it as it goes
+  (it never holds it whole), and END with the identity after reading; the
+  host maps the identity only if END's is START's. A START whose identity
+  is being sent waits for that transfer, so simultaneous starts send it
+  once. Identities belong to one machine (one `serveWasiPrograms()`, one
+  VsockHost; a restored snapshot is another VsockHost and gets its own
+  map). Timestamps are only as fine as the file system's (the initramfs's
+  rootfs: a clock tick; three in-place rewrites of the same size in a row
+  kept one ctime, 2026-11-18), so a file whose ctime is less than 2 s old
+  when kwwasi opens it is UNSETTLED: sent, never mapped (as git treats
+  racily clean files; this also covers a rewrite while kwwasi reads it).
+  On a 9p mount a host-side edit shows once the attribute cache expires
+  (1 s), as for reading the file. `stats.received` counts modules sent,
+  `stats.cached` compiled modules kept.
+- Calls kwwasi answers are a round trip to the owner, which writes the
+  request frame to the connection and hands the REPLY body back. Two
+  paths, one body of code (`#call()` returns a Reply or a promise of one):
+  - Shared, chosen when `wasiSharedChannelAvailable()` (SharedArrayBuffer
+    that can be posted, growable, and `Atomics.waitAsync`: Node; browsers
+    only when cross-origin isolated): one growable SharedArrayBuffer per
+    program (`CH_*` in wasi-program.ts; 256 KiB, grown up to kwwasi's
+    64 MiB frame limit). The import writes the frame there and bumps
+    `CH_REQ`, spins up to 200 µs (`SPIN_MS`), then sleeps in `Atomics.wait`;
+    the owner wakes on `Atomics.waitAsync` (it never blocks), writes the
+    body over the frame and sets `CH_REP`. The imports are plain functions,
+    so no JSPI is needed in the worker; `_start` runs to its end inside the
+    "start" message's handler. `terminate()` ends a worker that sleeps in
+    `Atomics.wait` at once.
+  - Messages, the fallback (`sharedMemory: false`): JSPI Suspending
+    imports, the frame goes as a "request" message and the body comes back
+    as "reply" (transferred). No cross-origin isolation needed.
+  Args, environ, clocks, random and preopens are answered in the worker.
+  Copies: a write's data is copied once on this side, from the program's
+  memory into the channel or the request message (transferred); the owner
+  writes request frames to the connection as they are (the connection
+  copies what it is given, and a channel frame is overwritten only after
+  kwwasi has read it all and replied), and reads a REPLY body straight
+  into the channel, or hands the connection's own chunk on when it is
+  exactly the body (messages).
+- Paths and the cwd (kwwasi.c's top, `resolve()`): a WASI program has no
+  cwd. wasi-libc's starts as "/" (no PWD; upstream main and zig 0.16's
+  copy alike), a relative path is made absolute against it, the leading
+  "/" is stripped and the longest matching preopen name wins, so
+  "/etc/x" and "etc/x" both reach path_open as (3, "etc/x"); only in a
+  program without chdir() linked does "./x" arrive as "./x" (Rust's std and
+  CPython 3.15 strip it too; all three traced 2026-11-18). So kwwasi
+  preopens one directory, "/" at descriptor 3, and in a cwd other than "/"
+  picks per path: "/x" absolute; ".", "./x", "../x" the cwd's; the first
+  component where it exists (a new name in the cwd); in both, where the
+  whole path (else its parent) exists in only one; else the cwd. Such a
+  collision, and creating an entry whose name exists only in "/" ("mkdir
+  lib": "/lib", EEXIST), warn once per run on stderr. `KWWASI_CWD`: `auto`
+  (no warning), `root` (undecided collisions to "/"), `off` (descriptor 3
+  is "/", every path from "/"). Known wrong cases: `ls /` lists the cwd
+  (the program's "/" and "." are one), a relative "tmp/x" in a cwd without
+  `tmp` is "/tmp/x" (ENOENT on Linux), and an inherited descriptor 3 is
+  replaced (4 and up stay).
+- Preview 0 (`wasi_unstable`, older toolchains such as wasienv): a module
+  may import it (or both); it gets the preview 1 functions adapted where
+  the preview 0 witx (wasmtime `crates/wasi/witx/p0`) differs: fd_seek's
+  whence (CUR 0, END 1, SET 2), the 56-byte filestat with a u32 nlink, and
+  poll_oneoff's 56-byte subscriptions (a u64 `identifier` before the clock
+  id); events, dirents, fdstat and errno are the same, and preview 0 has
+  no sock_accept. `test/wasi/p0.c` (no libc) checks those three.
+- Ending: "exit" (proc_exit, return, trap 134, failed instantiation 126)
+  becomes kwwasi's EXIT; that worker is idle and is kept for the next
+  program (`idleWorkers`, default 2; a worker is reused only after its
+  program ended by itself). When the connection ends first (kwwasi killed,
+  the kernel exited or stopped) the worker is terminated at once, mid
+  computation or not. `stats`: `running` programs, live `workers` (Node:
+  until its exit event), `idle` ones, `channels` whose owner loop still
+  runs (shared path; 0 a task turn after the program ended). `close()`
+  stops listening and ends the idle workers.
+- Snapshots: programs are not in them and do not hold the snapshot point
+  up (no `hostBusy`, no `keep`), so the restored kernel resets kwwasi's
+  connection and kwwasi exits 126 ("lost the connection to the host"); it
+  watches the connection while it waits on a blocking read, write or poll,
+  so a program waiting for its stdin ends too. Reads and writes that cannot
+  block skip that watch (`may_block()`: directories, /dev/null, zero, full
+  and urandom, regular files on tmpfs, ramfs, ext4, overlayfs, 9p and a few
+  other disk file systems; cached per descriptor), as preads and pwrites
+  always did. An EXIT that comes while a request is in flight (the
+  program's worker failed) is still obeyed when the reply's send then fails.
+- kwwasi's cost per request is system calls, each slow under emulation:
+  one recv() for a frame that has arrived whole, one send() per frame (its
+  header kept in front of the payload), buffers kept between requests and
+  no copies of the program's data (kwwasi.c's top).
+- `test/wasi-binfmt.ts` (`--messages` forces the fallback; state and
+  numbers in status.md).
 
 ## vsock (`js/core/vsock.ts`)
 

@@ -48,5 +48,7 @@ export { WorkerKernel } from "./worker-host.ts";
 export type { WorkerKernelOptions } from "./worker-host.ts";
 export { sharedMemoryAvailable } from "./worker-shared.ts";
 export type { KernelTransport } from "./worker-shared.ts";
+export { WASI_EXEC_PORT } from "./wasi-exec.ts";
+export type { WasiExecOptions, WasiExecServer, WasiExecStats } from "./wasi-exec.ts";
 export { DEVICE_SPEC_VERSION, isDiskSpec, isNetSpec } from "./devices.ts";
 export type { DataDiskSpec, DiskSpec, DiskState, FileDiskSpec, HttpDiskSpec, NetBackendSpec, NetSpec, SkippedDisk } from "./devices.ts";

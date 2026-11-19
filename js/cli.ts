@@ -25,6 +25,7 @@ import { directBackend, wispBackend } from "./node/net.ts";
 import { nodeFs } from "./node/nodefs.ts";
 import { nodePlatform } from "./node/platform.ts";
 import { cliSound } from "./node/sound.ts";
+import { serveWasiPrograms } from "./node/wasi.ts";
 
 // Next to this file, like the Node entry's (this module is an entry too, so
 // the URL stays relative to dist/cli.mjs; in a source checkout js/ has a
@@ -37,7 +38,7 @@ const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--initrd al
        [--data FILE [--data-template FILE.kwsparse.gz]]
        [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
        [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]] [--smp N]
-       [--mount HOSTDIR:GUESTPATH[:ro]]... [--forward HOSTPORT:GUESTPORT]...
+       [--mount HOSTDIR:GUESTPATH[:ro]]... [--forward HOSTPORT:GUESTPORT]... [--wasi]
        [--restore FILE]
 
 With no arguments it boots Alpine from the bundled kernel (unkernel-alpine.wasm:
@@ -131,6 +132,14 @@ connects each connection to the guest's 127.0.0.1:GUESTPORT (repeatable), e.g.
 SDK's vm.connect()), not the network, so it works with --no-net too, and it
 needs vsock. Half-closes pass through; a refused guest port resets the host
 connection.
+
+--wasi (prototype) runs the guest's WASI programs (wasm32-wasi .wasm files,
+preview 1 or 0, executable, run by path) on this host's wasm engine, each in
+a worker thread of its own: the guest's binfmt_misc hands them to
+/usr/bin/kwwasi, which talks to the host over vsock port 1021 and does the
+program's file I/O in the guest, as that process; killing kwwasi ends the
+program. It needs vsock, and kwwasi registered in the guest
+(/etc/kw-binfmt.sh).
 
 --shm gives the guest kwshm (/dev/kwshm: guest programs export shmem files to
 the host, which reads and writes their pages in place; the SDK's vm.shm). The
@@ -340,6 +349,10 @@ for (const [i, a] of args.entries()) {
 	}
 	forwards.push({ host, guest });
 }
+if (flag("wasi") && flag("no-vsock")) {
+	process.stderr.write("[host] --wasi needs vsock (kwwasi connects over it); drop --no-vsock\n");
+	process.exit(1);
+}
 if (forwards.length && flag("no-vsock")) {
 	process.stderr.write("[host] --forward needs vsock (kwtty connects in the guest); drop --no-vsock\n");
 	process.exit(1);
@@ -424,6 +437,7 @@ try {
 	})
 		: await createKernelOn(nodePlatform(bundledKernelUrl), { ...common, disks, net });
 	if (worker) log(`[host] kernel worker: input and frames by ${vm.transport === "shared" ? "shared memory" : "messages"}`);
+	if (flag("wasi")) serveWasiPrograms(vm.vsock!, { log });
 	vmReady(vm);
 } catch (e) {
 	process.stderr.write(`[host] boot failed: ${(e as Error).stack ?? e}\n`);

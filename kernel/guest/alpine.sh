@@ -25,6 +25,10 @@
 #                             AF_VSOCK port 1022 (host side js/core/tty.ts), run by inittab
 #   /usr/bin/kw9p             kernel/guest/kw9p.c, mounts a 9p file system the host serves
 #                             over AF_VSOCK (host side js/core/9p.ts)
+#   /usr/bin/kwwasi           kernel/guest/kwwasi.c, runs WASI preview 1 .wasm programs on
+#                             the host's wasm engine, from binfmt_misc (/etc/kw-binfmt.sh;
+#                             host side js/core/wasi-exec.ts). Prototype: no image with it
+#                             has been built yet
 set -euo pipefail
 
 . "$(dirname "$0")/../tools/env.sh"   # root, zig, ALPINE_*, fetch_verified, need_zig
@@ -329,6 +333,12 @@ reg i386 '\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03\x0
 	'\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
 reg arm '\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00' \
 	'\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
+# WebAssembly modules (binary format version 1, which WASI preview 1 programs
+# are) run on the host's wasm engine through kwwasi, which needs a host
+# serving vsock port 1021 (the CLI's --wasi). Prototype.
+if [ -x /usr/bin/kwwasi ] && [ ! -e $d/wasi ]; then
+	printf '%s\n' ':wasi:M::\x00asm\x01\x00\x00\x00::/usr/bin/kwwasi:P' > $d/register
+fi
 EOF
 chmod 755 "$stage/etc/kw-binfmt.sh"
 # The binfmt_misc interpreter: $1 = the binary, $2 = its argv[0], then its
@@ -466,10 +476,12 @@ EOF
 # the vsock pipe (kwvsock.c; it needs a host with vsock, CLI --vsock or the SDK),
 # the shm exporter (kwshm.c; it needs a host with shm, CLI --shm or the SDK)
 # the terminal server (kwtty.c, from inittab; it serves a host with vsock)
-# and the 9p mounter (kw9p.c; it needs a host serving 9p over vsock).
+# the 9p mounter (kw9p.c; it needs a host serving 9p over vsock)
+# and the WASI runner (kwwasi.c, from binfmt_misc; it needs a host serving
+# vsock port 1021, e.g. the CLI's --wasi).
 # All static aarch64 musl for the generic CPU (ARMv8.0, what kwemu runs).
 cc_guest=("$zig" cc -target aarch64-linux-musl -mcpu=generic -static -O2 -s)
-for t in glimmer kwvsock kwshm kwtty kw9p; do
+for t in glimmer kwvsock kwshm kwtty kw9p kwwasi; do
 	"${cc_guest[@]}" -o "$stage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
 # The kernel tests and benchmark (see the top of this file) are not in the

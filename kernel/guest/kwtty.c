@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 /*
- * kwtty: terminal sessions over AF_VSOCK (static riscv64 musl),
+ * kwtty: terminal sessions over AF_VSOCK (static aarch64 musl),
  * /usr/bin/kwtty in the Alpine initramfs, started by inittab as
  * "::respawn:/usr/bin/kwtty serve". The host side is js/core/tty.ts.
  *

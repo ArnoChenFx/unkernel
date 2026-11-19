@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Ubuntu Base 24.04 LTS riscv64 (glibc, dpkg and apt, no init system) as an
+# Ubuntu Base 24.04 LTS arm64 (glibc, dpkg and apt, no init system) as an
 # ext4 disk image for kwblk, built without root privileges like
 # alpine-disk.sh: `mke2fs -d` from the extracted tree, then debugfs gives
 # every file the owner and mode (setuid/setgid included) from the tarball
@@ -86,7 +86,8 @@ shutdown_now() {
 	# Remounting read-only flushes the journal and marks the fs clean.
 	mount -o remount,ro / 2>&3 && echo "kw-shutdown: / is clean (read-only)"
 	sync
-	# reboot(2) is syscall 142 on riscv64: no reboot binary without systemd.
+	# reboot(2) is syscall 142 on arm64 (the generic table): no reboot
+	# binary without systemd.
 	exec perl -e 'syscall(142, 0xfee1dead, 0x28121969, hex($ARGV[0])); die "reboot: $!\n"' "$1" 2>&3
 }
 if [ $$ != 1 ]; then

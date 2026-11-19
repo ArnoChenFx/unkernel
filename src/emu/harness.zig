@@ -6,13 +6,13 @@
 //!   * builds Sv39 page tables in its own "physical memory" buffer
 //!     (physical address 0x8000_0000 = first byte of the buffer, so
 //!     phys_base is non-trivial);
-//!   * loads a static riscv64 ELF, builds argv/envp/auxv on the stack;
+//!   * loads a static aarch64 ELF, builds argv/envp/auxv on the stack;
 //!   * demand paging: mmap/brk/stack only *reserve* pages (non-valid PTEs
 //!     carrying a software "reserved" bit + prot); faults allocate frames;
 //!   * new PTEs start with A=0/D=0, so the emulator faults again and the
 //!     kernel sets A (and D on writes) and flushes the TLB range - this
 //!     exercises the A/D protocol on every page;
-//!   * runs in budget slices, clears the LR/SC reservation on every trap
+//!   * runs in budget slices, clears the exclusive monitor on every trap
 //!     return, and services ~40 Linux syscalls (enough for static musl).
 //!
 //! Platform-independent: native and wasm front ends supply a `Host`.
@@ -228,7 +228,7 @@ pub const Machine = struct {
             }
         }.f;
         if (image.len < 64 or !std.mem.eql(u8, image[0..4], "\x7fELF") or image[4] != 2 or image[5] != 1) return error.BadElf;
-        if (rd(u16, image, 18) != 243) return error.NotRiscv;
+        if (rd(u16, image, 18) != 183) return error.NotAarch64;
         const etype = rd(u16, image, 16);
         const flags = rd(u32, image, 48);
         const entry0 = rd(u64, image, 24);
@@ -236,14 +236,7 @@ pub const Machine = struct {
         const phentsize = rd(u16, image, 54);
         const phnum = rd(u16, image, 56);
         const bias: u64 = if (etype == 3) 0x1000_0000 else 0;
-        if (m.opt.verbose) m.print("[harness] e_flags=0x{x} (float abi {s}, rvc={})\n", .{
-            flags, switch ((flags >> 1) & 3) {
-                0 => "soft",
-                1 => "single",
-                2 => "double",
-                else => "quad",
-            }, flags & 1 != 0,
-        });
+        if (m.opt.verbose) m.print("[harness] e_flags=0x{x}\n", .{flags});
 
         var phdr_va: u64 = 0;
         var max_end: u64 = 0;
@@ -280,7 +273,10 @@ pub const Machine = struct {
 
         // Stack: reserve, then argv/envp/auxv at the top.
         m.reserve(stack_top - stack_size, stack_top, 3);
-        var sp = stack_top;
+        // Like Linux, keep the strings off the very top (it puts the exec
+        // file name and a null word there): libc may read a few bytes past
+        // a string's end (aarch64 memchr loads 16 bytes at a time).
+        var sp = stack_top - 16;
         var ptrs: [64]u64 = undefined;
         var n: usize = 0;
         for (argv) |a| {
@@ -302,14 +298,13 @@ pub const Machine = struct {
         var rnd: [16]u8 = undefined;
         for (&rnd) |*b| b.* = @truncate(m.random());
         _ = m.copyOut(random_va, &rnd);
-        const hwcap: u64 = (1 << ('i' - 'a')) | (1 << ('m' - 'a')) | (1 << ('a' - 'a')) |
-            (1 << ('f' - 'a')) | (1 << ('d' - 'a')) | (1 << ('c' - 'a'));
+        const hwcap: u64 = 3; // HWCAP_FP | HWCAP_ASIMD
         const auxv = [_][2]u64{
-            .{ 3, phdr_va },      .{ 4, phentsize }, .{ 5, phnum }, .{ 6, page },
-            .{ 7, 0 },            .{ 8, 0 },         .{ 9, entry0 + bias }, .{ 11, 0 },
-            .{ 12, 0 },           .{ 13, 0 },        .{ 14, 0 },    .{ 16, hwcap },
-            .{ 17, 100 },         .{ 23, 0 },        .{ 25, random_va },
-            .{ 31, if (argv.len > 0) ptrs[0] else 0 }, .{ 0, 0 },
+            .{ 3, phdr_va }, .{ 4, phentsize }, .{ 5, phnum },         .{ 6, page },
+            .{ 7, 0 },       .{ 8, 0 },         .{ 9, entry0 + bias }, .{ 11, 0 },
+            .{ 12, 0 },      .{ 13, 0 },        .{ 14, 0 },            .{ 16, hwcap },
+            .{ 17, 100 },    .{ 23, 0 },        .{ 25, random_va },    .{ 31, if (argv.len > 0) ptrs[0] else 0 },
+            .{ 0, 0 },
         };
         const words = 1 + argv.len + 1 + envp.len + 1 + auxv.len * 2;
         sp = (sp - words * 8) & ~@as(u64, 15);
@@ -334,7 +329,11 @@ pub const Machine = struct {
             w += 16;
         }
         m.regs.pc = entry0 + bias;
-        m.regs.x[2] = sp;
+        m.regs.sp = sp;
+    }
+
+    fn pc(m: *const Machine) u64 {
+        return m.regs.pc;
     }
 
     fn random(m: *Machine) u64 {
@@ -364,79 +363,22 @@ pub const Machine = struct {
                     m.fault(ev.addr, ev.access);
                     kw.kw_clear_reservation(m.cpu);
                 },
-                kw.KW_EV_ILLEGAL => m.die(4, "illegal instruction 0x{x} at pc=0x{x}", .{ ev.insn, m.regs.pc }),
-                kw.KW_EV_BREAKPOINT => m.die(5, "breakpoint at pc=0x{x}", .{m.regs.pc}),
-                kw.KW_EV_MISALIGNED => m.die(7, "misaligned atomic at 0x{x} pc=0x{x}", .{ ev.addr, m.regs.pc }),
+                kw.KW_EV_ILLEGAL => m.die(4, "illegal instruction 0x{x} at pc=0x{x}", .{ ev.insn, m.pc() }),
+                kw.KW_EV_BREAKPOINT => m.die(5, "breakpoint at pc=0x{x}", .{m.pc()}),
+                kw.KW_EV_MISALIGNED => m.die(7, "misaligned access at 0x{x} pc=0x{x}", .{ ev.addr, m.pc() }),
                 else => m.die(6, "unknown event {d}", .{kind}),
             }
         }
         const dt = @max(m.host.now_ns() - t0, 1);
-        if (m.opt.stats and @import("kwemu_options").stats) {
-            // layout of kwemu.Stats: 11 counters, op_hist[nk], jit_insns,
-            // jit_handbacks, jit_hb[nk], jit_hb_gen[40], jit_jx[64], with nk =
-            // kwemu.max_ops (192)
-            const nk = 192;
-            const n_st = 11 + nk + 2 + nk + 40 + 64;
-            var st: [n_st]u64 = undefined;
-            @extern(*const fn (*kw.struct_kw_cpu, *[n_st]u64) callconv(.c) void, .{ .name = "kw_debug_stats" })(m.cpu, &st);
-            printJitStats(m, st[n_st - 64 ..]);
-            var line: [2048]u8 = undefined;
-            var pos: usize = 0;
-            for (st[11..][0..nk], 0..) |v, i| {
-                if (v * 200 < m.cpu.icount) continue; // >= 0.5%
-                const sl = std.fmt.bufPrint(line[pos..], " op{d}={d:.1}%", .{ i, @as(f64, @floatFromInt(v)) * 100 / @as(f64, @floatFromInt(m.cpu.icount)) }) catch break;
-                pos += sl.len;
-            }
-            m.print("[kwemu-ops]{s}\n", .{line[0..pos]});
-            const jit_insns = st[11 + nk];
-            const hbs = st[12 + nk];
-            if (jit_insns != 0 or hbs != 0) {
-                pos = 0;
-                // hand-backs per op handler (>= 1% of all hand-backs), then
-                // per generic class (g<OP-FP funct5>, g32 SYSTEM, g33 AMO, ...)
-                for (st[13 + nk ..][0..nk], 0..) |v, i| {
-                    if (v == 0 or v * 100 < hbs) continue;
-                    const sl = std.fmt.bufPrint(line[pos..], " op{d}={d}", .{ i, v }) catch break;
-                    pos += sl.len;
-                }
-                for (st[13 + 2 * nk ..][0..40], 0..) |v, i| {
-                    if (v == 0 or v * 100 < hbs) continue;
-                    const sl = std.fmt.bufPrint(line[pos..], " g{d}={d}", .{ i, v }) catch break;
-                    pos += sl.len;
-                }
-                m.print("[kwemu-jit] compiled insns={d:.2}% handbacks={d} (per 1M insns: {d:.1}):{s}\n", .{
-                    @as(f64, @floatFromInt(jit_insns)) * 100 / @as(f64, @floatFromInt(@max(m.cpu.icount, 1))),
-                    hbs,
-                    @as(f64, @floatFromInt(hbs)) * 1e6 / @as(f64, @floatFromInt(@max(m.cpu.icount, 1))),
-                    line[0..pos],
-                });
-            }
-            m.print("[kwemu-stats] lookups_slow={d} revalidated={d} decoded={d} resets={d} blocks={d} insns/block={d:.2} single_steps={d} walks r/w/x={d}/{d}/{d} generic={d}\n", .{
-                st[0], st[1], st[2], st[3], st[4], @as(f64, @floatFromInt(st[5])) / @as(f64, @floatFromInt(@max(st[4], 1))), st[6], st[7], st[8], st[9], st[10],
-            });
-        }
         if (m.opt.stats) {
             const n = m.cpu.icount;
             const mips = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(dt)) * 1000.0;
             m.print("[kwemu] instret={d} time={d}ms MIPS={d:.1} syscalls={d} demand_faults={d} ad_faults={d} spurious={d} frames={d}\n", .{
-                n,                     dt / 1_000_000,          mips,                    m.stats.syscalls,
-                m.stats.demand_faults, m.stats.ad_faults,       m.stats.spurious_faults, m.next_frame / page,
+                n,                     dt / 1_000_000,    mips,                    m.stats.syscalls,
+                m.stats.demand_faults, m.stats.ad_faults, m.stats.spurious_faults, m.next_frame / page,
             });
         }
         return m.exit_code.?;
-    }
-
-    /// -Dkwemu-stats: the JIT counters (Stats.jit.jx, indices in jit.zig `Jx`), if any.
-    fn printJitStats(m: *Machine, jx: []const u64) void {
-        var line: [64 * 21]u8 = undefined;
-        var pos: usize = 0;
-        var any = false;
-        for (jx) |v| {
-            any = any or v != 0;
-            const sl = std.fmt.bufPrint(line[pos..], " {d}", .{v}) catch break;
-            pos += sl.len;
-        }
-        if (any) m.print("[kwemu-jx]{s}\n", .{line[0..pos]});
     }
 
     fn die(m: *Machine, sig: u8, comptime fmt: []const u8, args: anytype) void {
@@ -446,10 +388,10 @@ pub const Machine = struct {
 
     fn fault(m: *Machine, va: u64, access: u32) void {
         const pg = va & ~(page - 1);
-        const s = m.slot(va, false) orelse return m.die(11, "segfault at 0x{x} (no table) pc=0x{x}", .{ va, m.regs.pc });
+        const s = m.slot(va, false) orelse return m.die(11, "segfault at 0x{x} (no table) pc=0x{x}", .{ va, m.pc() });
         const pte = s.*;
         if (pte & pte_v == 0) {
-            if (pte & pte_resv == 0) return m.die(11, "segfault at 0x{x} pc=0x{x}", .{ va, m.regs.pc });
+            if (pte & pte_resv == 0) return m.die(11, "segfault at 0x{x} pc=0x{x}", .{ va, m.pc() });
             m.populate(s);
             return; // retry: will fault again for A (and D)
         }
@@ -459,7 +401,7 @@ pub const Machine = struct {
             else => pte_x,
         };
         if (pte & need == 0 or pte & pte_u == 0)
-            return m.die(11, "protection fault ({d}) at 0x{x} pc=0x{x}", .{ access, va, m.regs.pc });
+            return m.die(11, "protection fault ({d}) at 0x{x} pc=0x{x}", .{ access, va, m.pc() });
         const new = pte | pte_a | (if (access == kw.KW_ACCESS_WRITE) pte_d else 0);
         if (new == pte) {
             m.stats.spurious_faults += 1;
@@ -475,10 +417,12 @@ pub const Machine = struct {
         return 0 -% e;
     }
 
+    /// The asm-generic syscall numbers (aarch64): number in x8, arguments
+    /// in x0..x5, result in x0.
     fn syscall(m: *Machine) void {
         m.stats.syscalls += 1;
-        const nr = m.regs.x[17];
-        const a = m.regs.x[10..16];
+        const nr = m.regs.x[8];
+        const a = m.regs.x[0..6].*;
         const ret: u64 = switch (nr) {
             29 => neg(ENOTTY), // ioctl
             56, 48, 78 => neg(ENOENT), // openat, faccessat, readlinkat
@@ -520,7 +464,7 @@ pub const Machine = struct {
             132, 134, 135 => 0, // sigaltstack, rt_sigaction, rt_sigprocmask
             160 => blk: { // uname
                 var u: [6 * 65]u8 = @splat(0);
-                for ([_][]const u8{ "Linux", "kwemu", "6.12.0", "#1", "riscv64", "" }, 0..) |s, i| @memcpy(u[i * 65 ..][0..s.len], s);
+                for ([_][]const u8{ "Linux", "kwemu", "6.12.0", "#1", "aarch64", "" }, 0..) |s, i| @memcpy(u[i * 65 ..][0..s.len], s);
                 break :blk if (m.copyOut(a[0], &u)) 0 else neg(EFAULT);
             },
             172, 178 => 1, // getpid, gettid
@@ -538,7 +482,6 @@ pub const Machine = struct {
                 break :blk 0;
             },
             233 => 0, // madvise
-            259 => 0, // riscv_flush_icache
             261, 163, 293 => neg(ENOSYS), // prlimit64, getrlimit, rseq
             278 => blk: { // getrandom
                 var i: u64 = 0;
@@ -550,7 +493,7 @@ pub const Machine = struct {
                 break :blk neg(ENOSYS);
             },
         };
-        m.regs.x[10] = ret;
+        m.regs.x[0] = ret;
     }
 
     fn pageUp(v: u64) u64 {

@@ -1,22 +1,30 @@
 # kwemu and its JIT tier
 
-kwemu is the RV64GC user-mode CPU (plus optional extensions, below) that the
-kernel links (`zig-out/lib/libkwemu.a`, contract `include/kw_emu.h`; the
-kernel side is in kernel.md). This file has the design, the invariants that
-tests guard, the numbers that drive decisions, and the designs that were
-tried and rejected.
+On this branch the library exports the AArch64 CPU (a64.md): `kw_run` is
+the A64 interpreter and `struct kw_regs` the A64 register file (ABI 9).
+This file describes the RV64GC CPU that kwemu was until ABI 8 (plus
+optional extensions, below), kept for reference. What A64 still shares
+with it: `kwemu.Cpu` in `src/emu/kwemu.zig` (struct kw_cpu, the Sv39
+walker, the TLBs and flushes, `Hart.resv` as the exclusive monitor) and
+`src/cpu/fpu.zig`. The riscv guests and unit tests build only with
+`-Driscv-legacy` (`zig build test-riscv`: the native and the wasm64+JIT unit
+tests); the harness is A64-only, so `test/kwemu-test.mjs`,
+`kwemu-bench.mjs` and the riscv guests' harness runs do not work. The rest
+of this file has the design, the invariants that tests guarded, the numbers
+that drove decisions, and the designs that were tried and rejected.
 
 ## Sources and outputs
 
 | Path | What |
 | --- | --- |
-| `src/libkwemu.zig`, `src/emu/kwemu.zig` | C ABI, Sv39 walker and TLBs, block cache (lookup, validation, SMC tracking), `kw_run` |
+| `src/libkwemu.zig` | library root: exports the A64 C ABI (`src/a64/run.zig`) |
+| `src/emu/kwemu.zig` | Sv39 walker and TLBs (shared with A64), riscv block cache (lookup, validation, SMC tracking), the riscv `run` |
 | `src/emu/exec.zig` | decoder (RV64GC to ops), op semantics, dispatch |
 | `src/emu/jit.zig` | JIT tier: block and region emitter, slot pool, compile policy, host imports |
 | `src/cpu/core.zig` | reference interpreter; kwemu runs its `generic` ops through it |
 | `src/cpu/fpu.zig` | exact softfloat for all rounding modes and flags, host-float fast paths for RNE |
 | `src/emu/kwemu_test.zig` | unit tests; roots `src/tests.zig` (native) and `src/tests_wasm.zig` (wasm64 with the JIT) |
-| `src/emu/harness*.zig` | test "kernel" using only the C ABI (native and wasm64) |
+| `src/emu/harness*.zig` | test "kernel" using only the C ABI (native and wasm64; A64 ELFs) |
 | `guest/` | test guests: `isatest`, `fptest`, `atomics`, `kbench`, `aestest` (+zkne,+zknd), `bktest` (+zbc,+zbkb,+zbkc,+zbkx), `zbtest` (+zba,+zbb,+zbs,+zicond), `rvatest` (+zcb,+zimop,+zcmop,+zicbom,+zicboz,+zawrs), `zfatest` (+zfa), `zfhtest` (+zfhmin), `jalrtest` (C, static musl); `hello`, `bench` (Zig, `rt.zig`) |
 | `test/kwemu-test.mjs`, `kwemu-unit-wasm.mjs` | run by `zig build test` |
 | `test/kwemu-jit-host.mjs` | JS host of the JIT imports, for tests and benchmarks |
@@ -25,7 +33,8 @@ tried and rejected.
 
 `zig build` writes `zig-out/lib/{kwemu.o,libkwemu.a}` (wasm64, cpu `mvp` +
 memory64 only, undefined `__stack_pointer`), `zig-out/lib/native/libkwemu.a`,
-and `zig-out/bin/kwemu-harness{,-jit}.wasm`.
+`zig-out/bin/kwemu-harness{,.wasm}` (A64) and the A64 tools and guests
+(a64.md). The JIT harness `kwemu-harness-jit.wasm` is no longer built.
 
 Build options: `-Dkwemu-jit` (off for plain `zig build`; kernel/build.sh
 turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (8192

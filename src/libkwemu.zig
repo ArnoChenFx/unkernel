@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! Root of the kwemu library build (static archive + relocatable object).
-//! The implementation is in emu/kwemu.zig; the contract is include/kw_emu.h.
+//! The contract is include/kw_emu.h (A64); the C ABI is exported from
+//! a64/run.zig, on top of the MMU in emu/kwemu.zig.
 
-const kwemu = @import("emu/kwemu.zig");
+const a64 = @import("a64/run.zig");
 
 comptime {
-    kwemu.exportAbi();
+    a64.exportAbi();
 }
 
 /// Safety checks are compiled out in release builds; anything that still

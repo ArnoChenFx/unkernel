@@ -196,12 +196,12 @@ const cases = {
 		const img = fresh();
 		let b = boot(img); await b.prompt();
 		// mv runs before the swap; nothing dynamic runs after it.
-		await b.run("head -c 4096 /lib/ld-musl-riscv64.so.1 > /lib/ld.broken; sync");
-		b.send("mv /lib/ld.broken /lib/ld-musl-riscv64.so.1\n");
+		await b.run("head -c 4096 /lib/ld-musl-aarch64.so.1 > /lib/ld.broken; sync");
+		b.send("mv /lib/ld.broken /lib/ld-musl-aarch64.so.1\n");
 		await sleep(4000); // the journal commit (commit=1)
 		await b.kill();
 		b = await expectSafe(img, "libc", /\/bin\/sh does not run/);
-		await b.run("rm /data/overlay/upper/lib/ld-musl-riscv64.so.1");
+		await b.run("rm /data/overlay/upper/lib/ld-musl-aarch64.so.1");
 		await b.poweroff();
 		await expectOverlay(img, "libc repaired");
 	},

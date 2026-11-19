@@ -2,7 +2,7 @@
   <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
   <!-- Copyright (C) 2026 Pooya Parsa <pooya@pi0.io> -->
   <title id="title">How unkernel fits together</title>
-  <desc id="desc">Unmodified riscv64 Linux programs run on kwemu, a riscv64 CPU linked into the Linux 7.x kernel; both are built into unkernel.wasm, and the kernel runs as native wasm. Programs make syscalls into the kernel (MMU, cgroups, namespaces, ext4, overlayfs, FUSE, 9p, TCP/IP, TUN, vsock, ALSA, evdev, fbdev), which talks through paravirtual devices to the JavaScript SDK: console, terminals, exec, host files, disks, network, fetch, screen, input, sound, vsock, shared memory, snapshots and workers.</desc>
+  <desc id="desc">Unmodified aarch64 Linux programs run on kwemu, an aarch64 CPU linked into the Linux 7.x kernel; both are built into unkernel.wasm, and the kernel runs as native wasm. Programs make syscalls into the kernel (MMU, cgroups, namespaces, ext4, overlayfs, FUSE, 9p, TCP/IP, TUN, vsock, ALSA, evdev, fbdev), which talks through paravirtual devices to the JavaScript SDK: console, terminals, exec, host files, disks, network, fetch, screen, input, sound, vsock, shared memory, snapshots and workers.</desc>
   <style>
     svg { --card: #ffffff; --stroke: #e2e8f0; --text: #0f172a; --muted: #64748b; --pill: #f8fafc; --pillstroke: #e2e8f0; --line: #94a3b8; --mod1: #eef2ff; --mod2: #f5f3ff; --modstroke: #c7d2fe; --green: #16a34a; --amber: #d97706; --blue: #2563eb; --dot: #6366f1; --shadow: 0.07; }
     @media (prefers-color-scheme: dark) { svg { --card: #161b22; --stroke: #30363d; --text: #e6edf3; --muted: #9198a1; --pill: #0d1117; --pillstroke: #30363d; --line: #6e7681; --mod1: #1b1d3f; --mod2: #211a3d; --modstroke: #4338ca; --green: #3fb950; --amber: #f0b429; --blue: #79c0ff; --dot: #a5b4fc; --shadow: 0; } }
@@ -43,7 +43,7 @@
   <rect class="card" x="40" y="20" width="720" height="86" rx="14" filter="url(#shadow)"/>
   <text class="tag green" x="400.0" y="48" text-anchor="middle">USER SPACE</text>
   <text class="title" x="400.0" y="72" text-anchor="middle">Linux programs</text>
-  <text class="sub" x="400.0" y="92" text-anchor="middle">unmodified riscv64 binaries</text>
+  <text class="sub" x="400.0" y="92" text-anchor="middle">unmodified aarch64 binaries</text>
 
   <!-- unkernel.wasm -->
   <rect class="module" x="40" y="146" width="720" height="270" rx="16"/>
@@ -51,9 +51,9 @@
   <rect class="card" x="64" y="212" width="276" height="182" rx="12" filter="url(#shadow)"/>
   <text class="tag amber" x="86" y="240">USER-MODE CPU</text>
   <text class="title" x="86" y="264">kwemu</text>
-  <text class="sub" x="86" y="288">riscv64 CPU written in Zig</text>
-  <text class="sub" x="86" y="308">RV64GC + scalar RVA23U64</text>
-  <text class="sub" x="86" y="328">hot code compiled to wasm</text>
+  <text class="sub" x="86" y="288">aarch64 CPU written in Zig</text>
+  <text class="sub" x="86" y="308">ARMv8.0-A + AES, SHA, CRC32</text>
+  <text class="sub" x="86" y="328">an interpreter (JIT to come)</text>
   <text class="sub" x="86" y="348">walks the kernel's page tables</text>
   <rect class="badge amber" x="205" y="226" width="119" height="22" rx="11"/>
   <text class="badge-text amber" x="264.5" y="241" text-anchor="middle">emulated + JIT</text>

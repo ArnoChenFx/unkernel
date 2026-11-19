@@ -1,22 +1,31 @@
 # AGENTS.md
 
 unkernel runs Linux 7.3, compiled to a single wasm module (`arch/wasm` with an
-MMU), in Node 24 or a browser with JSPI. User space is unmodified riscv64
-Linux ELF (rv64gc plus Zba, Zbb, Zbs, Zicond, Zkne, Zknd, Zbc, Zbkb, Zbkc,
-Zbkx), run by kwemu: a Zig interpreter with a wasm JIT tier, linked into the
-kernel. README.md is the overview, and kernel/README.md covers the kernel
-side, the devices and the guest image.
+MMU), in Node 24 or a browser with JSPI. User space is unmodified aarch64
+Linux ELF (ARMv8.0-A with FP, AdvSIMD, AES, PMULL, SHA1, SHA2, CRC32), run
+by kwemu: a Zig interpreter linked into the kernel. README.md is the
+overview, and kernel/README.md covers the kernel side, the devices and the
+guest image.
+
+This branch (`aarch64`) switches the guest CPU to AArch64: `include/kw_emu.h`
+(ABI 9) and the kwemu library are A64 only (src/a64, .agents/a64.md, a
+reference interpreter, no JIT yet; AdvSIMD floating point is not done).
+The kernel presents the arm64 user ABI (kernel.md, arm64 user ABI), and
+the guest image is Alpine's aarch64 minirootfs (kernel/README.md, alpine).
+The riscv CPU is kept in src/cpu and src/emu for reference
+(`-Driscv-legacy`).
 
 `.agents/` has one file per area. Read the one for the area you change:
 
 | File | Covers |
 | --- | --- |
-| [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, riscv user ABI, config |
-| [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs |
+| [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, config |
+| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, tests, coverage tool, state |
+| [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs (riscv; MMU and TLBs still shared) |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
-| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`): build, numbers, traps |
+| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`, off by default on aarch64): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
 | [.agents/testing.md](.agents/testing.md) | the full test matrix, for releases or when asked |
 | [.agents/status.md](.agents/status.md) | roadmap, open issues, work not yet in the image |
@@ -30,8 +39,8 @@ and stop exec on the whole host until a reboot. So:
   Do not use `mount`, `chroot`, `unshare` or `sysctl`, and do not change
   services.
 - No `sudo` and no package installs.
-- Run riscv64 binaries on the host only through an explicit emulator
-  (`qemu-riscv64-static ./bin`). Never run the guest's `/etc/kw-binfmt.sh`,
+- Run riscv64 and aarch64 binaries on the host only through an explicit
+  emulator (`qemu-riscv64-static ./bin`, `qemu-aarch64 ./bin`). Never run the guest's `/etc/kw-binfmt.sh`,
   or any part of it, on the host.
 - Do not start anything on port 8080: that is `pnpm dev`'s port.
 - Repeat these rules in every subagent brief.
@@ -50,7 +59,7 @@ The parts that `ls` does not make obvious:
   point it at another tree and output root. Linux patches are in
   `kernel/patches/linux/`, wasm-ld patches in `kernel/patches/llvm/`.
 - `vendor/` (gitignored) holds the kernel tree
-  `vendor/src/linux-wasm-kernel` (branch `kw-riscv-user`), `vendor/src/llvm22`,
+  `vendor/src/linux-wasm-kernel` (branch `kw-arm64-user`), `vendor/src/llvm22`,
   the toolchain and all build outputs. Those branches exist only there, so
   `kernel/patches/` is their only durable record.
 - The page's kernel is the gitignored `web/kernel/unkernel-alpine.wasm`.
@@ -63,8 +72,8 @@ The parts that `ls` does not make obvious:
 
 ```sh
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
-zig build test              # emulator tests, native and wasm64, with and without the JIT
-kernel/build.sh kernel      # the UP kernel: kwemu with the JIT, vmlinux, lower, refresh the bundle
+zig build test              # A64 unit tests, A64 guests (native and wasm64 harness) against qemu-aarch64
+kernel/build.sh kernel      # the UP kernel: kwemu (no JIT tier on A64), vmlinux, lower, refresh the bundle
 kernel/build.sh smp         # the SMP kernel (kwemu with atomics); the bundle then gets the SMP patch
 pnpm install                # SDK and page dev dependencies
 node js/cli.ts              # boot Alpine from the bundle; --help lists options
@@ -94,18 +103,22 @@ Details are in the area files.
   check `$KOUT/.config` after a change.
 - `js/core` stays universal: no `node:` imports, no unguarded DOM APIs
   (js.md).
-- The image's busybox, zlib, openssl and apk-tools are rebuilt from
-  pinned aports commits (`kernel/guest/alpine-opt.sh`). An Alpine update
-  needs new pins there; `alpine.sh` stops until they match
-  (guest-packages.md).
+- With `KW_ALPINE_OPT=1` the image's busybox, zlib, openssl and
+  apk-tools are rebuilt from pinned aports commits
+  (`kernel/guest/alpine-opt.sh`; off by default on aarch64). An Alpine
+  update needs new pins there; with the rebuild on, `alpine.sh` stops
+  until they match (guest-packages.md).
+- Guest C programs in the image (`kernel/guest/*.c`) are built for the
+  generic ARMv8.0 CPU. Check new code with the coverage classifier
+  (a64.md, Coverage tool): kwemu rejects AdvSIMD floating point for now.
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
 
 ## Changing things
 
-- **Kernel**: commit on `kw-riscv-user` in `vendor/src/linux-wasm-kernel`,
+- **Kernel**: commit on `kw-arm64-user` in `vendor/src/linux-wasm-kernel`,
   then export so that `kernel/patches/linux/` equals
-  `format-patch -N 7595a62d45e..kw-riscv-user` (kernel.md).
+  `format-patch -N 7595a62d45e..kw-arm64-user` (kernel.md).
 - **wasm-ld**: commit in `vendor/src/llvm22`, run `kernel/build.sh
   toolchain`, and re-export (toolchain.md).
 - **Guest image**: `kernel/build.sh alpine` or `kernel/build.sh disk`.
@@ -144,8 +157,9 @@ still part of the full matrix.
 Do not run the browser tests (`web/test/`) unless asked. The page is
 tested by hand with `pnpm dev`.
 
-To add a test: for the emulator, a guest in `build.zig` plus an entry in
-`test/kwemu-test.mjs`; for the kernel, a `CHECK(...)` in
+To add a test: for the emulator, a unit test in `src/a64/tests.zig` or a
+guest in `guest/a64/` plus entries in `build.zig` (`a64_guests`) and
+`test/a64-test.mjs`; for the kernel, a `CHECK(...)` in
 `kernel/guest/kwtest.c`.
 
 ## Conventions

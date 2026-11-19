@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-/* unkernel smoke test (static riscv64 musl): /usr/bin/kwtest in the Alpine
+/* unkernel smoke test (static aarch64 musl): /usr/bin/kwtest in the Alpine
  * initramfs, as /init with rdinit=/usr/bin/kwtest or from a shell. */
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/reboot.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -133,97 +134,59 @@ static int failures;
 	printf("\n"); \
 } while (0)
 
-#ifdef __riscv
+#ifdef __aarch64__
 #include <setjmp.h>
 #include <sys/auxv.h>
 #include <linux/futex.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/sysmacros.h>
+#include <sys/ucontext.h>
 #include <linux/vm_sockets.h>
 #include <linux/userfaultfd.h>
 #include <linux/rtnetlink.h>
 #include <linux/fib_rules.h>
 #include <linux/veth.h>
 
-#ifndef __NR_riscv_hwprobe
-#define __NR_riscv_hwprobe 258
-#endif
-struct hwprobe_pair {
-	int64_t key;
-	uint64_t value;
-};
-
 /*
- * The extensions the kernel may list after "rv64imafdc" in /proc/cpuinfo,
- * in that canonical order, with their riscv_hwprobe IMA_EXT_0 bits (and
- * ext1, the IMA_EXT_1 bit of a platform property; see
- * arch/wasm/kernel/cpu.c). kind: 2 = part of rv64gc (always listed), 1 =
- * listed unless kw.isa= masks it (every kwemu has it, or it is an optional
- * extension kwemu implements), 0 = an optional extension kwemu does not
- * implement yet (either). probe: an instruction (rd = a0, rs1 = a0, rs2 =
- * a1, fd = fa0; a compressed one followed by c.nop in the same word) that
- * only this extension (or alt) defines; it must raise SIGILL exactly when
- * neither is listed, and give `want` for a0 = 3, a1 = 5 when want is not
- * 0. With `mem`, a0 is the address of a writable buffer instead of 3.
+ * The arm64 features the kernel may report (arch/wasm/kernel/cpu.c): the
+ * AT_HWCAP bits and the /proc/cpuinfo "Features" line, which lists their
+ * names in this (HWCAP bit) order. kind: 2 = always listed (ARMv8.0-A with
+ * FP and AdvSIMD), 1 = one of kwemu's optional features (KW_ISA_*), listed
+ * unless kw.isa= masks it or kwemu does not implement it yet (either),
+ * 0 = cpuid, listed once kwemu answers the ID registers (either). probe: an
+ * instruction only this feature defines, on x0, x1, d0/v0 and v1; it must
+ * raise SIGILL exactly when the feature is not listed. Any other HWCAP bit
+ * (LSE atomics, SVE, SHA3, SHA512, PAC, ...) must never be set, and
+ * AT_HWCAP2 and AT_HWCAP3 are 0.
  */
-static const struct isa_ext {
+static const struct a64_feat {
 	const char *name;
-	unsigned long hwprobe;
+	unsigned long hwcap;
 	int kind;
 	uint32_t probe;
-	const char *alt;
-	unsigned long want;
-	int mem;
-	unsigned long ext1;
-} isa_exts[] = {
-	{ "zicbom", 1UL << 55, 1, 0x0015200f, NULL, 0, 1 },	/* cbo.clean (a0) */
-	{ "zicbop", 1UL << 60, 1 },
-	{ "zicboz", 1UL << 6, 1, 0x0045200f, NULL, 0, 1 },	/* cbo.zero (a0) */
-	{ "ziccamoa", 0, 1, .ext1 = 1UL << 2 },
-	{ "ziccif", 0, 1, .ext1 = 1UL << 3 },
-	{ "zicclsm", 0, 1, .ext1 = 1UL << 1 },
-	{ "ziccrse", 0, 1, .ext1 = 1UL << 4 },
-	{ "zicntr", 1UL << 50, 1 },
-	{ "zicond", 1UL << 35, 1, 0x0eb55533, NULL, 3 },	/* czero.eqz */
-	{ "zicsr", 0, 2 },
-	{ "zifencei", 0, 2 },
-	{ "zihintntl", 1UL << 29, 1 },
-	{ "zihintpause", 1UL << 36, 1 },
-	{ "zihpm", 1UL << 51, 1, 0xc0302573 },	/* csrr a0, hpmcounter3 (0: checked below) */
-	{ "zimop", 1UL << 42, 1, 0x81c54573 },	/* mop.r.0 a0, a0 (0: checked below) */
-	{ "za64rs", 0, 1, .ext1 = 1UL << 5 },
-	{ "zaamo", 1UL << 56, 1 },
-	{ "zalrsc", 1UL << 57, 1 },
-	{ "zawrs", 1UL << 48, 1, 0x00d00073, NULL, 3 },	/* wrs.nto */
-	{ "zfa", 1UL << 32, 1, 0xf2180553, NULL, 3 },	/* fli.d fa0, 1.0 */
-	{ "zfhmin", 1UL << 28, 1, 0xf4050553, NULL, 3 },	/* fmv.h.x fa0, a0 */
-	{ "zca", 1UL << 43, 1 },
-	{ "zcb", 1UL << 44, 1, 0x00019d75, NULL, ~3UL },	/* c.not a0; c.nop */
-	{ "zcd", 1UL << 45, 1 },
-	{ "zcmop", 1UL << 47, 1, 0x00016081, NULL, 3 },	/* c.mop.1; c.nop */
-	{ "zba", 1UL << 3, 1, 0x20b52533, NULL, 11 },	/* sh1add */
-	{ "zbb", 1UL << 4, 1, 0x60051513, NULL, 62 },	/* clz */
-	{ "zbc", 1UL << 7, 1, 0x0ab52533 },	/* clmulr (3, 5) = 0: not checked */
-	{ "zbkb", 1UL << 8, 1, 0x08b54533, NULL, 0x0000000500000003 },	/* pack */
-	{ "zbkc", 1UL << 9, 1, 0x0ab51533, "zbc", 15 },	/* clmul */
-	{ "zbkx", 1UL << 10, 1, 0x28b54533, NULL, 0x0303030303030300 },	/* xperm8 */
-	{ "zbs", 1UL << 5, 1, 0x28b51533, NULL, 35 },	/* bset */
-	{ "zknd", 1UL << 11, 1, 0x3ab50533, NULL, 0x52525252525252d5 },	/* aes64ds */
-	{ "zkne", 1UL << 12, 1, 0x32b50533, NULL, 0x636363636363637b },	/* aes64es */
+} a64_feats[] = {
+	{ "fp",    1UL << 0,  2, 0x1e602000 },	/* fcmp d0, d0 */
+	{ "asimd", 1UL << 1,  2, 0x4ea11c20 },	/* orr v0.16b, v1.16b, v1.16b */
+	{ "aes",   1UL << 3,  1, 0x4e284820 },	/* aese v0.16b, v1.16b */
+	{ "pmull", 1UL << 4,  1, 0x0ee1e000 },	/* pmull v0.1q, v0.1d, v1.1d */
+	{ "sha1",  1UL << 5,  1, 0x5e280820 },	/* sha1h s0, s1 */
+	{ "sha2",  1UL << 6,  1, 0x5e282820 },	/* sha256su0 v0.4s, v1.4s */
+	{ "crc32", 1UL << 7,  1, 0x1ac14000 },	/* crc32b w0, w0, w1 */
+	{ "cpuid", 1UL << 11, 0, 0xd5380600 },	/* mrs x0, id_aa64isar0_el1 */
 };
-#define NISA (int)(sizeof(isa_exts) / sizeof(isa_exts[0]))
+#define NFEAT (int)(sizeof(a64_feats) / sizeof(a64_feats[0]))
+#define A64_RET 0xd65f03c0u
 
-static int isa_find(const char *name, size_t len)
+static int feat_find(const char *name, size_t len)
 {
-	for (int i = 0; i < NISA; i++)
-		if (strlen(isa_exts[i].name) == len && !strncmp(isa_exts[i].name, name, len))
+	for (int i = 0; i < NFEAT; i++)
+		if (strlen(a64_feats[i].name) == len && !strncmp(a64_feats[i].name, name, len))
 			return i;
 	return -1;
 }
@@ -256,20 +219,28 @@ static int read_line(const char *path, const char *key, int colon, char *out, si
 	return found;
 }
 
-static sigjmp_buf ill_jmp;
+static sigjmp_buf trap_jmp;
+static volatile int trap_sig, trap_code;
+static volatile unsigned long trap_addr;
 
-static void on_ill(int sig)
+static void on_trap(int sig, siginfo_t *si, void *uc)
 {
-	(void)sig;
-	siglongjmp(ill_jmp, 1);
+	(void)uc;
+	trap_sig = sig;
+	trap_code = si->si_code;
+	trap_addr = (unsigned long)si->si_addr;
+	siglongjmp(trap_jmp, 1);
 }
 
-/* Run n instruction words (ending in ret) as long f(a0, a1); -1 on SIGILL. */
+/*
+ * Run n instruction words (ending in ret) as long f(x0, x1); 0 when they
+ * returned, else the signal (SIGILL, SIGTRAP, ...) they raised, with
+ * trap_code and trap_addr set from its siginfo.
+ */
 static int run_code(const uint32_t *w, int n, long a0, long a1, long *ret)
 {
 	static uint32_t *page;
-	struct sigaction sa = { .sa_handler = on_ill }, old;
-	volatile int ill = 0;
+	struct sigaction sa = { .sa_sigaction = on_trap, .sa_flags = SA_SIGINFO }, oill, otrap;
 
 	if (!page) {
 		page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -279,462 +250,96 @@ static int run_code(const uint32_t *w, int n, long a0, long a1, long *ret)
 		}
 	}
 	memcpy(page, w, n * 4);
-	__asm__ volatile("fence.i" ::: "memory");
-	sigaction(SIGILL, &sa, &old);
-	if (sigsetjmp(ill_jmp, 1))
-		ill = 1;
-	else
+	__builtin___clear_cache((char *)page, (char *)(page + n));
+	trap_sig = 0;
+	sigaction(SIGILL, &sa, &oill);
+	sigaction(SIGTRAP, &sa, &otrap);
+	if (!sigsetjmp(trap_jmp, 1))
 		*ret = ((long (*)(long, long))(void *)page)(a0, a1);
-	sigaction(SIGILL, &old, NULL);
-	return ill ? -1 : 0;
+	sigaction(SIGILL, &oill, NULL);
+	sigaction(SIGTRAP, &otrap, NULL);
+	return trap_sig;
 }
 
-/* Zkne / Zknd through .insn, so any assembler takes them. */
-#define AESR(f7, a, b) ({ unsigned long _r; \
-	__asm__ volatile(".insn r 0x33, 0, " #f7 ", %0, %1, %2" : "=r"(_r) : "r"(a), "r"(b)); _r; })
-#define AESI(imm, a) ({ unsigned long _r; \
-	__asm__ volatile(".insn i 0x13, 1, %0, %1, " #imm : "=r"(_r) : "r"(a)); _r; })
-#define AES_ES(a, b) AESR(0x19, a, b)
-#define AES_ESM(a, b) AESR(0x1b, a, b)
-#define AES_DS(a, b) AESR(0x1d, a, b)
-#define AES_DSM(a, b) AESR(0x1f, a, b)
-#define AES_KS2(a, b) AESR(0x3f, a, b)
-#define AES_IM(a) AESI(0x300, a)
-#define AES_KS(i, rk) do { \
-	rk[i + 1][0] = AES_KS2(AESI(0x31##i, rk[i][1]), rk[i][0]); \
-	rk[i + 1][1] = AES_KS2(rk[i + 1][0], rk[i][1]); } while (0)
+#define MRS(reg) ({ unsigned long _v; __asm__ volatile("mrs %0, " #reg : "=r"(_v)); _v; })
 
-/* AES-128 encrypt + decrypt of FIPS-197 C.1, 5000 times; returns the misses. */
-static int aes_fips(int *reps)
+/* Signal frames (arch/wasm/kernel/signal.c, as arch/arm64). */
+#define FPSIMD_MAGIC_ 0x46508001u
+#define FPCR_RZ (3UL << 22)
+struct a64_fpsimd {
+	uint32_t magic, size, fpsr, fpcr;
+	__uint128_t vregs[32];
+};
+static volatile int fr_ok, fr_ran;
+static volatile unsigned long fr_pc, fr_lr;
+
+static void on_frame(int sig, siginfo_t *si, void *ucv)
 {
-	unsigned long rk[11][2], dk[11][2];
-	const unsigned long pt[2] = { 0x7766554433221100, 0xffeeddccbbaa9988 };
-	const unsigned long ct[2] = { 0x30047b6ad8e0c469, 0x5ac5b47080b7cdd8 };
-	int bad = 0;
+	ucontext_t *uc = ucv;
+	struct a64_fpsimd *fp = (struct a64_fpsimd *)uc->uc_mcontext.__reserved;
+	uint32_t *end = (uint32_t *)((char *)fp + sizeof(*fp));
 
-	rk[0][0] = 0x0706050403020100;
-	rk[0][1] = 0x0f0e0d0c0b0a0908;
-	AES_KS(0, rk); AES_KS(1, rk); AES_KS(2, rk); AES_KS(3, rk); AES_KS(4, rk);
-	AES_KS(5, rk); AES_KS(6, rk); AES_KS(7, rk); AES_KS(8, rk); AES_KS(9, rk);
-	for (int r = 1; r < 10; r++) {
-		dk[r][0] = AES_IM(rk[r][0]);
-		dk[r][1] = AES_IM(rk[r][1]);
-	}
-	for (*reps = 0; *reps < 5000; ++*reps) {
-		unsigned long s0 = pt[0] ^ rk[0][0], s1 = pt[1] ^ rk[0][1], n0, n1;
-
-		for (int r = 1; r < 10; r++) {
-			n0 = AES_ESM(s0, s1);
-			n1 = AES_ESM(s1, s0);
-			s0 = n0 ^ rk[r][0];
-			s1 = n1 ^ rk[r][1];
-		}
-		n0 = AES_ES(s0, s1) ^ rk[10][0];
-		n1 = AES_ES(s1, s0) ^ rk[10][1];
-		bad += n0 != ct[0] || n1 != ct[1];
-		s0 = n0 ^ rk[10][0];
-		s1 = n1 ^ rk[10][1];
-		for (int r = 9; r >= 1; r--) {
-			n0 = AES_DSM(s0, s1);
-			n1 = AES_DSM(s1, s0);
-			s0 = n0 ^ dk[r][0];
-			s1 = n1 ^ dk[r][1];
-		}
-		n0 = AES_DS(s0, s1) ^ rk[0][0];
-		n1 = AES_DS(s1, s0) ^ rk[0][1];
-		bad += n0 != pt[0] || n1 != pt[1];
-	}
-	return bad;
+	(void)si;
+	fr_ran++;
+	/* main set d8 = 0x1122334455667788, d9 = 1, FPCR.RMode = RP before the svc. */
+	fr_ok = sig == SIGUSR2 && fp->magic == FPSIMD_MAGIC_ && fp->size == sizeof(*fp) && sizeof(*fp) == 528 &&
+		end[0] == 0 && end[1] == 0 && (uint64_t)fp->vregs[8] == 0x1122334455667788UL &&
+		(uint64_t)fp->vregs[9] == 1 && (fp->fpcr & (3U << 22)) == (1U << 22) &&
+		(uc->uc_mcontext.pstate & ~0xf0000000UL) == 0 && uc->uc_mcontext.regs[8] == SYS_kill;
+	fr_pc = uc->uc_mcontext.pc;
+	/* sigreturn must load these. */
+	fp->vregs[9] = 0xa5a5a5a5deadbeefUL;
+	fp->fpcr = (fp->fpcr & ~(3U << 22)) | FPCR_RZ;
 }
 
-/* Zbc / Zbkb through .insn too. */
-#define BKR(f3, f7, a, b) ({ unsigned long _r; \
-	__asm__ volatile(".insn r 0x33, " #f3 ", " #f7 ", %0, %1, %2" : "=r"(_r) : "r"(a), "r"(b)); _r; })
-#define CLMUL(a, b) BKR(1, 0x05, a, b)
-#define CLMULH(a, b) BKR(3, 0x05, a, b)
-#define BREV8(a) ({ unsigned long _r; \
-	__asm__ volatile(".insn i 0x13, 5, %0, %1, 0x687" : "=r"(_r) : "r"(a)); _r; })
-#define REV8(a) ({ unsigned long _r; \
-	__asm__ volatile(".insn i 0x13, 5, %0, %1, 0x6b8" : "=r"(_r) : "r"(a)); _r; })
+/* Raw rt_sigaction without SA_RESTORER: the handler returns through [sigpage]. */
+struct k_sigaction_ {
+	void (*handler)(int, siginfo_t *, void *);
+	unsigned long flags;
+	void (*restorer)(void);
+	unsigned long mask;
+};
 
-/* GHASH multiply as OpenSSL's Zbc + Zbkb code does it; x, y, z are blocks
- * as two big-endian halves. */
-static void gf_mul(const unsigned long x[2], const unsigned long y[2], unsigned long z[2])
+static void on_sigpage(int sig, siginfo_t *si, void *uc)
 {
-	unsigned long x0 = BREV8(REV8(x[0])), x1 = BREV8(REV8(x[1]));
-	unsigned long y0 = BREV8(REV8(y[0])), y1 = BREV8(REV8(y[1]));
-	unsigned long z0 = CLMUL(x0, y0);
-	unsigned long z1 = CLMULH(x0, y0) ^ CLMUL(x0, y1) ^ CLMUL(x1, y0);
-	unsigned long z2 = CLMULH(x0, y1) ^ CLMULH(x1, y0) ^ CLMUL(x1, y1);
-	unsigned long z3 = CLMULH(x1, y1);
-
-	z1 ^= CLMUL(z3, 0x87);
-	z2 ^= CLMULH(z3, 0x87);
-	z0 ^= CLMUL(z2, 0x87);
-	z1 ^= CLMULH(z2, 0x87);
-	z[0] = REV8(BREV8(z0));
-	z[1] = REV8(BREV8(z1));
+	(void)sig;
+	(void)si;
+	(void)uc;
+	fr_ran++;
+	fr_lr = (unsigned long)__builtin_return_address(0);
 }
 
-/* GHASH of the GCM spec's test case 2 (H, C = one block, no AAD) 5000
- * times; returns the misses. */
-static int ghash_kat(int *reps)
+/* The start and end of the mapping named `name` in /proc/self/maps. */
+static int find_map(const char *name, unsigned long *start, unsigned long *end)
 {
-	const unsigned long h[2] = { 0x66e94bd4ef8a2c3b, 0x884cfa59ca342b2e };
-	const unsigned long c[2] = { 0x0388dace60b6a392, 0xf328c2b971b2fe78 };
-	const unsigned long want[2] = { 0xf38cbb1ad69223dc, 0xc3457ae5b6b0f885 };
-	int bad = 0;
+	char line[512];
+	FILE *f = fopen("/proc/self/maps", "r");
+	int found = 0;
 
-	for (*reps = 0; *reps < 5000; ++*reps) {
-		unsigned long y[2];
-
-		gf_mul(c, h, y);
-		y[1] ^= 128; /* len(A) = 0, len(C) = 128 bits */
-		gf_mul(y, h, y);
-		bad += y[0] != want[0] || y[1] != want[1];
-	}
-	return bad;
+	if (!f)
+		return 0;
+	while (!found && fgets(line, sizeof(line), f))
+		if (strstr(line, name) && sscanf(line, "%lx-%lx", start, end) == 2)
+			found = 1;
+	fclose(f);
+	return found;
 }
 
-/* Zba / Zbb / Zbs / Zicond through .insn too. */
-#define ZR(op, f3, f7, a, b) ({ unsigned long _r; \
-	__asm__ volatile(".insn r " #op ", " #f3 ", " #f7 ", %0, %1, %2" : "=r"(_r) : "r"(a), "r"(b)); _r; })
-#define ZI(op, f3, imm, a) ({ unsigned long _r; \
-	__asm__ volatile(".insn i " #op ", " #f3 ", %0, %1, " #imm : "=r"(_r) : "r"(a)); _r; })
-
-/*
- * A mix of Zba, Zbb, Zbs and Zicond instructions (sh3add, add.uw,
- * slli.uw, clz, cpopw, sext.h, orc.b, max, minu, bset, bext, binvi,
- * czero.nez) in a loop long enough to compile, against the same in plain C
- * (this file is built for rv64gc, so the C uses none of them). Returns the
- * misses.
- */
-static int zb_mix(int *reps)
-{
-	unsigned long x = 0x0123456789abcdef, y = 0x0123456789abcdef;
-	int bad = 0;
-
-	for (*reps = 0; *reps < 20000; ++*reps) {
-		unsigned long i = *reps, a = x ^ (i << 7), b = x >> (i & 31);
-		unsigned long r = ZR(0x33, 6, 0x10, a, b);		/* sh3add */
-		unsigned long c, w;
-
-		r ^= ZR(0x3b, 0, 0x04, b, a);				/* add.uw */
-		r += ZI(0x1b, 1, 0x083, a);				/* slli.uw 3 */
-		r ^= ZI(0x13, 1, 0x600, b) << 8;			/* clz */
-		r += ZI(0x1b, 1, 0x602, a) << 16;			/* cpopw */
-		r ^= ZI(0x13, 1, 0x605, a);				/* sext.h */
-		r += ZI(0x13, 5, 0x287, b & 0xff00ff0000ff00ff);	/* orc.b */
-		r ^= ZR(0x33, 6, 0x05, a, b) + ZR(0x33, 5, 0x05, b, a);	/* max, minu */
-		r = ZR(0x33, 1, 0x14, r, i) ^ ZR(0x33, 5, 0x24, a, i);	/* bset, bext */
-		r = ZI(0x13, 1, 0x687, r);				/* binvi 7 */
-		r += ZR(0x33, 7, 0x07, a, i & 1);			/* czero.nez */
-
-		c = (a << 3) + b;
-		c ^= (b & 0xffffffff) + a;
-		c += (a & 0xffffffff) << 3;
-		c ^= (unsigned long)(b ? __builtin_clzl(b) : 64) << 8;
-		c += (unsigned long)__builtin_popcount((unsigned)a) << 16;
-		c ^= (unsigned long)(long)(short)a;
-		w = 0;
-		for (int k = 0; k < 64; k += 8)
-			if ((b & 0xff00ff0000ff00ff) >> k & 0xff)
-				w |= 0xffUL << k;
-		c += w;
-		c ^= ((long)a > (long)b ? a : b) + (b < a ? b : a);
-		c = (c | 1UL << (i & 63)) ^ (a >> (i & 63) & 1);
-		c ^= 1UL << 7;
-		c += i & 1 ? 0 : a;
-		bad += r != c;
-		x = x * 6364136223846793005UL + r;
-		y = y * 6364136223846793005UL + c;
-	}
-	return bad + (x != y);
-}
-
-/* Writable, 64-byte aligned memory for the probes with `mem`. */
-static unsigned char probe_buf[128] __attribute__((aligned(64)));
-
-/*
- * Zcb (with Zbb and Zba for c.sext.*, c.zext.h and c.zext.w), Zimop and
- * Zcmop as the compiler emits them for a function built with them (the
- * rest of this file is rv64gc); zcb_plain() is the same C for rv64gc.
- */
-#define ZCB_BODY \
-	unsigned long x = p[1] * a + (unsigned short)b + (unsigned char)a + (unsigned)(a >> 7); \
-	x += (unsigned long)(long)(signed char)b + (unsigned long)(long)(short)(a >> 3); \
-	x ^= ~a + ((unsigned short *)p)[1] + (unsigned long)(long)((short *)p)[2]; \
-	p[3] = (unsigned char)x; \
-	((unsigned short *)p)[3] = (unsigned short)(x >> 8); \
-	return x * b;
-__attribute__((target("arch=+zcb,+zbb,+zba"), noinline)) static unsigned long zcb_fn(unsigned char *p, unsigned long a, unsigned long b)
-{
-	ZCB_BODY
-}
-__attribute__((noinline)) static unsigned long zcb_plain(unsigned char *p, unsigned long a, unsigned long b)
-{
-	ZCB_BODY
-}
-
-/* mop.r.N / mop.rr.N write 0, c.mop.N does nothing; returns the misses */
-__attribute__((target("arch=+zimop"), noinline)) static int mop_check(unsigned long a, unsigned long b)
-{
-	unsigned long r0, r1;
-
-	__asm__ volatile("mop.r.0 %0, %1" : "=r"(r0) : "r"(a));
-	__asm__ volatile("mop.rr.7 %0, %1, %2" : "=r"(r1) : "r"(a), "r"(b));
-	return (r0 != 0) + (r1 != 0);
-}
-__attribute__((target("arch=+zcmop"), noinline)) static unsigned long cmop_check(unsigned long a)
-{
-	__asm__ volatile("c.mop.1\n\tc.mop.3\n\tc.mop.5\n\tc.mop.7\n\tc.mop.15\n\tmv %0, %0" : "+r"(a));
-	return a;
-}
-
-/*
- * Zfa: fround/froundnx in each static mode and dynamically, fli constants
- * and fmin/fmax, against libm's floor/ceil/trunc/round/rint and plain
- * constants in rv64gc code; plus fminm, fcvtmod.w.d and fltq.
- */
-#define FRND(op, rm, x) ({ double _r; __asm__ volatile(op " %0, %1, " rm : "=f"(_r) : "f"(x)); _r; })
-#define ZFA_BODY(FL, CE, TR, RO, RI, K) \
-	double r = FL(a * 0.5) + CE(a) * K(0.25) - TR(a * 1.5) + RO(a) + RI(a * 0.75); \
-	return fmin(r, 1e12) + fmax(r * K(0.125), -16.0) + RI(b) + K(0.3125);
-#define Z_FL(x) FRND("fround.d", "rdn", x)
-#define Z_CE(x) FRND("froundnx.d", "rup", x)
-#define Z_TR(x) FRND("fround.d", "rtz", x)
-#define Z_RO(x) FRND("froundnx.d", "rmm", x)
-#define Z_RI(x) FRND("froundnx.d", "dyn", x)
-#define Z_K(c) ({ double _r; __asm__ volatile("fli.d %0, " #c : "=f"(_r)); _r; })
-#define P_K(c) (c)
-__attribute__((target("arch=+zfa"), noinline)) static double zfa_fn(double a, double b)
-{
-	ZFA_BODY(Z_FL, Z_CE, Z_TR, Z_RO, Z_RI, Z_K)
-}
-__attribute__((noinline)) static double zfa_plain(double a, double b)
-{
-	ZFA_BODY(floor, ceil, trunc, round, rint, P_K)
-}
-__attribute__((target("arch=+zfa"), noinline)) static unsigned long zfa_minm(double a, double b)
-{
-	double m;
-	unsigned long u;
-
-	__asm__ volatile("fminm.d %0, %1, %2" : "=f"(m) : "f"(a), "f"(b));
-	memcpy(&u, &m, 8);
-	return u;
-}
-__attribute__((target("arch=+zfa"), noinline)) static long zfa_insns(double a, double b)
-{
-	double m;
-	long w, q;
-
-	__asm__ volatile("fminm.d %0, %1, %2" : "=f"(m) : "f"(a), "f"(b));
-	__asm__ volatile("fcvtmod.w.d %0, %1, rtz" : "=r"(w) : "f"(a));
-	__asm__ volatile("fltq.d %0, %1, %2" : "=r"(q) : "f"(a), "f"(b));
-	return w + (long)m * 3 + q;
-}
-
-/*
- * Zfhmin: every half through fmv.h.x, fcvt.s.h, fcvt.h.s, fcvt.d.h,
- * fcvt.h.d and fmv.x.h, against a C decoding of the format; returns the
- * misses (NaNs convert to the canonical NaN).
- */
-static unsigned h2s(unsigned h)
-{
-	unsigned s = (h >> 15) << 31, e = (h >> 10) & 31, m = h & 0x3ff;
-	int k = 0;
-
-	if (e == 31)
-		return m ? 0x7fc00000 : s | 0x7f800000;
-	if (e)
-		return s | (e + 112) << 23 | m << 13;
-	if (!m)
-		return s;
-	while (!(m & 0x400)) {
-		m <<= 1;
-		k++;
-	}
-	return s | (unsigned)(113 - k) << 23 | (m & 0x3ff) << 13;
-}
-__attribute__((target("arch=+zfhmin"), noinline)) static int zfh_all(void)
-{
-	int bad = 0;
-
-	for (unsigned h = 0; h < 65536; h++) {
-		float s;
-		double d;
-		long back, back2;
-		unsigned sb;
-		int nan = ((h >> 10) & 31) == 31 && (h & 0x3ff);
-
-		__asm__ volatile("fmv.h.x ft0, %3\n\tfcvt.s.h %0, ft0\n\tfcvt.d.h %1, ft0\n\t"
-				 "fcvt.h.s ft1, %0\n\tfmv.x.h %2, ft1"
-				 : "=&f"(s), "=&f"(d), "=&r"(back) : "r"((long)h) : "ft0", "ft1");
-		__asm__ volatile("fcvt.h.d ft1, %1, rtz\n\tfmv.x.h %0, ft1" : "=r"(back2) : "f"(d) : "ft1");
-		memcpy(&sb, &s, 4);
-		bad += sb != h2s(h) || (!nan && (double)s != d);
-		bad += (back & 0xffff) != (nan ? 0x7e00 : h) || back != (long)(short)back;
-		bad += (back2 & 0xffff) != (nan ? 0x7e00 : h);
-	}
-	__asm__ volatile("csrw fflags, x0");
-	return bad;
-}
-
-static sigjmp_buf sig_jmp;
-
-static void on_sig(int sig)
-{
-	siglongjmp(sig_jmp, sig);
-}
-
-/* Run fn(arg); the signal it raised (SIGSEGV, SIGILL), or 0. */
-static int catch_sig(void (*fn)(void *), void *arg)
-{
-	struct sigaction sa = { .sa_handler = on_sig }, o1, o2;
-	volatile int sig;
-
-	sigaction(SIGSEGV, &sa, &o1);
-	sigaction(SIGILL, &sa, &o2);
-	sig = sigsetjmp(sig_jmp, 1);
-	if (!sig)
-		fn(arg);
-	sigaction(SIGSEGV, &o1, NULL);
-	sigaction(SIGILL, &o2, NULL);
-	return sig;
-}
-static void do_cbo_zero(void *p)
-{
-	__asm__ volatile(".insn i 0x0f, 2, x0, %0, 4" :: "r"(p) : "memory");
-}
-static void do_cbo_clean(void *p)
-{
-	__asm__ volatile(".insn i 0x0f, 2, x0, %0, 1" :: "r"(p) : "memory");
-}
-static void do_cbo_flush(void *p)
-{
-	__asm__ volatile(".insn i 0x0f, 2, x0, %0, 2" :: "r"(p) : "memory");
-}
-static void do_cbo_inval(void *p)
-{
-	__asm__ volatile(".insn i 0x0f, 2, x0, %0, 0" :: "r"(p) : "memory");
-}
-
-/* The RVA23 extensions beyond probes: results, long enough to compile. */
-static void rva23_checks(const int *have)
-{
-	int bad = 0;
-
-	if (have[isa_find("zcb", 3)] && have[isa_find("zbb", 3)] && have[isa_find("zba", 3)]) {
-		unsigned char p1[8], p2[8];
-		unsigned long x = 0x0123456789abcdef;
-
-		for (int i = 0; i < 20000; i++) {
-			unsigned long a = x ^ ((unsigned long)i << 13), b = x >> (i & 31), r1, r2;
-
-			for (int k = 0; k < 8; k++)
-				p1[k] = p2[k] = (unsigned char)(x >> (8 * k));
-			r1 = zcb_fn(p1, a, b);
-			r2 = zcb_plain(p2, a, b);
-			bad += r1 != r2 || memcmp(p1, p2, 8);
-			x = x * 6364136223846793005UL + r1;
-		}
-		CHECK(!bad, "Zcb (compiled with Zbb, Zba): 20000 calls against rv64gc code, %d wrong", bad);
-	}
-	if (have[isa_find("zimop", 5)] && have[isa_find("zcmop", 5)]) {
-		bad = 0;
-		for (int i = 0; i < 20000; i++)
-			bad += mop_check(i + 1, ~(unsigned long)i) + (cmop_check(i) != (unsigned long)i);
-		CHECK(!bad, "Zimop, Zcmop: mop.r/mop.rr write 0, c.mop does nothing (20000 times), %d wrong", bad);
-	}
-	if (have[isa_find("zfa", 3)]) {
-		double x = 0.37;
-
-		bad = 0;
-		for (int i = 0; i < 20000; i++) {
-			double a = (double)(i % 2000) * 0.75 - 700.25 + x, b = x * 1e3 - (double)i;
-			double r1 = zfa_fn(a, b), r2 = zfa_plain(a, b);
-
-			bad += memcmp(&r1, &r2, 8) != 0;
-			x = fmod(x * 3.7 + r1 * 1e-9, 1.0);
-		}
-		/* fcvtmod(-2^31 - 1) = 2^31 - 1, fminm = a, fltq = 1; fminm with a NaN is the canonical NaN */
-		bad += zfa_insns(-2147483649.0, -3.0) != 2147483647L - 3 * 2147483649L + 1;
-		bad += zfa_insns(5.75, 2.0) != 5 + 6 + 0;
-		bad += zfa_minm(1.0, NAN) != 0x7ff8000000000000UL;
-		CHECK(!bad, "Zfa: fround(nx) in 5 modes, fli, fmin/fmax 20000 times against libm, fminm, fcvtmod.w.d, fltq: %d wrong", bad);
-	}
-	if (have[isa_find("zihpm", 5)]) {
-		unsigned long h3 = 1, h31 = 1;
-
-		for (int i = 0; i < 1000; i++) {
-			__asm__ volatile("csrr %0, 0xc03" : "=r"(h3));
-			__asm__ volatile("csrr %0, 0xc1f" : "=r"(h31));
-		}
-		CHECK(h3 == 0 && h31 == 0, "Zihpm: hpmcounter3 = %lu, hpmcounter31 = %lu (no events counted)", h3, h31);
-	}
-	if (have[isa_find("zfhmin", 6)]) {
-		bad = 0;
-		for (int rep = 0; rep < 3; rep++)
-			bad += zfh_all();
-		CHECK(!bad, "Zfhmin: every half to single and double and back (3 times), %d wrong", bad);
-	}
-	if (have[isa_find("zicboz", 6)] && have[isa_find("zicbom", 6)]) {
-		unsigned char *pg = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		int s_ro, s_none, s_clean_ro, s_flush_none, s_inval;
-
-		bad = 0;
-		for (int i = 0; i < 2000 && pg != MAP_FAILED; i++) {
-			int off = 64 + (i * 97) % 3900, b0 = off & ~63;
-
-			memset(pg, 0x5a, 4096);
-			do_cbo_clean(pg + off);
-			do_cbo_flush(pg + off);
-			do_cbo_zero(pg + off);
-			for (int j = 0; j < 4096; j++)
-				bad += pg[j] != (j >= b0 && j < b0 + 64 ? 0 : 0x5a);
-		}
-		/* read-only: cbo.clean works, cbo.zero faults; no access: both fault */
-		memset(pg + 4096, 0x77, 4096);
-		mprotect(pg + 4096, 4096, PROT_READ);
-		mprotect(pg + 8192, 4096, PROT_NONE);
-		s_ro = catch_sig(do_cbo_zero, pg + 4096 + 100);
-		s_clean_ro = catch_sig(do_cbo_clean, pg + 4096 + 100);
-		s_none = catch_sig(do_cbo_zero, pg + 8192);
-		s_flush_none = catch_sig(do_cbo_flush, pg + 8192);
-		s_inval = catch_sig(do_cbo_inval, pg);
-		for (int j = 4096; j < 8192; j++)
-			bad += pg[j] != 0x77;
-		CHECK(!bad && s_ro == SIGSEGV && s_clean_ro == 0 && s_none == SIGSEGV && s_flush_none == SIGSEGV &&
-		      s_inval == SIGILL,
-		      "Zicbom, Zicboz: cbo.zero zeroes its 64-byte block (2000 times, %d wrong); read-only: zero %d, clean %d; "
-		      "no access: zero %d, flush %d; cbo.inval %d", bad, s_ro, s_clean_ro, s_none, s_flush_none, s_inval);
-		munmap(pg, 3 * 4096);
-	}
-}
-
-/*
- * ISA advertising: the /proc/cpuinfo isa line, riscv_hwprobe and AT_HWCAP
- * agree with each other and with kw.isa= on the command line, the
- * extensions kwemu always has work, and an optional extension's
- * instructions run exactly when it is listed.
- */
 static void isa_checks(void)
 {
-	char isa[512] = "", cmdline[1024] = "", mask[256] = "-";
-	int want[NISA], have[NISA] = { 0 }, ordered = 1, unknown = 0, bad = 0, last = -1;
-	unsigned long ext0 = 1UL << 0 | 1UL << 1; /* IMA_FD | IMA_C */
-	unsigned long ext1 = 0;
+	char feats[512] = "", cmdline[1024] = "", mask[256] = "-", line[256];
+	int want[NFEAT], have[NFEAT] = { 0 }, ordered = 1, unknown = 0, bad = 0, last = -1;
+	unsigned long hwcap = getauxval(AT_HWCAP), allowed = 0, hw_want = 0;
 	const char *p;
 
 	mkdir("/proc", 0555);
 	mount("proc", "/proc", "proc", 0, NULL); /* EBUSY when it is mounted */
-	read_line("/proc/cpuinfo", "isa", 1, isa, sizeof(isa));
+	read_line("/proc/cpuinfo", "Features", 1, feats, sizeof(feats));
 	read_line("/proc/cmdline", "", 0, cmdline, sizeof(cmdline));
 
-	/* What should be listed: kind 2 and 1, then kw.isa= from left to right. */
-	for (int i = 0; i < NISA; i++)
-		want[i] = isa_exts[i].kind ? 1 : -1; /* -1: either */
+	/* What should be listed: kind 2, then kw.isa= from left to right. */
+	for (int i = 0; i < NFEAT; i++)
+		want[i] = a64_feats[i].kind == 2 ? 1 : -1; /* -1: either */
 	p = strstr(cmdline, "kw.isa=");
 	if (p && (p == cmdline || p[-1] == ' ')) {
 		p += 7;
@@ -743,186 +348,1150 @@ static void isa_checks(void)
 			int on = *tok != '-', i;
 
 			end = tok + strcspn(tok, ",");
-			if (end - tok == 6 && !strncmp(tok, "rv64gc", 6)) {
-				for (i = 0; i < NISA; i++)
-					if (isa_exts[i].kind != 2)
+			if (end - tok == 5 && !strncmp(tok, "armv8", 5)) {
+				for (i = 0; i < NFEAT; i++)
+					if (a64_feats[i].kind == 1)
 						want[i] = 0;
 				continue;
 			}
 			if (*tok == '-' || *tok == '+')
 				tok++;
-			i = isa_find(tok, end - tok);
-			if (i >= 0 && isa_exts[i].kind != 2)
-				want[i] = on ? (isa_exts[i].kind ? 1 : -1) : 0;
+			i = feat_find(tok, end - tok);
+			if (i >= 0 && a64_feats[i].kind == 1)
+				want[i] = on ? -1 : 0;
 		}
 	}
 
-	/* Parse the isa line: rv64imafdc, then _ext in canonical order. */
-	if (!strncmp(isa, "rv64imafdc", 10)) {
-		for (p = isa + 10; *p == '_'; ) {
-			size_t len = strcspn(p + 1, "_");
-			int i = isa_find(p + 1, len);
+	/* The Features line: known names, in HWCAP order, and AT_HWCAP to match. */
+	for (p = feats; *p; ) {
+		size_t len = strcspn(p, " ");
+		int i = feat_find(p, len);
 
-			if (i < 0)
-				unknown++;
-			else {
-				ordered &= i > last;
-				last = i;
-				have[i] = 1;
-				ext0 |= isa_exts[i].hwprobe;
-				ext1 |= isa_exts[i].ext1;
-			}
-			p += 1 + len;
+		if (i < 0)
+			unknown++;
+		else {
+			ordered &= i > last;
+			last = i;
+			have[i] = 1;
+			hw_want |= a64_feats[i].hwcap;
 		}
-		unknown += *p != 0;
-	} else
-		unknown++;
-	for (int i = 0; i < NISA; i++)
+		p += len;
+		p += *p == ' ';
+	}
+	for (int i = 0; i < NFEAT; i++) {
+		allowed |= a64_feats[i].hwcap;
 		if (want[i] >= 0 && want[i] != have[i]) {
-			printf("     %s: want %s\n", isa_exts[i].name, want[i] ? "listed" : "not listed");
+			printf("     %s: want %s\n", a64_feats[i].name, want[i] ? "listed" : "not listed");
 			bad++;
 		}
-	CHECK(!unknown && ordered && !bad, "cpuinfo isa: %s (kw.isa=%s)", isa, mask);
+	}
+	CHECK(!unknown && ordered && !bad && hwcap == hw_want && !(hwcap & ~allowed),
+	      "cpuinfo Features: %s (kw.isa=%s); AT_HWCAP %#lx (want %#lx)", feats, mask, hwcap, hw_want);
+	CHECK(getauxval(AT_HWCAP2) == 0 && getauxval(29 /* AT_HWCAP3 */) == 0 && !getauxval(AT_SYSINFO_EHDR) &&
+	      getauxval(AT_PLATFORM) && !strcmp((char *)getauxval(AT_PLATFORM), "aarch64") &&
+	      getauxval(51 /* AT_MINSIGSTKSZ */) == 4720,
+	      "auxv: HWCAP2 %#lx, HWCAP3 %#lx, no vDSO (%#lx), platform %s, MINSIGSTKSZ %lu (want 4720, as arm64 without SVE)",
+	      getauxval(AT_HWCAP2), getauxval(29), getauxval(AT_SYSINFO_EHDR),
+	      getauxval(AT_PLATFORM) ? (char *)getauxval(AT_PLATFORM) : "-", getauxval(51));
 
-	/* IMA_EXT_0, then the ZICBOP, ZICBOZ and ZICBOM block sizes */
-	struct hwprobe_pair pr[4] = { { 4 }, { 15 }, { 6 }, { 12 } };
-	long rc = syscall(__NR_riscv_hwprobe, pr, 4, 0, NULL, 0);
-	unsigned long zicbop = have[isa_find("zicbop", 6)] ? 64 : 0;
-	unsigned long zicboz = have[isa_find("zicboz", 6)] ? 64 : 0;
-	unsigned long zicbom = have[isa_find("zicbom", 6)] ? 64 : 0;
-	CHECK(rc == 0 && pr[0].value == ext0 && pr[1].key == 15 && pr[1].value == zicbop &&
-	      pr[2].key == 6 && pr[2].value == zicboz && pr[3].key == 12 && pr[3].value == zicbom,
-	      "riscv_hwprobe IMA_EXT_0 %#lx (want %#lx), Zicbop/Zicboz/Zicbom blocks %lu/%lu/%lu (want %lu/%lu/%lu)",
-	      (unsigned long)pr[0].value, ext0, (unsigned long)pr[1].value, (unsigned long)pr[2].value,
-	      (unsigned long)pr[3].value, zicbop, zicboz, zicbom);
+	/* The rest of arm64's cpuinfo, for kwemu's MIDR_EL1 (0x000f0000). */
+	int midr_ok = read_line("/proc/cpuinfo", "CPU implementer", 1, line, sizeof(line)) && !strcmp(line, "0x00");
+	midr_ok &= read_line("/proc/cpuinfo", "CPU architecture", 1, line, sizeof(line)) && !strcmp(line, "8");
+	midr_ok &= read_line("/proc/cpuinfo", "CPU part", 1, line, sizeof(line)) && !strcmp(line, "0x000");
+	midr_ok &= read_line("/proc/cpuinfo", "BogoMIPS", 1, line, sizeof(line));
+	CHECK(midr_ok, "cpuinfo: CPU implementer 0x00, architecture 8, part 0x000, BogoMIPS");
 
-	/*
-	 * IMA_EXT_1 (the platform properties) against the isa line; misaligned
-	 * scalar accesses are fast (3) whatever kw.isa= says, vector ones
-	 * unsupported (4).
-	 */
-	struct hwprobe_pair pr1[3] = { { 16 }, { 9 }, { 10 } };
-	rc = syscall(__NR_riscv_hwprobe, pr1, 3, 0, NULL, 0);
-	CHECK(rc == 0 && pr1[0].key == 16 && pr1[0].value == ext1 && pr1[1].key == 9 && pr1[1].value == 3 &&
-	      pr1[2].key == 10 && pr1[2].value == 4,
-	      "riscv_hwprobe IMA_EXT_1 %#lx (want %#lx), misaligned scalar/vector perf %lu/%lu (want 3/4)",
-	      (unsigned long)pr1[0].value, ext1, (unsigned long)pr1[1].value, (unsigned long)pr1[2].value);
+	/* EL0's system registers (.agents/a64.md): CTR, DCZID, TPIDRRO, MIDR, TPIDR. */
+	unsigned long ctr = MRS(ctr_el0), dczid = MRS(dczid_el0), tpidrro = MRS(tpidrro_el0);
+	unsigned long midr = MRS(midr_el1), tp = MRS(tpidr_el0);
+	CHECK(ctr == 0x8444c004 && dczid == 4 && tpidrro == 0 && midr == 0x000f0000 &&
+	      tp == (unsigned long)__builtin_thread_pointer(),
+	      "MRS: CTR_EL0 %#lx, DCZID_EL0 %#lx, TPIDRRO_EL0 %#lx, MIDR_EL1 %#lx, TPIDR_EL0 = thread pointer",
+	      ctr, dczid, tpidrro, midr);
 
-	/*
-	 * HIGHEST_VIRT_ADDRESS is the end of Sv39 user space (1 << 38, as on
-	 * riscv), the THEAD, SIFIVE and MIPS vendor keys are 0, and
-	 * TIME_CSR_FREQ is unknown (key -1): the time CSR counts instructions.
-	 */
-	struct hwprobe_pair pr2[5] = { { 7 }, { 11 }, { 13 }, { 14 }, { 8 } };
-	rc = syscall(__NR_riscv_hwprobe, pr2, 5, 0, NULL, 0);
-	CHECK(rc == 0 && pr2[0].key == 7 && pr2[0].value == 1UL << 38 &&
-	      pr2[1].key == 11 && pr2[1].value == 0 && pr2[2].key == 13 && pr2[2].value == 0 &&
-	      pr2[3].key == 14 && pr2[3].value == 0 && pr2[4].key == -1 && pr2[4].value == 0,
-	      "riscv_hwprobe highest virt %#lx (want %#lx), vendor keys %ld/%ld/%ld = %lu/%lu/%lu, time freq key %ld",
-	      (unsigned long)pr2[0].value, 1UL << 38, (long)pr2[1].key, (long)pr2[2].key, (long)pr2[3].key,
-	      (unsigned long)pr2[1].value, (unsigned long)pr2[2].value, (unsigned long)pr2[3].value,
-	      (long)pr2[4].key);
+	/* DC ZVA zeroes one aligned 64-byte block, nothing around it. */
+	static uint8_t zbuf[192] __attribute__((aligned(64)));
+	memset(zbuf, 0x77, sizeof(zbuf));
+	__asm__ volatile("dc zva, %0" :: "r"(zbuf + 64 + 17) : "memory");
+	int zok = zbuf[63] == 0x77 && zbuf[128] == 0x77;
+	for (int i = 64; i < 128; i++)
+		zok &= zbuf[i] == 0;
+	CHECK(zok, "DC ZVA: 64 bytes zeroed");
 
 	/*
-	 * Zicclsm (a property of every kwemu, also when kw.isa= hides it):
-	 * misaligned ld/sd, lw/sw and fld/fsd work, inside a page and across
-	 * the boundary of two, long enough to compile.
+	 * Misaligned LDR/STR of X, W and D registers, and LDP/STP, inside a page
+	 * and across the boundary of two (SCTLR_EL1.A = 0 for user space).
 	 */
 	uint8_t *mp = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	int mis = mp == MAP_FAILED;
-	for (int r = 0; !mis && r < 2000; r++)
-		for (int off = 4085; off < 4100; off++) {
+	for (int r = 0; !mis && r < 200; r++)
+		for (int off = 4077; off < 4100; off++) {
 			uint8_t *q = mp + off;
-			uint64_t v = 0x0123456789abcdefUL * (uint64_t)(r + off), d = 0, x;
+			uint64_t v = 0x0123456789abcdefUL * (uint64_t)(r + off), d = 0, x, y;
 			uint32_t w;
-			double f, g;
 
-			__asm__ volatile("sd %1, 0(%0)" :: "r"(q), "r"(v) : "memory");
+			__asm__ volatile("str %1, [%0]" :: "r"(q), "r"(v) : "memory");
 			for (int k = 7; k >= 0; k--)
 				d = d << 8 | q[k];
-			__asm__ volatile("ld %0, 0(%1)" : "=r"(x) : "r"(q) : "memory");
+			__asm__ volatile("ldr %0, [%1]" : "=r"(x) : "r"(q) : "memory");
 			mis += d != v || x != v;
-			__asm__ volatile("sw %2, 1(%1)\n\tlw %0, 1(%1)" : "=&r"(x) : "r"(q), "r"(~v) : "memory");
+			__asm__ volatile("str %w2, [%1, #1]\n\tldr %w0, [%1, #1]" : "=&r"(x) : "r"(q), "r"(~v) : "memory");
 			memcpy(&w, q + 1, 4);
 			mis += (uint32_t)x != (uint32_t)~v || w != (uint32_t)~v;
-			memcpy(&f, &v, 8);
-			__asm__ volatile("fsd %2, 3(%1)\n\tfld %0, 3(%1)" : "=&f"(g) : "r"(q), "f"(f) : "memory");
-			memcpy(&x, &g, 8);
+			__asm__ volatile("fmov d16, %2\n\tstr d16, [%1, #3]\n\tldr d17, [%1, #3]\n\tfmov %0, d17"
+					 : "=r"(x) : "r"(q), "r"(v) : "v16", "v17", "memory");
 			memcpy(&d, q + 3, 8);
 			mis += x != v || d != v;
+			__asm__ volatile("stp %2, %3, [%4]\n\tldp %0, %1, [%4]"
+					 : "=&r"(x), "=&r"(y) : "r"(v), "r"(~v), "r"(q + 5) : "memory");
+			mis += x != v || y != ~v;
 		}
-	CHECK(!mis, "Zicclsm: misaligned ld/sd, lw/sw, fld/fsd in a page and across pages (%d wrong)", mis);
+	CHECK(!mis, "misaligned LDR/STR (X, W, D) and LDP/STP in a page and across pages (%d wrong)", mis);
 	if (mp != MAP_FAILED)
 		munmap(mp, 8192);
-	CHECK(getauxval(AT_HWCAP) == 0x112d, "AT_HWCAP %#lx (IMAFDC)", getauxval(AT_HWCAP));
 
-	/* Hints run as no-ops; instret counts the instruction between two reads. */
-	static const uint32_t hints[] = {
-		0x0100000f,				/* pause */
-		0x00200033, 0x00300033, 0x00400033, 0x00500033, /* ntl.p1 ntl.pall ntl.s1 ntl.all */
-		0x00056013, 0x00156013, 0x00356013,	/* prefetch.i/r/w 0(a0) */
-		0x900e900a, 0x90169012,			/* c.ntl.p1 c.ntl.pall c.ntl.s1 c.ntl.all */
-		0xc0002673, 0xc0102673,			/* rdcycle a2; rdtime a2 */
-		0xc0202573, 0x00000013, 0xc02025f3,	/* rdinstret a0; nop; rdinstret a1 */
-		0x40a58533, 0x00008067,			/* sub a0, a1, a0; ret */
-	};
-	long d = 0;
-	rc = run_code(hints, sizeof(hints) / 4, 0, 0, &d);
-	CHECK(rc == 0 && d == 2, "hints (pause, ntl, c.ntl, prefetch) and cycle/time/instret: instret delta %ld", d);
+	/* UDF and BRK: SIGILL (ILL_ILLOPC) and SIGTRAP (TRAP_BRKPT) at their pc. */
+	static const uint32_t udf[] = { 0x00000000, A64_RET }, brk[] = { 0xd4200000, A64_RET };
+	long rv = 0;
+	int sig = run_code(udf, 2, 0, 0, &rv), code = trap_code;
+	unsigned long a1 = trap_addr;
+	int sig2 = run_code(brk, 2, 0, 0, &rv);
+	CHECK(sig == SIGILL && code == ILL_ILLOPC && sig2 == SIGTRAP && trap_code == TRAP_BRKPT && a1 == trap_addr,
+	      "UDF: signal %d code %d, BRK: signal %d code %d, both at %#lx", sig, code, sig2, trap_code, a1);
 
-	/* Optional extensions: an instruction of each runs iff it is listed. */
+	/* Optional features: an instruction of each runs iff it is listed. */
 	int ran = 0, trapped = 0;
 	bad = 0;
-	for (int i = 0; i < NISA; i++) {
-		const struct isa_ext *e = &isa_exts[i];
-		uint32_t code[2] = { e->probe, 0x00008067 };
+	for (int i = 0; i < NFEAT; i++) {
+		const struct a64_feat *e = &a64_feats[i];
+		uint32_t code2[2] = { e->probe, A64_RET };
 		long r = 0;
-		int listed;
+		int rc = run_code(code2, 2, 3, 5, &r);
 
-		if (!e->probe)
-			continue;
-		listed = have[i] || (e->alt && have[isa_find(e->alt, strlen(e->alt))]);
-		rc = run_code(code, 2, e->mem ? (long)probe_buf : 3, 5, &r);
 		if (rc == 0)
 			ran++;
 		else
 			trapped++;
-		if ((rc == 0) != listed) {
-			printf("     %s (%#x): %s but %s\n", e->name, e->probe, listed ? "listed" : "not listed",
-			       rc == 0 ? "ran" : "raised SIGILL");
-			bad++;
-		} else if (rc == 0 && e->want && (unsigned long)r != e->want) {
-			printf("     %s (%#x): %#lx, want %#lx\n", e->name, e->probe, (unsigned long)r, e->want);
+		if ((rc == 0) != have[i] || (rc && rc != SIGILL)) {
+			printf("     %s (%#x): %s but %s %d\n", e->name, e->probe, have[i] ? "listed" : "not listed",
+			       rc == 0 ? "ran" : "raised signal", rc);
 			bad++;
 		}
 	}
-	CHECK(!bad, "optional extensions: %d ran (listed), %d raised SIGILL (not listed)", ran, trapped);
+	CHECK(!bad, "features: %d ran (listed), %d raised SIGILL (not listed)", ran, trapped);
 
-	/* Zkne + Zknd: FIPS-197 C.1 (AES-128) as OpenSSL runs it, long enough to compile */
-	if (have[isa_find("zkne", 4)] && have[isa_find("zknd", 4)]) {
-		int reps = 0;
+	/*
+	 * The signal frame: an fpsimd_context record (528 bytes) and the
+	 * terminator in __reserved, x8 and the V registers and FPCR as they were
+	 * at the svc, and sigreturn loading V9 and FPCR from the frame. All in
+	 * one asm block, so the compiler keeps nothing in d8/d9 meanwhile.
+	 */
+	struct sigaction sa = { .sa_sigaction = on_frame, .sa_flags = SA_SIGINFO }, osa;
+	unsigned long d8, d9, fpcr_after, pc_svc;
+	sigaction(SIGUSR2, &sa, &osa);
+	fr_ok = fr_ran = 0;
+	__asm__ volatile(
+		"mrs x9, fpcr\n\t"
+		"bic x9, x9, #(3 << 22)\n\t"
+		"orr x9, x9, #(1 << 22)\n\t"
+		"msr fpcr, x9\n\t"
+		"movz x9, #0x7788\n\tmovk x9, #0x5566, lsl #16\n\tmovk x9, #0x3344, lsl #32\n\tmovk x9, #0x1122, lsl #48\n\t"
+		"fmov d8, x9\n\t"
+		"mov x9, #1\n\t"
+		"fmov d9, x9\n\t"
+		"mov x0, %4\n\t"
+		"mov x1, %5\n\t"
+		"mov x8, %6\n\t"
+		"adr %3, 1f\n\t"
+		"svc #0\n"
+		"1:\tfmov %0, d8\n\t"
+		"fmov %1, d9\n\t"
+		"mrs %2, fpcr\n\t"
+		"bic x9, %2, #(3 << 22)\n\t"
+		"msr fpcr, x9"
+		: "=&r"(d8), "=&r"(d9), "=&r"(fpcr_after), "=&r"(pc_svc)
+		: "r"((long)getpid()), "r"((long)SIGUSR2), "r"((long)SYS_kill)
+		: "x0", "x1", "x8", "x9", "v8", "v9", "memory");
+	sigaction(SIGUSR2, &osa, NULL);
+	CHECK(fr_ran == 1 && fr_ok && fr_pc == pc_svc && d8 == 0x1122334455667788UL && d9 == 0xa5a5a5a5deadbeefUL &&
+	      (fpcr_after & (3UL << 22)) == FPCR_RZ,
+	      "signal frame: fpsimd record %s, pc %s, after sigreturn d8 %#lx, d9 %#lx, FPCR.RMode %lu (want 3)",
+	      fr_ok ? "ok" : "BAD", fr_pc == pc_svc ? "ok" : "BAD", d8, d9, (fpcr_after >> 22) & 3);
 
-		bad = aes_fips(&reps);
-		CHECK(!bad, "AES-128 (Zkne, Zknd): FIPS-197 C.1 %d times, %d wrong", reps, bad);
-	}
-	/* Zba + Zbb + Zbs + Zicond: a mix of them, long enough to compile */
-	if (have[isa_find("zba", 3)] && have[isa_find("zbb", 3)] && have[isa_find("zbs", 3)] &&
-	    have[isa_find("zicond", 6)]) {
-		int reps = 0;
+	/*
+	 * Return paths: musl's sigaction sets SA_RESTORER, so its handlers
+	 * return to sa_restorer; without it they return to [sigpage].
+	 */
+	unsigned long sp_start = 0, sp_end = 0;
+	struct k_sigaction_ ksa = { on_sigpage, SA_SIGINFO, NULL, 0 }, kold;
+	int have_map = find_map("[sigpage]", &sp_start, &sp_end);
+	fr_ran = 0;
+	fr_lr = 0;
+	syscall(SYS_rt_sigaction, SIGUSR2, &ksa, &kold, 8);
+	kill(getpid(), SIGUSR2);
+	syscall(SYS_rt_sigaction, SIGUSR2, &kold, NULL, 8);
+	unsigned long lr_sigpage = fr_lr;
+	sa.sa_sigaction = on_sigpage;
+	sigaction(SIGUSR2, &sa, &osa);
+	kill(getpid(), SIGUSR2);
+	sigaction(SIGUSR2, &osa, NULL);
+	CHECK(have_map && fr_ran == 2 && lr_sigpage == sp_start && fr_lr && (fr_lr < sp_start || fr_lr >= sp_end),
+	      "signal return: without SA_RESTORER to [sigpage] %#lx (lr %#lx), with it (musl) to %#lx",
+	      sp_start, lr_sigpage, fr_lr);
 
-		bad = zb_mix(&reps);
-		CHECK(!bad, "Zba, Zbb, Zbs, Zicond: a mix of 13 of them %d times, %d wrong", reps, bad);
-	}
-	/* Zbc (or Zbkc) + Zbkb: GHASH as OpenSSL runs it, long enough to compile */
-	if ((have[isa_find("zbc", 3)] || have[isa_find("zbkc", 4)]) && have[isa_find("zbkb", 4)]) {
-		int reps = 0;
-
-		bad = ghash_kat(&reps);
-		CHECK(!bad, "GHASH (Zbc, Zbkb): GCM test case 2 %d times, %d wrong", reps, bad);
-	}
-	rva23_checks(have);
+	/* No vDSO: clock_gettime is a system call, and time goes on. */
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	usleep(2000);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	CHECK((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec) >= 2000000L,
+	      "clock_gettime without a vDSO: monotonic clock advanced over usleep(2000)");
 }
-#endif /* __riscv */
+
+/*
+ * ISA results: the optional features' known answers, scalar FP through
+ * FPCR and FPSR, and the user state the kernel keeps per task (V registers,
+ * FPCR, FPSR, TPIDR_EL0, the exclusive monitor). `kwtest isa` runs only
+ * these; under `qemu-aarch64 -cpu cortex-a53` they pass too, except the
+ * FPCR/FPSR read-back (qemu keeps AArch32's Len, Stride and NZCV bits) and
+ * the exec check (qemu-user cannot exec a foreign binary). Everything here
+ * is integer or scalar FP: kwemu has no AdvSIMD FP yet.
+ */
+#define CX_EXT ".arch_extension aes\n\t.arch_extension sha2\n\t.arch_extension crc\n\t"
+/* d = insn(d, n, m) on whole q registers: v0 = d, v1 = n, v2 = m */
+#define CX3(fn, insn) static void fn(uint8_t *d, const uint8_t *n, const uint8_t *m) { \
+	__asm__ volatile(CX_EXT "ldr q0, [%0]\n\tldr q1, [%1]\n\tldr q2, [%2]\n\t" insn "\n\tstr q0, [%0]" \
+			 : : "r"(d), "r"(n), "r"(m) : "v0", "v1", "v2", "memory"); }
+/* d = insn(d, n) */
+#define CX2(fn, insn) static void fn(uint8_t *d, const uint8_t *n) { \
+	__asm__ volatile(CX_EXT "ldr q0, [%0]\n\tldr q1, [%1]\n\t" insn "\n\tstr q0, [%0]" \
+			 : : "r"(d), "r"(n) : "v0", "v1", "memory"); }
+CX2(cx_aese, "aese v0.16b, v1.16b")
+CX2(cx_aesd, "aesd v0.16b, v1.16b")
+CX2(cx_aesmc, "aesmc v0.16b, v1.16b")
+CX2(cx_aesimc, "aesimc v0.16b, v1.16b")
+CX3(cx_sha1c, "sha1c q0, s1, v2.4s")
+CX3(cx_sha1p, "sha1p q0, s1, v2.4s")
+CX3(cx_sha1m, "sha1m q0, s1, v2.4s")
+CX3(cx_sha1su0, "sha1su0 v0.4s, v1.4s, v2.4s")
+CX2(cx_sha1h, "sha1h s0, s1")
+CX2(cx_sha1su1, "sha1su1 v0.4s, v1.4s")
+CX3(cx_sha256h, "sha256h q0, q1, v2.4s")
+CX3(cx_sha256h2, "sha256h2 q0, q1, v2.4s")
+CX3(cx_sha256su1, "sha256su1 v0.4s, v1.4s, v2.4s")
+CX2(cx_sha256su0, "sha256su0 v0.4s, v1.4s")
+#define CXCRC(fn, insn, reg) static uint32_t fn(uint32_t a, uint64_t v) { uint32_t r; \
+	__asm__ volatile(CX_EXT insn " %w0, %w1, %" reg "2" : "=r"(r) : "r"(a), "r"(v)); return r; }
+CXCRC(cx_crc32b, "crc32b", "w")
+CXCRC(cx_crc32h, "crc32h", "w")
+CXCRC(cx_crc32w, "crc32w", "w")
+CXCRC(cx_crc32x, "crc32x", "x")
+CXCRC(cx_crc32cb, "crc32cb", "w")
+CXCRC(cx_crc32ch, "crc32ch", "w")
+CXCRC(cx_crc32cw, "crc32cw", "w")
+CXCRC(cx_crc32cx, "crc32cx", "x")
+
+static uint32_t cx_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static void cx_put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+static uint32_t cx_get32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+
+/* AES-128, FIPS-197 C.1: the key expanded through AESE, encrypt and decrypt. */
+static int kat_aes(void)
+{
+	static const uint8_t key[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	static const uint8_t pt[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+					0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+	static const uint8_t ct[16] = { 0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30,
+					0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a };
+	static const uint8_t rcon[10] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36 };
+	static const uint8_t zero16[16] __attribute__((aligned(16)));
+	uint8_t rk[11][16] __attribute__((aligned(16))), s[16] __attribute__((aligned(16)));
+	uint8_t dk[16] __attribute__((aligned(16)));
+	uint32_t w[44];
+	int ok;
+
+	for (int i = 0; i < 4; i++)
+		w[i] = cx_get32(key + 4 * i);
+	for (int i = 4; i < 44; i++) {
+		uint32_t x = w[i - 1];
+
+		if (i % 4 == 0) {
+			/* SubWord by AESE: with four equal columns ShiftRows is the identity. */
+			x = x >> 8 | x << 24;
+			for (int j = 0; j < 4; j++)
+				cx_put32(s + 4 * j, x);
+			cx_aese(s, zero16);
+			x = cx_get32(s) ^ rcon[i / 4 - 1];
+		}
+		w[i] = w[i - 4] ^ x;
+	}
+	for (int r = 0; r < 11; r++)
+		for (int j = 0; j < 4; j++)
+			cx_put32(rk[r] + 4 * j, w[4 * r + j]);
+	memcpy(s, pt, 16);
+	for (int r = 0; r < 9; r++) {
+		cx_aese(s, rk[r]);
+		cx_aesmc(s, s);
+	}
+	cx_aese(s, rk[9]);
+	for (int i = 0; i < 16; i++)
+		s[i] ^= rk[10][i];
+	ok = !memcmp(s, ct, 16);
+	/* The equivalent inverse cipher. */
+	cx_aesd(s, rk[10]);
+	for (int r = 9; r >= 1; r--) {
+		cx_aesimc(s, s);
+		cx_aesimc(dk, rk[r]);
+		cx_aesd(s, dk);
+	}
+	for (int i = 0; i < 16; i++)
+		s[i] ^= rk[0][i];
+	return ok && !memcmp(s, pt, 16);
+}
+
+/* lo = a[0] * b[0] (PMULL), hi = a[1] * b[1] (PMULL2), carry-less. */
+static void cx_pmull(const uint64_t a[2], const uint64_t b[2], uint64_t lo[2], uint64_t hi[2])
+{
+	__asm__ volatile(CX_EXT "ldr q0, [%0]\n\tldr q1, [%1]\n\t"
+			 "pmull v2.1q, v0.1d, v1.1d\n\tpmull2 v3.1q, v0.2d, v1.2d\n\t"
+			 "str q2, [%2]\n\tstr q3, [%3]"
+			 : : "r"(a), "r"(b), "r"(lo), "r"(hi) : "v0", "v1", "v2", "v3", "memory");
+}
+
+static void clmul_ref(uint64_t a, uint64_t b, uint64_t r[2])
+{
+	r[0] = r[1] = 0;
+	for (int i = 0; i < 64; i++)
+		if (b >> i & 1) {
+			r[0] ^= a << i;
+			r[1] ^= i ? a >> (64 - i) : 0;
+		}
+}
+
+/* A GCM block as a polynomial: bit i is the coefficient of x^i (bit-reflected). */
+static void gf_load(const uint8_t *b, uint64_t x[2])
+{
+	x[0] = x[1] = 0;
+	for (int j = 0; j < 16; j++) {
+		uint64_t r = 0;
+
+		for (int k = 0; k < 8; k++)
+			r |= (uint64_t)(b[j] >> (7 - k) & 1) << k;
+		x[j / 8] |= r << (8 * (j % 8));
+	}
+}
+
+static void gf_store(const uint64_t x[2], uint8_t *b)
+{
+	for (int j = 0; j < 16; j++) {
+		uint8_t v = x[j / 8] >> (8 * (j % 8)), r = 0;
+
+		for (int k = 0; k < 8; k++)
+			r |= (v >> k & 1) << (7 - k);
+		b[j] = r;
+	}
+}
+
+/* x = x * h in GF(2^128) mod x^128 + x^7 + x^2 + x + 1, the product by PMULL/PMULL2. */
+static void gf_mul(uint64_t x[2], const uint64_t h[2])
+{
+	uint64_t hs[2] = { h[1], h[0] }, p0[2], p3[2], m0[2], m1[2], r[4];
+
+	cx_pmull(x, h, p0, p3);
+	cx_pmull(x, hs, m0, m1);
+	r[0] = p0[0];
+	r[1] = p0[1] ^ m0[0] ^ m1[0];
+	r[2] = p3[0] ^ m0[1] ^ m1[1];
+	r[3] = p3[1];
+	for (int i = 255; i >= 128; i--)
+		if (r[i >> 6] >> (i & 63) & 1) {
+			static const int t[4] = { 0, 1, 2, 7 };
+
+			r[i >> 6] ^= 1UL << (i & 63);
+			for (int k = 0; k < 4; k++)
+				r[(i - 128 + t[k]) >> 6] ^= 1UL << ((i - 128 + t[k]) & 63);
+		}
+	x[0] = r[0];
+	x[1] = r[1];
+}
+
+/*
+ * PMULL and PMULL2 (.1Q) against a C carry-less multiply, then GHASH of the
+ * GCM specification's test case 2 (H, one ciphertext block, the lengths).
+ */
+static int kat_pmull(void)
+{
+	static const uint8_t H[16] = { 0x66, 0xe9, 0x4b, 0xd4, 0xef, 0x8a, 0x2c, 0x3b,
+				       0x88, 0x4c, 0xfa, 0x59, 0xca, 0x34, 0x2b, 0x2e };
+	static const uint8_t C[16] = { 0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
+				       0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78 };
+	static const uint8_t want[16] = { 0xf3, 0x8c, 0xbb, 0x1a, 0xd6, 0x92, 0x23, 0xdc,
+					  0xc3, 0x45, 0x7a, 0xe5, 0xb6, 0xb0, 0xf8, 0x85 };
+	uint8_t len[16] = { 0 }, out[16];
+	uint64_t a[2], b[2], lo[2], hi[2], rl[2], rh[2], y[2] = { 0, 0 }, h[2], c[2], l[2];
+	uint64_t s = 0x9e3779b97f4a7c15UL;
+	int bad = 0;
+
+	for (int i = 0; i < 64; i++) {
+		for (int k = 0; k < 2; k++) {
+			s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+			a[k] = i == 0 ? ~0UL : s;
+			s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+			b[k] = i == 0 ? ~0UL : s;
+		}
+		cx_pmull(a, b, lo, hi);
+		clmul_ref(a[0], b[0], rl);
+		clmul_ref(a[1], b[1], rh);
+		bad += lo[0] != rl[0] || lo[1] != rl[1] || hi[0] != rh[0] || hi[1] != rh[1];
+	}
+	len[15] = 0x80;	/* len(A) = 0, len(C) = 128 bits */
+	gf_load(H, h);
+	gf_load(C, c);
+	gf_load(len, l);
+	y[0] ^= c[0], y[1] ^= c[1];
+	gf_mul(y, h);
+	y[0] ^= l[0], y[1] ^= l[1];
+	gf_mul(y, h);
+	gf_store(y, out);
+	return !bad && !memcmp(out, want, 16);
+}
+
+static void cx_add4(uint8_t *d, const uint8_t *a, const uint32_t *k)
+{
+	for (int i = 0; i < 4; i++)
+		cx_put32(d + 4 * i, cx_get32(a + 4 * i) + k[i]);
+}
+
+static void sha256_block(uint32_t st[8], const uint8_t *blk)
+{
+	static const uint32_t K[64] = {
+		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+		0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+		0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+		0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+		0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+		0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+		0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+	};
+	uint8_t w[4][16] __attribute__((aligned(16))), abcd[16] __attribute__((aligned(16)));
+	uint8_t efgh[16] __attribute__((aligned(16))), old[16] __attribute__((aligned(16)));
+	uint8_t wk[16] __attribute__((aligned(16)));
+
+	for (int i = 0; i < 16; i++)
+		cx_put32(w[i / 4] + 4 * (i % 4), cx_be32(blk + 4 * i));
+	for (int i = 0; i < 4; i++) {
+		cx_put32(abcd + 4 * i, st[i]);
+		cx_put32(efgh + 4 * i, st[4 + i]);
+	}
+	for (int q = 0; q < 16; q++) {
+		cx_add4(wk, w[q % 4], K + 4 * q);
+		memcpy(old, abcd, 16);
+		cx_sha256h(abcd, efgh, wk);
+		cx_sha256h2(efgh, old, wk);
+		if (q < 12) {
+			cx_sha256su0(w[q % 4], w[(q + 1) % 4]);
+			cx_sha256su1(w[q % 4], w[(q + 2) % 4], w[(q + 3) % 4]);
+		}
+	}
+	for (int i = 0; i < 4; i++) {
+		st[i] += cx_get32(abcd + 4 * i);
+		st[4 + i] += cx_get32(efgh + 4 * i);
+	}
+}
+
+static void sha1_block(uint32_t st[5], const uint8_t *blk)
+{
+	static const uint32_t K[4] = { 0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6 };
+	uint8_t w[4][16] __attribute__((aligned(16))), abcd[16] __attribute__((aligned(16)));
+	uint8_t wk[16] __attribute__((aligned(16))), e[16] __attribute__((aligned(16))) = { 0 };
+	uint8_t en[16] __attribute__((aligned(16)));
+
+	for (int i = 0; i < 16; i++)
+		cx_put32(w[i / 4] + 4 * (i % 4), cx_be32(blk + 4 * i));
+	for (int i = 0; i < 4; i++)
+		cx_put32(abcd + 4 * i, st[i]);
+	cx_put32(e, st[4]);
+	for (int q = 0; q < 20; q++) {
+		uint32_t k[4] = { K[q / 5], K[q / 5], K[q / 5], K[q / 5] };
+
+		cx_add4(wk, w[q % 4], k);
+		memset(en, 0xa5, 16);
+		cx_sha1h(en, abcd);
+		if (q / 5 == 0)
+			cx_sha1c(abcd, e, wk);
+		else if (q / 5 == 2)
+			cx_sha1m(abcd, e, wk);
+		else
+			cx_sha1p(abcd, e, wk);
+		memcpy(e, en, 16);
+		if (q < 16) {
+			cx_sha1su0(w[q % 4], w[(q + 1) % 4], w[(q + 2) % 4]);
+			cx_sha1su1(w[q % 4], w[(q + 3) % 4]);
+		}
+	}
+	for (int i = 0; i < 4; i++)
+		st[i] += cx_get32(abcd + 4 * i);
+	st[4] += cx_get32(e);
+}
+
+/* FIPS 180's "abc" and two-block message, padded; returns the block count. */
+static int sha_pad(uint8_t out[128], int m)
+{
+	const char *msg = m ? "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" : "abc";
+	size_t n = strlen(msg);
+	int blocks = n < 56 ? 1 : 2;
+
+	memset(out, 0, 128);
+	memcpy(out, msg, n);
+	out[n] = 0x80;
+	for (int i = 0; i < 8; i++)
+		out[64 * blocks - 1 - i] = (uint8_t)((uint64_t)n * 8 >> (8 * i));
+	return blocks;
+}
+
+static int kat_sha1(void)
+{
+	static const uint32_t want[2][5] = {
+		{ 0xa9993e36, 0x4706816a, 0xba3e2571, 0x7850c26c, 0x9cd0d89d },
+		{ 0x84983e44, 0x1c3bd26e, 0xbaae4aa1, 0xf95129e5, 0xe54670f1 },
+	};
+	int ok = 1;
+
+	for (int m = 0; m < 2; m++) {
+		uint8_t buf[128];
+		uint32_t st[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+		int nb = sha_pad(buf, m);
+
+		for (int b = 0; b < nb; b++)
+			sha1_block(st, buf + 64 * b);
+		ok &= !memcmp(st, want[m], sizeof(st));
+	}
+	return ok;
+}
+
+static int kat_sha2(void)
+{
+	static const uint32_t want[2][8] = {
+		{ 0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad },
+		{ 0x248d6a61, 0xd20638b8, 0xe5c02693, 0x0c3e6039, 0xa33ce459, 0x64ff2167, 0xf6ecedd4, 0x19db06c1 },
+	};
+	int ok = 1;
+
+	for (int m = 0; m < 2; m++) {
+		uint8_t buf[128];
+		uint32_t st[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+				   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+		int nb = sha_pad(buf, m);
+
+		for (int b = 0; b < nb; b++)
+			sha256_block(st, buf + 64 * b);
+		ok &= !memcmp(st, want[m], sizeof(st));
+	}
+	return ok;
+}
+
+/* CRC-32 and CRC-32C of "123456789": by bytes, by X then B, by W, H, B, H. */
+static int kat_crc32(void)
+{
+	const char *s = "123456789";
+	uint32_t a = ~0u, c = ~0u, w4 = cx_get32((const uint8_t *)s);
+	uint64_t v, h56 = (uint8_t)s[4] | (uint64_t)(uint8_t)s[5] << 8, h89 = (uint8_t)s[7] | (uint64_t)(uint8_t)s[8] << 8;
+	int ok;
+
+	for (int i = 0; i < 9; i++) {
+		a = cx_crc32b(a, (uint8_t)s[i]);
+		c = cx_crc32cb(c, (uint8_t)s[i]);
+	}
+	ok = ~a == 0xcbf43926 && ~c == 0xe3069283;
+	memcpy(&v, s, 8);
+	a = cx_crc32b(cx_crc32x(~0u, v), '9');
+	c = cx_crc32cb(cx_crc32cx(~0u, v), '9');
+	ok &= ~a == 0xcbf43926 && ~c == 0xe3069283;
+	a = cx_crc32h(cx_crc32b(cx_crc32h(cx_crc32w(~0u, w4), h56), (uint8_t)s[6]), h89);
+	c = cx_crc32ch(cx_crc32cb(cx_crc32ch(cx_crc32cw(~0u, w4), h56), (uint8_t)s[6]), h89);
+	return ok && ~a == 0xcbf43926 && ~c == 0xe3069283;
+}
+
+/* fn() (1 = right, 0 = wrong), or minus the signal it raised. */
+static int guarded(int (*fn)(void))
+{
+	struct sigaction sa = { .sa_sigaction = on_trap, .sa_flags = SA_SIGINFO }, oill;
+	volatile int r = -1;
+
+	trap_sig = 0;
+	sigaction(SIGILL, &sa, &oill);
+	if (!sigsetjmp(trap_jmp, 1))
+		r = fn();
+	sigaction(SIGILL, &oill, NULL);
+	return trap_sig ? -trap_sig : r;
+}
+
+/*
+ * Each optional feature's known answers run right when AT_HWCAP lists it,
+ * and raise SIGILL when it does not (kw.isa=, or not implemented).
+ */
+static void crypto_checks(void)
+{
+	static const struct {
+		const char *name, *what;
+		unsigned long hwcap;
+		int (*fn)(void);
+	} kats[] = {
+		{ "aes", "AES-128 FIPS-197 C.1 encrypt and decrypt (AESE, AESMC, AESD, AESIMC)", 1UL << 3, kat_aes },
+		{ "pmull", "PMULL/PMULL2 .1Q against a C multiply, GHASH of GCM test case 2", 1UL << 4, kat_pmull },
+		{ "sha1", "SHA-1 of FIPS 180 \"abc\" and the 2-block message", 1UL << 5, kat_sha1 },
+		{ "sha2", "SHA-256 of FIPS 180 \"abc\" and the 2-block message", 1UL << 6, kat_sha2 },
+		{ "crc32", "CRC-32 and CRC-32C of \"123456789\" by B, H, W, X", 1UL << 7, kat_crc32 },
+	};
+	unsigned long hwcap = getauxval(AT_HWCAP);
+
+	for (size_t i = 0; i < sizeof(kats) / sizeof(kats[0]); i++) {
+		int on = !!(hwcap & kats[i].hwcap), r = guarded(kats[i].fn);
+
+		if (on)
+			CHECK(r == 1, "isa %s: %s: %s", kats[i].name, kats[i].what,
+			      r == 1 ? "right" : r == 0 ? "WRONG" : "raised a signal");
+		else
+			CHECK(r == -SIGILL, "isa %s: not in AT_HWCAP: %s", kats[i].name,
+			      r == -SIGILL ? "SIGILL" : "ran without SIGILL");
+	}
+}
+
+/* Scalar FP on raw bits, with FPCR and FPSR set and read around it. */
+#define FPCR_RMODE(m) ((unsigned long)(m) << 22)
+#define FPCR_FZ (1UL << 24)
+#define FPCR_DN (1UL << 25)
+#define FPSR_IOC 0x01UL
+#define FPSR_DZC 0x02UL
+#define FPSR_OFC 0x04UL
+#define FPSR_UFC 0x08UL
+#define FPSR_IXC 0x10UL
+#define FPSR_IDC 0x80UL
+
+enum { F_DIVD, F_DIVS, F_MULD, F_ADDD, F_SQRTD, F_FRINTID, F_SCVTFD, F_FCVTZSW };
+
+static unsigned long fp_op(int op, unsigned long a, unsigned long b, unsigned long fpcr, unsigned long *fpsr)
+{
+	unsigned long r = 0, old = MRS(fpcr), sr;
+
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, xzr" : : "r"(fpcr));
+	switch (op) {
+	case F_DIVD:
+		__asm__ volatile("fmov d0, %1\n\tfmov d1, %2\n\tfdiv d0, d0, d1\n\tfmov %0, d0"
+				 : "=r"(r) : "r"(a), "r"(b) : "v0", "v1");
+		break;
+	case F_DIVS:
+		__asm__ volatile("fmov s0, %w1\n\tfmov s1, %w2\n\tfdiv s0, s0, s1\n\tfmov %w0, s0"
+				 : "=r"(r) : "r"(a), "r"(b) : "v0", "v1");
+		break;
+	case F_MULD:
+		__asm__ volatile("fmov d0, %1\n\tfmov d1, %2\n\tfmul d0, d0, d1\n\tfmov %0, d0"
+				 : "=r"(r) : "r"(a), "r"(b) : "v0", "v1");
+		break;
+	case F_ADDD:
+		__asm__ volatile("fmov d0, %1\n\tfmov d1, %2\n\tfadd d0, d0, d1\n\tfmov %0, d0"
+				 : "=r"(r) : "r"(a), "r"(b) : "v0", "v1");
+		break;
+	case F_SQRTD:
+		__asm__ volatile("fmov d0, %1\n\tfsqrt d0, d0\n\tfmov %0, d0" : "=r"(r) : "r"(a) : "v0");
+		break;
+	case F_FRINTID:
+		__asm__ volatile("fmov d0, %1\n\tfrinti d0, d0\n\tfmov %0, d0" : "=r"(r) : "r"(a) : "v0");
+		break;
+	case F_SCVTFD:
+		__asm__ volatile("scvtf d0, %1\n\tfmov %0, d0" : "=r"(r) : "r"(a) : "v0");
+		break;
+	case F_FCVTZSW:
+		__asm__ volatile("fmov d0, %1\n\tfcvtzs %w0, d0" : "=r"(r) : "r"(a) : "v0");
+		break;
+	}
+	sr = MRS(fpsr);
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, xzr" : : "r"(old));
+	*fpsr = sr;
+	return r;
+}
+
+#define D_1 0x3ff0000000000000UL
+#define D_M1 0xbff0000000000000UL
+#define D_2 0x4000000000000000UL
+#define D_3 0x4008000000000000UL
+#define D_0 0UL
+#define D_MAX 0x7fefffffffffffffUL
+#define D_MIN 0x0010000000000000UL
+#define D_HALF 0x3fe0000000000000UL
+#define D_QNAN 0x7ff8000000000000UL
+
+/*
+ * The rounding modes (FPCR.RMode, for division, square root, FRINTI and
+ * SCVTF), each FPSR flag and their accumulation, FZ (denormal input and
+ * output), DN (NaN payloads), the FPCR and FPSR bits that stick, and the
+ * FP state across fork and exec.
+ */
+static void fp_checks(char *self)
+{
+	static const struct {
+		const char *what;
+		int op;
+		unsigned long a, b, want[4];	/* RN, RP, RM, RZ */
+	} rm[] = {
+		{ "fdiv d 1/3", F_DIVD, D_1, D_3,
+		  { 0x3fd5555555555555, 0x3fd5555555555556, 0x3fd5555555555555, 0x3fd5555555555555 } },
+		{ "fdiv d -1/3", F_DIVD, D_M1, D_3,
+		  { 0xbfd5555555555555, 0xbfd5555555555555, 0xbfd5555555555556, 0xbfd5555555555555 } },
+		{ "fdiv s 1/3", F_DIVS, 0x3f800000, 0x40400000, { 0x3eaaaaab, 0x3eaaaaab, 0x3eaaaaaa, 0x3eaaaaaa } },
+		{ "fdiv s -1/3", F_DIVS, 0xbf800000, 0x40400000, { 0xbeaaaaab, 0xbeaaaaaa, 0xbeaaaaab, 0xbeaaaaaa } },
+		{ "fsqrt d 2", F_SQRTD, D_2, 0,
+		  { 0x3ff6a09e667f3bcd, 0x3ff6a09e667f3bcd, 0x3ff6a09e667f3bcc, 0x3ff6a09e667f3bcc } },
+		{ "frinti 2.5", F_FRINTID, 0x4004000000000000, 0, { D_2, D_3, D_2, D_2 } },
+		{ "frinti -2.5", F_FRINTID, 0xc004000000000000, 0,
+		  { 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, 0xc000000000000000 } },
+		{ "scvtf 2^53+1", F_SCVTFD, (1UL << 53) + 1, 0,
+		  { 0x4340000000000000, 0x4340000000000001, 0x4340000000000000, 0x4340000000000000 } },
+	};
+	static const struct {
+		const char *what;
+		int op;
+		unsigned long a, b, fpcr, want, fpsr;
+	} fl[] = {
+		{ "1/3", F_DIVD, D_1, D_3, 0, 0x3fd5555555555555, FPSR_IXC },
+		{ "1/0", F_DIVD, D_1, D_0, 0, 0x7ff0000000000000, FPSR_DZC },
+		{ "0/0", F_DIVD, D_0, D_0, 0, D_QNAN, FPSR_IOC },
+		{ "sqrt(-1)", F_SQRTD, D_M1, 0, 0, D_QNAN, FPSR_IOC },
+		{ "max*2", F_MULD, D_MAX, D_2, 0, 0x7ff0000000000000, FPSR_OFC | FPSR_IXC },
+		{ "min*min", F_MULD, D_MIN, D_MIN, 0, 0, FPSR_UFC | FPSR_IXC },
+		{ "min*0.5 (exact)", F_MULD, D_MIN, D_HALF, 0, 0x0008000000000000, 0 },
+		{ "fcvtzs w 1e10", F_FCVTZSW, 0x4202a05f20000000, 0, 0, 0x7fffffff, FPSR_IOC },
+		{ "1.5*2 (exact)", F_MULD, 0x3ff8000000000000, D_2, 0, D_3, 0 },
+		{ "FZ denormal+0", F_ADDD, 1, D_0, FPCR_FZ, 0, FPSR_IDC },
+		{ "denormal+0", F_ADDD, 1, D_0, 0, 1, 0 },
+		{ "FZ min*0.5", F_MULD, D_MIN, D_HALF, FPCR_FZ, 0, FPSR_UFC },
+		{ "qNaN payload+1", F_ADDD, 0x7ff8000000000123, D_1, 0, 0x7ff8000000000123, 0 },
+		{ "DN qNaN payload+1", F_ADDD, 0x7ff8000000000123, D_1, FPCR_DN, D_QNAN, 0 },
+		{ "sNaN payload+1", F_ADDD, 0x7ff0000000000123, D_1, 0, 0x7ff8000000000123, FPSR_IOC },
+		{ "DN sNaN payload+1", F_ADDD, 0x7ff0000000000123, D_1, FPCR_DN, D_QNAN, FPSR_IOC },
+	};
+	unsigned long sr, r, fpcr_rb, fpsr_rb, old = MRS(fpcr);
+	int bad = 0;
+
+	for (size_t i = 0; i < sizeof(rm) / sizeof(rm[0]); i++)
+		for (int m = 0; m < 4; m++) {
+			r = fp_op(rm[i].op, rm[i].a, rm[i].b, FPCR_RMODE(m), &sr);
+			if (r != rm[i].want[m]) {
+				printf("     %s, RMode %d: %#lx, want %#lx\n", rm[i].what, m, r, rm[i].want[m]);
+				bad++;
+			}
+		}
+	CHECK(!bad, "fp: rounding modes through FPCR.RMode (RN, RP, RM, RZ: fdiv d and s, fsqrt, frinti, scvtf): %d wrong", bad);
+
+	bad = 0;
+	for (size_t i = 0; i < sizeof(fl) / sizeof(fl[0]); i++) {
+		r = fp_op(fl[i].op, fl[i].a, fl[i].b, fl[i].fpcr, &sr);
+		if (r != fl[i].want || sr != fl[i].fpsr) {
+			printf("     %s: %#lx FPSR %#lx, want %#lx FPSR %#lx\n", fl[i].what, r, sr, fl[i].want, fl[i].fpsr);
+			bad++;
+		}
+	}
+	/* The flags accumulate until FPSR is written. */
+	__asm__ volatile("msr fpsr, xzr\n\tfmov d0, %1\n\tfmov d1, %2\n\tfmov d2, %3\n\t"
+			 "fdiv d3, d0, d1\n\tfdiv d3, d0, d2\n\tmrs %0, fpsr\n\tmsr fpsr, xzr"
+			 : "=r"(r) : "r"(D_1), "r"(D_3), "r"(D_0) : "v0", "v1", "v2", "v3");
+	if (r != (FPSR_IXC | FPSR_DZC)) {
+		printf("     1/3 then 1/0: FPSR %#lx, want %#lx\n", r, FPSR_IXC | FPSR_DZC);
+		bad++;
+	}
+	CHECK(!bad, "fp: FPSR flags (IOC, DZC, OFC, UFC, IXC, IDC, sticky), FZ and DN: %d wrong", bad);
+
+	/* What FPCR and FPSR keep (.agents/a64.md: AHP, DN, FZ, RMode; QC, IDC, IXC..IOC). */
+	__asm__ volatile("msr fpcr, %2\n\tmrs %0, fpcr\n\tmsr fpcr, %3\n\tmsr fpsr, %2\n\tmrs %1, fpsr\n\tmsr fpsr, xzr"
+			 : "=&r"(fpcr_rb), "=&r"(fpsr_rb) : "r"(~0UL), "r"(old));
+	CHECK(fpcr_rb == 0x07c00000 && fpsr_rb == 0x0800009f, "fp: FPCR reads back %#lx (want 0x7c00000), FPSR %#lx (want 0x800009f)",
+	      fpcr_rb, fpsr_rb);
+
+	/* fork copies FPCR and FPSR; exec starts with both 0. */
+	int st_fork = -1, st_exec = -1;
+	unsigned long dirty_cr = FPCR_RMODE(3) | FPCR_DN, dirty_sr = FPSR_IXC | FPSR_UFC;
+	pid_t pid;
+
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1" : : "r"(dirty_cr), "r"(dirty_sr));
+	pid = fork();
+	if (pid == 0)
+		_exit(MRS(fpcr) == dirty_cr && MRS(fpsr) == dirty_sr ? 0 : 1);
+	if (pid > 0)
+		waitpid(pid, &st_fork, 0);
+	pid = fork();
+	if (pid == 0) {
+		char *av[] = { self, "fpstate", NULL };
+
+		__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1" : : "r"(dirty_cr), "r"(dirty_sr));
+		execv(self, av);
+		_exit(99);
+	}
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, xzr" : : "r"(old));
+	if (pid > 0)
+		waitpid(pid, &st_exec, 0);
+	CHECK(WIFEXITED(st_fork) && !WEXITSTATUS(st_fork) && WIFEXITED(st_exec) && !WEXITSTATUS(st_exec),
+	      "fp: fork keeps FPCR and FPSR (%s), exec clears them (%s)",
+	      WIFEXITED(st_fork) && !WEXITSTATUS(st_fork) ? "ok" : "BAD",
+	      WIFEXITED(st_exec) && !WEXITSTATUS(st_exec) ? "ok" : "BAD");
+}
+
+/*
+ * The whole user register state a task switch or a signal must keep: V0..V31
+ * (128 bits each), FPCR, FPSR, x9..x18 (which a handler clobbers), and
+ * TPIDR_EL0. Loaded and stored in one asm block each, because libc
+ * (memcpy, malloc) uses q registers.
+ */
+struct ustate {
+	unsigned long fpcr, fpsr, x[10], tpidr, pad;
+	__uint128_t v[32];
+};
+
+#define LDV(r) "ldp q0, q1, [" r "]\n\tldp q2, q3, [" r ", #32]\n\tldp q4, q5, [" r ", #64]\n\t" \
+	"ldp q6, q7, [" r ", #96]\n\tldp q8, q9, [" r ", #128]\n\tldp q10, q11, [" r ", #160]\n\t" \
+	"ldp q12, q13, [" r ", #192]\n\tldp q14, q15, [" r ", #224]\n\tldp q16, q17, [" r ", #256]\n\t" \
+	"ldp q18, q19, [" r ", #288]\n\tldp q20, q21, [" r ", #320]\n\tldp q22, q23, [" r ", #352]\n\t" \
+	"ldp q24, q25, [" r ", #384]\n\tldp q26, q27, [" r ", #416]\n\tldp q28, q29, [" r ", #448]\n\t" \
+	"ldp q30, q31, [" r ", #480]\n\t"
+#define STV(r) "stp q0, q1, [" r "]\n\tstp q2, q3, [" r ", #32]\n\tstp q4, q5, [" r ", #64]\n\t" \
+	"stp q6, q7, [" r ", #96]\n\tstp q8, q9, [" r ", #128]\n\tstp q10, q11, [" r ", #160]\n\t" \
+	"stp q12, q13, [" r ", #192]\n\tstp q14, q15, [" r ", #224]\n\tstp q16, q17, [" r ", #256]\n\t" \
+	"stp q18, q19, [" r ", #288]\n\tstp q20, q21, [" r ", #320]\n\tstp q22, q23, [" r ", #352]\n\t" \
+	"stp q24, q25, [" r ", #384]\n\tstp q26, q27, [" r ", #416]\n\tstp q28, q29, [" r ", #448]\n\t" \
+	"stp q30, q31, [" r ", #480]\n\t"
+/* x9..x18 = s->x[], FPCR, FPSR, TPIDR_EL0 (the old one saved in x26), V0..V31 from *r. */
+#define LDS(r) "ldp x9, x10, [" r ", #16]\n\tldp x11, x12, [" r ", #32]\n\t" \
+	"ldp x13, x14, [" r ", #48]\n\tldp x15, x16, [" r ", #64]\n\tldp x17, x18, [" r ", #80]\n\t" \
+	"ldr x0, [" r "]\n\tmsr fpcr, x0\n\tldr x0, [" r ", #8]\n\tmsr fpsr, x0\n\t" \
+	"mrs x26, tpidr_el0\n\tldr x0, [" r ", #96]\n\tmsr tpidr_el0, x0\n\tadd x0, " r ", #112\n\t" LDV("x0")
+#define STS(r) "stp x9, x10, [" r ", #16]\n\tstp x11, x12, [" r ", #32]\n\t" \
+	"stp x13, x14, [" r ", #48]\n\tstp x15, x16, [" r ", #64]\n\tstp x17, x18, [" r ", #80]\n\t" \
+	"add x0, " r ", #112\n\t" STV("x0") \
+	"mrs x0, fpcr\n\tstr x0, [" r "]\n\tmrs x0, fpsr\n\tstr x0, [" r ", #8]\n\t" \
+	"mrs x0, tpidr_el0\n\tstr x0, [" r ", #96]\n\tmsr tpidr_el0, x26\n\t"
+#define VCLOB "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", \
+	"v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", \
+	"v28", "v29", "v30", "v31"
+#define XCLOB "x0", "x1", "x2", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", \
+	"x19", "x20", "x21", "x22", "x23", "x24", "x26"
+
+_Static_assert(__builtin_offsetof(struct ustate, x) == 16 && __builtin_offsetof(struct ustate, tpidr) == 96 &&
+	       __builtin_offsetof(struct ustate, v) == 112, "ustate layout");
+
+static void ustate_fill(struct ustate *s, unsigned long seed, unsigned long fpcr, unsigned long fpsr)
+{
+	unsigned long z = seed;
+
+	for (int i = 0; i < 32; i++) {
+		unsigned long lo, hi;
+
+		z += 0x9e3779b97f4a7c15UL, lo = (z ^ z >> 31) * 0xbf58476d1ce4e5b9UL;
+		z += 0x9e3779b97f4a7c15UL, hi = (z ^ z >> 29) * 0x94d049bb133111ebUL;
+		s->v[i] = (__uint128_t)hi << 64 | lo;
+	}
+	for (int i = 0; i < 10; i++)
+		s->x[i] = seed * 31 + i;
+	s->fpcr = fpcr;
+	s->fpsr = fpsr;
+	s->tpidr = seed ^ 0x7e57000000000000UL;
+}
+
+/* Which parts differ: bit i for V(i), 32 FPCR, 33 FPSR, 34 an X register, 35 TPIDR_EL0. */
+static unsigned long ustate_diff(const struct ustate *a, const struct ustate *b)
+{
+	unsigned long d = 0;
+
+	for (int i = 0; i < 32; i++)
+		d |= (unsigned long)(a->v[i] != b->v[i]) << i;
+	d |= (unsigned long)(a->fpcr != b->fpcr) << 32 | (unsigned long)(a->fpsr != b->fpsr) << 33;
+	d |= (unsigned long)!!memcmp(a->x, b->x, sizeof(a->x)) << 34 | (unsigned long)(a->tpidr != b->tpidr) << 35;
+	return d;
+}
+
+/*
+ * Signal handlers that clobber everything: V0..V31, FPCR, FPSR, x9..x18
+ * (sigreturn must restore them all from the frame). kwt_vsig_handler first
+ * checks the frame (kwt_vsig_check); kwt_valarm_handler counts.
+ */
+__attribute__((used, aligned(16))) struct ustate kwt_vgarbage;
+__attribute__((used)) const struct ustate *kwt_vsig_want;
+__attribute__((used)) volatile int kwt_vsig_frame_ok, kwt_valarms;
+__attribute__((used)) volatile unsigned long kwt_vsig_tpidr;
+
+__attribute__((used)) void kwt_vsig_check(int sig, siginfo_t *si, void *ucv)
+{
+	ucontext_t *uc = ucv;
+	struct a64_fpsimd *fp = (struct a64_fpsimd *)uc->uc_mcontext.__reserved;
+	const struct ustate *w = kwt_vsig_want;
+	int ok = sig == SIGUSR2 && fp->magic == FPSIMD_MAGIC_ && fp->fpcr == w->fpcr && fp->fpsr == w->fpsr;
+
+	(void)si;
+	for (int i = 0; i < 32; i++)
+		ok &= fp->vregs[i] == w->v[i];
+	for (int i = 0; i < 10; i++)
+		ok &= uc->uc_mcontext.regs[9 + i] == w->x[i];
+	kwt_vsig_frame_ok = ok;
+	kwt_vsig_tpidr = MRS(tpidr_el0);
+}
+
+#define CLOBBER_ALL "adrp x9, kwt_vgarbage\n\tadd x9, x9, :lo12:kwt_vgarbage\n\tadd x9, x9, #112\n\t" LDV("x9") \
+	"mov x9, #(3 << 22)\n\tmsr fpcr, x9\n\tmov x9, #0x9f\n\tmsr fpsr, x9\n\t" \
+	"mov x9, #-1\n\tmov x10, #-1\n\tmov x11, #-1\n\tmov x12, #-1\n\tmov x13, #-1\n\t" \
+	"mov x14, #-1\n\tmov x15, #-1\n\tmov x16, #-1\n\tmov x17, #-1\n\tmov x18, #-1\n\t"
+
+__attribute__((naked)) static void kwt_vsig_handler(int sig, siginfo_t *si, void *uc)
+{
+	__asm__ volatile("stp x29, x30, [sp, #-16]!\n\tmov x29, sp\n\tbl kwt_vsig_check\n\t"
+			 CLOBBER_ALL "ldp x29, x30, [sp], #16\n\tret");
+}
+
+__attribute__((naked)) static void kwt_valarm_handler(int sig)
+{
+	__asm__ volatile("adrp x9, kwt_valarms\n\tadd x9, x9, :lo12:kwt_valarms\n\t"
+			 "ldr w10, [x9]\n\tadd w10, w10, #1\n\tstr w10, [x9]\n\t" CLOBBER_ALL "ret");
+}
+
+/*
+ * Run with the state of *in: n round trips of one byte (write wfd, read
+ * rfd) when rfd >= 0, else spin until *stop >= 5 or n loops; with sig set,
+ * first send that signal to pid. The state is then stored to *out, and
+ * FPCR, FPSR and TPIDR_EL0 are put back.
+ */
+static void ustate_run(const struct ustate *in, struct ustate *out, long rfd, long wfd, long n,
+		       volatile int *stop, long pid, long sig)
+{
+	unsigned long fpcr = MRS(fpcr), fpsr = MRS(fpsr);
+	struct {
+		const struct ustate *in;
+		struct ustate *out;
+		long rfd, wfd, n;
+		volatile int *stop;
+		long pid, sig;
+		char buf[8];
+	} a = { in, out, rfd, wfd, n, stop, pid, sig, { 0 } };
+
+	__asm__ volatile(
+		"mov x25, %0\n\t"
+		"ldp x19, x20, [x25]\n\tldp x21, x22, [x25, #16]\n\tldp x23, x24, [x25, #32]\n\t"
+		LDS("x19")
+		"ldr x1, [x25, #56]\n\tcbz x1, 1f\n\t"
+		"ldr x0, [x25, #48]\n\tmov x8, %1\n\tsvc #0\n"
+		"1:\ttbnz x21, #63, 3f\n"
+		"2:\tcbz x23, 4f\n\t"
+		"mov x0, x22\n\tadd x1, x25, #64\n\tmov x2, #1\n\tmov x8, %2\n\tsvc #0\n\t"
+		"mov x0, x21\n\tadd x1, x25, #64\n\tmov x2, #1\n\tmov x8, %3\n\tsvc #0\n\t"
+		"sub x23, x23, #1\n\tb 2b\n"
+		"3:\tcbz x23, 4f\n\tsub x23, x23, #1\n\tldr w0, [x24]\n\tcmp w0, #5\n\tb.lo 3b\n"
+		"4:\t" STS("x20")
+		: : "r"(&a), "i"(SYS_kill), "i"(SYS_write), "i"(SYS_read)
+		: XCLOB, "x25", VCLOB, "cc", "memory");
+	__asm__ volatile("msr fpcr, %0\n\tmsr fpsr, %1" : : "r"(fpcr), "r"(fpsr));
+}
+
+/* A child that keeps its own state through n round trips or a spin; exit 0 if it kept it. */
+static int ustate_child(unsigned long seed, long rfd, long wfd, long n)
+{
+	static struct ustate in __attribute__((aligned(16))), out __attribute__((aligned(16)));
+	static volatile int never;
+	struct rusage ru;
+
+	ustate_fill(&in, seed, FPCR_RMODE(seed & 3) | FPCR_FZ, FPSR_IXC | (seed & 7));
+	ustate_run(&in, &out, rfd, wfd, n, &never, 0, 0);
+	if (ustate_diff(&in, &out))
+		return 1;
+	getrusage(RUSAGE_SELF, &ru);
+	return rfd < 0 && !ru.ru_nivcsw ? 2 : 0;
+}
+
+static void vreg_checks(void)
+{
+	static struct ustate in __attribute__((aligned(16))), out __attribute__((aligned(16)));
+	struct sigaction sa = { .sa_sigaction = kwt_vsig_handler, .sa_flags = SA_SIGINFO }, osa;
+	unsigned long d;
+
+	ustate_fill(&kwt_vgarbage, 0xbad, 0, 0);
+	ustate_fill(&in, 1, FPCR_RMODE(1) | FPCR_FZ | FPCR_DN, 0x08000000UL | FPSR_IXC | FPSR_OFC | FPSR_IOC);
+
+	/* A signal at an svc: the frame has the state, sigreturn restores it. */
+	sigaction(SIGUSR2, &sa, &osa);
+	kwt_vsig_want = &in;
+	kwt_vsig_frame_ok = 0;
+	memset(&out, 0, sizeof(out));
+	ustate_run(&in, &out, -1, -1, 0, &kwt_valarms, getpid(), SIGUSR2);
+	sigaction(SIGUSR2, &osa, NULL);
+	d = ustate_diff(&in, &out);
+	CHECK(kwt_vsig_frame_ok && !d && kwt_vsig_tpidr == in.tpidr,
+	      "vregs: signal at an svc: frame %s, handler's TPIDR_EL0 %s, V0..V31, FPCR, FPSR, x9..x18 back after sigreturn (diff %#lx)",
+	      kwt_vsig_frame_ok ? "ok" : "BAD", kwt_vsig_tpidr == in.tpidr ? "ok" : "BAD", d);
+
+	/* Signals between any two instructions: a 1 ms SIGALRM while the state is live. */
+	struct itimerval it = { { 0, 1000 }, { 0, 1000 } }, off = { 0 };
+	sa.sa_handler = kwt_valarm_handler;
+	sa.sa_flags = 0;
+	sigaction(SIGALRM, &sa, &osa);
+	kwt_valarms = 0;
+	in.tpidr ^= 1;
+	setitimer(ITIMER_REAL, &it, NULL);
+	ustate_run(&in, &out, -1, -1, 1L << 40, &kwt_valarms, 0, 0);
+	setitimer(ITIMER_REAL, &off, NULL);
+	sigaction(SIGALRM, &osa, NULL);
+	d = ustate_diff(&in, &out);
+	CHECK(kwt_valarms >= 5 && !d, "vregs: %d SIGALRMs in a spin, the handler clobbering all: state kept (diff %#lx)",
+	      kwt_valarms, d);
+
+	/*
+	 * Task switches: two processes with different states ping-pong 300
+	 * bytes (a switch at each blocking read), then spin side by side on
+	 * one CPU (preempted: involuntary switches).
+	 */
+	int p1[2], p2[2], st1 = -1, st2 = -1, st3 = -1, st4 = -1;
+	pid_t a, b;
+
+	if (pipe(p1) || pipe(p2)) {
+		CHECK(0, "vregs: pipe");
+		return;
+	}
+	a = fork();
+	if (a == 0)
+		_exit(ustate_child(2, p1[0], p2[1], 300));
+	b = fork();
+	if (b == 0) {
+		/* the other end: read first, so the two alternate */
+		char c;
+
+		if (read(p2[0], &c, 1) != 1 || write(p1[1], &c, 1) != 1)
+			_exit(3);
+		_exit(ustate_child(3, p2[0], p1[1], 299));
+	}
+	waitpid(a, &st1, 0);
+	waitpid(b, &st2, 0);
+	close(p1[0]), close(p1[1]), close(p2[0]), close(p2[1]);
+
+	unsigned long one = 1;
+	a = fork();
+	if (a == 0) {
+		syscall(SYS_sched_setaffinity, 0, sizeof(one), &one);
+		_exit(ustate_child(4, -1, -1, 6000000));
+	}
+	b = fork();
+	if (b == 0) {
+		syscall(SYS_sched_setaffinity, 0, sizeof(one), &one);
+		_exit(ustate_child(5, -1, -1, 6000000));
+	}
+	waitpid(a, &st3, 0);
+	waitpid(b, &st4, 0);
+#define ST_OK(s) (WIFEXITED(s) && !WEXITSTATUS(s))
+	CHECK(ST_OK(st1) && ST_OK(st2) && ST_OK(st3) && ST_OK(st4),
+	      "vregs: two processes with their own V0..V31, FPCR, FPSR, TPIDR_EL0: 300 pipe round trips %s/%s, "
+	      "spinning on one CPU %s/%s",
+	      ST_OK(st1) ? "ok" : "BAD", ST_OK(st2) ? "ok" : "BAD",
+	      ST_OK(st3) ? "ok" : WIFEXITED(st3) && WEXITSTATUS(st3) == 2 ? "never preempted" : "BAD",
+	      ST_OK(st4) ? "ok" : WIFEXITED(st4) && WEXITSTATUS(st4) == 2 ? "never preempted" : "BAD");
+}
+
+/* TPIDR_EL0 per thread: 3 threads set their own and yield 2000 times. */
+static void *tpidr_fn(void *arg)
+{
+	unsigned long want = (unsigned long)arg, bad, last;
+
+	__asm__ volatile("mrs x19, tpidr_el0\n\tmsr tpidr_el0, %2\n\tmov x20, #2000\n\tmov %0, #0\n"
+			 "1:\tmov x8, %3\n\tsvc #0\n\tmrs x0, tpidr_el0\n\tcmp x0, %2\n\tcinc %0, %0, ne\n\t"
+			 "mov x0, #500\n2:\tsubs x0, x0, #1\n\tb.ne 2b\n\t"
+			 "subs x20, x20, #1\n\tb.ne 1b\n\tmrs %1, tpidr_el0\n\tmsr tpidr_el0, x19"
+			 : "=&r"(bad), "=&r"(last) : "r"(want), "i"(SYS_sched_yield)
+			 : "x0", "x8", "x19", "x20", "cc", "memory");
+	return (void *)(bad + (last != want));
+}
+
+static void tpidr_checks(void)
+{
+	pthread_t t[2];
+	void *r[3] = { (void *)1, (void *)1, (void *)1 };
+	int prc[2], tls_ok;
+
+	for (int i = 0; i < 2; i++)
+		prc[i] = pthread_create(&t[i], NULL, tpidr_fn, (void *)(0x7ead0000UL + i));
+	r[2] = tpidr_fn((void *)0x7ead0002UL);
+	for (int i = 0; i < 2; i++)
+		if (!prc[i])
+			pthread_join(t[i], &r[i]);
+	tls_ok = MRS(tpidr_el0) == (unsigned long)__builtin_thread_pointer();
+	CHECK(!prc[0] && !prc[1] && !r[0] && !r[1] && !r[2] && tls_ok,
+	      "tpidr: 3 threads with their own TPIDR_EL0 over 2000 yields each: %lu/%lu/%lu wrong, TLS %s",
+	      (unsigned long)r[0], (unsigned long)r[1], (unsigned long)r[2], tls_ok ? "ok" : "BAD");
+}
+
+/*
+ * The exclusive monitor: an LDXR, then something that enters the kernel,
+ * then an STXR to the same word must fail (ERET clears the monitor on
+ * arm64): a syscall, a signal whose handler did its own LDXR of the word,
+ * a switch to a thread that did one. Without anything between, it passes.
+ */
+__attribute__((used, aligned(16))) volatile unsigned long kwt_excl_word;
+
+__attribute__((naked)) static void kwt_excl_handler(int sig)
+{
+	__asm__ volatile("adrp x9, kwt_excl_word\n\tadd x9, x9, :lo12:kwt_excl_word\n\tldxr x10, [x9]\n\tret");
+}
+
+static int ex_pipe[2];
+
+static void *excl_thread(void *arg)
+{
+	unsigned long v;
+
+	(void)arg;
+	/* the main thread blocks in read(); arm the monitor on its word, wake it */
+	__asm__ volatile("ldxr %0, [%1]" : "=r"(v) : "r"(&kwt_excl_word) : "memory");
+	write(ex_pipe[1], "x", 1);
+	return NULL;
+}
+
+static void excl_checks(void)
+{
+	unsigned long v, *w = (unsigned long *)&kwt_excl_word;
+	unsigned int plain = 9, sc = 9, sig = 9, sw = 9;
+	struct sigaction sa = { .sa_handler = kwt_excl_handler }, osa;
+	pthread_t t;
+	char c;
+	int prc;
+
+	kwt_excl_word = 100;
+	__asm__ volatile("ldxr %0, [%2]\n\tadd %0, %0, #1\n\tstxr %w1, %0, [%2]"
+			 : "=&r"(v), "=&r"(plain) : "r"(w) : "memory");
+	__asm__ volatile("ldxr %0, [%2]\n\tmov x8, %3\n\tsvc #0\n\tadd %0, %0, #1\n\tstxr %w1, %0, [%2]"
+			 : "=&r"(v), "=&r"(sc) : "r"(w), "i"(SYS_getppid) : "x0", "x8", "memory");
+	sigaction(SIGUSR2, &sa, &osa);
+	__asm__ volatile("ldxr %0, [%2]\n\tmov x0, %3\n\tmov x1, %4\n\tmov x8, %5\n\tsvc #0\n\t"
+			 "add %0, %0, #1\n\tstxr %w1, %0, [%2]"
+			 : "=&r"(v), "=&r"(sig) : "r"(w), "r"((long)getpid()), "r"((long)SIGUSR2), "i"(SYS_kill)
+			 : "x0", "x1", "x8", "memory");
+	sigaction(SIGUSR2, &osa, NULL);
+	prc = pipe(ex_pipe) || pthread_create(&t, NULL, excl_thread, NULL);
+	if (!prc) {
+		__asm__ volatile("ldxr %0, [%2]\n\tmov x0, %3\n\tmov x1, %4\n\tmov x2, #1\n\tmov x8, %5\n\tsvc #0\n\t"
+				 "add %0, %0, #1\n\tstxr %w1, %0, [%2]"
+				 : "=&r"(v), "=&r"(sw) : "r"(w), "r"((long)ex_pipe[0]), "r"(&c), "i"(SYS_read)
+				 : "x0", "x1", "x2", "x8", "memory");
+		pthread_join(t, NULL);
+		close(ex_pipe[0]);
+		close(ex_pipe[1]);
+	}
+	CHECK(plain == 0 && sc == 1 && sig == 1 && sw == 1 && kwt_excl_word == 101,
+	      "exclusive monitor: STXR passes right after LDXR (%u), fails after a syscall (%u), a signal whose handler did LDXR (%u), "
+	      "a switch to a thread that did LDXR (%u); word %lu (want 0 1 1 1, 101)",
+	      plain, sc, sig, sw, (unsigned long)kwt_excl_word);
+}
+
+static void isa_result_checks(char *self)
+{
+	crypto_checks();
+	fp_checks(self);
+	vreg_checks();
+	tpidr_checks();
+	excl_checks();
+}
+#endif /* __aarch64__ */
 
 static volatile int alarms;
 
@@ -932,7 +1501,7 @@ static void on_alarm(int sig)
 	alarms++;
 }
 
-#ifdef __riscv
+#ifdef __aarch64__
 static int file_has(const char *path, const char *word)
 {
 	char buf[4096];
@@ -1084,8 +1653,9 @@ static void net_config_checks(void)
  * (only a fatal signal ends it): read() from a pipe into a userfaultfd page
  * while the handler signals the reader before it supplies the page. And
  * the futex ops on user words (FUTEX_WAKE_OP here) must be atomic against
- * user AMOs on other CPUs: one thread adds through FUTEX_OP_ADD while
- * another (on another CPU when there is one) runs amoadd on the same word,
+ * user atomics on other CPUs: one thread adds through FUTEX_OP_ADD while
+ * another (on another CPU when there is one) runs an atomic add (an
+ * LDXR/STXR loop) on the same word,
  * and no increment may be lost.
  */
 static volatile int ua_sigs;
@@ -1198,7 +1768,7 @@ static void uaccess_checks(void)
 	      "uaccess: fault retried with a signal pending (userfaultfd): %d/%d reads whole, %d signals", good, rounds,
 	      ua_sigs);
 
-	/* 2. FUTEX_WAKE_OP's add against amoadd on another CPU. */
+	/* 2. FUTEX_WAKE_OP's add against an atomic add on another CPU. */
 	for (i = 0; i < 2; i++) {
 		pthread_t a, b;
 
@@ -1209,7 +1779,7 @@ static void uaccess_checks(void)
 		pthread_join(b, NULL);
 		sum += ua_word;
 	}
-	CHECK(sum == 2 * 2 * UA_ITERS, "uaccess: FUTEX_WAKE_OP add beside amoadd on %s CPU: %u, want %u",
+	CHECK(sum == 2 * 2 * UA_ITERS, "uaccess: FUTEX_WAKE_OP add beside atomic adds on %s CPU: %u, want %u",
 	      online > 1 ? "another" : "the same", sum, 2 * 2 * UA_ITERS);
 }
 
@@ -1278,9 +1848,9 @@ static void vsock_checks(void)
 {
 	struct sockaddr_vm a = { .svm_family = AF_VSOCK, .svm_cid = VMADDR_CID_HOST, .svm_port = 9 };
 	const char *node;
-	unsigned int cid = VMADDR_CID_ANY, minor;
+	unsigned int cid = VMADDR_CID_ANY, minor = 0;
 	char buf[4096], *p;
-	int fd = open("/proc/misc", O_RDONLY), n, s, rc, err = 0, made;
+	int fd = open("/proc/misc", O_RDONLY), n, s, rc, err = 0, made, opened = 0;
 
 	n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
 	if (fd >= 0)
@@ -1295,6 +1865,7 @@ static void vsock_checks(void)
 		if (made)
 			unlink(node);
 		if (fd >= 0) {
+			opened = 1;
 			ioctl(fd, IOCTL_VM_SOCKETS_GET_LOCAL_CID, &cid);
 			close(fd);
 		}
@@ -1304,7 +1875,11 @@ static void vsock_checks(void)
 	err = rc ? errno : 0;
 	if (s >= 0)
 		close(s);
-	if (cid == VMADDR_CID_ANY)
+	/* Without it the CID would read as "no host device" (VMADDR_CID_ANY). */
+	if (p && !opened)
+		CHECK(0, "vsock: /proc/misc lists vsock (minor %u), but no /dev/vsock node opened (no devtmpfs, no /tmp?)",
+		      minor);
+	else if (cid == VMADDR_CID_ANY)
 		CHECK(s >= 0 && rc && err == ENODEV, "vsock: no host device (CLI --no-vsock): socket %s, connect: %s",
 		      s >= 0 ? "ok" : "FAILED", rc ? strerror(err) : "succeeded?");
 	else
@@ -1713,8 +2288,9 @@ static void park_checks(void)
 
 /*
  * SMP (more than one CPU online): threads on several CPUs hammer shared
- * counters through AMOs (amoadd), LR/SC (a compare-and-swap loop) and a
- * pthread mutex (LR/SC plus futex wait and wake across CPUs); every
+ * counters through atomic adds and compare-and-swap loops (both LDXR/STXR
+ * without LSE) and a pthread mutex (exclusives plus futex wait and wake
+ * across CPUs); every
  * increment must count, and the threads must have run on more than one
  * CPU (tasks stay on the CPU they first ran on).
  */
@@ -1776,7 +2352,7 @@ static void smp_checks(void)
 	CHECK(made == SMP_THREADS && smp_shared.amo == SMP_THREADS * SMP_ITERS &&
 	      smp_shared.lrsc == SMP_THREADS * SMP_ITERS &&
 	      smp_shared.locked == SMP_THREADS * (SMP_ITERS / 16) && __builtin_popcountl(cpus) >= 2,
-	      "smp: %ld CPUs; %d threads on CPUs %#lx: amoadd %u, lr/sc %u, mutex %u (want %u, %u, %u)",
+	      "smp: %ld CPUs; %d threads on CPUs %#lx: atomic add %u, cas %u, mutex %u (want %u, %u, %u)",
 	      online, made, cpus, smp_shared.amo, smp_shared.lrsc, smp_shared.locked,
 	      SMP_THREADS * SMP_ITERS, SMP_THREADS * SMP_ITERS, SMP_THREADS * (SMP_ITERS / 16));
 }
@@ -2409,11 +2985,11 @@ static void move_checks(void)
  *    thread signals each of them every millisecond (the handler changes
  *    the rounding mode and raises DZ, which sigreturn must undo): exact
  *    results, and every thread took signals;
- *  - plain byte and halfword stores next to AMOs and LR/SC in one cache
+ *  - plain byte and halfword stores next to exclusives in one cache
  *    line, from loops that get compiled: no store may be lost;
  *  - a thread in hot() and fphot() moved round the CPUs every 4 ms;
  *  - code that one hart rewrites while another runs it compiled: after
- *    the writer's __builtin___clear_cache() (riscv_flush_icache) the
+ *    the writer's __builtin___clear_cache() (DC CVAU, IC IVAU) the
  *    runner never runs the old version again; a page replaced by
  *    mremap() likewise (the unmap flushes); code made non-executable by
  *    mprotect() faults.
@@ -2544,7 +3120,7 @@ static void js_store_check(void)
 		bad += js_line.b[i] != (uint8_t)JS_ITERS || js_line.h[i] != (uint16_t)(3 * JS_ITERS);
 	CHECK(made == 4 && !bad && js_line.amo == 4UL * JS_ITERS && js_line.lrsc == JS_ITERS &&
 	      cpus == (mv.online < 4 ? mv.all : 15UL),
-	      "jit: byte and halfword stores beside AMOs and LR/SC in one line, 4 threads on CPUs %#lx: %d wrong, amoadd %lu, lr/sc %lu (want %lu, %d)",
+	      "jit: byte and halfword stores beside exclusives in one line, 4 threads on CPUs %#lx: %d wrong, atomic add %lu, cas %lu (want %lu, %d)",
 	      cpus, bad, js_line.amo, js_line.lrsc, 4UL * JS_ITERS, JS_ITERS);
 }
 
@@ -2608,13 +3184,13 @@ static void js_mig_check(void)
 	      s.rounds, k, s.seen, b.moved - a.moved, s.bad);
 }
 
-/* f(a0, a1): a1 passes of a0 += v, then return a0 (a self-loop, then ret). */
+/* f(x0, x1): x1 passes of x0 += v, then return x0 (a self-loop, then ret). */
 static void js_gen(uint32_t *p, int v)
 {
-	p[0] = 0x00050513u | ((uint32_t)v << 20);	/* addi a0, a0, v */
-	p[1] = 0xfff58593u;				/* addi a1, a1, -1 */
-	p[2] = 0xfe059ce3u;				/* bne a1, zero, -8 */
-	p[3] = 0x00008067u;				/* ret */
+	p[0] = 0x91000000u | ((uint32_t)v << 10);	/* add x0, x0, #v (v < 4096) */
+	p[1] = 0xd1000421u;				/* sub x1, x1, #1 */
+	p[2] = 0xb5ffffc1u;				/* cbnz x1, -8 */
+	p[3] = 0xd65f03c0u;				/* ret */
 }
 
 #define JS_PASSES 64
@@ -2702,11 +3278,11 @@ static void js_smc_check(void)
 		CHECK(0, "jit: cross-hart code changes: no thread");
 		return;
 	}
-	/* In place: one aligned store of the new addi, then the flush. */
+	/* In place: one aligned store of the new add, then the flush. */
 	for (i = 0; i < rewrites && ok; i++, done_rw++) {
 		ok = js_wait_calls(2500);
 		v++;
-		__atomic_store_n(&page[0], 0x00050513u | ((uint32_t)v << 20), __ATOMIC_RELAXED);
+		__atomic_store_n(&page[0], 0x91000000u | ((uint32_t)v << 10), __ATOMIC_RELAXED);
 		__builtin___clear_cache((char *)page, (char *)(page + 4));
 		__atomic_store_n(&jx.published, v, __ATOMIC_RELEASE);
 	}
@@ -2767,7 +3343,7 @@ static void jit_smp_checks(void)
 	js_smc_check();
 	mv_setaff(0, mv.all);
 }
-#endif /* __riscv */
+#endif /* __aarch64__ */
 
 static void *hot_thread(void *arg)
 {
@@ -2777,7 +3353,7 @@ static void *hot_thread(void *arg)
 int main(int argc, char **argv)
 {
 	struct utsname u;
-	const char msg[] = "hello from riscv64 user mode via write()\n";
+	const char msg[] = "hello from aarch64 user mode via write()\n";
 
 	if (argc > 1 && !strcmp(argv[1], "child"))
 		return 7;	/* exec'd by the execve test */
@@ -2795,9 +3371,24 @@ int main(int argc, char **argv)
 		printf("%#lx\n", fphot(HOT_SEED));	/* FPHOT_EXPECT, see fphot() */
 		return 0;
 	}
-#ifdef __riscv
+#ifdef __aarch64__
+	/* exec'd by fp_checks() with FPCR and FPSR set: exec must clear both. */
+	if (argc > 1 && !strcmp(argv[1], "fpstate"))
+		return (MRS(fpcr) != 0) | (MRS(fpsr) != 0) << 1;
+	/* Only the ISA result checks (also under qemu-aarch64). */
+	if (argc > 1 && !strcmp(argv[1], "isa")) {
+		isa_result_checks(argv[0]);
+		goto done;
+	}
+	/*
+	 * As /init on an initramfs that has no /tmp (devtmpfs is not mounted
+	 * there either), the device checks make their nodes in /tmp.
+	 */
+	if (getpid() == 1)
+		mkdir("/tmp", 01777);
 	/* Only the SMP checks (`rdinit=/usr/bin/kwtest -- smp` repeats them faster). */
 	if (argc > 1 && !strcmp(argv[1], "smp")) {
+		mkdir("/proc", 0555);
 		mount("proc", "/proc", "proc", 0, NULL);
 		uaccess_checks();
 		smp_checks();
@@ -2810,10 +3401,11 @@ int main(int argc, char **argv)
 	write(1, msg, sizeof(msg) - 1);
 
 	uname(&u);
-	CHECK(!strcmp(u.machine, "riscv64"), "uname: %s %s %s", u.sysname, u.release, u.machine);
+	CHECK(!strcmp(u.machine, "aarch64"), "uname: %s %s %s", u.sysname, u.release, u.machine);
 	CHECK(getpid() == 1 || getppid() > 0, "getpid = %d", getpid());
-#ifdef __riscv
+#ifdef __aarch64__
 	isa_checks();
+	isa_result_checks(argv[0]);
 #endif
 
 	/* brk/malloc and anonymous mmap */
@@ -2911,7 +3503,7 @@ int main(int argc, char **argv)
 	unsigned long fp1 = fphot(HOT_SEED), fp2 = fphot(HOT_SEED);
 	CHECK(fp1 == FPHOT_EXPECT && fp2 == FPHOT_EXPECT, "FP hot loop (JIT): %#lx %#lx, want %#lx", fp1, fp2, FPHOT_EXPECT);
 
-#ifdef __riscv
+#ifdef __aarch64__
 	config_checks();
 	net_config_checks();
 	uaccess_checks();

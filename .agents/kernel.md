@@ -6,7 +6,7 @@ file covers how to change the kernel and what must not break.
 
 ## Tree and patch workflow
 
-`vendor/src/linux-wasm-kernel` is a git tree on branch `kw-riscv-user`:
+`vendor/src/linux-wasm-kernel` is a git tree on branch `kw-arm64-user`:
 base `7595a62d45e` (Linux v7.3.4 from kernel.org) plus one commit per file in
 `kernel/patches/linux/`. `arch/wasm` grew from Joel Severin's linux-wasm
 series (`joelseverin/linux`, branch `wasm-7.0`); the first two patches
@@ -24,7 +24,7 @@ git commit -a          # a new patch, or `git commit --fixup X` and then
 cd ../../..
 kernel/build.sh kernel
 rm kernel/patches/linux/*.patch
-git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linux" 7595a62d45e..kw-riscv-user
+git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linux" 7595a62d45e..kw-arm64-user
 ```
 
 - The series has one patch per piece: generic changes first (Joel's two,
@@ -48,6 +48,12 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   block and the spinlocks taken out of turn (below, SMP, Waiting for
   another CPU). There
   `kernel/patches/linux/` equals `format-patch -N 7595a62d45e..kw-smp`.
+- The switch to an arm64 user ABI (kwemu ABI 9) is, for now, one more
+  patch at the end, `wasm: run arm64 user space (kwemu ABI 9)`, on top
+  of the riscv series (whose arch and ISA patches it rewrites: registers,
+  syscalls, uapi, ELF, signals, cpuinfo), followed by the arm64 fixes
+  made since (`wasm: clear the exclusive monitor on every return to user
+  mode`); fold them into the arch and ISA patches once the port settles.
 - To check that the series applies to a clean base:
   `git -C vendor/src/linux-wasm-kernel worktree add /path/x 7595a62d45e && git -C /path/x am "$PWD"/kernel/patches/linux/*.patch`,
   built with `KSRC=/path/x KOUT=vendor/build/kernel-x kernel/build.sh kernel`.
@@ -77,11 +83,11 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 | kwemu glue, ABI check, `kw_cpu_storage` | `arch/wasm/mm/tlb.c` |
 | software uaccess and the fault path | `arch/wasm/mm/fault.c` |
 | flat vmalloc | `mm/vmalloc-flat.c` (`CONFIG_VMALLOC_FLAT`) |
-| riscv syscall table | `arch/wasm/kernel/Makefile.syscalls`, `syscall_table.c` (from `scripts/syscall.tbl`, abis `riscv rlimit memfd_secret`) |
-| riscv signal frames | `arch/wasm/kernel/signal.c`, `arch/wasm/mm/sigpage.c` |
-| riscv uapi | `arch/wasm/include/uapi/asm/` (ptrace, sigcontext, ucontext, hwcap, hwprobe), `include/asm/elf.h` |
-| `riscv_hwprobe`, `riscv_flush_icache` | `arch/wasm/kernel/sys_riscv.c` |
-| ISA extensions: the table, `kw.isa=`, the cpuinfo `isa` line, the hwprobe bits | `arch/wasm/kernel/cpu.c`, `kw_isa_init()` from `tlb.c` |
+| arm64 syscall table | `arch/wasm/kernel/Makefile.syscalls`, `syscall_table.c` (from `scripts/syscall.tbl`, abis `renameat rlimit memfd_secret`) |
+| arm64 `mmap`, `personality` | `arch/wasm/kernel/sys.c` |
+| arm64 signal frames | `arch/wasm/kernel/signal.c`, `arch/wasm/mm/sigpage.c` |
+| arm64 uapi | `arch/wasm/include/uapi/asm/` (arm64's fcntl, signal, mman, param, posix_types, statfs, auxvec, ptrace, sigcontext, sve_context, ucontext, hwcap), `include/asm/elf.h` |
+| features: the table, `kw.isa=`, AT_HWCAP, the cpuinfo `Features` line | `arch/wasm/kernel/cpu.c`, `kw_isa_init()` from `tlb.c` |
 | IRQ numbers | `arch/wasm/include/asm/irq.h` |
 | devices | `drivers/tty/hvc/hvc_wasm.c`, `drivers/block/kwblk.c`, `drivers/net/kwnet.c`, `drivers/video/fbdev/kwfb.c`, `drivers/input/kwinput.c`, `sound/drivers/kwsnd.c`, `net/vmw_vsock/kwvsock.c`, `drivers/misc/kwshm.c` with `include/uapi/linux/kwshm.h` |
 
@@ -92,7 +98,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and a
 patch re-export.
 
-- `KW_ABI_VERSION` is 8. `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 9 (A64 registers; 1 to 8 were riscv64). `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it, in both copies, on any change to
   the layout or the semantics. A new `KW_ISA_*` bit is an ABI change;
   implementing an extension that already has a bit is not. Host imports
@@ -111,7 +117,10 @@ patch re-export.
   compile time through translate-c. About 53 KiB of it is spare
   (kwemu.md, Sizes).
 - kwemu has no allocator and no globals. All state lives in `struct kw_cpu`
-  and `struct kw_regs`, which the kernel owns.
+  and `struct kw_regs`, which the kernel owns. One exception: the atomics
+  build (SMP kernels) has one static word, `pair_lock` (128-bit STXP), in
+  kwemu's data section, which the shared memory makes common to every CPU
+  as it must be; parking and snapshots, UP only, never see it.
 - Sv39 tables are read at `phys_base + pa`, and kwemu never writes a PTE.
   If A is 0, or D is 0 on a store, it raises `KW_EV_FAULT`. The kernel then
   sets the bits directly (a fast path, like Svadu) or goes through
@@ -119,23 +128,34 @@ patch re-export.
 - Flushes: the kernel calls `kw_flush_tlb_range`/`kw_flush_tlb_all` from
   `flush_tlb_*` and `update_mmu_cache`, and `kw_set_pgd` from `switch_mm`.
   Code the kernel or the host writes (COW copies, page reuse, file data,
-  kwshm) becomes visible only after one of these calls or a guest FENCE.I.
-  kwemu tracks guest stores into code exactly by itself.
+  kwshm) becomes visible only after one of these calls or a guest IC IVAU.
+  The A64 interpreter decodes from memory every time, so it sees guest
+  stores into code at once (kw_emu.h, Code coherence).
 - `kw_clear_reservation` must be called on every context switch, signal
-  delivery and sigreturn (process.c, signal.c), or LR/SC breaks.
+  delivery and sigreturn (process.c, signal.c), or the exclusive monitor
+  (LDXR/STXR) breaks.
 - kwemu polls `*irq_pending` (`&wasm_host_irqs`) on entry and at every
   block end, so at least every 64 instructions, and returns
   `KW_EV_INTERRUPT`.
-- The `cycle`, `time` and `instret` CSRs return `icount`, not wall time.
-  That is why there is no vDSO and `clock_gettime` is a real syscall.
-  Signal handlers return through the `[sigpage]` mapping
-  (`li a7,139; ecall`).
+- `CNTVCT_EL0` counts this CPU's retired instructions (`CNTFRQ_EL0` says
+  1 GHz), not wall time. That is why there is no vDSO and `clock_gettime`
+  is a real syscall (musl and glibc fall back to it without
+  `AT_SYSINFO_EHDR`). Signal handlers return to `sa_restorer` (musl and
+  glibc always set SA_RESTORER), else through the `[sigpage]` mapping
+  (`mov x8, #139; svc #0`).
+- kwemu answers every MRS that arm64 Linux allows or emulates at EL0
+  (MIDR_EL1 0x000f0000, MPIDR, REVIDR, the ID_AA64* space with Linux's
+  EL0 view, ID_AA64ISAR0_EL1 from the enabled features), so the kernel
+  emulates no instruction: every `KW_EV_ILLEGAL` is SIGILL. WFI and WFE
+  are NOPs.
 - The JIT imports (`unkernel.kw_host_jit_caps`/`compile`/`free`) are not
   part of the ABI version (a host takes a missing `flags` argument of
   `compile`, from a kwemu before ABI 8, as 0), and the kernel never calls
-  them. kwemu imports
-  them itself and owns 1024 stub functions in the kernel's exported
-  `__indirect_function_table`. Details are in kwemu.md.
+  them. Only a kwemu built with `-Dkwemu-jit=true` imports them (it then
+  owns 1024 stub functions in the kernel's exported
+  `__indirect_function_table`; kwemu.md); that JIT compiles riscv blocks
+  only, which the A64 `kw_run` never enters, so build.sh leaves it out
+  unless `KWEMU_JIT=1`, and the kernel then has no JIT imports at all.
 
 ## Memory model
 
@@ -463,8 +483,8 @@ module's imports against a build without it).
   to their range) or a held folio whose mapping or index no longer
   matches. Unpinning marks a writable export's folios dirty
   (`folio_mark_dirty_lock()`). Host writes bypass kwemu: code the host
-  writes into a page a guest program executes is not seen until a FENCE.I
-  or a flush.
+  writes into a page a guest program executes is not seen until an IC
+  IVAU or a flush.
   Ordering: every export is announced (attach) when it is made, refreshed
   and released, so a guest export's page list is already at the host when
   the guest sends its id, and an attach comes before the reply to the
@@ -570,7 +590,7 @@ third-party implementation.
 
 A second build of the same tree: `make kw_defconfig kw_smp.config` (SMP,
 `NR_CPUS` 8), which also links with `--shared-memory` (arch Makefile),
-with kwemu built by `zig build -Dkwemu-jit=true -Dkwemu-atomics=true`.
+with kwemu built by `zig build -Dkwemu-atomics=true`.
 `kernel/build.sh smp` does that into `vendor/build/kernel-smp` (Two
 kernels, below). The UP build does not change
 (every SMP piece is `#ifdef CONFIG_SMP` or compiles away). Status,
@@ -623,8 +643,8 @@ numbers and open issues: status.md item 8.
     -ERESTARTSYS still restarts) and runs `irqentry_exit_to_user_mode()`
     from the top. What the old pass had still to do (a signal,
     notify-resume, another reschedule) is in the TIF flags, which only
-    the task clears; `regs->cause` and a0 are as it left them; the LR/SC
-    reservation is cleared at every switch anyway. Equivalent to the old
+    the task clears; `regs->cause` and x0 are as it left them; the
+    exclusive monitor is cleared at every switch anyway. Equivalent to the old
     stack's path with rseq off (this config) and no CONTEXT_TRACKING_USER;
     with rseq on, the syscall and interrupt exits differ in
     `rseq_*_exit_to_user_mode()` and would need a look. Tasks preempted
@@ -724,8 +744,10 @@ numbers and open issues: status.md item 8.
   `kw_set_pgd()` and removes it from the previous mm (still referenced:
   lazy TLB refcount). `flush_tlb_*()` runs `kw_flush_tlb_*` here and,
   through `smp_call_function_many()` with wait, on every other CPU in the
-  mask that uses the mm; `riscv_flush_icache` flushes every CPU
-  (`kw_flush_icache_all()`). A CPU in lazy TLB mode (`enter_lazy_tlb()`:
+  mask that uses the mm. User space's IC IVAU reaches only its own CPU's
+  kwemu (on arm64 hardware it is broadcast); the interpreter keeps no
+  decoded code, so nothing else needs it, but a decoded-code cache or JIT
+  on SMP will need its own way to drop other CPUs' code. A CPU in lazy TLB mode (`enter_lazy_tlb()`:
   idle, a kthread, a task past `exit_mm()`) keeps the mm loaded and its
   mask bit, but a flush does not wait for it (its host thread may be
   asleep): it sets that CPU's `kw_tlb_stale` instead, and `switch_mm()`
@@ -742,8 +764,7 @@ numbers and open issues: status.md item 8.
   store, so the user stores made before the compile are visible); kwemu
   clears `jit_busy`, then takes `flush_all` and flushes everything before
   it runs user code (`kw_flush_later()`, tlb.c; kwemu.md, JIT on several
-  harts). `flush_tlb_all()` (so `riscv_flush_icache`) skips both kinds
-  too. Unlike on x86 this
+  harts). `flush_tlb_all()` skips both kinds too. Unlike on x86 this
   holds when page tables are freed too: a lazy CPU runs no user code and
   no uaccess walk for the mm, and kwemu walks the table only while it
   runs user code and caches no table entries. `update_mmu_cache_range()`
@@ -769,7 +790,7 @@ numbers and open issues: status.md item 8.
   tables in the same batch). The walk takes no lock (munmap frees page
   tables under the mmap read lock), so it reads each level once and
   finds the next table from that value, as gup-fast does. User code on
-  other CPUs updates futex words with AMOs and LR/SC, so the kernel's
+  other CPUs updates futex words with exclusives (LDXR/STXR), so the kernel's
   futex ops on them (`FUTEX_WAKE_OP`, PI, robust futex death) are
   atomic RMWs (asm/futex.h).
 - **Per-CPU memory** is percpu-km (mm/Kconfig allows `NEED_PER_CPU_KM`
@@ -884,8 +905,8 @@ numbers and open issues: status.md item 8.
   several harts). A `kw_cpu` is only ever used by its CPU's instance
   (`wasm_kw_cpu` is `kw_cpus[smp_processor_id()]`, and a task that moves
   starts afresh on the new CPU), so nothing compiled on one CPU is
-  reachable from another. Its atomics build makes AMOs, LR/SC and FENCE
-  atomic (kwemu.md).
+  reachable from another. Its atomics build makes exclusives and
+  barriers atomic (.agents/a64.md, Exclusives).
 - **Costs** (2026-11-16, i7-10700K, Node 24, interpreter only). Each
   atomic RMW, cmpxchg or seq_cst store is a locked instruction in V8 on
   x86-64, about 4.3 ns more than the plain op, and `atomic.fence`
@@ -908,40 +929,65 @@ numbers and open issues: status.md item 8.
   less per mapped page; one-CPU and same-CPU numbers did not move.
   With the JIT on every CPU: kwemu.md, Numbers, SMP with the JIT.
 
-## riscv64 user ABI
+## arm64 user ABI
 
-- Syscall numbers come from `scripts/syscall.tbl` through pt_regs wrappers,
-  so every syscall has one wasm type.
-- Generic code takes ABI choices from arch `Kconfig` selects. Riscv's
+The kernel mirrors arch/arm64 without compat (AArch32), a vDSO, SVE, SME,
+MTE, PAC, BTI, GCS or POE.
+
+- Syscalls: number in x8, arguments in x0..x5, result in x0 (traps.c,
+  asm/syscall.h); numbers from `scripts/syscall.tbl` (which is arm64's
+  `syscall_64.tbl`) with arm64's ABIs `renameat rlimit memfd_secret`,
+  through pt_regs wrappers so every syscall has one wasm type. sys.c has
+  arm64's `mmap` (offset must be page aligned) and `personality`
+  (PER_LINUX32 is EINVAL). Restart backs pc up by 4 (the SVC).
+- Generic code takes ABI choices from arch `Kconfig` selects. arm64's
   clone argument order is `CLONE_BACKWARDS` (otherwise `tls` and
-  `child_tid` swap and every pthread program breaks). Compare with
-  `arch/riscv/Kconfig` before adding a syscall-ABI select.
-- ELF: `EM_RISCV`, `AT_HWCAP` = IMAFDC (single letters only, never more),
-  `AT_MINSIGSTKSZ`. `riscv_flush_icache` flushes kwemu's translations.
-- ISA advertising (cpu.c): one table of multi-letter extensions in the
-  canonical order of riscv's `riscv_isa_ext[]`, each with its kwemu bit (0
-  for ones every kwemu has: Zicbop, Ziccamoa, Ziccif, Zicclsm, Ziccrse,
-  Zicntr, Zihintntl, Zihintpause, Za64rs, Zaamo, Zalrsc, Zca, Zcd) and its
-  hwprobe bit, in `IMA_EXT_0` or, for the platform properties Ziccamoa,
-  Ziccif, Zicclsm, Ziccrse and Za64rs (kwemu.md), in `IMA_EXT_1`. The
-  effective set (implemented, minus `kw.isa=`) gives the `/proc/cpuinfo`
-  `isa` line and `riscv_hwprobe` `IMA_EXT_0` and `IMA_EXT_1`;
-  `ZICBOP_BLOCK_SIZE`, `ZICBOZ_BLOCK_SIZE` and `ZICBOM_BLOCK_SIZE` are 64
-  while that extension is listed. User space picks code paths from these
-  (OpenSSL reads `IMA_EXT_0`, V8 on musl only the cpuinfo line), so an
-  extension is listed only once kwemu implements it. Optional ones listed
-  by default: Zicbom, Zicboz, Zicond, Zihpm, Zimop, Zawrs, Zfa, Zfhmin,
-  Zcb, Zcmop, Zba, Zbb, Zbc, Zbkb, Zbkc, Zbkx, Zbs, Zknd, Zkne: all of
-  RVA23U64 but V and its sub-extensions, Supm and Zkt. Not listed: Zkt
-  (kwemu's AES is not constant-time, kwemu.md), Supm (pointer masking:
-  dropped), Zmmul (M implies it and upstream has no name for it).
-  `MISALIGNED_SCALAR_PERF` (and `CPUPERF_0`) is FAST: a misaligned access
-  costs what an aligned one does, several times less than its bytes one by
-  one. `MISALIGNED_VECTOR_PERF` is UNSUPPORTED (no V). `riscv_hwprobe`
-  ignores `RISCV_HWPROBE_WHICH_CPUS` and answers as for a plain query.
-  `HIGHEST_VIRT_ADDRESS` is 1 << 38 (`STACK_TOP_MAX`, as riscv Sv39), the
-  THEAD, SIFIVE and MIPS vendor keys are 0, and `TIME_CSR_FREQ` is
-  unknown (key -1), because the time CSR counts instructions.
+  `child_tid` swap and every pthread program breaks); arm64's other
+  ABI selects are for compat or BTI. Compare with `arch/arm64/Kconfig`
+  before adding a syscall-ABI select. clone: the child's x0 is 0,
+  CLONE_SETTLS sets TPIDR_EL0 (otherwise the parent's is kept); exec
+  zeroes every register, TPIDR_EL0, FPCR and FPSR.
+- uapi: arm64's headers (fcntl: O_DIRECTORY, O_NOFOLLOW, O_DIRECT and
+  O_LARGEFILE differ from generic; signal: SA_RESTORER, MINSIGSTKSZ 5120;
+  mman, param, posix_types, statfs, auxvec, ptrace, sigcontext,
+  sve_context, ucontext, hwcap). `uname -m` is aarch64.
+- ELF: `EM_AARCH64`, AT_PLATFORM `aarch64`, AT_HWCAP below, AT_HWCAP2 and
+  AT_HWCAP3 0, AT_MINSIGSTKSZ 4720 (what arm64 without SVE reports), no
+  AT_SYSINFO_EHDR.
+- Signals (signal.c): arm64's rt_sigframe (siginfo, ucontext with x0..x30,
+  sp, pc, pstate = NZCV and EL0t, fault_address = the last user fault) with
+  an fpsimd_context record (FPSR, FPCR, V0..V31) and the null terminator in
+  `__reserved`, and a frame record {x29, x30} above it that x29 points
+  to; no ESR record. x30 is `sa_restorer` when SA_RESTORER is set, else
+  the `[sigpage]` page (`mov x8, #139; svc #0`, mm/sigpage.c). sigreturn
+  checks the records as arm64 does (one FPSIMD record of the right size,
+  ESR ignored, anything else invalid), keeps NZCV of pstate and refuses a
+  non-EL0t mode, and masks FPCR and FPSR to the bits kwemu keeps.
+- Features (cpu.c): AT_HWCAP is FP | ASIMD | the KW_ISA_* features
+  `kw_set_isa()` enabled (AES, PMULL, SHA1, SHA2, CRC32: HWCAP bits 3 to
+  7) | CPUID (kwemu answers the ID registers; `KW_HWCAP_CPUID`). The
+  `/proc/cpuinfo` `Features` line lists the same names in HWCAP order,
+  with arm64's other fields for kwemu's MIDR_EL1 (implementer 0x00,
+  architecture 8, variant 0x0, part 0x000, revision 0) and BogoMIPS from
+  `loops_per_jiffy` (2000.00). `kw.isa=` is a comma list from left to
+  right: `armv8` turns every optional feature off, `-aes` one off, `+aes`
+  (or `aes`) one back on. User space picks code paths from these (OpenSSL
+  reads AT_HWCAP), so nothing beyond what kwemu runs is ever listed: no
+  LSE atomics, SVE, SHA3/SHA512, RNG, PAC or BTI.
+- Address space: user page tables keep the Sv39 format kwemu walks, and
+  TASK_SIZE is 1 << 38 (256 GiB), half of arm64's 39-bit VA user space:
+  mmap hints and MAP_FIXED at or above 1 << 38 do not get there. kwemu has
+  no top-byte-ignore, so tagged pointers fault (SIGSEGV), and the tagged
+  address ABI (`PR_SET_TAGGED_ADDR_CTRL`) is not there.
+- User space makes new code visible with DC CVAU and IC IVAU (CTR_EL0
+  has IDC = DIC = 0); there is no cache-flush syscall. IC IVAU acts on
+  the executing CPU only (a64.md, System registers): harmless while
+  kwemu interprets every instruction from memory, a gap for a future
+  decoded-code cache or JIT on SMP.
+- The exclusive monitor: every entry to user mode clears it
+  (`user_mode_loop()`, traps.c), as ERET does on arm64 and qemu-user
+  does, so an STXR after a syscall, a fault, an interrupt, a signal or a
+  task switch fails; kwemu's monitor belongs to the CPU, not the task.
 - ptrace has no regsets, so strace and gdb do not work. There are no core
   dumps, seccomp, modules, swap or kallsyms. Kernel stack overflow (16 KiB
   shadow stacks) is not detected, and a wasm trap in the kernel ends the
@@ -1019,7 +1065,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   `pnpm build` and the tests read `vendor/build`, so pass them paths.
   `LINUX_REPO` names where a fresh tree fetches the base commit from.
 - On a fresh clone `prepare_kernel_tree` applies the whole series (UP and
-  SMP patches alike) as `kw-riscv-user`; it warns when the checked-out
+  SMP patches alike) as `kw-arm64-user`; it warns when the checked-out
   HEAD of `KSRC` has another number of commits than the series has
   patches.
 
@@ -1029,23 +1075,49 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   `alpine-test.cpio`, not in release bundles; kernel/README.md, alpine):
   run as `rdinit=` on both builds, with and without `--no-jit`. Device
   nodes come from devtmpfs when it is mounted, else they are made in
-  `/tmp`; it never opens a node in `/tmp` once `/dev` has one, because
+  `/tmp` (as `/init` it makes `/tmp` and `/proc` if the initramfs has
+  none); it never opens a node in `/tmp` once `/dev` has one, because
   the overlay root mounts `/tmp` nodev. It powers off on
-  success and halts (exit 1) on failure. What it covers beyond syscalls:
-  - ISA, reading `kw.isa=` from `/proc/cmdline`: the cpuinfo `isa` line
-    (order, names, what must be listed), `riscv_hwprobe` `IMA_EXT_0` and
-    `IMA_EXT_1` against it (and the three CBO block sizes, misaligned
-    scalar FAST and vector UNSUPPORTED), misaligned loads and stores in a
-    page and across pages (Zicclsm), `AT_HWCAP`, the hints and counters, and one
-    probe instruction per optional extension that must raise SIGILL
-    exactly when the extension is not listed (`isa_exts`). Listed
-    extensions get result checks long enough to compile: FIPS-197 AES-128
-    (Zkne/Zknd), OpenSSL's GHASH (Zbc or Zbkc, Zbkb), 13 B/Zicond
-    instructions against plain C, a Zcb-compiled function against rv64gc,
-    the MOPs, Zfa rounding/fli/fmin/fmax against libm, Zfhmin conversions,
-    Zihpm counters reading 0, and the CBOs (including SIGSEGV on read-only
-    and PROT_NONE pages, SIGILL for cbo.inval). Run it with
-    `kw.isa=rv64gc` too after an ISA change.
+  success and halts (exit 1) on failure. alpine.sh builds it with `zig cc
+  -target aarch64-linux-musl -mcpu=generic -static -O2 -s`. It
+  needs kwemu's scalar FP and AdvSIMD arithmetic (Zig's libc malloc uses
+  CNT), and no AdvSIMD FP (classifier, 2026-11-17). What it covers beyond syscalls:
+  - Features and the arm64 ABI, reading `kw.isa=` from `/proc/cmdline`:
+    the cpuinfo `Features` line (names, HWCAP order, what must be listed)
+    against AT_HWCAP (no bit outside the table), AT_HWCAP2/3 0, AT_PLATFORM,
+    no vDSO, AT_MINSIGSTKSZ 4720, the cpuinfo MIDR fields, the EL0 system
+    registers (CTR_EL0, DCZID_EL0, TPIDRRO_EL0, MIDR_EL1, TPIDR_EL0), DC
+    ZVA, misaligned LDR/STR of X, W, D and LDP/STP in a page and across
+    pages, UDF (SIGILL, ILL_ILLOPC) and BRK (SIGTRAP, TRAP_BRKPT), one probe
+    instruction per feature (`a64_feats`: fcmp, orr, aese, pmull, sha1h,
+    sha256su0, crc32b, an ID register MRS) that must raise SIGILL exactly
+    when the feature is not listed, the signal frame (the fpsimd record
+    and terminator, V8 and FPCR as at the SVC, sigreturn loading V9 and
+    FPCR from the frame), the return to `sa_restorer` and, without
+    SA_RESTORER, to `[sigpage]`, and `clock_gettime` without a vDSO. Run
+    it with `kw.isa=armv8` too after a feature change.
+  - ISA results (`kwtest isa` runs only these, also under `qemu-aarch64
+    -cpu cortex-a53`, where all but the FPCR/FPSR read-back and the exec
+    check pass): `isa <feature>:` known answers for each optional
+    feature listed in AT_HWCAP, and SIGILL for each one that is not (AES-128
+    FIPS-197 C.1 encrypt and decrypt with the key expanded by AESE;
+    PMULL/PMULL2 .1Q against a C carry-less multiply and GHASH of GCM test
+    case 2; SHA-1 and SHA-256 of FIPS 180 "abc" and the two-block message;
+    CRC-32 and CRC-32C of "123456789" by B, H, W and X). `fp:` each
+    FPCR.RMode for FDIV (double and single), FSQRT, FRINTI and SCVTF; each
+    FPSR flag (IOC, DZC, OFC, UFC, IXC, IDC) and their accumulation, FZ on
+    a denormal input and output, DN with NaN payloads; FPCR and FPSR read
+    back 0x07c00000 and 0x0800009f after writing all ones; fork keeps
+    FPCR and FPSR, exec clears them. `vregs:` V0..V31 (128 bits), FPCR,
+    FPSR, x9..x18 and TPIDR_EL0 kept across a signal at an SVC (the frame
+    holds them; the handler clobbers everything), across 1 ms SIGALRMs
+    in a spin, and in two processes with different states that ping-pong
+    300 bytes over pipes and then spin side by side on one CPU (each must
+    see an involuntary switch). `tpidr:` three threads with their own
+    TPIDR_EL0 over 2000 `sched_yield()` each. `exclusive monitor:` STXR
+    passes right after LDXR and fails after a syscall, after a signal
+    whose handler did an LDXR of the same word, and after a switch to a
+    thread that did one.
   - `hot loops (JIT)` and `FP hot loop (JIT)` run long enough to compile
     (self-looping blocks with page faults, a thread, a COW child,
     SIGALRM); the FP hash comes from a native build (`fphot()`).
@@ -1066,13 +1138,13 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     page whose handler signals the reader before it supplies the page
     must return the data (a non-fatal signal neither ends the fault's
     wait nor fails the retried access); `FUTEX_WAKE_OP`'s add beside an
-    amoadd loop on the same word, on another CPU when there is one, must
+    atomic add (an LDXR/STXR loop) on the same word, on another CPU when there is one, must
     lose no increment. `kwtest smp` runs it too.
   - `config:` checks the options below, and `input handlers` that no
     input handler besides evdev and sysrq is registered.
   - `smp:` (more than one CPU online; skipped otherwise): three threads,
-    the main one among them, count to 900000 through amoadd, an LR/SC
-    loop and a pthread mutex, and must have run on at least two CPUs.
+    the main one among them, count to 900000 through atomic adds, a
+    compare-and-swap loop and a pthread mutex, and must have run on at least two CPUs.
   - `move:` (more than one CPU online; skipped otherwise; SMP above):
     2 threads per CPU (at most 8) started on CPU 0 and then allowed
     everywhere run `fphot()` for 2 s and must sit evenly on every CPU at
@@ -1096,8 +1168,8 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     while the main thread sends each a signal every millisecond whose
     handler sets FE_TOWARDZERO and raises DZ (sigreturn must undo both);
     four threads on different CPUs increment their own byte and
-    halfword of one cache line 200000 times each beside an amoadd and
-    an LR/SC loop on the same line (no store lost); a thread in `hot()`
+    halfword of one cache line 200000 times each beside an atomic add and
+    a compare-and-swap loop on the same line (no store lost); a thread in `hot()`
     and `fphot()` whose affinity changes every 4 ms; code that CPU 1
     calls in a loop (a compiled self-loop) rewritten 300 times by CPU 0
     with one aligned store and `__builtin___clear_cache()`, replaced 40
@@ -1108,6 +1180,20 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     crash.
     `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only
     `uaccess:`, `smp:`, `move:` and `jit:`.
+- abitest (`kernel/guest/abitest.c`): a freestanding arm64 ABI test (no
+  libc, no exclusives, no TLS), so it runs before a libc does and is the
+  only test that sees the registers exec leaves (all of x0..x30, V0..V31,
+  FPCR, FPSR, NZCV and TPIDR_EL0 0, for itself as init and for a process
+  that execs itself with all of them set). It also checks the auxv,
+  `personality(PER_LINUX32)`, an unaligned `mmap` offset, the signal
+  frame and sigreturn (x19 from the frame, the {x29, x30} record),
+  `sa_restorer` and `[sigpage]`, EINTR and SA_RESTART restarts, and raw
+  `clone()` (fork's x0, CLONE_SETTLS). Its header has the build command
+  (`zig cc -target aarch64-linux-none -nostdlib -ffreestanding -static -O2
+  -fno-stack-protector`); boot it like kwtest with
+  `rdinit=/usr/bin/abitest` (`abitest: 0 failure(s)`, exit 0). It tests
+  this kernel's ABI, not qemu-user's. Not in an image yet: the image
+  scripts should build it beside kwtest once they are ported.
 - kwbench (`rdinit=/usr/bin/kwbench`, add `--stats` for the JIT counters)
   gives rough guest speed.
 - `node test/wasi-node.ts`: the WASI side under `node:wasi` (no JIT).
@@ -1117,7 +1203,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   `pr_info`s every `-ENOSYS` in `do_syscall` and every `do_user_trap`
   (traps.c); Ubuntu 24.04 boot, apt and python3 hit neither, systemd only
   `bpf` and `keyctl`. For a hang, the same kernel can print each user
-  task's state and `a7` (the syscall it sleeps in) from `arch_cpu_idle`
+  task's state and `x8` (the syscall it sleeps in) from `arch_cpu_idle`
   every 20 s; a busy host can be paused through the Node inspector
   (`kill -USR1`, then `Debugger.pause` over CDP), which shows the wasm
   kernel stack at the next import call.
@@ -1133,7 +1219,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
   and DUMMY (measured together 2026-11-17: +64 KB raw, +24 KB gzip,
   20 KiB RAM, no new imports; DUMMY built in makes a `dummy0` link at
   boot). There is no netfilter. BPF_SYSCALL, KEYS, IPV6 and SECCOMP stay off. COREDUMP must
-  stay off until the arch has `elf_core_copy_task_fpregs` and riscv64 core
+  stay off until the arch has `elf_core_copy_task_fpregs` and arm64 core
   notes: without them a fault with a core limit is a wasm trap.
 - To measure an option, copy a built `$KOUT`, append the option to its
   `.config`, run `make olddefconfig` and `vmlinux` with build.sh's make

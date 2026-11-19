@@ -558,17 +558,31 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **GNU ld binaries exec slower.** Alpine links everything with GNU ld,
-  whose one R+X segment for code and read-only data costs about 0.5 ms
-  per exec under kwemu against lld's layout (guest-packages.md). The cause
-  on the kwemu or kernel side is not known. Fixing it there would speed
-  up every Alpine binary.
+- **aarch64 image: AdvSIMD floating point.** kwemu rejects it (a64.md),
+  and Alpine's own builds use a little of it: `fcvtzs`, `scvtf`,
+  `ucvtf`, `fcvtzu` on D registers (busybox, musl, libcrypto) and `fneg
+  .2d` (musl's libm). busybox `sleep` (any argument) dies with SIGILL at
+  `fcvtzs d31, d0` (0x5ee1b81f), which fails 4 kwtty tests of `pnpm
+  test:api` and makes `kw-shutdown`'s `sleep 0.2` print "Illegal
+  instruction" (harmless: the next commands still run). kwbench has
+  `scvtf d0, d0` and `scvtf d1, d1`. Everything else in the image is clean
+  (2026-11-17, a64.md, The image).
+- **aarch64 image: not yet rerun.** The Ubuntu arm64 disk, x86_64, i386
+  and arm binaries through qemu-user (riscv64 works: a static riscv64
+  program installed qemu-riscv64 and its library root on first run, 60 s,
+  and then ran in 0.4 s, 2026-11-17), the `KW_ALPINE_OPT=1` rebuild, and
+  the page.
+- **GNU ld binaries exec slower** (measured on the riscv64 guest). Alpine
+  links everything with GNU ld, whose one R+X segment for code and
+  read-only data cost about 0.5 ms per exec under riscv64 kwemu against
+  lld's layout (guest-packages.md). The cause on the kwemu or kernel side
+  is not known. Not measured on aarch64.
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
-  nghttp2) are Alpine's builds; only openssl and zlib are rebuilt. V8 can
-  emit Zba/Zbb with `--riscv-b-extension` (kwemu.md: -6.5% on an integer
-  JS benchmark), but it is off by default and `NODE_OPTIONS` does not
-  accept it. `npx --version` did not change with the rebuilt packages
-  (about 4.1 s, 2026-11-16): it is V8 in the node binary.
+  nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
+  `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but
+  it is off by default and `NODE_OPTIONS` does not accept it, and `npx
+  --version` did not change with the rebuilt packages (about 4.1 s,
+  2026-11-16): it is V8 in the node binary.
 - **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
   --seccomp FD` fails, and GTK programs that load images through glycin
   abort. Workaround in the image: `/usr/local/bin/bwrap`
@@ -594,5 +608,5 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   It was measured 2026-11-14 under Node with a static riscv64 C benchmark
   as `/init` of a cpio, against native x86, `qemu-riscv64` and
   `qemu-system-riscv64 -M virt` with Alpine's linux-lts.
-- Kernel limits are in kernel.md (riscv64 user ABI), the data-disk and
+- Kernel limits are in kernel.md (arm64 user ABI), the data-disk and
   overlay limits in data-disk.md.

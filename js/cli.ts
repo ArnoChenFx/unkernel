@@ -72,9 +72,11 @@ disables it, --net-mtu N sets the MTU handed out by DHCP. The guest is
 sends the guest's TCP through a Wisp server instead (handshake with
 Origin: http://localhost, which wss://wisp.pi0.io:6680/ requires).
 
-kwemu's JIT tier (hot riscv64 code compiled to WebAssembly) is on by default;
---no-jit runs the interpreter only. --stats prints its counters at exit, and
-kwemu's own (exits, compiled share) from a kernel built by kernel/build.sh stats.
+kwemu's JIT tier (hot guest code compiled to WebAssembly) is offered by default;
+--no-jit runs the interpreter only. The aarch64 kwemu has no JIT yet, so its
+kernels never ask for it (--stats then says "not in this kernel"). --stats
+prints the JIT counters at exit, and kwemu's own (exits, compiled share) from a
+kernel built by kernel/build.sh stats.
 
 --worker runs the kernel in a worker thread (createKernel({ worker: true })),
 with the disks and the network built there from specs; the display, the input

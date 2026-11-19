@@ -1,8 +1,28 @@
 # Rebuilt guest packages
 
-The Alpine image ships the minirootfs packages as Alpine builds them,
-except four that sit on the guest's hot paths, which
-`kernel/guest/alpine-opt.sh` rebuilds for kwemu's CPU:
+The aarch64 image ships the minirootfs packages as Alpine builds them.
+`kernel/guest/alpine-opt.sh` can rebuild four that sit on the guest's hot
+paths for kwemu's CPU, but on aarch64 it is off unless `KW_ALPINE_OPT=1`:
+
+- Its gains (the tables below) were measured on the riscv64 guest with
+  kwemu's JIT, where `-O2` with Zba/Zbb/Zbs/Zicond code and lld's layout
+  shortened what the JIT ran. The A64 kwemu is an interpreter so far, and
+  nothing has been measured on it.
+- Alpine's aarch64 builds run as they are: their code is ARMv8.0 (gcc's
+  default `-march=armv8-a`), and the instructions beyond it (LSE atomics
+  through gcc's outline atomics, SVE, SHA3/SHA512 in libcrypto) are
+  chosen at run time from AT_HWCAP, which never lists them (a64.md, The
+  image). A rebuild would not avoid the one gap either: the AdvSIMD FP
+  conversions (`fcvtzs d, d` and kin) are plain gcc code for any
+  `-march`.
+- The script is ported to aarch64 (Bootlin's aarch64 musl gcc, the
+  aarch64 sysroot apks, `-O2 -march=armv8-a`, openssl `linux-aarch64`,
+  meson `cpu_family = 'aarch64'`) with the same aports pins, so it can be
+  turned on once the A64 kwemu has a JIT to tune for. Not built end to end
+  on aarch64 yet (2026-11-17): the toolchain and the sysroot apks were
+  fetched and checked (musl's apk holds the minirootfs's loader byte for
+  byte; a test program against the utmps headers compiled, linked with
+  lld and ran under qemu-aarch64), the four packages were not compiled.
 
 | aports package | files replaced in the image |
 | --- | --- |
@@ -27,17 +47,19 @@ scanelf.
   - openssl: Configure options, with threads on as in the native build;
   - apk-tools: abuild-meson's options and the APKBUILD's, without the lua
     and python modules and the man pages, which the image does not have.
-- **The compiler.** gcc 16.2 from Bootlin's riscv64 musl toolchain
+- **The compiler.** gcc 16.2 from Bootlin's aarch64 musl toolchain
   (`vendor/toolchain-gcc/`). It builds against a sysroot of Alpine's own
-  packages (`musl-dev`, `linux-headers`, the utmps and skalibs static libs,
-  and the musl runtime). musl-dev is the same version as the image's musl,
-  so the binaries link to the image's `libc.musl-riscv64.so.1`.
-- **The flags.** Alpine uses gcc 15 at `-Os` for rv64gc; busybox's own
+  aarch64 packages (`musl-dev`, `linux-headers`, the utmps and skalibs
+  static libs, and the musl runtime). musl-dev is the same version as the
+  image's musl, so the binaries link to the image's
+  `libc.musl-aarch64.so.1`.
+- **The flags.** Alpine uses gcc 15 at `-Os`; busybox's own
   Makefile.flags adds `-Oz`, `-finline-limit=0` and
-  `-fno-guess-branch-probability`. The rebuild uses
-  `-O2 -march=rv64gc_zba_zbb_zbs_zicond` and drops those busybox lines.
-  The one exception is openssl's `crypto/sha/sha256.c`, built at `-Os`
-  (below).
+  `-fno-guess-branch-probability`. The rebuild uses `-O2 -march=armv8-a`
+  and drops those busybox lines. (The riscv64 rebuild used
+  `-O2 -march=rv64gc_zba_zbb_zbs_zicond`, and built openssl's
+  `crypto/sha/sha256.c` at `-Os`, below; on aarch64 OpenSSL's SHA-256 is
+  assembly, so that exception is gone.)
 - **The linker.** lld (zig's `ld.lld`, through `-fuse-ld=lld -B`), not
   GNU ld, with `-z pack-relative-relocs` (RELR; musl supports it) and
   `--undefined-version`. busybox is not PIE. apk is PIE (gcc's default
@@ -54,8 +76,9 @@ scanelf.
   `alpine-opt.sh --install "$stage"` after unpacking the minirootfs. That
   builds first when `vendor/build/alpine-opt/.stamp` is stale (it records
   the script's hash and `ALPINE_VERSION`). A full build takes about 75 s
-  on 16 cores (2026-11-16). Building needs an x86_64 host (Bootlin's gcc);
-  elsewhere, or to keep Alpine's builds, set `KW_ALPINE_OPT=0`. A stage
+  on 16 cores (riscv64, 2026-11-16). Without `KW_ALPINE_OPT=1` it does
+  nothing (the aarch64 default). Building needs an x86_64 host (Bootlin's
+  gcc). A stage
   from an `ALPINE_TARBALL` override with other package versions (e.g. the
   second image for `test/overlay-node.mjs --image2`) keeps Alpine's builds,
   with a warning.
@@ -73,7 +96,8 @@ scanelf.
   `.stamp`, the APKBUILDs; about 9 MB), under the key
   `alpine-opt-<hash of alpine-opt.sh and env.sh>`, exact match only. On a
   miss the rebuild adds about 4 minutes on a 4-core runner (233 s,
-  2026-11-16).
+  riscv64, 2026-11-16). The workflow does not set `KW_ALPINE_OPT=1`, so
+  on aarch64 nothing is built and that cache stays empty.
 - **Keep the other caches.** The existing cache keys hash
   `kernel/build.sh` and `kernel/tools/env.sh`, and a kernel cache miss
   costs about an hour. So the rebuild is not a `build.sh` step. Before
@@ -96,7 +120,11 @@ scanelf.
    SHA-256) in the script.
 3. Check that the APKBUILD's configure options still match the script's.
 
-## Measurements
+## Measurements (riscv64 guest)
+
+These and the next section are the riscv64 rebuild's numbers, kept as
+the rationale for the script; "B" is Zba/Zbb/Zbs. Nothing has been
+measured on aarch64.
 
 All 2026-11-16, Node CLI, JIT on. The guest timed itself with
 `/proc/uptime` (10 ms steps). Medians in ms. Boots interleaved the
@@ -136,7 +164,7 @@ and apk-tools.
 The image has no `openssl` command. The benchmark used the rebuild's,
 against both libcrypto builds.
 
-## What did not help, or was worse
+## What did not help, or was worse (riscv64 guest)
 
 - **GNU ld.** Its output has one R+X segment holding code and read-only
   data. That makes each exec about 0.5 ms slower under kwemu: 200 execs
@@ -186,7 +214,7 @@ Rebuild, then boot the bundle with
 - **Libraries:** point `LD_LIBRARY_PATH` at a directory holding only the
   library under test.
 - **musl:** run its loader as a command
-  (`ld-musl-riscv64.so.1 --library-path DIR PROG`).
+  (`ld-musl-aarch64.so.1 --library-path DIR PROG`).
 - **Noise:** interleave the variants within a boot, rotate their order
   across boots, and compare medians. Boot-to-boot noise is several
   percent (kwemu.md).

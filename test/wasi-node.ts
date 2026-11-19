@@ -145,7 +145,7 @@ async function test(): Promise<void> {
 			cmdline: "console=hvc0 rdinit=/init",
 			// [wait for, then type]
 			script: [[/⇒/, "uname -a; apk --version\n"], [/apk-tools \S+/, "poweroff\n"]],
-			expect: [/Linux unkernel .* riscv64 Linux/, /apk-tools \S+, compiled for riscv64/, /reboot: Power down/],
+			expect: [/Linux unkernel .* aarch64 Linux/, /apk-tools \S+, compiled for aarch64/, /reboot: Power down/],
 		},
 	];
 

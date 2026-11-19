@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 /*
  * kw9p: mount a file system the host serves over 9P2000.L on AF_VSOCK
- * (static riscv64 musl), /usr/bin/kw9p in the Alpine initramfs. The host
+ * (static aarch64 musl), /usr/bin/kw9p in the Alpine initramfs. The host
  * side is js/core/9p.ts (the SDK's vm.mount() and createKernel({ mounts })
  * run kw9p through kwtty).
  *

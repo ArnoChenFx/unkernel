@@ -200,7 +200,7 @@ jobs:
           restore-keys: downloads-
 
       # Exact key only: build.sh never re-applies the series on an existing
-      # kw-riscv-user branch, so a tree with other patches must not be restored.
+      # kw-arm64-user branch, so a tree with other patches must not be restored.
       - name: Restore the kernel tree
         id: linux-src
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

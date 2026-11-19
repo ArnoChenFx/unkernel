@@ -2,10 +2,26 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 const std = @import("std");
 
-/// Zig guests (rv64imac, soft-float, no libc; see guest/rt.zig) run by the kwemu harness tests and benchmarks.
+// The guest CPU is AArch64 (src/a64). The riscv64 CPU (src/cpu, src/emu
+// exec/jit) and its guests are kept for reference: built and unit-tested
+// only with -Driscv-legacy (zig build test-riscv); the harness is A64-only.
+
+/// riscv Zig guests (rv64imac, soft-float, no libc; see guest/rt.zig); -Driscv-legacy only.
 const zig_guests = [_][]const u8{ "hello", "bench" };
-/// Hard-float (rv64gc, lp64d) static musl C guests used by the kwemu library tests.
+/// riscv hard-float (rv64gc, lp64d) static musl C guests; -Driscv-legacy only.
 const gc_guests = [_][]const u8{ "fptest", "isatest", "atomics", "kbench", "aestest", "bktest", "zbtest", "rvatest", "zfatest", "zfhtest", "jalrtest" };
+/// AArch64 guests (static aarch64-linux-musl C, guest/a64/), run under kwemu's
+/// kw_a64_run and under qemu-aarch64 by test/a64-test.mjs (outputs must match).
+const a64_guests = [_][]const u8{
+    "hello",
+    "inttest",
+    "simdmovetest",
+    "cryptotest",
+    "atomictest",
+    "simdtest",
+    "fptest",
+    "simdfptest",
+};
 /// Optional extensions (core.Ext) a gc guest is built with on top of rv64gc.
 fn guestExts(name: []const u8) std.Target.Cpu.Feature.Set {
     if (std.mem.eql(u8, name, "aestest")) return std.Target.riscv.featureSet(&.{ .zkne, .zknd });
@@ -20,6 +36,7 @@ fn guestExts(name: []const u8) std.Target.Cpu.Feature.Set {
 pub fn build(b: *std.Build) void {
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode for the native library and harness (default: ReleaseFast)") orelse .ReleaseFast;
     const native = b.standardTargetOptions(.{});
+    const riscv_legacy = b.option(bool, "riscv-legacy", "Also build the riscv64 guests and the riscv unit tests (zig build test-riscv; the riscv CPU is kept for reference only; default: false)") orelse false;
 
     // ---- guest programs (riscv64, rv64imac, soft-float) -------------------------
     const guest_target = b.resolveTargetQuery(.{
@@ -29,7 +46,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.riscv.featureSet(&.{ .m, .a, .c }),
     });
     const rt = b.createModule(.{ .root_source_file = b.path("guest/rt.zig"), .target = guest_target });
-    for (zig_guests) |name| {
+    if (riscv_legacy) for (zig_guests) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -40,7 +57,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         installGuest(b, exe, name);
-    }
+    };
 
     // ---- kwemu: the CPU core as a library for the real kernel -----------------
     // wasm64 relocatable object + static archive with the C ABI of
@@ -120,38 +137,43 @@ pub fn build(b: *std.Build) void {
     harness_wasm.root_module.linkLibrary(lib_wasm);
     b.installArtifact(harness_wasm); // zig-out/bin/kwemu-harness.wasm
 
-    // The same harness with the JIT tier, for the tests and benchmarks: it
-    // imports unkernel.kw_host_jit_* and exports its function table.
-    const lib_wasm_jit = if (jit) lib_wasm else b.addLibrary(.{
-        .name = "kwemu-jit",
-        .linkage = .static,
-        .root_module = kwemuModule(b, wasm64, lib_optimize, kw_h_wasm, kw_opts_jit_mod),
-    });
-    const harness_jit = b.addExecutable(.{
-        .name = "kwemu-harness-jit",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/emu/harness_wasm.zig"),
-            .target = wasm64,
-            .optimize = lib_optimize,
-            .strip = lib_optimize != .Debug,
-            .imports = &.{ .{ .name = "kw_h", .module = kw_h_wasm }, .{ .name = "kwemu_options", .module = kw_opts_jit_mod } },
-        }),
-    });
-    harness_jit.entry = .disabled;
-    harness_jit.rdynamic = true;
-    harness_jit.export_table = true;
-    harness_jit.root_module.linkLibrary(lib_wasm_jit);
-    b.installArtifact(harness_jit); // zig-out/bin/kwemu-harness-jit.wasm
-
     // Hard-float guests: riscv64-linux-musl, default CPU = rv64gc (lp64d).
-    for (gc_guests) |name| {
+    if (riscv_legacy) for (gc_guests) |name| {
         const gc_target = b.resolveTargetQuery(.{ .cpu_arch = .riscv64, .os_tag = .linux, .abi = .musl, .cpu_features_add = guestExts(name) });
         const mod = b.createModule(.{ .target = gc_target, .optimize = .ReleaseFast, .link_libc = true });
         mod.addCSourceFile(.{ .file = b.path(b.fmt("guest/{s}.c", .{name})), .flags = &.{ "-std=c11", "-Wall", "-frounding-math" } });
         mod.linkSystemLibrary("m", .{});
         const exe = b.addExecutable(.{ .name = name, .root_module = mod, .linkage = .static });
         installGuest(b, exe, name);
+    };
+
+    // A64 guests: ARMv8.0-A (the generic cpu: FP and AdvSIMD, no LSE), no
+    // auto-vectorization in the test code itself (libc is what it is).
+    const a64_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .abi = .musl,
+        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic },
+    });
+    for (a64_guests) |name| {
+        const mod = b.createModule(.{ .target = a64_target, .optimize = .ReleaseFast, .link_libc = true });
+        mod.addCSourceFile(.{ .file = b.path(b.fmt("guest/a64/{s}.c", .{name})), .flags = &.{ "-std=gnu11", "-Wall", "-fno-vectorize", "-fno-slp-vectorize" } });
+        const exe = b.addExecutable(.{ .name = b.fmt("a64-{s}", .{name}), .root_module = mod, .linkage = .static });
+        installGuest(b, exe, b.fmt("a64/{s}", .{name}));
     }
+
+    // A64 coverage classifier (test/a64-coverage.mjs): which raw words the
+    // interpreter rejects as ILLEGAL, and the group each one is routed to.
+    const a64_classify = b.addExecutable(.{
+        .name = "kwemu-a64-classify",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/a64_classify.zig"),
+            .target = native,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "kw_h", .module = kw_h_native }, .{ .name = "kwemu_options", .module = kw_opts_mod } },
+        }),
+    });
+    b.installArtifact(a64_classify);
 
     // ---- tests -------------------------------------------------------------------
     const unit = b.addTest(.{
@@ -184,18 +206,34 @@ pub fn build(b: *std.Build) void {
     unit_wasm_run.addFileArg(unit_wasm.getEmittedBin());
     unit_wasm_run.has_side_effects = true;
 
-    const lib_e2e = b.addSystemCommand(&.{"node"});
-    lib_e2e.addFileArg(b.path("test/kwemu-test.mjs"));
-    lib_e2e.addArg(b.getInstallPath(.prefix, ""));
-    lib_e2e.step.dependOn(b.getInstallStep());
-    lib_e2e.has_side_effects = true;
-    const test_step = b.step("test", "Run unit tests and kwemu library tests (native + wasm64, with and without the JIT tier)");
-    test_step.dependOn(&b.addRunArtifact(unit).step);
-    test_step.dependOn(&lib_e2e.step);
-    test_step.dependOn(&unit_wasm_run.step);
+    // A64 guests under kwemu (native and wasm64) against qemu-aarch64 (the
+    // comparison is skipped, with a note, without qemu-aarch64 on PATH).
+    const a64_e2e = b.addSystemCommand(&.{"node"});
+    a64_e2e.addFileArg(b.path("test/a64-test.mjs"));
+    a64_e2e.addArg(b.getInstallPath(.prefix, ""));
+    a64_e2e.step.dependOn(b.getInstallStep());
+    a64_e2e.has_side_effects = true;
+    const unit_a64 = b.addTest(.{
+        .name = "a64-unit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_a64.zig"),
+            .target = native,
+            .optimize = .Debug,
+            .imports = &.{ .{ .name = "kw_h", .module = kw_h_native }, .{ .name = "kwemu_options", .module = kw_opts_mod } },
+        }),
+    });
+    const test_step = b.step("test", "Run the A64 unit tests and the A64 guests (native and wasm64 harness) against qemu-aarch64");
+    test_step.dependOn(&b.addRunArtifact(unit_a64).step);
+    test_step.dependOn(&a64_e2e.step);
+    if (riscv_legacy) {
+        const test_riscv = b.step("test-riscv", "Run the riscv unit tests (native, and wasm64 with the JIT tier); reference code only");
+        test_riscv.dependOn(&b.addRunArtifact(unit).step);
+        test_riscv.dependOn(&unit_wasm_run.step);
+    }
 
     // `zig build fuzz -- N [SEED]`: the wasm64 unit tests with N seeds of the
     // randomized interpreter-vs-JIT test (src/emu/kwemu_test.zig, "kwemu jit fuzz").
+    if (!riscv_legacy) return;
     const fuzz_run = b.addSystemCommand(&.{"node"});
     fuzz_run.addFileArg(b.path("test/kwemu-unit-wasm.mjs"));
     fuzz_run.addFileArg(unit_wasm.getEmittedBin());

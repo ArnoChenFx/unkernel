@@ -1,21 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Contract between the wasm Linux kernel (arch side) and the guest CPU
- * emulator ("kwemu", Zig, src/emu). The emulator is a freestanding library
- * with no allocator and no global mutable state: everything lives in the
- * kernel-owned struct kw_cpu, and guest registers in a kernel-owned
- * struct kw_regs (normally inside the task's pt_regs).
+ * emulator ("kwemu", Zig, src/a64 on top of the MMU in src/emu). The
+ * emulator is a freestanding library with no allocator and no global
+ * mutable state: everything lives in the kernel-owned struct kw_cpu, and
+ * guest registers in a kernel-owned struct kw_regs (normally inside the
+ * task's pt_regs).
  *
- * Guest ISA: riscv64 (rv64gc), user mode only, plus the optional
- * extensions below (KW_ISA_*) that kwemu implements and the kernel enables.
+ * Guest ISA (ABI 9): AArch64, A64 instruction set, ARMv8.0-A user mode
+ * (EL0), little-endian, with FP and AdvSIMD. No LSE, SVE, pointer
+ * authentication or MTE; the PAC and BTI encodings in the hint space run as
+ * NOPs. Optional features (KW_ISA_*, below) are enabled only when this
+ * build implements them. .agents/a64.md lists which instructions are
+ * implemented; every other encoding raises KW_EV_ILLEGAL. (ABI 1 to 8 were
+ * riscv64; that code is kept in src/cpu and src/emu for reference only.)
  *
  * Memory model: kernel and emulator share one wasm64 linear memory. A
  * "physical address" is a linear-memory address minus cpu->phys_base.
  * The emulator walks the kernel's user page tables itself, like hardware:
  * the kernel writes PTEs and calls the flush hooks below.
  *
- * Page-table format (RISC-V Sv39 layout, 4 KiB pages, 3 levels, 512
- * entries per level, 8-byte little-endian PTEs):
+ * Page-table format (RISC-V Sv39 layout, kept for every guest ISA: 4 KiB
+ * pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs; user
+ * virtual addresses below 2^38):
  *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
  *   bits 10..53 PPN (physical address >> 12).
  * A valid PTE with R=W=X=0 points to the next level. Leaves are only
@@ -23,42 +30,23 @@
  * The emulator never writes PTEs: an access with A=0, or a store with
  * D=0, raises KW_EV_FAULT so the kernel can set the bits.
  *
- * Decoded-code cache (ABI 2): the emulator keeps predecoded basic blocks
- * in struct kw_cpu, keyed by virtual pc and physical address and checked
- * against the raw instruction bits. Coherence rules:
- *  - guest stores (any mapping, incl. AMOs) are tracked exactly: code
- *    rewritten by the guest is seen by the next instruction;
- *  - code rewritten by the kernel (page reuse, COW copy, file data,
- *    ptrace) is seen after kw_flush_tlb_range() of a page that maps it,
- *    kw_flush_tlb_all(), kw_set_pgd(), or a guest FENCE.I -- i.e. the
- *    flushes the kernel already does when it changes a mapping or flushes
- *    the icache. (Rewriting a currently mapped exec page in place with no
- *    flush at all may keep running the old code until one of those, as an
- *    incoherent icache would.)
+ * Code coherence: the A64 interpreter decodes every instruction from
+ * memory as it runs it, so code rewritten by the guest or the kernel is
+ * seen at once. Code the kernel rewrites must still be followed by the
+ * flushes it does anyway (kw_flush_tlb_range() of a page that maps it,
+ * kw_flush_tlb_all(), kw_set_pgd()), and guests make new code visible with
+ * IC IVAU (+ ISB), as on hardware with CTR_EL0.DIC = IDC = 0: a later
+ * decoded-code cache relies on exactly these points.
  *
  * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
- * built with wasm atomics (zig build -Dkwemu-atomics) makes guest AMOs
- * atomic read-modify-writes, SC a compare-and-swap against the value LR
- * read, and FENCE a full barrier; without atomics they assume one hart.
- * Guest stores are tracked only by the struct kw_cpu that runs them: code
- * another CPU rewrites is seen after a flush on this one (riscv's
- * flush_icache syscall, FENCE.I alone is local), as on hardware.
+ * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
+ * DSB) full barriers and is meant to make exclusives atomic; without
+ * atomics everything assumes one CPU.
  *
- * Flushes during a JIT compile (ABI 8): a compile takes a few hundred
- * microseconds, and the CPU answers no interrupt meanwhile. Around each
- * (choosing the blocks, emitting the module, kw_host_jit_compile()) kwemu
- * sets jit_busy (below) to 1 and back to 0; in between it runs no guest
- * instruction and touches no guest memory and no page table. Another CPU that needs this one's TLB flushed may then
- * skip waiting for it: it sets flush_all to 1, issues a full barrier and
- * reads jit_busy with acquire semantics; only if it reads 1 may it go on
- * without this CPU's answer. When the call returns, kwemu stores 0 to
- * jit_busy, issues a full barrier, takes flush_all (atomic exchange with
- * 0) and, if it was set, does what kw_flush_tlb_all() does before it runs
- * any guest code. So either the flusher sees the window closed (and waits
- * as usual), or kwemu sees the request. Guest stores before the window are
- * ordered before its jit_busy = 1 (a release store). Only kwemu clears
- * flush_all; a kwemu built without atomics (one hart) never sees it set.
+ * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
+ * and another CPU may skip waiting for its TLB flush. The A64 build has no
+ * JIT yet: it never sets jit_busy, and never sees flush_all set.
  */
 #ifndef KW_EMU_H
 #define KW_EMU_H
@@ -73,23 +61,42 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 8
+#define KW_ABI_VERSION 9
 
+/*
+ * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
+ * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
+ * the 32 128-bit V registers at 288 (16-byte aligned; each is two
+ * little-endian 64-bit halves, low half first, i.e. the memory image of a
+ * little-endian __uint128_t). Register number 31 is SP or XZR depending on
+ * the instruction, as in the architecture; there is no x[31].
+ */
 struct kw_regs {
-	uint64_t x[32];   /* x[0] is ignored and reads as zero */
+	uint64_t x[31];
+	uint64_t sp;       /* SP_EL0 */
 	uint64_t pc;
-	uint64_t f[32];   /* raw 64-bit FP registers (NaN-boxed singles) */
-	uint32_t fcsr;
+	uint32_t nzcv;     /* PSTATE.{N,Z,C,V} in bits 31..28 (as MRS NZCV
+			      reads them); the other bits are zero */
+	uint32_t fpcr;     /* FPCR as MSR/MRS see it */
+	uint32_t fpsr;     /* FPSR (cumulative exception flags, QC) */
 	uint32_t _pad;
-};
+	uint64_t tpidr_el0;
+	uint64_t v[32][2] __attribute__((aligned(16)));
+} __attribute__((aligned(16)));
 
 enum kw_event_kind {
 	KW_EV_BUDGET = 0,      /* instruction budget used up (timer tick point) */
-	KW_EV_SYSCALL = 1,     /* ecall; pc already advanced past it */
+	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm); pc already past it; the
+				  number is in x8, the arguments in x0..x5 */
 	KW_EV_FAULT = 2,       /* page fault; pc at the faulting instruction */
-	KW_EV_ILLEGAL = 3,     /* illegal instruction; pc at it */
-	KW_EV_BREAKPOINT = 4,  /* ebreak; pc at it */
-	KW_EV_MISALIGNED = 5,  /* misaligned fetch/atomic; pc at it */
+	KW_EV_ILLEGAL = 3,     /* unallocated or unimplemented encoding, UDF,
+				  HLT, HVC, SMC, a system register EL0 may not
+				  access; pc at it, ev.insn = the raw word */
+	KW_EV_BREAKPOINT = 4,  /* BRK #imm; pc at it, ev.insn = the raw word */
+	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), or an
+				  exclusive or acquire/release access that is
+				  not naturally aligned (ev.addr = the
+				  address); pc at the instruction */
 	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
 };
 
@@ -105,8 +112,8 @@ struct kw_event {
 	uint64_t addr;    /* faulting guest virtual address (FAULT: any byte of
 			     the faulting page; MISALIGNED: the address;
 			     ILLEGAL/BREAKPOINT: the pc) */
-	uint64_t insn;    /* raw instruction, for KW_EV_ILLEGAL (16 bits if
-			     compressed) */
+	uint64_t insn;    /* raw instruction, for KW_EV_ILLEGAL and
+			     KW_EV_BREAKPOINT */
 };
 
 /*
@@ -118,16 +125,17 @@ struct kw_event {
 
 /*
  * Only the leading fields are public. The rest of the KW_CPU_SIZE bytes
- * (TLBs, decoded-block cache, LR/SC reservation) belong to the emulator.
+ * (TLBs, exclusive monitor, caches) belong to the emulator.
  */
 struct kw_cpu {
 	uint64_t phys_base;            /* linear address of physical address 0 */
 	uint64_t pgd;                  /* physical address of the root table */
-	const volatile uint32_t *irq_pending; /* polled at block boundaries; may be NULL */
+	const volatile uint32_t *irq_pending; /* polled at least every 64
+						 instructions; may be NULL */
 	uint64_t budget;               /* instructions kw_run may execute */
 	uint64_t icount;               /* total instructions executed (stats) */
 	struct kw_event ev;            /* details of the last event */
-	/* ABI 8, see "Flushes during a JIT compile" above */
+	/* ABI 8, see "jit_busy / flush_all" above */
 	uint32_t jit_busy;             /* written by kwemu only */
 	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
 };
@@ -138,112 +146,72 @@ void kw_cpu_init(struct kw_cpu *cpu);
 /*
  * Run guest code from regs until an event. Returns enum kw_event_kind and
  * fills cpu->ev. Never blocks, never re-enters the kernel.
- * cpu->budget is decremented per retired instruction (ecall retires;
+ * cpu->budget is decremented per retired instruction (SVC retires;
  * faulting/illegal instructions do not) and cpu->icount advanced by the
  * same amount; KW_EV_BUDGET when it reaches exactly 0 (returns at once if
- * 0 on entry). *irq_pending is checked on entry and at the end of every
- * decoded block, i.e. at least every 64 instructions (ABI 1: after every
- * taken branch/jump). The cycle/time/instret CSRs read cpu->icount.
- * Every event leaves regs (incl. pc) exactly at an instruction boundary.
+ * 0 on entry). *irq_pending is checked on entry, after every taken branch
+ * and at least every 64 instructions. Every event leaves regs (incl. pc)
+ * exactly at an instruction boundary. Data accesses may be unaligned
+ * (SCTLR_EL1.A = 0); SP alignment is not checked.
  */
 uint32_t kw_run(struct kw_cpu *cpu, struct kw_regs *regs);
 
-/* Switch address space: sets cpu->pgd, drops the TLB and LR/SC reservation. */
+/* Switch address space: sets cpu->pgd, drops the TLB and the exclusive monitor. */
 void kw_set_pgd(struct kw_cpu *cpu, uint64_t pgd);
 
 void kw_flush_tlb_all(struct kw_cpu *cpu);
 void kw_flush_tlb_range(struct kw_cpu *cpu, uint64_t start, uint64_t end);
 
-/* Drop the LR/SC reservation (call on every context switch / trap return). */
+/*
+ * Clear the exclusive monitor (LDXR/STXR; call on every context switch /
+ * trap return, as exception entry and return clear it on hardware).
+ */
 void kw_clear_reservation(struct kw_cpu *cpu);
 
 uint32_t kw_abi_version(void);
 
 /*
- * Optional ISA extensions (ABI 3; ABI 4 added bits 10..18). RV64GC is
- * always there; these are the extensions beyond it that a kwemu build may
- * implement, one bit each. Bits 19..63 are reserved for more. An
- * instruction of an extension that is not implemented, or not enabled,
- * raises KW_EV_ILLEGAL like any other unknown encoding. (Hints such as
- * PAUSE, the NTL hints and the Zicbop prefetches are plain RV64GC
- * encodings that run as no-ops: always there, no bit.)
+ * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
+ * (they map to the AT_HWCAP bits the kernel reports). Bits 5..63 are
+ * reserved. An instruction of a feature that is not implemented, or not
+ * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
+ * kw_isa_supported() says which ones this build implements.
  */
-#define KW_ISA_ZBA	(1ULL << 0)	/* address generation */
-#define KW_ISA_ZBB	(1ULL << 1)	/* basic bit manipulation */
-#define KW_ISA_ZBC	(1ULL << 2)	/* carry-less multiplication */
-#define KW_ISA_ZBS	(1ULL << 3)	/* single-bit instructions */
-#define KW_ISA_ZBKB	(1ULL << 4)	/* bit manipulation for cryptography */
-#define KW_ISA_ZBKC	(1ULL << 5)	/* carry-less multiplication for cryptography */
-#define KW_ISA_ZBKX	(1ULL << 6)	/* crossbar permutations */
-#define KW_ISA_ZKND	(1ULL << 7)	/* AES decryption (aes64ds, aes64dsm, aes64im, aes64ks1i, aes64ks2) */
-#define KW_ISA_ZKNE	(1ULL << 8)	/* AES encryption (aes64es, aes64esm, aes64ks1i, aes64ks2) */
-#define KW_ISA_ZICOND	(1ULL << 9)	/* czero.eqz, czero.nez */
-#define KW_ISA_ZCB	(1ULL << 10)	/* c.lbu, c.lhu, c.lh, c.sb, c.sh, c.mul, c.zext.*, c.sext.*, c.not */
-#define KW_ISA_ZIMOP	(1ULL << 11)	/* mop.r.N, mop.rr.N (rd = 0) */
-#define KW_ISA_ZCMOP	(1ULL << 12)	/* c.mop.N (no effect) */
-#define KW_ISA_ZICBOM	(1ULL << 13)	/* cbo.clean, cbo.flush (64-byte blocks; cbo.inval stays illegal) */
-#define KW_ISA_ZICBOZ	(1ULL << 14)	/* cbo.zero (64-byte blocks) */
-#define KW_ISA_ZAWRS	(1ULL << 15)	/* wrs.nto, wrs.sto (no-ops) */
-#define KW_ISA_ZFA	(1ULL << 16)	/* fli, fminm/fmaxm, fround(nx), fcvtmod.w.d, fleq/fltq (S and D) */
-#define KW_ISA_ZFHMIN	(1ULL << 17)	/* flh, fsh, fmv.x.h, fmv.h.x, fcvt between H and S/D */
-#define KW_ISA_ZIHPM	(1ULL << 18)	/* hpmcounter3..31 (read as 0) */
+#define KW_ISA_AES	(1ULL << 0)	/* AESE, AESD, AESMC, AESIMC (HWCAP_AES) */
+#define KW_ISA_PMULL	(1ULL << 1)	/* PMULL/PMULL2 with 64-bit elements (HWCAP_PMULL) */
+#define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
+#define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
+#define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
 
-/* The KW_ISA_* extensions this kwemu build implements. */
+/* The KW_ISA_* features this kwemu build implements. */
 uint64_t kw_isa_supported(void);
 
 /*
- * Enable the extensions in `isa` that are implemented (isa &
+ * Enable the features in `isa` that are implemented (isa &
  * kw_isa_supported()) and disable all others; returns the enabled set.
- * kw_cpu_init enables every implemented extension. This drops all decoded
- * (and compiled) code, so call it once at boot, after kw_cpu_init and
- * before the first kw_run; it is correct, only slow, at any other time
- * between kw_run calls. The kernel advertises exactly the returned set to
- * user space.
+ * kw_cpu_init enables every implemented feature. Call it once at boot,
+ * after kw_cpu_init and before the first kw_run. The kernel advertises
+ * exactly the returned set to user space (AT_HWCAP).
  */
 uint64_t kw_set_isa(struct kw_cpu *cpu, uint64_t isa);
 
 /*
  * The host changed under a live struct kw_cpu: the kernel's memory was
- * restored into a new module instance (a snapshot). Forget every compiled
- * slot without calling kw_host_jit_free (the instance that held them is
- * gone, and its table slots hold their stubs again), ask kw_host_jit_caps
- * again (the new host may have no JIT) and drop all decoded code. Call it
- * before the first kw_run on the new instance.
+ * restored into a new module instance (a snapshot). Drop everything that
+ * belongs to the old instance (compiled code, if a JIT is built in) and
+ * all decoded code. Call it before the first kw_run on the new instance.
  */
 void kw_host_reset(struct kw_cpu *cpu);
 
 /*
- * Optional JIT tier (emulator built with -Dkwemu-jit; wasm64 only; not part
- * of the ABI version). Without it the object has no such imports. With it,
- * the object imports these from wasm module "unkernel", and hot decoded
- * blocks are compiled to wasm and entered through call_indirect. kwemu owns
- * a fixed pool of stub functions in the module's function table; their
- * table indices are the "slots" below, and the table never grows. See
- * src/emu/jit.zig and docs/kwemu.md.
- *
+ * Optional JIT tier (-Dkwemu-jit; not part of the ABI version). The JIT
+ * in src/emu/jit.zig compiles riscv blocks only and is never entered by the
+ * A64 kw_run; a library built with it still imports these from wasm module
+ * "unkernel" (see src/emu/jit.zig for their contract):
  *   uint32_t kw_host_jit_caps(void);
- *     bit 0: JIT available (0: kwemu never compiles);
- *     bit 1: memory is 32-bit (module lowered with --memory64-lowering:
- *            generated code imports a 32-bit memory);
- *     bit 2: eager, compile blocks on first entry (tests).
- *     Called from kw_cpu_init and kw_host_reset.
  *   int32_t kw_host_jit_compile(const uint8_t *module, size_t len, uint32_t slot,
  *                               uint32_t flags);
- *     Synchronously compile the module (it imports "env" "memory", i.e.
- *     this memory, and exports function "f", type (i64 i64 i64 i64) -> i64)
- *     and install "f" into table slot `slot`. 0 = installed; < 0 = failed,
- *     slot untouched. flags bit 0 (ABI 8; older kwemu passes no flags): f
- *     called with a second argument of 0 returns 0 at once and touches
- *     nothing, so a host whose engine compiles a function only at its first
- *     call can have it compiled here, inside the jit_busy window, by
- *     calling f(0, 0, 0, 0).
  *   void kw_host_jit_free(uint32_t slot);
- *     Restore the function the slot held before its first compile and drop
- *     the module.
- * kw_cpu_init forgets installed slots without freeing them; a compile into
- * a slot that is still installed must replace its function. Only one
- * struct kw_cpu per module instance may use the JIT (the slots are
- * per-table).
  */
 
 #ifdef __cplusplus

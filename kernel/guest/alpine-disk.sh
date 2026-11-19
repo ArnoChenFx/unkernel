@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Alpine Linux riscv64 minirootfs as an ext4 disk image for kwblk, built
+# Alpine Linux aarch64 minirootfs as an ext4 disk image for kwblk, built
 # without root privileges: `mke2fs -d` from the extracted tree, then debugfs
 # fixes ownership/modes from the tarball (tools/ext4-owners.py).
 #
@@ -35,7 +35,8 @@ rm -rf "$stage"
 mkdir -p "$stage"
 tar -xzf "$ALPINE_TARBALL" -C "$stage" --no-same-owner 2>/dev/null || true
 chmod -R u+rwX "$stage"
-# busybox, zlib, openssl and apk-tools rebuilt for kwemu (see alpine.sh).
+# busybox, zlib, openssl and apk-tools rebuilt for kwemu with
+# KW_ALPINE_OPT=1 (see alpine.sh; off by default).
 "$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk with main only, community in /etc/kw-apk-lazy (see alpine.sh).
 r="$stage/etc/apk/repositories"
@@ -114,7 +115,7 @@ from_alpine_sh etc/kw-apk-install APKINDEX
 from_alpine_sh etc/kw-apk-enable kw-apk-lazy
 install -m 755 "$root/kernel/guest/curl-shim.sh" "$stage/usr/local/bin/curl"
 chmod 755 "$stage/etc/kw-apk-install" "$stage/etc/kw-apk-enable"
-# x86_64, aarch64, i386 and arm binaries through qemu-user (binfmt_misc),
+# x86_64, riscv64, i386 and arm binaries through qemu-user (binfmt_misc),
 # and kw-arch to fake uname -m for installers.
 from_alpine_sh etc/kw-binfmt.sh register
 from_alpine_sh etc/kw-qemu qemu-

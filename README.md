@@ -15,8 +15,8 @@
 unkernel is Linux 7.x built as a single wasm module with a real MMU. The
 kernel (syscalls, scheduler, memory management, ext4, TCP/IP) is compiled
 code, not emulated, so programs get Linux's own behavior down to the edge
-cases. Only user programs are emulated, with a JIT: unmodified riscv64
-Linux binaries, so Alpine and Ubuntu packages run as they are.
+cases. Only user programs are emulated: unmodified aarch64 (arm64) Linux
+binaries, so Alpine and Ubuntu packages run as they are.
 
 [Open a page](#-try-it-in-the-browser) and you have a Linux machine with a
 shell, a package manager, a persistent disk, internet access, and a screen
@@ -25,7 +25,7 @@ server, and every layer is open source. [How it works](#-how-it-works)
 explains the design.
 
 <p align="center">
-  <img alt="Linux programs run on kwemu, a riscv64 CPU linked into the Linux kernel, built together into unkernel.wasm, which talks to the JavaScript SDK" src="assets/architecture.svg" width="760">
+  <img alt="Linux programs run on kwemu, an aarch64 CPU linked into the Linux kernel, built together into unkernel.wasm, which talks to the JavaScript SDK" src="assets/architecture.svg" width="760">
 </p>
 
 ## ⚡ Performance
@@ -42,12 +42,16 @@ path runs at wasm speed.
   native).
 - **fork at native speed**: fork + exit + wait takes about 60 µs, against
   about 70 µs natively and 1.2 ms under qemu-system.
-- **A JIT for user code**: hot riscv64 code is compiled to wasm while it
-  runs. A tight loop takes 2.5 ns per iteration (1.8 native, 28 without the
-  JIT), and https downloads in the guest reach 30 MB/s.
+- **A JIT for user code** (riscv64 guest; the aarch64 CPU is an
+  interpreter so far): hot riscv64 code is compiled to wasm while it runs. A
+  tight loop takes 2.5 ns per iteration (1.8 native, 28 without the JIT),
+  and https downloads in the guest reach 30 MB/s.
 
-CPU-heavy programs are still well behind native. [Benchmarks](#-benchmarks)
-has the full numbers.
+These numbers were measured with the riscv64 guest. The aarch64 guest has
+no JIT yet, and CPU-bound work in it runs several times slower than
+riscv64 with its JIT (`apk search` over the main index: 5.9 s against
+0.75 s, 2026-11-17). CPU-heavy programs are well behind native.
+[Benchmarks](#-benchmarks) has the full numbers.
 
 ## 🐧 A real kernel
 
@@ -71,11 +75,12 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   sound through ALSA and `/dev/dsp`](#display-input-and-sound),
   [AF_VSOCK](#talk-over-vsock), and [shared memory](#share-memory) with the
   host.
-- **riscv64 user space**: RV64GC plus Zba, Zbb, Zbs, Zbc, Zbkb, Zbkc, Zbkx,
-  Zkne, Zknd, Zicond and the scalar rest of RVA23U64, so distribution
-  binaries and OpenSSL's AES and carry-less multiply paths run unchanged.
-  riscv64 is a modern 64-bit architecture with official ports in Alpine,
-  Debian and Ubuntu, so their full, current package archives are available.
+- **aarch64 user space**: ARMv8.0-A with FP and AdvSIMD plus the AES,
+  PMULL, SHA1, SHA2 and CRC32 extensions, so distribution binaries and
+  OpenSSL's hardware AES, GHASH and SHA paths run unchanged; AdvSIMD
+  floating point is still being finished. aarch64 is a first-class port of
+  every distribution, so their full, current package archives are
+  available.
 
 [Known limits](#-known-limits) lists what is still missing.
 
@@ -191,10 +196,10 @@ wasm speed, under unmodified binaries with a real MMU.
 | Syscall emulators | none: a runtime reimplements the syscalls | unmodified, emulated | the runtime's own |
 | POSIX runtimes for wasm (Wasmer WASIX, WebContainers, BrowserPod) | none: a runtime provides the syscalls | rebuilt for wasm, or JavaScript | none |
 | Linux without an MMU (linux-wasm, tombl/linux, WasmLinux (LKL)) | Linux, native wasm | rebuilt for wasm | none |
-| **unkernel** | **Linux, native wasm** | **unmodified riscv64, with a JIT** | **real Sv39 page tables** |
+| **unkernel** | **Linux, native wasm** | **unmodified aarch64, emulated** | **real page tables** |
 
 The kernel is compiled straight to WebAssembly. User programs run on
-**kwemu**, a riscv64 CPU written in Zig and linked into the kernel. kwemu
+**kwemu**, an aarch64 CPU written in Zig and linked into the kernel. kwemu
 walks the kernel's own page tables, so memory management is done by the
 real Linux code.
 
@@ -203,9 +208,10 @@ it as native wasm. There is no emulated trap and no emulated kernel mode in
 between. Task switches use JSPI (`WebAssembly.Suspending`), so the kernel
 gets real stacks that it can suspend and resume.
 
-Hot user code goes through a second tier: a JIT that compiles riscv64 to
-wasm modules at run time, with output that matches the interpreter bit for
-bit. [Benchmarks](#-benchmarks) shows what each tier costs.
+For the riscv64 guest, hot user code goes through a second tier: a JIT that
+compiles riscv64 to wasm modules at run time, with output that matches the
+interpreter bit for bit. The aarch64 CPU has the interpreter only so far.
+[Benchmarks](#-benchmarks) shows what each tier costs.
 
 Devices are small paravirtual drivers that talk to the JavaScript host:
 [block](#add-disks) (kwblk), [network](#add-a-network) (kwnet, with a
@@ -222,7 +228,7 @@ The design helps most with syscalls. These were measured under Node:
   <img alt="Time per operation for native, qemu-user, qemu-system and unkernel: getppid 110, 320, 1662 and 172 ns; read 64 B from /dev/zero 161, 481, 2247 and 172 ns; pipe write + read 417, 1032, 7256 and 482 ns; fork + exit + wait 73, 537, 1178 and 57 µs" src="assets/performance.svg" width="760">
 </p>
 
-In this test fork is faster than native. Pure computation is slower. The JIT
+In this test (riscv64 guest) fork is faster than native. Pure computation is slower. The JIT
 runs a tight integer loop at about 3900 MIPS (about 270 interpreted), and
 real Alpine work (`sort`, `gzip`, `sha256sum`, `awk`) runs 1.7 to 4.6 times
 faster than without it, which is still well behind native.
@@ -235,7 +241,8 @@ faster than without it, which is still well behind native.
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
 - No ptrace register sets, so `strace` and `gdb` don't work. No seccomp.
-- The JIT leaves atomics and system instructions to the interpreter.
+- No JIT for the aarch64 CPU yet, and no AdvSIMD (vector) floating point:
+  a program that uses it gets SIGILL (Alpine's busybox `sleep` does).
 - A wasm trap in the kernel ends the session.
 
 ## 🧩 Use it from JavaScript

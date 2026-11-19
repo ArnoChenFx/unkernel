@@ -17,15 +17,15 @@ build="$(realpath -m "${KW_BUILD:-$vendor/build}")"
 zig="${ZIG:-$(command -v zig || true)}"
 
 ALPINE_VERSION=3.24.4
-ALPINE_TARBALL_NAME="alpine-minirootfs-$ALPINE_VERSION-riscv64.tar.gz"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/releases/riscv64/$ALPINE_TARBALL_NAME"
-ALPINE_SHA256=010683db6c73b3ad1c334fc8f93f64ae748ef67ae6d69e964929aeaf8517bff3
+ALPINE_TARBALL_NAME="alpine-minirootfs-$ALPINE_VERSION-aarch64.tar.gz"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/releases/aarch64/$ALPINE_TARBALL_NAME"
+ALPINE_SHA256=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 
 # Ubuntu Base (the minimal root file system), for kernel/guest/ubuntu-disk.sh.
 UBUNTU_VERSION=24.04.5
-UBUNTU_TARBALL_NAME="ubuntu-base-$UBUNTU_VERSION-base-riscv64.tar.gz"
+UBUNTU_TARBALL_NAME="ubuntu-base-$UBUNTU_VERSION-base-arm64.tar.gz"
 UBUNTU_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION%.*}/release/$UBUNTU_TARBALL_NAME"
-UBUNTU_SHA256=651c516f291259ec913caa1efd0cfff738cd223adfc6617c884f07af487f08cf
+UBUNTU_SHA256=a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2
 
 # real_bin NAME: the first NAME on PATH that is an ELF executable, else the
 # first NAME on PATH at all (empty if none). Some hosts put wrapper scripts

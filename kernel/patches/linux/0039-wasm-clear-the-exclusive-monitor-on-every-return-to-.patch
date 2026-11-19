@@ -1,0 +1,41 @@
+From f5671b2ea625cd41942404d291205de1f523279f Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Tue, 17 Nov 2026 20:17:59 +0000
+Subject: [PATCH] wasm: clear the exclusive monitor on every return to user
+ mode
+
+On arm64 an exception return (ERET) clears the local exclusive monitor,
+so an STXR after a syscall, a fault, an interrupt or a task switch
+fails, whatever ran in between; qemu-user does the same. kwemu's monitor
+belongs to the CPU, and the kernel closed it only at a task switch,
+signal delivery and sigreturn, so LDXR; SVC; STXR passed here.
+
+Close it in user_mode_loop() before each kw_run(), which is every entry
+to user mode. A loop of LDXR and STXR that a slice end interrupts fails
+once and retries, as on hardware.
+---
+ arch/wasm/kernel/traps.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index 7587e52e17f..b9a22f81e9b 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -141,6 +141,14 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 		if (unlikely(READ_ONCE(kw_park_users)))
+ 			kw_park_user();
+ 
++		/*
++		 * Each entry to user mode is an exception return, and on arm64
++		 * ERET clears the local exclusive monitor (qemu-user does the
++		 * same): an STXR after a syscall, a fault, an interrupt or a
++		 * task switch fails, whatever the kernel ran meanwhile.
++		 */
++		kw_clear_reservation(cpu);
++
+ 		/*
+ 		 * "sret": user mode runs with interrupts enabled. On SMP without
+ 		 * taking what is pending here: kw_run() sees it at once
+-- 
+2.56.0
+

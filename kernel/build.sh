@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Build the unkernel kernels (wasm64 vmlinux with emulated riscv64 user mode)
+# Build the unkernel kernels (wasm64 vmlinux with emulated aarch64 user mode)
 # and their 32-bit-memory variants (the ones the page and the bundle use):
 # the UP kernel and the SMP kernel (CONFIG_SMP, one wasm instance per CPU on
 # a shared memory) from the same tree; the Alpine initramfs and disk
@@ -46,7 +46,7 @@
 #   vendor/src/llvm22               llvm-project llvmorg-22.1.8 (sparse: llvm, lld)
 #   vendor/build/lld22              wasm-ld with kernel/patches/llvm applied
 #   vendor/src/linux-wasm-kernel    Linux at $LINUX_BASE (kernel.org) + kernel/patches/linux
-#                                   (branch kw-riscv-user)
+#                                   (branch kw-arm64-user)
 #   vendor/build/kernel             UP kernel build output (vmlinux = the wasm64 module,
 #                                   vmlinux32.wasm = the same lowered to a 32-bit memory/table,
 #                                   the default for the browser page)
@@ -81,8 +81,9 @@
 #                  (default: vendor/build/kwemu-smp/lib/libkwemu.a, rebuilt on every run).
 #                  Libraries given here count as built from this checkout with the
 #                  default options (the build id hashes the sources, not the library)
-#   KWEMU_JIT=0    build those libraries without the JIT tier (default 1: -Dkwemu-jit=true,
-#                  the kernel then imports unkernel.kw_host_jit_*; ignored with KWEMU=)
+#   KWEMU_JIT=1    build those libraries with the JIT tier (-Dkwemu-jit=true; the kernel
+#                  then imports unkernel.kw_host_jit_*; ignored with KWEMU=). Default 0:
+#                  the JIT compiles riscv blocks only and the A64 kw_run never enters it
 #   KWEMU_STATS=1  build the UP library with -Dkwemu-stats into vendor/build/kwemu-stats
 #                  (what `stats` sets; ignored with KWEMU=)
 #   JOBS=n         parallelism (default: nproc)
@@ -179,35 +180,37 @@ prepare_kernel_tree() {
 		git -C "$ksrc.tmp" checkout -q --detach FETCH_HEAD
 		mv "$ksrc.tmp" "$ksrc"
 	fi
-	if ! git -C "$ksrc" rev-parse -q --verify kw-riscv-user >/dev/null; then
+	if ! git -C "$ksrc" rev-parse -q --verify kw-arm64-user >/dev/null; then
 		git -C "$ksrc" checkout -q --detach "$LINUX_BASE"
 		git_am "$ksrc" "$root"/kernel/patches/linux/*.patch
-		git -C "$ksrc" checkout -q -b kw-riscv-user
+		git -C "$ksrc" checkout -q -b kw-arm64-user
 	fi
 	# An existing branch is never re-applied: say so when what is checked
-	# out (kw-riscv-user, or the branch of a KSRC worktree) no longer
+	# out (kw-arm64-user, or the branch of a KSRC worktree) no longer
 	# matches the series (an older series, or commits not yet exported).
 	local npatch ncommit
 	npatch=$(ls "$root"/kernel/patches/linux/*.patch | wc -l)
 	ncommit=$(git -C "$ksrc" rev-list --count "$LINUX_BASE..HEAD" 2>/dev/null || echo "?")
 	if [ "$npatch" != "$ncommit" ]; then
 		echo "warning: $ksrc has $ncommit commits on $LINUX_BASE, kernel/patches/linux has $npatch patches;" >&2
-		echo "  export your commits, or rename the branch (git -C $ksrc branch -m kw-riscv-user old) to re-apply the series" >&2
+		echo "  export your commits, or rename the branch (git -C $ksrc branch -m kw-arm64-user old) to re-apply the series" >&2
 	fi
 	# The emulator contract (include/kw_emu.h) is the source of truth; the
 	# kernel tree has a copy (arch/wasm/include/asm/kw_emu.h). Keep the build consistent if they
 	# drift, and say so: the kernel patch needs updating.
 	if ! cmp -s "$root/include/kw_emu.h" "$ksrc/arch/wasm/include/asm/kw_emu.h"; then
 		echo "warning: include/kw_emu.h differs from the kernel tree's arch/wasm/include/asm/kw_emu.h;" >&2
-		echo "  copying it (commit it on kw-riscv-user and re-export kernel/patches/linux)" >&2
+		echo "  copying it (commit it on kw-arm64-user and re-export kernel/patches/linux)" >&2
 		cp "$root/include/kw_emu.h" "$ksrc/arch/wasm/include/asm/kw_emu.h"
 	fi
 }
 
-# The zig build option for the kwemu JIT tier (src/emu/jit.zig), on unless
-# KWEMU_JIT=0. Hosts without the JIT simply answer kw_host_jit_caps() with 0.
+# The zig build option for the kwemu JIT tier (src/emu/jit.zig), off unless
+# KWEMU_JIT=1: it compiles riscv blocks only, which the A64 guest CPU never
+# runs (.agents/a64.md). Hosts without the JIT simply answer
+# kw_host_jit_caps() with 0.
 kwemu_jit_flag() {
-	if [ "${KWEMU_JIT:-1}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi
+	if [ "${KWEMU_JIT:-0}" = 0 ]; then echo -Dkwemu-jit=false; else echo -Dkwemu-jit=true; fi
 }
 
 # kwemu_obj up|smp: the kwemu library to link into that kernel (empty for
@@ -269,7 +272,7 @@ kernel_stamps() {
 			git -C "$ksrc" --no-optional-locks diff --binary HEAD
 			(cd "$ksrc" && git --no-optional-locks ls-files -z -o --exclude-standard | xargs -0r sha256sum)
 			digest_files "$root" src include build.zig build.zig.zon kernel/patches/llvm kernel/tools/fake-llvm
-			echo "zig $("${zig:-zig}" version 2>/dev/null) jit ${KWEMU_JIT:-1} stats ${KWEMU_STATS:-0}"
+			echo "zig $("${zig:-zig}" version 2>/dev/null) jit ${KWEMU_JIT:-0} stats ${KWEMU_STATS:-0}"
 		} | sha256sum | cut -c1-12
 	)"
 	when="$({

@@ -21,8 +21,8 @@ const TEXT = `Welcome to unkernel
 
 This is a Linux 7.3 kernel compiled to WebAssembly, running in your
 browser tab. Nothing runs on a server. The kernel is native wasm, and the
-programs are unmodified riscv64 Linux binaries, run by kwemu, a riscv64
-CPU with a JIT that is linked into the kernel.
+programs are unmodified aarch64 Linux binaries, run by kwemu, an aarch64
+CPU that is linked into the kernel.
 
 User space is Alpine Linux (musl, busybox). You are root, and this is
 your home directory.
@@ -39,9 +39,9 @@ Things to try
                     Guest web servers open in the page's preview
                     (Ctrl-A p).
 
-x86_64, aarch64, i386 and arm binaries also run, through qemu-user
+x86_64, riscv64, i386 and arm binaries also run, through qemu-user
 (installed the first time one starts). "kw-arch x86_64 CMD" makes
-uname report x86_64, for installers that refuse riscv64.
+uname report x86_64, for installers that pick their download by it.
 
 The page
 --------

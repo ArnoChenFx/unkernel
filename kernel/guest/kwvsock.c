@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 /*
- * kwvsock: a byte pipe over AF_VSOCK (static riscv64 musl), /usr/bin/kwvsock
+ * kwvsock: a byte pipe over AF_VSOCK (static aarch64 musl), /usr/bin/kwvsock
  * in the Alpine initramfs. The SDK's vsock test (test/api.test.ts) drives it.
  *
  *   kwvsock connect PORT [CID]   connect to CID (default 2, the host), PORT

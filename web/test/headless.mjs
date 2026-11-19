@@ -113,7 +113,7 @@ const scenarios = {
 		if (!/^unkernel · Linux on WebAssembly/.test(top)) throw new Error(`the screen does not start with the banner: ${JSON.stringify(top)}`);
 		await page.evaluate(`globalThis.kernel.sendInput(${JSON.stringify("cat /etc/os-release | head -2; uname -m; echo $((7*6))\r")})`);
 		const s = await page.waitScreen("/^42\\s*$/m", "command output");
-		if (!/riscv64/.test(s)) throw new Error("uname -m did not print riscv64");
+		if (!/aarch64/.test(s)) throw new Error("uname -m did not print aarch64");
 		console.log(s.split("\n").filter((l) => l.trim()).slice(-4).map((l) => `    | ${l}`).join("\n"));
 		// The host steps stay above the summary. Kernel messages go
 		// only to the Kernel log tab (the terminal showed them on its transient line).

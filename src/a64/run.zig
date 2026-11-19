@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+//! The C ABI of include/kw_emu.h (ABI 9, A64) and the run loop behind
+//! kw_run: a reference interpreter, one instruction at a time through
+//! decode.zig; no decoded-code cache and no JIT yet. struct kw_cpu, the
+//! Sv39-format page-table walker, the TLBs and flushes are kwemu.Cpu
+//! (src/emu/kwemu.zig, shared with the riscv code kept there); the
+//! exclusive monitor's address is Hart.resv, so kw_clear_reservation and
+//! kw_set_pgd clear it.
+
+const std = @import("std");
+const core = @import("../cpu/core.zig");
+const kwemu = @import("../emu/kwemu.zig");
+const c = @import("common.zig");
+const decode = @import("decode.zig");
+const branch = @import("branch.zig");
+const kw_h = @import("kw_h");
+
+pub const Regs = c.Regs;
+const Cpu = kwemu.Cpu;
+
+/// Poll *irq_pending at least this often (instructions) on straight-line code.
+const poll_every = 64;
+
+comptime {
+    // Layout must match struct kw_regs in include/kw_emu.h exactly.
+    const H = kw_h.struct_kw_regs;
+    std.debug.assert(@sizeOf(Regs) == @sizeOf(H));
+    std.debug.assert(@sizeOf(Regs) == 800);
+    std.debug.assert(@alignOf(Regs) == 16 and @alignOf(H) == 16);
+    for (.{ "x", "sp", "pc", "nzcv", "fpcr", "fpsr", "_pad", "tpidr_el0", "v" }, .{ 0, 248, 256, 264, 268, 272, 276, 280, 288 }) |f, off| {
+        std.debug.assert(@offsetOf(Regs, f) == @offsetOf(H, f));
+        std.debug.assert(@offsetOf(Regs, f) == off);
+    }
+    // common.zig's register views rely on sp following x30.
+    std.debug.assert(@offsetOf(Regs, "sp") == 31 * 8);
+    // Optional features: common.Feature matches the KW_ISA_* bits.
+    for (.{ "aes", "pmull", "sha1", "sha2", "crc32" }, .{ kw_h.KW_ISA_AES, kw_h.KW_ISA_PMULL, kw_h.KW_ISA_SHA1, kw_h.KW_ISA_SHA2, kw_h.KW_ISA_CRC32 }) |name, v|
+        std.debug.assert(c.featureBit(@field(c.Feature, name)) == v);
+    std.debug.assert(@typeInfo(c.Feature).@"enum".fields.len == 5);
+}
+
+fn event(cpu: *Cpu, kind: core.Kind, access: u32, addr: u64, insn: u64) u32 {
+    cpu.ev = .{ .kind = @intFromEnum(kind), .access = access, .addr = addr, .insn = insn };
+    return @intFromEnum(kind);
+}
+
+pub fn run(cpu: *Cpu, regs: *Regs) u32 {
+    const start = cpu.budget;
+    var left = start;
+    defer {
+        cpu.budget = left;
+        cpu.icount +%= start - left;
+    }
+    const irq = cpu.irq_pending;
+    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+    const h = &cpu.priv.hart;
+    const s: c.St = .{ .r = regs, .h = h, .m = cpu };
+    var since_poll: u32 = 0;
+    while (true) {
+        if (left == 0) return event(cpu, .budget, 0, 0, 0);
+        if (regs.pc & 3 != 0) return event(cpu, .misaligned, 0, regs.pc, 0);
+        const e = decode.step(s) catch {
+            cpu.priv.smc = 0;
+            return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
+        };
+        // Set by stores into pages the (riscv) block cache tracks and by
+        // IC IVAU; nothing here is decoded ahead, so just clear it.
+        cpu.priv.smc = 0;
+        switch (e) {
+            .next => {
+                left -= 1;
+                since_poll += 1;
+                if (since_poll < poll_every) continue;
+            },
+            .jump => left -= 1,
+            .trap => if (h.trap == .counter) {
+                // MRS CNTVCT_EL0: retires with the instructions retired before it.
+                branch.finishCounter(s, cpu.icount +% (start - left));
+                left -= 1;
+                since_poll += 1;
+                if (since_poll < poll_every) continue;
+            } else return switch (h.trap) {
+                .syscall => blk: {
+                    left -= 1; // SVC retires
+                    regs.pc +%= 4;
+                    break :blk event(cpu, .syscall, 0, 0, 0);
+                },
+                .breakpoint => event(cpu, .breakpoint, 0, regs.pc, h.trap_val),
+                .misaligned => event(cpu, .misaligned, 0, h.trap_val, 0),
+                else => event(cpu, .illegal, 0, regs.pc, h.trap_val),
+            },
+        }
+        since_poll = 0;
+        if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+    }
+}
+
+pub fn cpuInit(cpu: *Cpu) void {
+    kwemu.cpuInit(cpu);
+    cpu.priv.a64.isa = c.implemented;
+}
+
+pub fn setIsa(cpu: *Cpu, isa: u64) u64 {
+    cpu.priv.a64.isa = isa & c.implemented;
+    return cpu.priv.a64.isa;
+}
+
+/// Export the C ABI (from the library root only, so that the unit tests can
+/// link against the native archive without duplicate symbols).
+pub fn exportAbi() void {
+    @export(&kw_cpu_init, .{ .name = "kw_cpu_init" });
+    @export(&kw_run, .{ .name = "kw_run" });
+    @export(&kw_set_pgd, .{ .name = "kw_set_pgd" });
+    @export(&kw_flush_tlb_all, .{ .name = "kw_flush_tlb_all" });
+    @export(&kw_flush_tlb_range, .{ .name = "kw_flush_tlb_range" });
+    @export(&kw_clear_reservation, .{ .name = "kw_clear_reservation" });
+    @export(&kw_abi_version, .{ .name = "kw_abi_version" });
+    @export(&kw_isa_supported, .{ .name = "kw_isa_supported" });
+    @export(&kw_set_isa, .{ .name = "kw_set_isa" });
+    @export(&kw_host_reset, .{ .name = "kw_host_reset" });
+}
+
+fn kw_cpu_init(cpu: *Cpu) callconv(.c) void {
+    cpuInit(cpu);
+}
+fn kw_run(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {
+    return run(cpu, regs);
+}
+fn kw_set_pgd(cpu: *Cpu, pgd: u64) callconv(.c) void {
+    kwemu.setPgd(cpu, pgd);
+}
+fn kw_flush_tlb_all(cpu: *Cpu) callconv(.c) void {
+    cpu.flushAll();
+}
+fn kw_flush_tlb_range(cpu: *Cpu, start: u64, end: u64) callconv(.c) void {
+    cpu.flushRange(start, end);
+}
+fn kw_clear_reservation(cpu: *Cpu) callconv(.c) void {
+    kwemu.clearReservation(cpu);
+}
+fn kw_abi_version() callconv(.c) u32 {
+    return kwemu.abi_version;
+}
+fn kw_isa_supported() callconv(.c) u64 {
+    return c.implemented;
+}
+fn kw_set_isa(cpu: *Cpu, isa: u64) callconv(.c) u64 {
+    return setIsa(cpu, isa);
+}
+fn kw_host_reset(cpu: *Cpu) callconv(.c) void {
+    kwemu.hostReset(cpu);
+}

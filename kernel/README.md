@@ -1,10 +1,11 @@
-# kernel/: Linux on wasm64 with emulated riscv64 user mode
+# kernel/: Linux on wasm64 with emulated aarch64 user mode
 
 This directory holds the Linux kernel built as a single wasm64 module (Joel
-Severin's `arch/wasm`, reworked). User space is unmodified riscv64 Linux ELF,
-run by the kwemu software CPU (`src/`, contract in `include/kw_emu.h`). The
-CPU walks real Sv39 page tables, so fork, mmap and copy-on-write behave like
-real Linux. A stock Alpine riscv64 minirootfs boots to a shell under Node, in
+Severin's `arch/wasm`, reworked). User space is unmodified aarch64 Linux ELF
+(ARMv8.0-A), run by the kwemu software CPU (`src/a64`, contract in
+`include/kw_emu.h`; an interpreter, no JIT yet). The CPU walks real page
+tables, so fork, mmap and copy-on-write behave like real Linux. A stock
+Alpine aarch64 minirootfs boots to a shell under Node, in
 Chromium, and in WebKit (Safari 27+, whose JSPI it needs), and Ubuntu Base
 24.04 LTS (glibc, apt) boots from a disk image under Node. The browser page
 and the single-file bundle use a 32-bit-memory build of the same kernel, which
@@ -61,13 +62,14 @@ and `stats` are separate and not part of `all`):
   `call_indirect` for wasm64, and an LLVM 18 linker produces an invalid
   module from those objects.
 * **kernel**: fetches Linux v7.3.4 from kernel.org (commit `7595a62d45e`,
-  shallow), applies `patches/linux/` as branch `kw-riscv-user` (`arch/wasm`
+  shallow), applies `patches/linux/` as branch `kw-arm64-user` (`arch/wasm`
   is based on Joel Severin's linux-wasm port),
   and builds `vmlinux` with `kw_defconfig`. Kbuild drives the toolchain
   through `tools/fake-llvm/llvm-wrapper.py`. The emulator comes from
-  `zig-out/lib/libkwemu.a` (`zig build -Dkwemu-jit=true`, run first, so
-  with kwemu's JIT tier; `KWEMU_JIT=0` builds it without, `KWEMU=path`
-  takes a prebuilt library as is); with `KWEMU=none` a stub is linked
+  `zig-out/lib/libkwemu.a` (`zig build -Dkwemu-jit=false`, run first;
+  the JIT tier compiles riscv blocks only, so it is off unless
+  `KWEMU_JIT=1`; `KWEMU=path` takes a prebuilt library as is); with
+  `KWEMU=none` a stub is linked
   instead. `include/kw_emu.h` is copied over the kernel's
   `arch/wasm/include/asm/kw_emu.h` (with a warning) if the two differ. It
   then runs `lower`. After a reconfigure it checks that `.config` has
@@ -121,8 +123,8 @@ and `stats` are separate and not part of `all`):
   without mke2fs warns and goes on.
 * **alpine** (`guest/alpine.sh`), the only initramfs, `vendor/build/initramfs/alpine.cpio`, and `alpine-test.cpio`, which always has kwtest and kwbench:
   * The Alpine minirootfs 3.24.4 (version and checksum pinned in `tools/env.sh`, `ALPINE_TARBALL=file` overrides). It gets a small `/init` and an inittab with `hvc0::respawn:-/bin/sh` and `::respawn:/usr/bin/kwtty serve` (see vsock).
-  * busybox, zlib, libcrypto, libssl, libapk and apk are the same Alpine packages rebuilt for kwemu's CPU (`guest/alpine-opt.sh`: gcc 16 `-O2` with Zba/Zbb/Zbs/Zicond, linked with lld), which made shell scripts about 20% faster and apk about 11% (2026-11-16). The disk image gets them too. Details in `.agents/guest-packages.md`.
-  * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target riscv64-linux-musl`, so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell. They come as a second cpio archive after the image's, which the kernel unpacks after the first. With `KW_RELEASE=1` (set by the release workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release bundles, the npm package and the deployed page have no kwtest; boot a release bundle with `--initrd alpine-test` to run it. The choice is in `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel cache key. Both archives have the same image id (`/usr/lib/kw-image`), which leaves the test programs out.
+  * Every package is Alpine's own aarch64 build. `KW_ALPINE_OPT=1` swaps in busybox, zlib, libcrypto, libssl, libapk and apk rebuilt from the same sources (`guest/alpine-opt.sh`: gcc 16 `-O2 -march=armv8-a`, linked with lld), in the disk image too; on riscv64 with its JIT that made shell scripts about 20% faster and apk about 11% (2026-11-16), and it is off until the A64 kwemu has a JIT. Details in `.agents/guest-packages.md`.
+  * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target aarch64-linux-musl -mcpu=generic` (ARMv8.0), so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell. They come as a second cpio archive after the image's, which the kernel unpacks after the first. With `KW_RELEASE=1` (set by the release workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release bundles, the npm package and the deployed page have no kwtest; boot a release bundle with `--initrd alpine-test` to run it. The choice is in `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel cache key. Both archives have the same image id (`/usr/lib/kw-image`), which leaves the test programs out.
   * `/usr/bin/glimmer`, built the same way (see Display, input and sound), and so are `/usr/bin/kwvsock`, `/usr/bin/kwshm`, `/usr/bin/kwtty` and `/usr/bin/kw9p` (see vsock, Host file systems and Shared memory).
   * The cpio archive is written by `tools/mkcpio.py`; no root is needed.
 * **disk** (`guest/alpine-disk.sh`, `DISK_SIZE`, default 512M; `all` keeps
@@ -137,8 +139,8 @@ and `stats` are separate and not part of `all`):
   shell on hvc0; `::shutdown:/etc/kw-shutdown` kills everything and
   remounts `/` read-only, so `poweroff` leaves the fs clean.
 * **ubuntu** (`guest/ubuntu-disk.sh`, `DISK_SIZE`, default 2G sparse;
-  `UBUNTU_TARBALL=file` overrides the download): Ubuntu Base 24.04.5 riscv64
-  (`ubuntu-base-24.04.5-base-riscv64.tar.gz` from
+  `UBUNTU_TARBALL=file` overrides the download): Ubuntu Base 24.04.5 arm64
+  (`ubuntu-base-24.04.5-base-arm64.tar.gz` from
   `cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/`, SHA-256 pinned
   in `tools/env.sh`) as `vendor/build/disk/ubuntu.ext4`, built like the
   Alpine disk. See Ubuntu below.
@@ -271,13 +273,14 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
   runs the real curl, installed on first use by `/etc/kw-apk-install curl`;
   after that, the shim execs `/usr/bin/curl` directly. Output is written only
   after a complete transfer, so `curl | sh` does not stream.
-* **x86_64, aarch64, i386 and arm binaries** run through qemu-user. i386
-  also covers i486-i686 (Alpine's `x86`), and arm covers armv5-armv7
-  (`armhf`, `armv7`), little-endian only. The kernel has
+* **x86_64, riscv64, i386 and arm binaries** run through qemu-user
+  (aarch64 is native; the kernel has no AArch32, so 32-bit arm needs qemu
+  too). i386 also covers i486-i686 (Alpine's `x86`), and arm covers
+  armv5-armv7 (`armhf`, `armv7`), little-endian only. The kernel has
   `CONFIG_BINFMT_MISC`, and the inittab runs
   `/etc/kw-binfmt.sh`, which registers the four ELF types (flag P) with the
   interpreter `/etc/kw-qemu`, which runs the binary under `qemu-ARCH` (ARCH
-  is `x86_64`, `aarch64`, `i386` or `arm`). The first time an ARCH is needed
+  is `x86_64`, `riscv64`, `i386` or `arm`). The first time an ARCH is needed
   (as root, with a network, under a lock so parallel execs do not race apk)
   it installs `qemu-ARCH` and a library root for dynamic binaries at qemu's
   default prefix `/usr/gnemul/qemu-ARCH`: musl, libgcc, libstdc++ and
@@ -285,11 +288,12 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
   binaries run too), about 4 MB, verified with that architecture's keys from
   `alpine-keys`. Add more with `apk add --root /usr/gnemul/qemu-ARCH --arch
   APKARCH --keys-dir /usr/share/apk/keys/APKARCH PKG` (APKARCH is `x86` for
-  i386 and `armv7` for arm). Expect about 7x slower than riscv64 code: qemu's
+  i386 and `armv7` for arm). Expect it to be several times slower than
+  native aarch64 code (riscv64 kwemu with its JIT measured about 7x): qemu's
   TCG output is interpreted by kwemu like any other code.
 * **`kw-arch ARCH [command...]`** runs a command (default: a shell) with
-  `uname` and `arch` reporting x86_64, aarch64, i686 or armv7l instead of
-  riscv64, for installers that refuse riscv64:
+  `uname` and `arch` reporting x86_64, riscv64, i686 or armv7l instead of
+  aarch64, for installers that pick their download by `uname -m`:
   `curl -fsSL https://opencode.ai/install | kw-arch x86_64 bash`. Only the
   commands are faked (shims in `/usr/lib/kw-arch` first on PATH), not the
   `uname()` syscall.
@@ -486,7 +490,7 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
     panel (Data disk) and a toast. Tested cases (`test/overlay-node.mjs`,
     `web/test/data.mjs` step 2b, and one case under WebKit): garbage
     `/etc/inittab`, a deleted `/bin/sh` and a truncated
-    `/lib/ld-musl-riscv64.so.1` fall back at the next boot; `/etc/profile`
+    `/lib/ld-musl-aarch64.so.1` fall back at the next boot; `/etc/profile`
     ending in `exit` is detected by bootwatch within about 3 s, and the
     next boot is safe mode; a `profile.d` script that hangs or spins
     gives two boots without a prompt, then safe mode; a broken
@@ -669,7 +673,7 @@ default; the page offers all three.
 ## Ubuntu (disk root)
 
 `kernel/build.sh ubuntu` (`guest/ubuntu-disk.sh`) turns Ubuntu Base 24.04.5
-LTS riscv64 (glibc 2.39, dpkg, apt 2.8, perl-base; no init system, no
+LTS arm64 (glibc 2.39, dpkg, apt 2.8, perl-base; no init system, no
 python) into `vendor/build/disk/ubuntu.ext4`, 2 GiB sparse (`DISK_SIZE`),
 about 143 MiB allocated. Nothing runs as root on the host: the tarball has
 no device nodes and no xattrs or file capabilities, its two hard links
@@ -698,6 +702,9 @@ node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot          # root s
 node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot --append "console=hvc0 root=/dev/wda rw init=/bin/bash"
 node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --mem 1024          # persistent: apt-get update && apt-get install ...
 ```
+
+The arm64 image has not been booted yet; everything below was measured
+with the riscv64 image and kwemu's riscv64 JIT.
 
 Measured on 2026-11-13 (x86-64 host, Node 24, JIT on): `apt-get update`
 (28.6 MB of indexes) takes about 4 minutes, mostly at about 130 kB/s from
@@ -909,7 +916,8 @@ from source). Everything is self-hosted except the Wisp fallback.
 * **MMU=y without hardware.**
   * The kernel runs only in the direct map: virtual address = physical
     address = linear address, and `phys_base` is 0.
-  * User page tables use the Sv39 layout. The PTE bits are riscv's, with
+  * User page tables use the Sv39 layout (kept from the riscv64 guest; kwemu
+    walks it for every guest ISA). The PTE bits are riscv's, with
     `_PAGE_PROT_NONE` = G and the riscv swap format, in a 3-level table with
     the PUD folded.
   * kwemu walks the tables and raises `KW_EV_FAULT`. The kernel either
@@ -924,48 +932,31 @@ from source). Everything is self-hosted except the Wisp fallback.
 * **vmalloc** returns direct-mapped memory (`mm/vmalloc-flat.c`, behind
   `CONFIG_VMALLOC_FLAT`). `vmap()` of non-contiguous pages fails, there is no
   `VMAP_STACK`, and per-cpu memory uses `percpu-km`.
-* **riscv64 user ABI.**
-  * Syscalls come from `scripts/syscall.tbl` with abis
-    `riscv rlimit memfd_secret`. pt_regs-wrapped entry points give every
-    syscall one Wasm type.
-  * Signal frames use riscv's `rt_sigframe`/`ucontext` (FP state, END ext
-    header).
-  * ELF loading uses binfmt_elf with `EM_RISCV`, `AT_HWCAP` = IMAFDC, and
-    `AT_MINSIGSTKSZ`.
-  * `uname -m` reports `riscv64`. The ISA that user space sees comes from
-    one set (`arch/wasm/kernel/cpu.c`): RV64GC plus the extensions that
-    every kwemu has (Zicbop, Ziccamoa, Ziccif, Zicclsm, Ziccrse, Zicntr,
-    Zihintntl, Zihintpause, Za64rs, Zaamo, Zalrsc, Zca, Zcd) plus the optional ones kwemu implements (`kw_isa_supported()`:
-    Zba, Zbb, Zbc and Zbs, the B extension and carry-less multiplication;
-    Zbkb, Zbkc and Zbkx, the bit manipulation for cryptography; Zknd and
-    Zkne, the scalar AES instructions; Zicond, conditional zeroing; and of
-    the RVA23U64 profile Zcb, more compressed instructions, Zimop and Zcmop,
-    the may-be-operations, Zicbom and Zicboz, the cache-block operations
-    with 64-byte blocks, Zawrs, wait on reservation set, Zfa, more
-    floating-point instructions, Zfhmin, half-precision conversions, and
-    Zihpm, whose counters read 0), minus
-    `kw.isa=`. The `isa` line of `/proc/cpuinfo` lists it in upstream's
-    canonical order
-    (`rv64imafdc_zicbom_zicbop_zicboz_ziccamoa_ziccif_zicclsm_ziccrse_zicntr_zicond_zicsr_zifencei_zihintntl_zihintpause_zihpm_zimop_za64rs_zaamo_zalrsc_zawrs_zfa_zfhmin_zca_zcb_zcd_zcmop_zba_zbb_zbc_zbkb_zbkc_zbkx_zbs_zknd_zkne`),
-    and `riscv_hwprobe` reports the same set in `IMA_EXT_0` (FD, C and the
-    `RISCV_HWPROBE_EXT_*` bits) and `IMA_EXT_1` (the platform properties),
-    Zicbop, Zicboz and Zicbom block sizes of 64, fast misaligned scalar
-    access and no vector, the end of user space (1 << 38) and no vendor
-    extensions; `TIME_CSR_FREQ` is unknown. `AT_HWCAP` stays IMAFDC. The cycle, time and
-    instret CSRs all count retired instructions. `riscv_flush_icache`
-    flushes the emulator's translations.
-  * **`kw.isa=`** masks extensions, for A/B measurements and bisecting: a
-    comma list applied from left to right, where `rv64gc` turns off
-    everything beyond RV64GC, `-ext` turns one off and `+ext` turns one
-    back on (if kwemu implements it). Examples: `kw.isa=rv64gc`,
-    `kw.isa=-zkne,-zknd`, `kw.isa=-zba,-zbb,-zbs,-zicond`,
-    `kw.isa=rv64gc,+zkne`. A
-    masked optional extension raises SIGILL like an unimplemented one.
-    Masking one that every kwemu has (Zicntr, Zca, ...) only stops
-    advertising it. The boot log shows the result (`kwemu: isa ...`).
-    Under Node: `--append "console=hvc0 rdinit=/init kw.isa=rv64gc"`.
-  * There is no vDSO. Handlers return through a `[sigpage]` special mapping
-    that holds `li a7,139; ecall`.
+* **arm64 user ABI** (details in `.agents/kernel.md`, arm64 user ABI).
+  * Syscalls come from `scripts/syscall.tbl` with arm64's abis
+    `renameat rlimit memfd_secret`; number in x8, arguments in x0..x5.
+    pt_regs-wrapped entry points give every syscall one Wasm type. No
+    AArch32 (compat).
+  * Signal frames use arm64's `rt_sigframe` (ucontext with an
+    `fpsimd_context` record), with `SA_RESTORER`.
+  * ELF loading uses binfmt_elf with `EM_AARCH64`, `AT_PLATFORM` aarch64,
+    `AT_HWCAP` = FP, ASIMD, CPUID and the optional features kwemu
+    implements (AES, PMULL, SHA1, SHA2, CRC32), `AT_MINSIGSTKSZ` 4720.
+  * `uname -m` reports `aarch64`. The `Features` line of `/proc/cpuinfo`
+    lists the AT_HWCAP names. Nothing beyond what kwemu runs is listed (no
+    LSE atomics, SVE, SHA3/SHA512, RNG, PAC or BTI), and user space picks
+    its code paths from that (OpenSSL reads AT_HWCAP).
+  * **`kw.isa=`** masks optional features, for A/B measurements and
+    bisecting: a comma list applied from left to right, where `armv8`
+    turns every optional feature off, `-aes` turns one off and `+aes` turns
+    one back on. A masked feature raises SIGILL like an unimplemented
+    instruction. Under Node: `--append "console=hvc0 rdinit=/init kw.isa=armv8"`.
+  * User space makes new code visible with DC CVAU and IC IVAU. There is no
+    vDSO. Handlers return to `sa_restorer`, else through a `[sigpage]`
+    special mapping that holds `mov x8, #139; svc #0`.
+  * Missing for now: vector (AdvSIMD) floating point, which the
+    interpreter rejects with SIGILL (`.agents/a64.md`); Alpine's busybox
+    `sleep` hits it (`fcvtzs d31, d0`).
 * **Console.** `hvc_wasm` on WASI fds 1 (output) and 0 (input, read only
   after a zero-timeout `poll_oneoff`, so it never blocks), `console=hvc0`.
 * **Network.** `kwnet`, IRQ 2; see Networking.
@@ -1018,7 +1009,7 @@ suspend only when the host returns a promise.
   (kwshm, optional; see .agents/kernel.md), the display, input and sound
   imports (optional),
   `wasm_driver_console_size` (console rows << 16 | cols, 0 = unknown) and `wasm_dump_stacktrace`. kwemu, when built with its JIT tier
-  (the default), adds `kw_host_jit_caps`, `kw_host_jit_compile` and
+  (`KWEMU_JIT=1`; off for the aarch64 guest, which it cannot compile yet), adds `kw_host_jit_caps`, `kw_host_jit_compile` and
   `kw_host_jit_free` (contract in `include/kw_emu.h`; host
   `js/core/jit.ts`): the host compiles a hot block's module synchronously
   against the kernel's memory and `table.set`s it into one of 1024 kwemu
@@ -1054,7 +1045,7 @@ switching, no block or net device, no JIT).
   not work. There are no core dumps, seccomp, modules, swap, or kallsyms.
   COREDUMP needs arch work first: the ELF core writer calls
   `elf_core_copy_task_fpregs`, which arch/wasm lacks, and the notes would
-  have to carry the riscv64 registers from kwemu.
+  have to carry the aarch64 registers from kwemu.
 * Without a kwblk disk the root file system is the initramfs (tmpfs/rootfs),
   so packages installed with `apk add` must fit in RAM; with a data disk
   they go to its overlay root, with a root disk to that disk.

@@ -23,7 +23,7 @@ const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
 pub const Regs = core.Regs;
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 pub const cpu_size: usize = 8 << 20;
 
 pub const Event = extern struct {
@@ -110,6 +110,7 @@ const no_tgen = std.math.maxInt(u64);
 const mark_wild = std.math.maxInt(u64);
 
 const exec = @import("exec.zig");
+const a64_state = @import("../a64/state.zig");
 const Op = exec.Op;
 const jit = @import("jit.zig");
 
@@ -212,6 +213,8 @@ const Priv = extern struct {
     ops: [nops]Op,
     /// JIT tier bookkeeping (-Dkwemu-jit); empty otherwise.
     jit: jit.State,
+    /// A64 (src/a64): exclusive-monitor extras, enabled features.
+    a64: a64_state.Priv,
 };
 
 inline fn hostLoad(comptime T: type, addr: u64) T {
@@ -547,6 +550,21 @@ pub const Cpu = extern struct {
         return @ptrFromInt(@as(usize, @intCast(try self.writeHost(va, @sizeOf(T)))));
     }
 
+    /// Fault now unless the byte at `va` may be accessed as `access`; fills
+    /// the TLB and has no other effect (a write probe does not count as a
+    /// store into decoded code). Instructions with several accesses (A64
+    /// pairs, structures) probe every page before their first store.
+    pub fn probe(self: *Cpu, va: u64, access: core.Access) core.Error!void {
+        switch (access) {
+            .read => _ = try self.readHost(va),
+            .write => {
+                const vpn = va >> page_shift;
+                if (self.priv.tlb_w[@intCast(vpn & (dtlb_n - 1))].tag & ~code_flag != vpn) _ = try self.translate(va, .write);
+            },
+            .exec => _ = try self.execHost(va),
+        }
+    }
+
     // ---- block lookup / decode --------------------------------------------------
 
     inline fn lookup(self: *Cpu, pc: u64) core.Error!*Block {
@@ -706,25 +724,15 @@ comptime {
     std.debug.assert(@sizeOf(Event) == @sizeOf(c.struct_kw_event));
     for (.{ "kind", "access", "addr", "insn" }) |f|
         std.debug.assert(@offsetOf(Event, f) == @offsetOf(c.struct_kw_event, f));
-    std.debug.assert(@sizeOf(Regs) == @sizeOf(c.struct_kw_regs));
-    for (.{ "x", "pc", "f", "fcsr", "_pad" }) |f|
-        std.debug.assert(@offsetOf(Regs, f) == @offsetOf(c.struct_kw_regs, f));
-    // x[32] (the redirected x0 destination) is pc.
-    std.debug.assert(@offsetOf(Regs, "pc") == 32 * 8);
+    // struct kw_regs is the A64 layout now (checked in src/a64/run.zig);
+    // the riscv Regs/KW_ISA_* checks went with ABI 9. core.Kind and Access
+    // still match the header's events.
     for (.{ "budget", "syscall", "fault", "illegal", "breakpoint", "misaligned", "interrupt" }, .{
         c.KW_EV_BUDGET, c.KW_EV_SYSCALL, c.KW_EV_FAULT, c.KW_EV_ILLEGAL, c.KW_EV_BREAKPOINT, c.KW_EV_MISALIGNED, c.KW_EV_INTERRUPT,
     }) |name, v| std.debug.assert(@intFromEnum(@field(core.Kind, name)) == v);
     std.debug.assert(@intFromEnum(core.Access.read) == c.KW_ACCESS_READ);
     std.debug.assert(@intFromEnum(core.Access.write) == c.KW_ACCESS_WRITE);
     std.debug.assert(@intFromEnum(core.Access.exec) == c.KW_ACCESS_EXEC);
-    // Optional extensions: core.Ext matches the KW_ISA_* bits one to one.
-    const exts = .{ "zba", "zbb", "zbc", "zbs", "zbkb", "zbkc", "zbkx", "zknd", "zkne", "zicond", "zcb", "zimop", "zcmop", "zicbom", "zicboz", "zawrs", "zfa", "zfhmin", "zihpm" };
-    std.debug.assert(exts.len == @typeInfo(core.Ext).@"enum".fields.len);
-    for (exts, .{
-        c.KW_ISA_ZBA,   c.KW_ISA_ZBB,    c.KW_ISA_ZBC,    c.KW_ISA_ZBS,   c.KW_ISA_ZBKB, c.KW_ISA_ZBKC,   c.KW_ISA_ZBKX,
-        c.KW_ISA_ZKND,  c.KW_ISA_ZKNE,   c.KW_ISA_ZICOND, c.KW_ISA_ZCB,   c.KW_ISA_ZIMOP, c.KW_ISA_ZCMOP, c.KW_ISA_ZICBOM,
-        c.KW_ISA_ZICBOZ, c.KW_ISA_ZAWRS, c.KW_ISA_ZFA,    c.KW_ISA_ZFHMIN, c.KW_ISA_ZIHPM,
-    }) |name, v| std.debug.assert(core.bit(@field(core.Ext, name)) == v);
 }
 
 // ---- C ABI -----------------------------------------------------------------------
@@ -970,8 +978,8 @@ pub fn hostReset(cpu: *Cpu) void {
     cpu.resetCache();
 }
 
-/// Export the C ABI (called from the library root only, so that the unit
-/// tests can link against the native archive without duplicate symbols).
+/// The riscv C ABI (ABI 8 and older). Not exported any more: the library
+/// root exports src/a64/run.zig's ABI. Kept for reference.
 pub fn exportAbi() void {
     @export(&kw_cpu_init, .{ .name = "kw_cpu_init" });
     @export(&kw_run, .{ .name = "kw_run" });

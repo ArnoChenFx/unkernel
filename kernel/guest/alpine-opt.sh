@@ -7,13 +7,13 @@
 # Same source, patches and configuration as the image's packages (aports at
 # the commit recorded for each in the image's apk database), built as their
 # APKBUILDs build them, except:
-#   - gcc 16 (Bootlin's riscv64 musl toolchain, used with a sysroot of
-#     Alpine's own packages: musl-dev is the image's musl) at -O2 for rv64gc
-#     + Zba/Zbb/Zbs/Zicond, where Alpine uses gcc 15 at -Os (busybox: -Oz
-#     and -finline-limit=0) for rv64gc;
+#   - gcc 16 (Bootlin's aarch64 musl toolchain, used with a sysroot of
+#     Alpine's own packages: musl-dev is the image's musl) at -O2 for
+#     armv8-a, where Alpine uses gcc 15 at -Os (busybox: -Oz and
+#     -finline-limit=0);
 #   - linked with lld, not GNU ld (whose one R+X segment for code and
-#     read-only data makes each exec ~0.5 ms slower under kwemu), with RELR
-#     relocations; busybox is not PIE (apk is, as in Alpine).
+#     read-only data made each exec ~0.5 ms slower under riscv64 kwemu),
+#     with RELR relocations; busybox is not PIE (apk is, as in Alpine).
 # Numbers, traps and the update procedure: .agents/guest-packages.md.
 #
 #   kernel/guest/alpine-opt.sh                 build all (again)
@@ -22,9 +22,11 @@
 #                                              stage (alpine.sh, alpine-disk.sh);
 #                                              builds first if out of date
 #
-# KW_ALPINE_OPT=0 keeps Alpine's builds (--install does nothing); so does a
-# stage from an ALPINE_TARBALL override whose versions differ. Building
-# needs an x86_64 host (the gcc toolchain).
+# Off by default on aarch64: --install does nothing (Alpine's builds stay)
+# unless KW_ALPINE_OPT=1. The tuning was measured for riscv64 kwemu with its
+# JIT; the A64 kwemu has no JIT yet (.agents/guest-packages.md). A stage
+# from an ALPINE_TARBALL override whose versions differ keeps Alpine's
+# builds too. Building needs an x86_64 host (the gcc toolchain).
 #
 # Output: vendor/build/alpine-opt/root/ (installed files, as in the image;
 # the build trees are under vendor/build/alpine-opt/src/). zlib and openssl
@@ -53,22 +55,24 @@ declare -A apkbuild_sha256=(
 )
 pkgs="busybox zlib openssl apk-tools"
 # The sysroot: Alpine packages of the image's release (musl is the image's).
-APK_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/main/riscv64"
+APK_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/main/aarch64"
 apks="
-f21b18f22a511de1e57f70112f761d0daad0c7d74e0734a82fcd5e037387dbb4 musl-1.2.6-r3
-f47066d861413b3d76fe200240ea2919cdf807f82770d574a16d10dbd6b56ad7 musl-dev-1.2.6-r3
-0b5173b68b701e09c2b1182a238186d87d5956e8474d50dcd8448ea8be1d7aca linux-headers-7.0.0-r1
-4f3cb0e704bb9379f1e7c3f60da834b85cc7b2eb2e4b3826cf2017123f745431 utmps-dev-0.1.3.3-r0
-777aaa8ad61618418bdcb59b8c37802555620816c43bc76dc3cad305a61630e2 utmps-static-0.1.3.3-r0
-df7862d2f21045b0063821f0d8a22e28bb888d0b2f10c67555f456b9579b74e2 skalibs-dev-2.15.0.0-r0
-8c1ba6e5644f54fe2ef735ff0f45af708a1e9c7cefa9ca0266a5187084bce12e skalibs-static-2.15.0.0-r0
+2e17864102278d9049c3a56f1bceed9e8cf287065617e579325123443daed8a5 musl-1.2.6-r3
+45afe0a9f78de3402b6b5d11f5153ed955bf59d59b45344d9c3fed9f4bbf2f66 musl-dev-1.2.6-r3
+d61656e81116040ebac0bc8d9046a3ba97f01a00ee085809103576e8a437468f linux-headers-7.0.0-r1
+7af699bfbe389d9eaaf94a0ba1a9eadc22c27e69e876edc69eec18c2df303a44 utmps-dev-0.1.3.3-r0
+efbecee796ef55f90f1e8f8d63d4f1fbaf218a4491751863ebda381f80259aa4 utmps-static-0.1.3.3-r0
+48ca905e32549caad4ae01b96f0965d12e1492734f16c9855d7e2754f9c81530 skalibs-dev-2.15.0.0-r0
+db0cbcda40f8ba934630772b4301ab40f7a50e9d14131e673b357d772a81d59c skalibs-static-2.15.0.0-r0
 "
 # gcc 16.2.0, binutils 2.46.1, for x86_64 hosts.
-GCC_TC=riscv64-lp64d--musl--bleeding-edge-2026.08-1
-GCC_TC_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/riscv64-lp64d/tarballs/$GCC_TC.tar.xz"
-GCC_TC_SHA256=f8d96c08c00141280103aaf17ed7c19ccbc9b79a35baf94ede05e7f97f37182a
+GCC_TC=aarch64--musl--bleeding-edge-2026.08-1
+GCC_TC_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/$GCC_TC.tar.xz"
+GCC_TC_SHA256=aa465cba276340e377b881dfdd1429db01d8b2f170a309ed2c25158d3b44f447
 
-OPT_CFLAGS="-O2 -march=rv64gc_zba_zbb_zbs_zicond -mabi=lp64d"
+# ARMv8.0 (what kwemu runs). gcc's default -moutline-atomics stays: its
+# helpers use LSE only when AT_HWCAP has ATOMICS, which kwemu never sets.
+OPT_CFLAGS="-O2 -march=armv8-a"
 # --undefined-version: lld rejects version scripts naming symbols a link
 # does not define, which GNU ld allows (zlib's configure test does that).
 OPT_LDFLAGS="-Wl,--as-needed,-O1,--sort-common -Wl,-z,pack-relative-relocs -Wl,--undefined-version"
@@ -125,7 +129,7 @@ unpack() {
 
 setup() {
 	mkdir -p "$b/bin/lld" "$dl"
-	tc="$vendor/toolchain-gcc/$GCC_TC/bin/riscv64-linux"
+	tc="$vendor/toolchain-gcc/$GCC_TC/bin/aarch64-linux"
 	if [ ! -x "$tc-gcc" ]; then
 		fetch_verified "$GCC_TC_URL" "$dl/$GCC_TC.tar.xz" "$GCC_TC_SHA256"
 		rm -rf "$vendor/toolchain-gcc/$GCC_TC"
@@ -200,13 +204,11 @@ build_zlib() {
 build_openssl() {
 	fetch openssl
 	unpack openssl "openssl-${ver%-r*}.tar.gz" "openssl-${ver%-r*}"
-	# As the APKBUILD's native build (threads on). sha256.c is built at
-	# -Os, which runs faster under kwemu (16 MB sha256: 455 ms vs 500 with
-	# -O2, stock 480; 2026-11-16); for sha1dgst.c and sha512.c, -Os is
-	# slower.
+	# As the APKBUILD's native build (threads on). The riscv64 build had
+	# crypto/sha/sha256.c at -Os here (faster under that kwemu's JIT); on
+	# aarch64 OpenSSL's SHA-256 is assembly (sha256-armv8.S).
 	cat > "$b/bin/cc-openssl" <<-EOF
 	#!/bin/sh
-	case "\$*" in *crypto/sha/sha256.c*) exec "$b/bin/cc" "\$@" -Os ;; esac
 	exec "$b/bin/cc" "\$@"
 	EOF
 	chmod +x "$b/bin/cc-openssl"
@@ -214,7 +216,7 @@ build_openssl() {
 	# environment. CC by name (on PATH): Configure records the compiler
 	# command in libcrypto (`openssl version -a`), so a path would put the
 	# build host's directory into the image.
-	PATH="$b/bin:$PATH" CC=cc-openssl CFLAGS= LDFLAGS= perl ./Configure linux64-riscv64 \
+	PATH="$b/bin:$PATH" CC=cc-openssl CFLAGS= LDFLAGS= perl ./Configure linux-aarch64 \
 		--prefix=/usr --libdir=lib --openssldir=/etc/ssl enable-fips enable-ktls shared \
 		no-zlib no-async no-comp no-idea no-mdc2 no-rc5 no-ec2m no-ssl3 no-seed \
 		no-weak-ssl-ciphers $OPT_CFLAGS $OPT_LDFLAGS -Wa,--noexecstack
@@ -237,8 +239,8 @@ build_apk_tools() {
 	pkg_config_libdir = '$sysroot/usr/lib/pkgconfig'
 	[host_machine]
 	system = 'linux'
-	cpu_family = 'riscv64'
-	cpu = 'riscv64'
+	cpu_family = 'aarch64'
+	cpu = 'aarch64'
 	endian = 'little'
 	EOF
 	# abuild-meson's options, then the APKBUILD's, without the lua and
@@ -247,7 +249,7 @@ build_apk_tools() {
 	VERSION="$ver" meson setup --cross-file cross.ini \
 		--prefix=/usr --libdir=/usr/lib --sysconfdir=/etc --localstatedir=/var \
 		--buildtype=plain --wrap-mode=nofallback -Db_staticpic=true -Db_pie=true \
-		--auto-features=disabled --bindir=/sbin -Darch=riscv64 -Ddocs=disabled \
+		--auto-features=disabled --bindir=/sbin -Darch=aarch64 -Ddocs=disabled \
 		-Dhelp=enabled -Dlua_bin="$lua" -Dzstd=disabled -Dlua=disabled -Dpython=disabled \
 		-Dtests=disabled output
 	ninja -C output
@@ -256,7 +258,7 @@ build_apk_tools() {
 
 build() {
 	local p t f
-	[ "$(uname -m)" = x86_64 ] || { echo "alpine-opt: building needs an x86_64 host (Bootlin's gcc); KW_ALPINE_OPT=0 keeps Alpine's builds" >&2; exit 1; }
+	[ "$(uname -m)" = x86_64 ] || { echo "alpine-opt: building needs an x86_64 host (Bootlin's gcc); without KW_ALPINE_OPT=1 the images keep Alpine's builds" >&2; exit 1; }
 	for t in meson ninja pkg-config patch perl; do
 		command -v $t > /dev/null || { echo "alpine-opt: need $t" >&2; exit 1; }
 	done
@@ -284,8 +286,8 @@ build() {
 # audit` lists them); upgrading a package brings Alpine's build back.
 install_into() {
 	local stage=$1 db="$1/lib/apk/db/installed" p f want have
-	if [ "${KW_ALPINE_OPT:-1}" = 0 ]; then
-		echo "alpine-opt: KW_ALPINE_OPT=0, keeping Alpine's builds"
+	if [ "${KW_ALPINE_OPT:-0}" != 1 ]; then
+		echo "alpine-opt: keeping Alpine's builds (KW_ALPINE_OPT=1 installs the rebuild)"
 		return
 	fi
 	[ "$(cat "$b/.stamp" 2> /dev/null)" = "$stamp" ] || build $pkgs

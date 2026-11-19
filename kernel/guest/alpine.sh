@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Alpine Linux riscv64 minirootfs as an initramfs (dynamic musl userland),
+# Alpine Linux aarch64 minirootfs as an initramfs (dynamic musl userland),
 # vendor/build/initramfs/alpine.cpio, the only root fs image.
 # /init mounts the pseudo filesystems and hands over to busybox init with a
 # login-less shell on hvc0; with a disk labelled kwdata, mounted at /data,
@@ -57,9 +57,10 @@ chmod 1777 "$stage/tmp" "$stage/var/tmp"
 # and upgrading libcrypto3 or libssl3 brings them back.
 rm -rf "$stage/usr/lib/engines-3" "$stage/usr/lib/ossl-modules/legacy.so" \
 	"$stage/etc/ssl/openssl.cnf.dist" "$stage/etc/ssl/ct_log_list.cnf.dist"
-# busybox, zlib, libcrypto, libssl, libapk and apk rebuilt for kwemu's CPU
-# (gcc 16 -O2 with Zba/Zbb/Zbs/Zicond, linked with lld), from the same source
-# as these packages; see alpine-opt.sh. alpine-disk.sh does the same.
+# With KW_ALPINE_OPT=1: busybox, zlib, libcrypto, libssl, libapk and apk
+# rebuilt for kwemu's CPU (gcc 16 -O2, linked with lld), from the same
+# source as these packages; see alpine-opt.sh. Off by default for aarch64
+# (Alpine's own builds). alpine-disk.sh does the same.
 "$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk starts with main only. Every apk command that loads the indexes parses
 # all of them, and community (21k packages to main's 6k) makes that ~2.7 s
@@ -302,11 +303,13 @@ for r; do
 done
 EOF
 chmod 755 "$stage/etc/kw-apk-enable"
-# Foreign binaries: x86_64, aarch64, i386 (i486-i686 too) and 32-bit arm
+# Foreign binaries: x86_64, riscv64, i386 (i486-i686 too) and 32-bit arm
 # (armv5-armv7, armhf) little-endian ELF executables run through qemu-user,
-# by binfmt_misc in the guest kernel. The magic/mask pairs are the ones from
-# qemu's scripts/qemu-binfmt-conf.sh: 20 bytes, up to e_machine, matching
-# ET_EXEC and ET_DYN. Flag P passes the original argv[0] to the interpreter.
+# by binfmt_misc in the guest kernel (aarch64 is native; the kernel has no
+# AArch32, so 32-bit arm needs qemu too). The magic/mask pairs are the ones
+# from qemu's scripts/qemu-binfmt-conf.sh: 20 bytes, up to e_machine,
+# matching ET_EXEC and ET_DYN. Flag P passes the original argv[0] to the
+# interpreter.
 cat > "$stage/etc/kw-binfmt.sh" <<'EOF'
 #!/bin/sh
 d=/proc/sys/fs/binfmt_misc
@@ -315,7 +318,7 @@ mountpoint -q $d || mount -t binfmt_misc binfmt_misc $d 2>/dev/null || exit 0
 reg() { [ -e $d/$1 ] || printf '%s\n' ":$1:M::$2:$3:/etc/kw-qemu:P" > $d/register; }
 reg x86_64 '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00' \
 	'\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
-reg aarch64 '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00' \
+reg riscv64 '\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xf3\x00' \
 	'\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
 reg i386 '\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x03\x00' \
 	'\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff'
@@ -338,7 +341,7 @@ cat > "$stage/etc/kw-qemu" <<'EOF'
 #!/bin/sh
 case $(od -An -tx1 -j18 -N1 "$1" 2>/dev/null) in
 *3e) arch=x86_64 apkarch=x86_64 ;;
-*b7) arch=aarch64 apkarch=aarch64 ;;
+*f3) arch=riscv64 apkarch=riscv64 ;;
 *03) arch=i386 apkarch=x86 ;;
 *28) arch=arm apkarch=armv7 ;;
 *) echo "$1: cannot tell the architecture" >&2; exit 126 ;;
@@ -382,18 +385,20 @@ exec $q -0 "$a0" "$f" "$@"
 EOF
 chmod 755 "$stage/etc/kw-qemu"
 # kw-arch ARCH [COMMAND [ARG...]]: run COMMAND (default: a shell) with uname
-# and arch reporting ARCH instead of riscv64, for installers that refuse
-# riscv64 or pick their download by `uname -m`; what they fetch then runs
-# through /etc/kw-qemu. E.g. `curl -fsSL URL | kw-arch x86_64 bash`. Only
-# the commands are faked (PATH), not the uname() syscall.
+# and arch reporting ARCH instead of aarch64, for installers that pick their
+# download by `uname -m` (or have no aarch64 build); what they fetch then
+# runs through /etc/kw-qemu. E.g. `curl -fsSL URL | kw-arch x86_64 bash`.
+# Only the commands are faked (PATH), not the uname() syscall. aarch64
+# (arm64) is accepted and changes nothing.
 cat > "$stage/usr/bin/kw-arch" <<'EOF'
 #!/bin/sh
 case $1 in
 x86_64|amd64|x64) m=x86_64 ;;
-aarch64|arm64) m=aarch64 ;;
+riscv64) m=riscv64 ;;
 i386|i486|i586|i686|x86) m=i686 ;;
 arm|armv7|armv7l|armhf) m=armv7l ;;
-*) echo "usage: kw-arch x86_64|aarch64|i686|armv7l [command [arg...]]" >&2; exit 2 ;;
+aarch64|arm64) m=aarch64 ;;
+*) echo "usage: kw-arch x86_64|riscv64|i686|armv7l|aarch64 [command [arg...]]" >&2; exit 2 ;;
 esac
 shift
 [ $# = 0 ] && set -- "${SHELL:-/bin/sh}"
@@ -402,7 +407,7 @@ EOF
 mkdir -p "$stage/usr/lib/kw-arch"
 cat > "$stage/usr/lib/kw-arch/uname" <<'EOF'
 #!/bin/sh
-/bin/busybox "${0##*/}" "$@" | sed "s/riscv64/${KW_ARCH:-riscv64}/g"
+/bin/busybox "${0##*/}" "$@" | sed "s/aarch64/${KW_ARCH:-aarch64}/g"
 EOF
 ln -sf uname "$stage/usr/lib/kw-arch/arch"
 chmod 755 "$stage/usr/bin/kw-arch" "$stage/usr/lib/kw-arch/uname"
@@ -457,8 +462,10 @@ EOF
 # the shm exporter (kwshm.c; it needs a host with shm, CLI --shm or the SDK)
 # the terminal server (kwtty.c, from inittab; it serves a host with vsock)
 # and the 9p mounter (kw9p.c; it needs a host serving 9p over vsock).
+# All static aarch64 musl for the generic CPU (ARMv8.0, what kwemu runs).
+cc_guest=("$zig" cc -target aarch64-linux-musl -mcpu=generic -static -O2 -s)
 for t in glimmer kwvsock kwshm kwtty kw9p; do
-	"$zig" cc -target riscv64-linux-musl -static -O2 -s -o "$stage/usr/bin/$t" "$root/kernel/guest/$t.c"
+	"${cc_guest[@]}" -o "$stage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
 # The kernel smoke test and benchmark (see the top of this file) are not in
 # the image: they go into a second archive, below.
@@ -466,7 +473,7 @@ tstage="$out/kwtest-root"
 rm -rf "$tstage"
 mkdir -p "$tstage/usr/bin"
 for t in kwtest kwbench; do
-	"$zig" cc -target riscv64-linux-musl -static -O2 -s -o "$tstage/usr/bin/$t" "$root/kernel/guest/$t.c"
+	"${cc_guest[@]}" -o "$tstage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
 
 # Image id, for the overlay root (overlay/root.sh): a hash of the tree (names,

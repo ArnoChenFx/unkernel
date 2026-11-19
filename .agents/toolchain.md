@@ -49,8 +49,9 @@ The API differs from 0.13-0.15. Examples of all of these are in
   `b.addLibrary(.{ .linkage })` and `b.addTranslateC`.
 - kwemu is built for wasm64 with cpu `mvp`, so the object needs only
   memory64: no atomics, bulk memory or sign-ext.
-- The guest programs kwtest and kwbench are built with `zig cc`
-  (`riscv64-linux-musl`, static).
+- The guest programs (kwtest, kwbench, glimmer, kwtty, kw9p, kwvsock,
+  kwshm) are built with `zig cc` (`aarch64-linux-musl`, `-mcpu=generic`,
+  static).
 
 ## Host tools
 
@@ -65,8 +66,8 @@ The API differs from 0.13-0.15. Examples of all of these are in
   `timeconst.h` with `HZ == 0` ("Totally bogus HZ value!"). Put the real
   tools first on `PATH` for such runs.
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
-- `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`)
-  also needs meson, ninja, pkg-config, patch, lua 5.x, and perl with
+- `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`;
+  it builds only with `KW_ALPINE_OPT=1`) also needs meson, ninja, pkg-config, patch, lua 5.x, and perl with
   FindBin, IPC::Cmd and File::Compare (guest-packages.md).
 - `setup.sh` runs only ELF binaries for its version checks, so a wrapper
   that installs packages on first use is never triggered.
@@ -74,11 +75,12 @@ The API differs from 0.13-0.15. Examples of all of these are in
 ## Pinned downloads
 
 The kernel base commit and the LLVM tag and commit are in build.sh. The
-SHA-256 sums for Binaryen 133 and the Alpine 3.24.4 minirootfs are in
-build.sh and `kernel/tools/env.sh` (`ALPINE_TARBALL=file` overrides the
-download). wterm (`@wterm/dom` 0.5.10, Apache-2.0) is an npm dependency
-of `web/`, pinned exactly and locked in `pnpm-lock.yaml` (see web.md).
-`kernel/guest/alpine-opt.sh` pins Bootlin's riscv64 musl gcc
+SHA-256 sums for Binaryen 133, the Alpine 3.24.4 aarch64 minirootfs and
+Ubuntu Base 24.04.5 arm64 are in build.sh and `kernel/tools/env.sh`
+(`ALPINE_TARBALL=file` overrides the download). wterm (`@wterm/dom`
+0.5.10, Apache-2.0) is an npm dependency of `web/`, pinned exactly and
+locked in `pnpm-lock.yaml` (see web.md).
+`kernel/guest/alpine-opt.sh` pins Bootlin's aarch64 musl gcc
 (bleeding-edge 2026.08-1, gcc 16.2), the Alpine apks of its sysroot, and
 per package the aports commit and APKBUILD (whose sha512sums cover the
 sources).

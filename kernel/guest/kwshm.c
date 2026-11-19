@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 /*
- * kwshm: export a shmem file to the host through /dev/kwshm (static riscv64
+ * kwshm: export a shmem file to the host through /dev/kwshm (static aarch64
  * musl), /usr/bin/kwshm in the Alpine initramfs. The SDK's shm test
  * (test/api.test.ts) drives it.
  *

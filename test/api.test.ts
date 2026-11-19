@@ -44,6 +44,8 @@ const kernelImports = WebAssembly.Module.imports(await WebAssembly.compile(kerne
 const kernelHas9p = kernelBytes.includes("9P2000.L");
 const kernelHasVsock = kernelImports.some((i) => i.name === "wasm_driver_vsock_init");
 const kernelHasShm = kernelImports.some((i) => i.name === "wasm_driver_shm_init");
+/** Was kwemu built with its JIT tier (kw_host_jit_*)? Not yet for the A64 guest CPU (.agents/a64.md). */
+const kernelHasJit = kernelImports.some((i) => i.name === "kw_host_jit_caps");
 
 type BootOptions = NonNullable<Parameters<typeof createKernel>[0]>;
 // A failed assertion must not leave a kernel running (it would keep the test process alive).
@@ -124,12 +126,12 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.match(s.text, /Linux version/, "the stream starts at the first byte");
 			const at = s.text.length;
 			vm.write("uname -m; nproc; ls /sys/class/net | cat\n");
-			await waitFor(/riscv64[\s\S]*⇒/, at);
+			await waitFor(/aarch64[\s\S]*⇒/, at);
 			const out = s.text.slice(at);
 			// stats().cpus: the CPUs the kernel got, which the guest sees (UNKERNEL_TEST_CPUS on an SMP kernel).
 			const cpus = vm.stats().cpus;
 			assert.equal(cpus, testCpus ?? 1);
-			assert.match(out, new RegExp(`riscv64\\r?\\n${cpus}\\r?\\n`), "the guest's nproc is stats().cpus");
+			assert.match(out, new RegExp(`aarch64\\r?\\n${cpus}\\r?\\n`), "the guest's nproc is stats().cpus");
 			assert.match(out, /\blo\b/);
 			assert.doesNotMatch(out, /\beth0\b/, "no network device unless one is passed");
 			assert.ok(vm.vsock, "a vsock device by default");
@@ -452,6 +454,13 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			return { sum, st: vm.stats().jit, logs };
 		};
 		const [on, off] = await Promise.all([run(undefined), run(false)]);
+		if (!kernelHasJit) {
+			// A kernel without the tier never asks for it, whatever the option says.
+			assert.ok(!on.st.requested && !off.st.requested && on.st.compiled === 0, JSON.stringify(on.st));
+			assert.ok(on.sum && on.sum === off.sum, `same sha256 with and without the JIT option: ${on.sum} vs ${off.sum}`);
+			t.diagnostic("this kernel has no JIT tier (kw_host_jit_*): checked the option only");
+			return;
+		}
 		assert.ok(on.st.enabled && on.st.requested, JSON.stringify(on.st));
 		assert.ok(on.st.compiled > 0 && on.st.compileMs > 0 && on.st.bytes > 0, JSON.stringify(on.st));
 		assert.equal(on.st.failed, 0, on.logs.join("\n"));

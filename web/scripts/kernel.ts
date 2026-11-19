@@ -22,7 +22,9 @@
 //   GITHUB_TOKEN, GH_TOKEN    for the GitHub API (60 requests an hour without
 //                             one; past that, the release feed is used)
 // If GitHub cannot be reached and the file is a release's (the tag asked
-// for, if one was), a build keeps it.
+// for, if one was), a build keeps it. A release whose kernel was built for
+// another kwemu ABI than include/kw_emu.h's is refused (checkAbi): after a
+// guest or contract change, cut a release before the page is deployed.
 //
 // splitKernel() then makes what the page serves, in web/kernel/page/: the
 // UP bundle unkernel-alpine.wasm, which is the file above without its SMP
@@ -151,14 +153,43 @@ async function fetchOnce(dev: boolean): Promise<KernelRelease> {
 	return store(bytes, { tag: rel.tag, date: rel.date, sha256: sum });
 }
 
+/**
+ * The kernel at KERNEL_FILE must have been built for this checkout's guest
+ * CPU and kernel contract: its kwemu's kw_abi_version() (kernelInfo() in
+ * kernel/tools/bundle.mjs) must be include/kw_emu.h's KW_ABI_VERSION. The
+ * page (its texts, demos and the data disk's guest architecture) is written
+ * for that guest, so a release from before an ABI change (for example a
+ * release of another guest architecture, the newest one until a release is
+ * cut from this checkout) is refused. A local file only gets a warning.
+ */
+async function checkAbi(rel: KernelRelease): Promise<KernelRelease> {
+	const h = await readFile(new URL("../../include/kw_emu.h", import.meta.url), "utf8");
+	const want = Number(/^#define KW_ABI_VERSION (\d+)$/m.exec(h)?.[1]);
+	if (!Number.isInteger(want)) throw new Error("include/kw_emu.h: no KW_ABI_VERSION");
+	const { kernelInfo } = (await import(new URL("../../kernel/tools/bundle.mjs", import.meta.url).href)) as {
+		kernelInfo(wasm: Uint8Array): { abi: number | null };
+	};
+	const { abi } = kernelInfo(new Uint8Array(await readFile(KERNEL_FILE)));
+	if (abi === want) return rel;
+	const what = `${ASSET} (${rel.tag}) has kwemu ABI ${abi ?? "unknown"}, this checkout's include/kw_emu.h has ${want}`;
+	if (rel.tag === "local") {
+		log(`warning: ${what}`);
+		return rel;
+	}
+	throw new Error(`${what}: the release was built for another guest CPU or kernel contract. ` +
+		`Cut a release from this checkout first (.github/workflows/release.yml), or give a bundle built here ` +
+		`(KW_KERNEL=../vendor/build/bundle/${ASSET}) or a matching release (KW_KERNEL_RELEASE=<tag>)`);
+}
+
 let once: Promise<KernelRelease> | undefined;
 
 /**
  * Puts the kernel at KERNEL_FILE (once per process) and says which it is.
- * `dev`: the dev server, which keeps a file that is there.
+ * `dev`: the dev server, which keeps a file that is there. Refuses a
+ * release built for another guest (checkAbi).
  */
 export function fetchKernel(dev = false): Promise<KernelRelease> {
-	return (once ??= fetchOnce(dev));
+	return (once ??= fetchOnce(dev).then(checkAbi));
 }
 
 /** Write `bytes` to `file` unless it holds them already (atomically). */
@@ -176,8 +207,8 @@ let split: Promise<{ smp: boolean }> | undefined;
  * Make web/kernel/page/ from KERNEL_FILE (once per process unless `again`,
  * which the dev server passes when the file changes; after fetchKernel()):
  * the UP bundle without the SMP patch section and, if there is a patch,
- * the SMP bundle. A bundle without the section (every release so far)
- * gives the same UP file and no SMP file.
+ * the SMP bundle. A bundle without the section gives the same UP file
+ * and no SMP file.
  */
 export function splitKernel(again = false): Promise<{ smp: boolean }> {
 	if (again) split = undefined;

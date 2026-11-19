@@ -32,6 +32,24 @@ and rejected designs are in kwemu.md.
   entries of key = word with Rd and Rn cleared, executions, calls from
   compiled code; `KwemuStats.words` from word 501 on; disassemble the
   keys with llvm-mc).
+- **Counter traps**: all counters run from boot. `gen_words` fills up
+  during the boot, so in a later window about half of the generic ops land
+  in the last entry (its key stays 0); the class totals (`tier.genClass`)
+  are complete. `Ar.heat_kept` re-adds a block's whole progress at every
+  re-decode, so it is a running stock, not a flow: do not compare it with
+  `Ax.lost_drop`. Two losses of progress are not counted: `victim()`
+  halving the surviving way's progress on a conflict eviction, and
+  `jc.evict` resetting a compiled block to the full threshold
+  (`Ar.ten_evicted_compiled` counts those blocks, not what they lose).
+- **One guest command**: with the SDK, take `vm.stats().kwemu` (and
+  `stats().jit` for compile time and bytes) before and after
+  `vm.exec(...)` on a stats bundle, and subtract word by word. Host time
+  for the same window: `node:inspector`'s `Profiler.start`/`stop` around
+  the exec. Pre-install big programs on a data disk opened with
+  `openDisk(file, { snapshot: true })` so each boot skips the install.
+  `claude -p` (no valid key) is not repeatable (4.5-12 G instructions per
+  run); `claude --help` is (0.44 G), so use it for A/B comparisons, with 8
+  or more interleaved rounds to resolve 3%.
 - **Host profile**: `node --cpu-prof` of the CLI.
 
 ## Current numbers
@@ -120,6 +138,25 @@ it could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0` (status.md).
   the process (ASLR moves node's text, and ops hold absolute addresses),
   0.58M decodes again after nursery resets. Exclusives (1-10M per command)
   and AdvSIMD (1-8M) in node run mostly interpreted, in cold code.
+- **Claude Code** (2.1.328, a Bun executable; Debian, UP, 2026-11-19).
+  `claude -p hi` with an invalid key: 4.6 G instructions in 23.6 s, 76%
+  compiled, 22.7% interpreted while counting down, 1.1% tails after
+  hand-backs. Host profile of that window: `runOps` 32.8%, `kw_run`'s
+  loop 13.5%, compiled code 24.6%, decode 8.9%, block cache and heat
+  (`validate`, `lookupSlow`, `noteHot`, `resetNursery`) 5.1%, generic
+  and SIMD reference code 3.9%, `jc.enter` and compiles 2.9%, MMU slow
+  paths (`translate`, `loadSlow`, `ldSlow`) 2.6%. All 4.9M hand-backs are
+  translated ops taking their slow path, none untranslated ops: loads 63%
+  (real read-TLB misses; `walks_r` 1549 per M instructions), exclusives
+  and LSE 14% (`casa`, `ldar`, `ldadd*`), stores 17%. Generic executions
+  are 0.47% of instructions, nearly all in interpreted blocks. 283
+  nursery resets; 1.97M of 3.2M decodes re-decode blocks a reset
+  discarded. About two thirds of compiles are `shortened` (the first emit
+  overflowed the 16 KiB buffer), because `candidate()` takes any decoded
+  block that is not compiled yet as a region member, with no heat test.
+  The tuning in Rejected designs (threshold, ring, `KW_CPU_SIZE`) fixes
+  these counters without changing the time: the countdown share comes
+  from a flat profile, not from thrashing.
 - **apk.** Outside compiled code nearly all is blocks counting down
   (13-27% of instructions): about half the warm-up of blocks that do get
   compiled (compiles x 2^17), the rest blocks that never reach the
@@ -158,6 +195,18 @@ it could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0` (status.md).
    transfers needs a runtime kind for the checked entry's stop path.
 4. **FMADD inline**: needs fparith's emulated FMA inline (no wasm FMA);
    worth at most about 2% of the gzip row.
+5. **Cheaper compiles for lukewarm code** (2026-11-19, from Claude Code):
+   a heat test in `candidate()` (members need some countdown progress) or
+   a smaller `region_max` for a region's first compile. A lower threshold
+   only pays if compiles get cheaper: at about 0.6 ms per near-16 KiB
+   module under Liftoff, break-even is about 2^17 instructions per module.
+   Expect fewer `shortened` compiles and less `bytes` and `compileMs`.
+6. **Interpreter per-op cost on cold code**: `runOps` runs about 6.5 ns
+   per op on Claude Code against 3.4 ns on the hot benches, and `kw_run`
+   costs about 13 ns per block (`lookupIn`, `ready`, the `runOps` call,
+   refunds, the irq poll). Untested: whether that is dispatch mispredicts
+   or data misses on the 16-byte ops and the block table (`perf stat` of
+   `--no-jit --help` on the host). Misses would point to denser ops.
 
 The shared-core levers (bigger regions, self-loop exits, threshold) are in
 kwemu.md, Next steps.
@@ -174,13 +223,14 @@ interleaved.
 | Self-loop pass count as `left / ninsn` per entry | a 64-bit division per entry: sha, interp, fib -6..-9%; `runOps` subtracts per pass |
 | Error unions from non-inlined slow paths inside `runOps` | each result slot is a shadow-stack frame slot set up on every call (~50 wasm instructions); plain integer results: mem +7%, interp +4% |
 | No cross-CPU invalidation | kwtest's cross-CPU rewrite check ran 751695 of 877496 calls stale (a64/tier.md, Coherence) |
-| JIT threshold 2^15 or 2^13 | 2^15 within noise; 2^13 apk rows 5-25% slower: extra compiles (~0.3 ms each) cost more than they move into compiled code. With countdowns kept across resets 2^15 made npm 5.93 against 4.86 s |
+| JIT threshold 2^15 or 2^13 | 2^15 within noise; 2^13 apk rows 5-25% slower: extra compiles (~0.3 ms each) cost more than they move into compiled code. With countdowns kept across resets 2^15 made npm 5.93 against 4.86 s. Claude Code `--help` (2026-11-19): 2^16 3.7-4.0 s and 2^15 4.2-4.4 s against 3.3-3.4 (compiled 62% and 67% against 54.5%; 2-4x the compiles, and the 64K ring then drops 2-5.6K compiled blocks) |
+| V8 without Liftoff (`node --no-liftoff`) | Claude Code `--help` 4.7 against 3.3 s, about 3.5 ms more per extra compile (2026-11-19) |
 | A heat table keyed by host address (short countdown for code compiled before, also in an earlier process) | compiled share +2..+8 points on apk, but twice the compiles; time equal at best, worse with shorter countdowns; remembering counting blocks too thrashed the table |
 | Countdowns kept across arena resets with alternating-way replacement | npm 6.04 against 5.22 s: conflict evictions lost progress and evicted members failed checked entries; replacing the way with less progress fixed it |
 | A tenured part that frees every module when full | short apk commands 10-15% slower (~450 modules freed per command) |
-| A 128K-op tenured ring (nursery 256K) | npm 5.17 against 4.86 s, npx 4.69 against 4.41; apk within noise |
+| A 128K-op tenured ring (nursery 256K) | npm 5.17 against 4.86 s, npx 4.69 against 4.41; apk within noise. Claude Code `--help` 3.5-3.6 against 3.3-3.4 s (no compiled block dropped, but 39 nursery resets against 27; 2026-11-19) |
 | `jc.enter` inlined into `run` | within noise |
 | Exec TLB of 1024 sets instead of 256 | npm exec-TLB walks 160K to 30K and revalidations 1.3M to 0.5M per command, time within noise: a revalidation is cheap |
-| `KW_CPU_SIZE` 16 MiB (64K blocks, 704K-op nursery; an ABI change) | npm decodes 880K to 565K, compiled share unchanged; `node -e 0` slower (host cache misses), npm within noise. Most decodes left are first decodes of a new process, which no size removes |
+| `KW_CPU_SIZE` 16 MiB (64K blocks, 704K-op nursery; an ABI change) | npm decodes 880K to 565K, compiled share unchanged; `node -e 0` slower (host cache misses), npm within noise. Most decodes left are first decodes of a new process, which no size removes. Claude Code `--help` (2026-11-19, 4 rounds): a 576K nursery, a 512K nursery with a 128K ring, that plus threshold 2^16 (66% compiled), and that plus 32K block sets all ran 3.25-3.54 s against 3.26-3.37. Nursery resets fell from 27 to 11-13, decodes by 23%, ring drops to 0, but decode is only 9% of the time and a bigger CPU block costs host cache misses |
 | Chaining interpreted blocks inside `runOps` | the `run` loop is 12% of npm's host time, but every node row got 2-4% slower: the chain code in each branch kind costs more than the returns it saves |
 | NZCV of hand-back paths through module helper functions | materialisation fell from 31% to 20% of module bytes, but regions took more members up to the buffer: module bytes unchanged, compile time +9%, time within noise |

@@ -720,20 +720,21 @@ window's command without the wrapper), the host's network instead of Wisp,
 a display or sound card where the demo needs one, and the Ubuntu tarball
 pushed as `downloads` does (a scratch harness, not in the repository).
 Each reached its working state: the
-servers answered over `vm.fetch()` (nitro's echo POST, python's note
-POST), postgres's `select version()` said aarch64, glimmer and Doom drew
+servers answered over `vm.fetch()` (nitro's echo POST), postgres's `select version()` said aarch64, glimmer and Doom drew
 frames, radio and speak played sound, sshfs mounted Rebex's server.
 Seconds from run.sh's start, the `apk add` step (indexes and packages
 over the host's network) first, then the time to the working state:
 htop 1.6/1.7, tmux 1.8/2.6, mc 2.6/3.0, Neovim 6.8/7.7 (community), Git
 2.8/4.9 (clone 1.6 s), sshfs 2.9/4.6 (mounted, tour done), nginx
-1.8/2.1, Node.js 5.3/10.5, Nitro 5.9/39.4 (upm install 16 s, `nitro dev`
-14 s), Python 4.3/6.2, PostgreSQL 5.7/19.6 (initdb and start 13 s),
+1.8/2.1, Nitro 5.9/39.4 (upm install 16 s, `nitro dev`
+14 s), PostgreSQL 5.7/19.6 (initdb and start 13 s),
 SQLite 1.7/2.9, Valkey 2.1/3.3, radio 1.7 (sound about 1 s after a
 station is picked), speak 2.4 (the introduction starts at once),
 asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
 (extracting the pushed tarball; 0.2 later, `apt-get update` 28 s in the
 chroot), Doom 22 (tcc install, downloads and a 6 s build; 0.2 later).
+The REPL and toolchain demos (Claude Code, fx, Bun, Node.js, Python, Go,
+Rust) came after that run and have not been through it.
 
 `?showcase` runs `src/showcase.ts` once the guest is up: a
 fast, hands-off tour of the demos, leaving out the web servers (described at its top).

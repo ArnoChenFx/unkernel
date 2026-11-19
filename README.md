@@ -16,7 +16,7 @@ unkernel is Linux 7.x built as a single wasm module with a real MMU. The
 kernel (syscalls, scheduler, memory management, ext4, TCP/IP) is compiled
 code, not emulated, so programs get Linux's own behavior down to the edge
 cases. Only user programs are emulated: unmodified aarch64 (arm64) Linux
-binaries, so Alpine and Ubuntu packages run as they are.
+binaries, so Alpine and Debian packages run as they are.
 
 [Open a page](#-try-it-in-the-browser) and you have a Linux machine with a
 shell, a package manager, a persistent disk, internet access, and a screen
@@ -64,9 +64,10 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   hardware. This is not a NOMMU port where programs are limited to `vfork`.
 - **Linux's own file systems**: ext4, overlayfs, tmpfs, loop devices, FUSE,
   and 9p, which [mounts file systems](#mount-host-files) your program serves
-  from the host. In the browser the root file system is an overlay on a
-  persistent ext4 disk, so everything you change survives a reload, and a safe
-  mode recovers a system you broke.
+  from the host. The root file system is an overlay: a read-only distro
+  image under your changes, which go to a persistent ext4 disk, so
+  everything you change survives a reload, and a safe mode recovers a
+  system you broke.
 - **Linux's own TCP/IP stack**, with DHCP and DNS, reaching the internet
   through your host's sockets or a Wisp proxy
   ([Add a network](#add-a-network)).
@@ -95,8 +96,8 @@ overlayfs, behaves as it does on a server, because it runs the same code.
   starts with only the `main` repository, because it is about 4x faster that
   way; `community` is added the first time a command needs it.
 - **Run real runtimes and tools**: Node and npm, Python, OpenSSL, curl and
-  `wget`, straight from the distribution. Ubuntu 26.10 boots from a disk,
-  with apt and, once you install it, systemd.
+  `wget`, straight from the distribution. Debian 13 boots the same way as
+  Alpine (`--distro debian`), with apt.
 - **[Write graphics and sound programs](#display-input-and-sound)** against
   `/dev/fb0`, evdev and ALSA. Try `glimmer`, a tiny game with sound.
 - **[Embed Linux in your app](#-use-it-from-javascript)** with a
@@ -154,12 +155,15 @@ host the page somewhere else, point `?wisp=` at your own proxy.
 npx unkernel
 ```
 
-This boots Alpine from RAM, with networking over your host's sockets. Press
-**Ctrl-]** to quit.
+This boots Alpine, with networking over your host's sockets. Press
+**Ctrl-]** to quit. The package holds the kernel and a small base system;
+the first run downloads the Alpine image (about 4 MB) from the GitHub
+release of your version and keeps it in `~/.cache/unkernel`.
 
 ```sh
-npx unkernel --disk alpine.ext4              # boot from an ext4 image, changes persist
-npx unkernel --data my-data.img              # a persistent /data disk, created on first use
+npx unkernel --distro debian                 # Debian 13 instead (about 57 MB, downloaded once)
+npx unkernel --distro none                   # no distro: the base shell (busybox)
+npx unkernel --data my-data.img              # changes persist on a /data disk, created on first use
 npx unkernel --display --sound               # a framebuffer and a sound card
 npx unkernel --mem 1024 --no-net             # more memory, no network
 npx unkernel --mount .:/work                 # this directory at /work in the guest (:ro for read-only)
@@ -167,6 +171,11 @@ npx unkernel --forward 8000:80               # host 127.0.0.1:8000 to port 80 in
 npx unkernel --timeout 60 --input '{8}uname -a\n{2}poweroff\n'   # scripted: wait, type, wait, type
 npx unkernel --help                          # everything else
 ```
+
+Without `--data`, changes to the root file system are kept in memory and
+gone at exit; with it, each distro keeps its own in `/data/distros/<name>/`.
+`--distro` also takes an image file or an http(s) URL, and
+`UNKERNEL_CACHE_DIR` moves the download cache.
 
 Exit codes: 0 power off, 1 halt or boot failure, 2 restart, 124 timeout, 253
 kernel panic, 254 wasm trap, 255 fatal error. The CLI is built on the
@@ -260,19 +269,38 @@ npm install unkernel
 ```
 
 ```js
-import { createKernel } from "unkernel";
+import { createKernel, fetchDistro } from "unkernel";
 
-const vm = await createKernel();                 // bundled Alpine, no network
+const vm = await createKernel({ distro: await fetchDistro("alpine") });   // Alpine, no network
 vm.onOutput((bytes) => process.stdout.write(bytes));
 vm.write("uname -a; poweroff\n");
 
 const { code, kind } = await vm.exited;          // 0, "halt"
 ```
 
-The same code runs in the browser. Importing `unkernel` picks the Node or
-browser entry automatically, and `unkernel/node` or `unkernel/web` selects
-one explicitly. The kernel ships in the package and loads from next to the
-entry, streamed and compiled while it downloads.
+Importing `unkernel` picks the Node or browser entry automatically, and
+`unkernel/node` or `unkernel/web` selects one explicitly. The kernel ships
+in the package (`unkernel/unkernel.wasm`) and loads from next to the entry,
+streamed and compiled while it downloads. It carries a small base system
+that mounts a distro image read-only under an overlay root and runs its
+init; `createKernel()` without `distro` boots the base shell
+(busybox and unkernel's tools), which needs no download.
+
+The distro images are not in the package. On Node, `fetchDistro("alpine")`
+(or `"debian"`) downloads one once from the GitHub release of the
+package's version, checks it against the release's `distros.json` (size and
+SHA-256), keeps it in `~/.cache/unkernel` (`UNKERNEL_CACHE_DIR`) and
+returns its path; nothing else in the SDK downloads anything. In the
+browser, host the image yourself (it is read lazily with range requests)
+and pass its URL:
+
+```js
+const vm = await createKernel({ distro: "/distros/alpine.erofs" });
+```
+
+Changes to the root file system stay in memory, unless a persistent data
+disk (labelled `kwdata`) is attached: then each distro keeps them in
+`/data/distros/<name>/` on it.
 
 ### Add a network
 
@@ -290,18 +318,21 @@ own backend.
 ### Add disks
 
 ```js
-import { createKernel, openDisk } from "unkernel/node";
+import { createImageFromKwsparse, createKernel, bundledBoot, openDisk } from "unkernel/node";
 
 const vm = await createKernel({
-  disks: [await openDisk("alpine.ext4")],        // or an https:// URL
-  cmdline: "root=/dev/wda rw",
+  distro,
+  disks: [await openDisk("data.img")],           // the data disk, or any ext4 image or https:// URL
 });
 ```
 
-In the browser, `openHttpDisk(url)` keeps your writes in IndexedDB and
+`createImageFromKwsparse(file, template)` makes a new data disk from the
+template the kernel carries (`bundledBoot(module).datadisk`). In the
+browser, `openHttpDisk(url)` keeps your writes in IndexedDB and
 `openDataDisk()` gives you the persistent data disk that
-[the page](#-try-it-in-the-browser) uses. Anything that
-implements `BlockDevice` works too.
+[the page](#-try-it-in-the-browser) uses. Anything that implements
+`BlockDevice` works too, and a disk of your own can be the root:
+`cmdline: "console=hvc0 root=/dev/wda rw"` with `initrd: null`.
 
 ### Console and lifecycle
 
@@ -463,8 +494,9 @@ a fresh frame.
 ```js
 const vm = await createKernel({
   worker: true,
+  distro,                                        // a path or URL
   net: { kind: "net", backend: { kind: "direct" } },
-  disks: [{ kind: "file", path: "alpine.ext4" }],
+  disks: [{ kind: "file", path: "data.img" }],
 });
 ```
 
@@ -525,10 +557,16 @@ patched `wasm-ld`, and uses 5 GiB of disk.
 
 ```sh
 ./setup.sh              # check, then build everything
-node js/cli.ts          # boot your build
+node js/cli.ts          # boot your build (Alpine from vendor/build/distro/)
 pnpm install && pnpm dev   # the web page at http://localhost:8080
 zig build test          # emulator tests
 ```
+
+The build makes the kernel bundle `vendor/build/bundle/unkernel.wasm` and
+the distro images `vendor/build/distro/{alpine,debian}.erofs` with their
+index `distros.json`; a source checkout uses those and never downloads
+them. [guest/README.md](guest/README.md) describes the base system and how
+to add a distro.
 
 [kernel/README.md](kernel/README.md) maps the kernel directory and its
 build steps. [AGENTS.md](AGENTS.md) and [.agents/](.agents/) hold the
@@ -563,8 +601,10 @@ The project is GPL-2.0-or-later ([LICENSE](LICENSE)) unless a file says
 otherwise. The JavaScript SDK and page (`js/`, `web/`, SDK tests) are MIT
 ([LICENSE-MIT](LICENSE-MIT)), so you can embed them anywhere.
 
-The npm package ships a Linux kernel (GPL-2.0) with an Alpine userland whose
-packages keep their own licenses, so it is `MIT AND GPL-2.0-only`. The
+The npm package ships a Linux kernel (GPL-2.0) with a small base system
+(Alpine's static busybox, GPL-2.0, and unkernel's own tools), so it is `MIT
+AND GPL-2.0-only`. The distro images it downloads hold the distributions'
+packages, which keep their own licenses. The
 kernel's source is Linux 7.3.4 plus
 [kernel/patches/linux](kernel/patches/linux) (`arch/wasm` is based on
 linux-wasm's). Those patches and

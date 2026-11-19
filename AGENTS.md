@@ -7,8 +7,12 @@ extensions; a64/isa.md), run by kwemu, a software CPU in Zig linked
 into the kernel: the AArch64 front end (src/a64: a reference interpreter, a
 decoded-op tier and a wasm JIT) on an ISA-neutral MMU, block cache and JIT
 core (src/emu). Its contract with the kernel is `include/kw_emu.h` (ABI 2).
-The guest image is Alpine's aarch64 minirootfs. README.md is the overview,
-and kernel/README.md maps the kernel directory and its build steps.
+The kernel bundle (`unkernel.wasm`) carries a small base initramfs that
+boots a distro image (Alpine or Debian, read-only erofs, attached as a disk)
+under an overlay root, or the base shell without one. README.md is the overview,
+kernel/README.md maps the kernel directory and its build steps, and
+guest/README.md the guest side (base initramfs, distro images, guest
+programs).
 
 `.agents/` has one file per area. Read the one for the area you change:
 
@@ -19,8 +23,8 @@ and kernel/README.md maps the kernel directory and its build steps.
 | [.agents/kwemu.md](.agents/kwemu.md) | the ISA-neutral core: MMU and TLBs, block cache, JIT core (regions, invariants, SMP, compile window, host contract), softfloat, measuring, rejected designs |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
-| [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
-| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`): build, numbers, traps |
+| [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, image updates |
+| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`guest/distro/alpine/opt/build.sh`): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
 | [.agents/testing.md](.agents/testing.md) | quick checks per area, CLI exit codes, the full matrix, release CI |
 | [.agents/status.md](.agents/status.md) | roadmap and open issues; read only for planning, or when asked |
@@ -31,7 +35,7 @@ and kernel/README.md maps the kernel directory and its build steps.
 ./setup.sh                  # check prerequisites, then zig build + kernel/build.sh all
 zig build test              # A64 unit tests and guests against qemu-aarch64
 kernel/build.sh kernel      # the UP kernel, refreshes the bundle (smp: the SMP kernel)
-node js/cli.ts              # boot Alpine from the bundle; --help lists options
+node js/cli.ts              # boot Alpine (vendor/build/distro) on the bundle; --help lists options
 ```
 
 Run the quick check for what you changed (testing.md, Quick checks); the
@@ -62,7 +66,9 @@ These cut across areas; each area file lists its own invariants.
   `format-patch -N 7595a62d45e..kw-arm64-user` (kernel.md).
 - **wasm-ld**: commit in `vendor/src/llvm22`, run `kernel/build.sh
   toolchain`, and re-export (toolchain.md).
-- **Guest image**: `kernel/build.sh alpine` or `kernel/build.sh disk`.
+- **Guest image**: `kernel/build.sh base` (the base initramfs and the
+  bundle) or `kernel/build.sh distro [NAME]` (the images and
+  `distros.json`); guest/README.md.
 - **Page**: kernel and guest changes reach the deployed page with the next
   release (`.github/workflows/release.yml`, which the maintainer runs
   by hand; web.md).

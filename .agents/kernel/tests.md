@@ -1,18 +1,18 @@
 # Kernel tests
 
 Quick checks per change and the full matrix are in testing.md. To add a kernel check: a `CHECK(...)` in
-`kernel/guest/kwtest.c`.
+`guest/src/test/kwtest.c`.
 
-## kwtest (`kernel/guest/kwtest.c`)
+## kwtest (`guest/src/test/kwtest.c`)
 
-`/usr/bin/kwtest` in local builds and `alpine-test.cpio`, not in release
-bundles (guest.md). Run as `rdinit=/usr/bin/kwtest` on both builds (UP and
+`/usr/bin/kwtest` in local builds' bundle and in `base-test.cpio` (`--initrd
+base-test`), not in release bundles (guest.md). Run as `rdinit=/usr/bin/kwtest` on both builds (UP and
 SMP), with and without `--no-jit`; it powers off on success (`kwtest: 0
 failure(s)`) and halts (exit 1) on failure. `kwtest isa` runs only the ISA
 checks; `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only
 `uaccess:`, `smp:`, `lse smp:`, `excl smp:`, `move:` and `jit:`.
 
-Built by alpine.sh with `zig cc -target aarch64-linux-musl -mcpu=generic
+Built by `guest/base/build.sh` with `zig cc -target aarch64-linux-musl -mcpu=generic
 -static -O2 -s`. It needs kwemu's scalar FP and AdvSIMD arithmetic (Zig's
 libc malloc uses CNT), and no AdvSIMD FP. Device nodes come from devtmpfs
 when it is mounted, else they are made in `/tmp` (as `/init` it makes
@@ -114,7 +114,7 @@ What it covers beyond syscalls:
   version once a new one is published, never run non-executable code, and
   never crash.
 
-## abitest (`kernel/guest/abitest.c`)
+## abitest (`guest/src/test/abitest.c`)
 
 A freestanding arm64 ABI test (no libc, no exclusives, no TLS), so it runs
 before a libc does and is the only test that sees the registers exec leaves
@@ -137,8 +137,8 @@ CPUs.
   WASI import (`unkernel` imports from the script: JSPI switching, no
   block or net device, no JIT), a check of the WASI side against a
   third-party implementation.
-- Ubuntu (guest.md) is the glibc check: boot it, and with a network run an
-  `apt-get install`; after a kernel change, a systemd boot.
+- Debian (`--distro debian`, guest.md) is the glibc check: boot it, and
+  with a network run an `apt-get install`.
 
 ## Debugging
 

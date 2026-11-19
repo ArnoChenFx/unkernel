@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 #
-# Release: build everything from source (patched wasm-ld, kernel, Alpine
-# initramfs, data disk template, bundle), smoke-test it, build and pack the
-# npm package, and for a release publish it to npm (trusted publishing,
-# with provenance) and publish a GitHub release (a normal one, marked
-# latest) with the npm tarball and the bundle (unkernel-alpine.wasm)
-# attached.
+# Release: build everything from source (patched wasm-ld, the UP and SMP
+# kernels, the data disk template, the base bundle unkernel.wasm with its
+# SMP patch, the distro images alpine.erofs and debian.erofs and their
+# index distros.json), smoke-test it, build and pack the npm package (the
+# base bundle, no distro image), and for a release publish it to npm
+# (trusted publishing, with provenance) and publish a GitHub release (a
+# normal one, marked latest) with the npm tarball, unkernel.wasm,
+# distros.json and the images it names attached. The SDK's fetchDistro()
+# and the page's build (web/scripts/kernel.ts) download those assets by
+# the tag v<version>, the version stamped into package.json.
 #
 # Runs:
 #   - by hand from main (Actions > Release > Run workflow): a release with
@@ -29,10 +33,13 @@
 #   kernel-out  the UP and SMP kernel build directories, reused only with
 #               the same tree (same patches, clang and fake-llvm wrapper), so
 #               Kbuild rebuilds incrementally and never from a different source
-#   downloads   Alpine minirootfs and Binaryen (checksums are verified anyway)
+#   downloads   Binaryen, the base's busybox, the Alpine and Debian root file
+#               systems, erofs-utils, lz4 and zstd (checksums are verified
+#               anyway); key: env.sh, build.sh and the guest's pins
+#               (guest/**/pins.sh)
 #   alpine-opt  the rebuilt busybox, zlib, openssl and apk-tools (installed
-#               files only, ~9 MB; ~4 min to rebuild); key: alpine-opt.sh,
-#               env.sh
+#               files only, ~9 MB; ~4 min to rebuild); key:
+#               guest/distro/alpine/opt/build.sh and the Alpine pins
 #   zig, pnpm   by their setup actions
 name: Release
 
@@ -114,9 +121,10 @@ jobs:
     runs-on: ${{ vars.RELEASE_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 240
     env:
-      # alpine.sh then writes alpine.cpio, which the bundle gets, without
-      # kwtest and kwbench. The kwtest steps boot this bundle's kernel with
-      # alpine-test.cpio instead: the same image plus the test programs.
+      # The base build then writes base.cpio, which the bundle gets, without
+      # kwtest, abitest and kwbench. The kwtest steps boot this bundle's
+      # kernel with base-test.cpio instead: the same initramfs plus the test
+      # programs.
       KW_RELEASE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -196,7 +204,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/downloads
-          key: downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh') }}
+          key: downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh', 'guest/**/pins.sh') }}
           restore-keys: downloads-
 
       # Exact key only: build.sh never re-applies the series on an existing
@@ -258,13 +266,29 @@ jobs:
             vendor/build/kernel-smp
           key: ${{ steps.kernel-out.outputs.cache-primary-key }}
 
+      # The distro images' build runs the SDK from source (the Debian image
+      # boots on the base bundle at build time: guest/tools/vm-run.ts).
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The template first: the base bundle carries it.
+      - name: Build the data disk template and the base bundle
+        env:
+          KW_SMP: "1" # the bundle must carry the SMP patch
+        run: |
+          kernel/build.sh datadisk
+          kernel/build.sh base
+          ls -l vendor/build/bundle/unkernel.wasm vendor/build/initramfs/base.cpio vendor/build/initramfs/base-test.cpio
+          sha256sum vendor/build/bundle/unkernel.wasm
+
       # busybox, zlib, openssl and apk-tools rebuilt for kwemu
-      # (kernel/guest/alpine-opt.sh, run by alpine.sh). Its stamp is the
-      # script's hash plus ALPINE_VERSION, which is what the key hashes, so
-      # on a hit --install only copies files: it reads root/, .stamp and the
-      # APKBUILDs. Exact key only: a fallback restore could bring a stale
-      # build. Its host tools (meson, lua, ...) are in the host tools step,
-      # which setup.sh --check verifies; the gcc toolchain is downloaded.
+      # (guest/distro/alpine/opt/build.sh, run by the Alpine image's build).
+      # Its stamp is the hash of the script without its comments plus
+      # ALPINE_VERSION (guest/distro/alpine/pins.sh); the key hashes both
+      # files, so on a hit --install only copies files: it reads root/, .stamp
+      # and the APKBUILDs. Exact key only: a fallback restore could bring a
+      # stale build. Its host tools (meson, lua, ...) are in the host tools
+      # step, which setup.sh --check verifies; the gcc toolchain is downloaded.
       - name: Restore the rebuilt Alpine packages
         id: alpine-opt
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -273,15 +297,39 @@ jobs:
             vendor/build/alpine-opt/root
             vendor/build/alpine-opt/.stamp
             vendor/downloads/alpine-opt/*/APKBUILD
-          key: alpine-opt-${{ runner.os }}-${{ hashFiles('kernel/guest/alpine-opt.sh', 'kernel/tools/env.sh') }}
-      - name: Build the Alpine initramfs, data disk template and bundle
-        env:
-          KW_SMP: "1" # the bundle must carry the SMP patch
+          key: alpine-opt-${{ runner.os }}-${{ hashFiles('guest/distro/alpine/opt/build.sh', 'guest/distro/alpine/pins.sh') }}
+
+      # alpine.erofs and debian.erofs (and .ext4, not released), their ids
+      # and distros.json, after the base bundle: the Debian image boots on it
+      # to make apt's source cache, and distros.json takes its ABI and base
+      # id from it. Network only for the pinned downloads.
+      - name: Build the distro images
         run: |
-          kernel/build.sh alpine
-          kernel/build.sh datadisk   # refreshes the bundle with the template
-          ls -l vendor/build/bundle/unkernel-alpine.wasm
-          sha256sum vendor/build/bundle/unkernel-alpine.wasm
+          kernel/build.sh distro 2>&1 | tee distro.log
+          if grep -q "has no apt cache" distro.log; then
+            echo "::error::the Debian image was built without apt's cache"
+            exit 1
+          fi
+          cat vendor/build/distro/distros.json
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          node -e '
+            const fs = require("node:fs"), crypto = require("node:crypto");
+            const j = JSON.parse(fs.readFileSync("vendor/build/distro/distros.json", "utf8"));
+            const want = Number(/^#define KW_ABI_VERSION (\d+)$/m.exec(fs.readFileSync("include/kw_emu.h", "utf8"))[1]);
+            const fail = (m) => { console.log(`::error::distros.json: ${m}`); process.exit(1); };
+            if (j.abi !== want) fail(`abi ${j.abi}, include/kw_emu.h has ${want}`);
+            if (!j.base) fail("no base id");
+            const names = j.distros.map((d) => d.name).sort().join(",");
+            if (names !== "alpine,debian") fail(`distros ${names}, expected alpine,debian`);
+            for (const d of j.distros) {
+              if (!/^[a-z0-9]+\.erofs$/.test(d.file)) fail(`${d.name}: ${d.file} is not an erofs image`);
+              const b = fs.readFileSync(`vendor/build/distro/${d.file}`);
+              const sum = crypto.createHash("sha256").update(b).digest("hex");
+              if (b.length !== d.size || sum !== d.sha256) fail(`${d.file}: ${b.length} bytes, ${sum}`);
+              if (!d.image) fail(`${d.name}: no image id`);
+            }
+            console.log(`ok: abi ${j.abi}, ${j.base}, ${j.distros.map((d) => `${d.file} ${d.image}`).join(", ")}`);
+          '
 
       - name: Save the rebuilt Alpine packages
         if: steps.alpine-opt.outputs.cache-hit != 'true'
@@ -304,38 +352,39 @@ jobs:
           path: vendor/downloads
           key: ${{ steps.downloads.outputs.cache-primary-key }}
 
-      - name: Install npm dependencies
-        run: pnpm install --frozen-lockfile
-
+      # The kernel tests boot the base bundle's kernel with base-test.cpio
+      # (no distro image): the test program is PID 1.
       - name: kwtest (JIT)
         run: |
-          node js/cli.ts --timeout 600 --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+          node js/cli.ts --timeout 600 --kernel vendor/build/bundle/unkernel.wasm --initrd base-test \
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
       - name: kwtest (no JIT)
         run: |
-          node js/cli.ts --timeout 900 --no-jit --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+          node js/cli.ts --timeout 900 --no-jit --kernel vendor/build/bundle/unkernel.wasm --initrd base-test \
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
 
       - name: kwtest (SMP, 2 CPUs)
         run: |
-          node js/cli.ts --timeout 900 --smp 2 --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+          node js/cli.ts --timeout 900 --smp 2 --kernel vendor/build/bundle/unkernel.wasm --initrd base-test \
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
 
-      # The arm64 user ABI without a libc (kernel/guest/abitest.c), on the
+      # The arm64 user ABI without a libc (guest/src/test/abitest.c), on the
       # UP kernel and on the SMP kernel with 2 CPUs.
       - name: abitest (UP, SMP)
         run: |
           for cpus in 1 2; do
-            node js/cli.ts --timeout 300 --smp "$cpus" --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+            node js/cli.ts --timeout 300 --smp "$cpus" --kernel vendor/build/bundle/unkernel.wasm --initrd base-test \
               --append "console=hvc0 rdinit=/usr/bin/abitest" </dev/null | tee abitest.log
             grep -q 'abitest: 0 failure(s)' abitest.log
           done
 
       - name: Typecheck
-        run: pnpm typecheck
+        run: |
+          pnpm typecheck
+          pnpm typecheck:web
       - name: Kernel patch tests
         env:
           KPATCH_UP: vendor/build/kernel/vmlinux32.wasm
@@ -346,6 +395,10 @@ jobs:
           pnpm test:tty
           pnpm test:http
           pnpm test:9p
+      # The base bundle with each image (createKernel({ distro })): boot,
+      # the root overlay on a data disk, snapshots.
+      - name: Distro tests
+        run: pnpm test:distro
 
       - name: Build the package
         env:
@@ -353,21 +406,41 @@ jobs:
         run: |
           npm pkg set version="$VERSION"
           pnpm build
+          ls -l dist/*.wasm
+          cmp dist/unkernel.wasm vendor/build/bundle/unkernel.wasm
       # The api suite (~85 s) runs once, on the built package: the same code
-      # as the sources, plus the packaging.
+      # as the sources, plus the packaging (its distro tests read
+      # vendor/build/distro/alpine.erofs).
       - name: Test the built package
         run: |
-          node dist/cli.mjs --timeout 600 --kernel dist/unkernel-alpine.wasm --initrd vendor/build/initramfs/alpine-test.cpio \
+          node dist/cli.mjs --timeout 600 --kernel dist/unkernel.wasm --initrd vendor/build/initramfs/base-test.cpio \
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
           UNKERNEL_DIST=1 node --test test/api.test.ts
+      # The release's assets: the npm tarball (the base bundle and no distro
+      # image: the SDK downloads those by the tag), unkernel.wasm, distros.json
+      # and the images it names (not the .ext4, .tar or .id files next to them).
       - name: Pack
         run: |
           mkdir -p out
           # A fixed name; the version is inside (package.json) and in the tag.
           mv "out/$(npm pack --pack-destination out | tail -1)" out/unkernel.tgz
-          cp vendor/build/bundle/unkernel-alpine.wasm out/
+          if tar -tzf out/unkernel.tgz | grep -E '\.(erofs|ext4|tar|cpio)$'; then
+            echo "::error::the npm package carries a distro image or initramfs"
+            exit 1
+          fi
+          size=$(stat -c %s out/unkernel.tgz)
+          echo "npm package: $size bytes packed, $(tar -tzvf out/unkernel.tgz | awk '{ s += $3 } END { print s }') unpacked"
+          if [ "$size" -gt 20000000 ]; then
+            echo "::error::the npm package is $size bytes (more than 20 MB)"
+            exit 1
+          fi
+          cp vendor/build/bundle/unkernel.wasm vendor/build/distro/distros.json out/
+          for f in $(node -p 'JSON.parse(require("node:fs").readFileSync("vendor/build/distro/distros.json", "utf8")).distros.map((d) => d.file).join(" ")'); do
+            cp "vendor/build/distro/$f" out/
+          done
           ls -l out
+          (cd out && sha256sum -- *)
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -432,7 +505,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ needs.guard.outputs.version }}
         run: |
+          # gh uploads the assets to a draft and publishes it after the last
+          # one: a run cut off in between leaves a draft without some of them.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            have="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            for f in out/*; do
+              grep -qxF "$(basename "$f")" <<<"$have" || gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+            done
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            fi
             echo "release $TAG exists"
             exit 0
           fi

@@ -2,7 +2,8 @@
 
 The Alpine image ships the minirootfs packages as Alpine builds them,
 except four that sit on the guest's hot paths, which
-`kernel/guest/alpine-opt.sh` rebuilds for kwemu's CPU:
+`guest/distro/alpine/opt/build.sh` (below: the script; `guest/build.sh opt
+alpine [PKG...]` runs it) rebuilds for kwemu's CPU:
 
 | aports package | files replaced in the image |
 | --- | --- |
@@ -84,22 +85,20 @@ ones (Measurements).
   compiler command (`openssl version -a`) names the wrapper `cc-openssl`,
   not a host path. Two clean builds gave byte-identical image files
   (2026-11-18), so a rebuild keeps the image id the overlay root keys on.
-- **Into the images.** `alpine.sh` and `alpine-disk.sh` call
-  `alpine-opt.sh --install "$stage"` after unpacking the minirootfs. That
-  builds first when `vendor/build/alpine-opt/.stamp` is stale (it records
-  the script's hash and `ALPINE_VERSION`). A full build takes about 80 s
+- **Into the image.** `guest/distro/alpine/build.sh` (the distro image)
+  calls the script with `--install "$stage"` after unpacking the
+  minirootfs. That builds first
+  when `vendor/build/alpine-opt/.stamp` (`KW_ALPINE_OPT_DIR` moves the
+  cache) is stale: it records the hash of the script without its comment
+  lines, and `ALPINE_VERSION` (`guest/distro/alpine/pins.sh`). A full build takes about 80 s
   on 16 cores (2026-11-18). Building needs an x86_64 host (Bootlin's gcc);
   elsewhere, or to keep Alpine's builds, set `KW_ALPINE_OPT=0`. A stage
-  from an `ALPINE_TARBALL` override with other package versions (e.g. the
-  second image for `test/overlay-node.mjs --image2`) keeps Alpine's builds,
-  with a warning.
+  from an `ALPINE_TARBALL` override with other package versions keeps
+  Alpine's builds, with a warning.
 - **Size.** The image grows by about 570 KiB (busybox 995 KiB against
-  919 KiB, libcrypto 4.9 MiB against 4.4 MiB), the gzipped initramfs
-  in the bundle by 0.3 MiB; initramfs pages stay resident.
-- **`build.sh all` rebuilds the disk image** when `alpine-opt.sh` is
-  newer than it (its check of whether the disk is current lists the
-  script). Plain `alpine-opt.sh` rebuilds everything; with package names
-  it rebuilds only those.
+  919 KiB, libcrypto 4.9 MiB against 4.4 MiB).
+- The script without arguments rebuilds everything; with package names it
+  rebuilds only those.
 - **Host tools:** meson, ninja, pkg-config, patch, lua 5.x (apk's help
   text), and perl with FindBin, IPC::Cmd and File::Compare (openssl's
   Configure). busybox's host tools build with `zig cc`. `setup.sh
@@ -107,13 +106,12 @@ ones (Measurements).
 - **CI.** The release workflow installs those tools with apt in its host
   tools step. It caches what `--install` reads on a hit (`root/`,
   `.stamp`, the APKBUILDs; about 9 MB), under the key
-  `alpine-opt-<hash of alpine-opt.sh and env.sh>`, exact match only. On a
+  `alpine-opt-<hash of the script and the Alpine pins.sh>`, exact match only. On a
   miss the rebuild adds a few minutes (riscv64's took 233 s on a 4-core
   runner, 2026-11-16; the aarch64 one has not run in CI yet, and took
   79 s on 16 cores locally, 2026-11-18).
-- **Keep the other caches.** The existing cache keys hash
-  `kernel/build.sh` and `kernel/tools/env.sh`, and a kernel cache miss
-  costs about an hour. So the rebuild is not a `build.sh` step. Before
+- **Keep the other caches.** The kernel cache key hashes
+  `kernel/build.sh`, and a kernel cache miss costs about an hour. So the rebuild is not a `build.sh` step. Before
   "Save downloads", the workflow deletes the rebuild's downloads except
   the APKBUILDs, so they stay out of that cache.
 - **The apk database is unchanged.** It keeps Alpine's file checksums,
@@ -121,14 +119,13 @@ ones (Measurements).
   installs Alpine's build again, which is correct but slower (2026-11-18,
   on a data disk: `apk upgrade` replaced the rebuilt zlib 1.3.2-r1 with
   Alpine's 1.4-r0 in the overlay's upper layer, and `apk audit` then
-  listed the other five). The overlay root's database rebase (data-disk.md)
-  goes by package checksum, so the swapped files do not affect it.
+  listed the other five).
 
 ## Alpine updates
 
 `--install` compares the stage's apk database with the versions it built
 (`pkgver-rpkgrel` from the pinned APKBUILDs). On a mismatch it stops with
-"update kernel/guest/alpine-opt.sh". After bumping `ALPINE_VERSION`:
+"update guest/distro/alpine/opt/build.sh". After bumping `ALPINE_VERSION`:
 
 1. Take each package's new `c:` commit from the new image's apk database.
 2. Update `commit`, `apkbuild_sha256` and the sysroot apks (versions and

@@ -36,6 +36,14 @@
   connections (the host stack carries no UDP).
 - OVERLAY_FS without optional features (data-disk.md; +116 KiB, 43 KiB
   gzip), the devices (devices.md), 9p (devices.md).
+- EROFS_FS for a distro's read-only root image on kwblk: zstd, xattrs
+  with POSIX ACLs and `security.*`, file-backed mounts; MISC_FILESYSTEMS
+  is on for it, nothing else in that menu. +189 KB raw, +70 KB gzip (zstd
+  alone +102 KB, +35 KB), no RAM, no new imports (2026-11-19). lz4, which
+  EROFS_FS_ZIP always brings, does not work: erofs maps scattered pages
+  with `vm_map_ram`/`vmap`, which VMALLOC_FLAT cannot, so lz4 files read
+  as ENOMEM and an lz4 image with big pclusters (`mkfs.erofs -C`) does
+  not mount. microLZMA is off (+21 KB, +8 KB gzip).
 - `FRAME_WARN=3072`: clang's wasm backend gives each variadic call its own
   16-byte stack slot (`snmp_seq_show` 2304 bytes, all others under 1024).
   The kernel builds without warnings; keep it that way.
@@ -58,7 +66,7 @@ has moved a lot:
 | KEYS | +64 KB | +24 KB | 4 KiB | keyctl (systemd's other ENOSYS), cryptsetup |
 | VFAT_FS + NLS 437, iso8859-1, utf8 | +92 KB | +35 KB | 20 KiB | FAT images |
 | SWAP + ZRAM (lzo-rle) | +96 KB | +36 KB | 4 KiB | swap for 256 MiB phones; 64 MiB zram swapon worked |
-| MISC_FILESYSTEMS + SQUASHFS (zlib, xz, zstd) | +156 KB | +56 KB | 16 KiB | AppImage, snap |
+| SQUASHFS (zlib, xz, zstd; zstd now comes with EROFS) | +156 KB | +56 KB | 16 KiB | AppImage, snap |
 | TLS + CRYPTO_CHACHA20POLY1305 | +181 KB | +66 KB | 40 KiB | kTLS works, but curl, Node, Go, rustls, BoringSSL and busybox wget never use it |
 | IO_URING | +192 KB | +71 KB | 16 KiB | liburing, PostgreSQL |
 | IPV6 | +467 KB | +170 KB | 52 KiB | `::1` ping worked; out of scope for now |

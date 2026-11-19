@@ -10,7 +10,7 @@ break. Longer topics are in `.agents/kernel/`:
 | [kernel/devices.md](kernel/devices.md) | console, kwblk, kwnet, kwfb, kwinput, kwsnd, kwvsock, kwshm, 9p |
 | [kernel/config.md](kernel/config.md) | `kw_defconfig` rules, what is on and off, measured options |
 | [kernel/tests.md](kernel/tests.md) | kwtest and abitest coverage, other checks, debugging |
-| [kernel/guest.md](kernel/guest.md) | the Alpine and Ubuntu images, guest tools and shims |
+| [kernel/guest.md](kernel/guest.md) | the base initramfs and its shell, the kw layer, the Alpine and Debian images, guest tools and shims |
 
 ## Tree and patch workflow
 
@@ -400,8 +400,9 @@ atomics in `vendor/build/kwemu-smp` (`KWEMU_SMP=` takes a prebuilt one);
 each is lowered, and `all` builds both (`KW_SMP=0`: UP only). `kernel` is
 the quick loop and never builds SMP.
 
-- **The bundle** (`kernel/tools/bundle.mjs`): `vmlinux32.wasm` with
-  `alpine.cpio` (gzipped), its command line and the data disk template in
+- **The bundle** (`kernel/tools/bundle.mjs`, `kernel/build.sh base`:
+  `vendor/build/bundle/unkernel.wasm`): `vmlinux32.wasm` with
+  `base.cpio` (gzipped), its command line and the data disk template in
   custom sections (`unkernel.initrd`, `unkernel.cmdline`,
   `unkernel.datadisk`), and `unkernel.kernel.smp.kwpatch`, a patch from the
   UP kernel to the SMP one (`tools/kwdiff.mjs`, 1.3 MiB) that the runtime
@@ -411,7 +412,7 @@ the quick loop and never builds SMP.
   `kw_abi_version()` must return the same constant, only the SMP one may
   import `wasm_cpu_start`, and both must have the same memory index type.
   Every step that refreshes the bundle (`kernel`, `smp`, `lower`,
-  `alpine`, `datadisk`, `bundle`) adds the patch when the SMP kernel exists
+  `datadisk`, `base`) adds the patch when the SMP kernel exists
   and matches, and otherwise warns and leaves it out, so after a tree
   change `kernel` gives a bundle without the patch until `smp` runs.
   `KW_SMP=1` (and `all`) makes a missing or mismatched SMP kernel an error;
@@ -434,9 +435,12 @@ the quick loop and never builds SMP.
   `KWEMU=` or `KWEMU_SMP=` count as built from the checkout's sources.
 - **Overrides**: `KSRC` (the tree), `KOUT`, `KOUT_SMP`, and `KW_BUILD` (the
   output root, default `vendor/build`: kernels, kwemu-smp and kwemu-stats,
-  initramfs, disks, bundle; the toolchain's `vendor/build/lld22` and
-  alpine-opt.sh's package cache stay). The CLI, `pnpm build` and the tests
-  read `vendor/build`, so pass them paths. `KWEMU=path` takes a prebuilt
+  initramfs, the data disk template, bundle, distro images; the toolchain's `vendor/build/lld22` and
+  the Alpine package rebuild's cache stay; `KW_BASE_OUT` and
+  `KW_DISTRO_OUT` move the base and the distro images, guest/README.md).
+  The CLI, `pnpm build` and the tests read `vendor/build`, so pass them
+  paths (`--kernel`, `--distro`, `UNKERNEL_TEST_KERNEL`,
+  `UNKERNEL_TEST_DISTRO_DIR`). `KWEMU=path` takes a prebuilt
   kwemu as is, `KWEMU=none` links a stub. The header of `build.sh` lists
   the rest.
 

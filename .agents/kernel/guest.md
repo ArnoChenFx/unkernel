@@ -1,73 +1,144 @@
 # Guest images
 
-What `kernel/guest/` puts in the images. The rebuilt packages are in
-guest-packages.md, the data disk and overlay root in data-disk.md.
+What goes into the guest (`guest/`, layout and conventions in
+`guest/README.md`): the bundle `unkernel.wasm` (the kernel and a small base
+initramfs; the default of the SDK, the CLI and the npm package) boots a
+distro image, a read-only erofs or ext4 file system the host attaches,
+under an overlay root, or the base shell without one. Below: base
+initramfs, kw layer, distro images, guest tools. The rebuilt Alpine
+packages are in guest-packages.md, the data disk and overlay root in
+data-disk.md.
 
-## Alpine initramfs (`kernel/build.sh alpine`, `guest/alpine.sh`)
+## Base initramfs (`kernel/build.sh base`, `guest/base/`)
 
-The only initramfs: `vendor/build/initramfs/alpine.cpio`, plus
-`alpine-test.cpio`, which always has the test programs. The cpio archives
-are written by `tools/mkcpio.py` (no root needed).
+`guest/build.sh base` writes `vendor/build/initramfs/base.cpio` and
+`base-test.cpio`; `kernel/build.sh base` also bundles it as
+`vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
+rdinit=/init`, the data disk template, the SMP patch) and copies that to
+`web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
+1661 KiB (930 KiB gzipped), bundle 9.8 MiB (2026-11-19).
 
-- The Alpine aarch64 minirootfs 3.24.4 (version and checksum pinned in
-  `tools/env.sh`; `ALPINE_TARBALL=file` overrides), with a small `/init`
-  and an inittab with `hvc0::respawn:-/bin/sh` and
-  `::respawn:/usr/bin/kwtty serve`. `/init` mounts cgroup2 at
-  `/sys/fs/cgroup` (as does the Alpine disk's fstab).
-- busybox, zlib, libcrypto, libssl, libapk and apk are rebuilt for kwemu
-  (`guest/alpine-opt.sh`, guest-packages.md; `KW_ALPINE_OPT=0` keeps
-  Alpine's builds). Every other package is Alpine's own build.
-- Programs from `kernel/guest/*.c`, built static with `zig cc -target
-  aarch64-linux-musl -mcpu=generic` (ARMv8.0): `glimmer`, `kwvsock`,
-  `kwshm`, `kwtty`, `kw9p`, `kwwasi`, and the test programs `kwtest`, `kwbench` and
-  `abitest` (tests.md). New code must stay within what kwemu implements:
-  check it with the coverage classifier (a64/isa.md).
-- The test programs come as a second cpio archive after the image's, which
-  the kernel unpacks after the first. With `KW_RELEASE=1` (the release
-  workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release
+- Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
+  with its own Alpine release), every applet linked in `/bin` (names from
+  the binary's applet table), `/init` (`base/initramfs/init`: the boot
+  sequence and the state on `/data`, data-disk.md), the base shell
+  (`/etc/inittab`, `/kw/lib/sysinit`), and the kw layer at `/kw/layer`.
+- The kernel tests and benchmark (`guest/src/test/`: kwtest, abitest,
+  kwbench; tests.md) are a second cpio archive after the image's, which the
+  kernel unpacks after the first: in `base-test.cpio` always, in
+  `base.cpio` unless `KW_RELEASE=1` (the release workflow), so release
   bundles, the npm package and the deployed page have none; boot a release
-  bundle with `--initrd alpine-test` to run them. The choice is in
-  `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel
-  cache key.
-- `/usr/lib/kw-image` is the image id (`alpine-<version>-<hash of the
-  tree>`, unchanged by an identical rebuild; the test programs are not part
-  of it), which the overlay root uses to detect image updates
-  (data-disk.md).
+  bundle with `--initrd base-test` (a checkout's
+  `vendor/build/initramfs/base-test.cpio`) to run them. The choice is in
+  `guest/base/build.sh`, not `kernel/build.sh`, because `kernel/build.sh`
+  is part of CI's kernel cache key.
+- `/kw/layer/usr/lib/kw-base` is the base's id (`base-<hash of the
+  tree>`).
+- `kw.root=base`, no image labelled kwroot (`createKernel()` without
+  `distro`, the CLI's `--distro none`), or an image that does not mount or
+  boot: the base shell on the base itself (busybox init, a shell on hvc0
+  with the prompt `base DIR #`, `kwtty serve`, the layer's rc and net),
+  with `/data` mounted when there is one; `kw-overlay status NAME` works
+  there. Most of `test/api.test.ts` runs on it.
 
-## Alpine disk (`kernel/build.sh disk`, `guest/alpine-disk.sh`)
+## The kw layer (`guest/base/rootfs/`)
 
-`vendor/build/disk/alpine.ext4` (`DISK_SIZE`, default 512M; `all` keeps an
-image newer than its inputs, `disk` always rebuilds): the same minirootfs
-as a sparse ext4 image, made without root: `mke2fs -d` from the extracted
-tree, then `tools/ext4-owners.py` emits debugfs `sif` commands that make
-every inode root-owned and restore the tarball's modes and owners (setuid,
-`/etc/shadow` root:shadow). Inode tables and journal are zeroed at mkfs
-time (no lazyinit writes on first boot); `e2fsck -fn` checks it. It boots
-the real `/sbin/init` (busybox) with an inittab running `/etc/kw-rc`
-(mount -a, hostname), `/etc/kw-net.sh` and a shell on hvc0;
-`::shutdown:/etc/kw-shutdown` kills everything and remounts `/` read-only,
-so `poweroff` leaves the file system clean. `node js/cli.ts --disk
-vendor/build/disk/alpine.ext4` boots it with `root=/dev/wda rw`.
+The top lower layer of every distro's root (`/kw/layer` in the base, so
+RAM-resident: keep it small). Everything in it is `kw-*` or under
+`/usr/lib/kw/`, so it never shadows a distro's file; its scripts run the
+base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
+
+- `/usr/bin/kwtty`, `kw9p`, `kwvsock`, `kwshm`, `kwwasi` (Guest tools,
+  below). The image must not carry them: kwtty's protocol belongs to the
+  SDK shipped with the kernel. `glimmer` is not in the layer: every distro
+  build compiles it into its image (`install_common`, guest/lib/stage.sh),
+  so the base shell has none.
+- `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
+  hostname (`/etc/hostname` unless empty or `localhost`, else
+  `unkernel`), binfmt_misc and the WASI format (kwwasi).
+- `/usr/lib/kw/welcome`: `Welcome to PRETTY_NAME on unkernel (aarch64)`,
+  then `/run/kw-overlay.msg` in yellow on a terminal.
+- `/usr/lib/kw/net`: lo, and eth0 by DHCP with busybox udhcpc (lease
+  script `/usr/lib/kw/udhcpc`, which writes `/etc/resolv.conf` only when
+  it changes) on every distro.
+- `/usr/lib/kw/shutdown`: with `/data` mounted, stop every process, then
+  `/usr/lib/kw/data-stop` (data-disk.md); then sync.
+- `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`
+  (`~/.local/bin` first on PATH, below), `/etc/profile.d/kw-term.sh`
+  (busybox init's console is vt102, without colours: TERM becomes
+  xterm-256color), the X.Org fbdev/evdev config (below), and
+  `/usr/share/licenses/unkernel` (the GPL notice for these files).
+
+## Distro images (`kernel/build.sh distro`, `guest/distro/`)
+
+`guest/build.sh distro [NAME...]` writes `vendor/build/distro/NAME.erofs`
+and `NAME.ext4` (`KW_DISTRO_OUT` elsewhere, `KW_DISTRO_FORMATS` picks),
+`NAME.id` (the image id) and then the index `distros.json` (guest/README.md),
+which a release publishes with the `.erofs` images for `fetchDistro()`
+(js.md).
+Both formats come from one tar stream (`guest/tools/mktree.py`) with the
+upstream tarball's owners, modes and hard links and fixed times, so no
+step needs root and a rebuild is byte-identical. `guest/lib/image.sh` has
+the erofs choices (zstd level 15, 128 KiB clusters with fragments; not
+lz4, not ztailpacking with fragments) and the ext4 one (`mke2fs -d`, then
+debugfs from the stream). Each image has label `kwroot`,
+`/usr/lib/kw-distro` (its name) and `/usr/lib/kw-image`
+(`NAME-VERSION-<hash of the tree>`), and an init that calls into the kw
+layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
+`createKernel()` (Node, 2026-11-19).
+
+- **Alpine** (`distro/alpine/`): the minirootfs with the rebuilt packages
+  (`opt/build.sh`), busybox init with `etc/inittab` (the layer's rc,
+  welcome and net, `/etc/kw-binfmt.sh` for qemu-user, a shell on hvc0,
+  `kwtty serve`, the layer's shutdown), and what "In the Alpine image"
+  below lists. OpenSSL's engines, `legacy.so` and `*.dist` stay (the image
+  is paged in on demand, not RAM-resident). An `apk add` cut off
+  mid-install needs no cleanup (data-disk.md).
+- **Debian** (`distro/debian/`): debian:trixie-slim (pinned in
+  `pins.sh`), Debian's own builds in full. `/sbin/init` ->
+  `/usr/local/sbin/kw-init`, a bash PID 1: the layer's rc, welcome and
+  net, a login shell on hvc0 and `kwtty serve` (respawned);
+  `poweroff`/`halt`/`reboot` in `/usr/local/sbin` signal it, and it stops
+  everything, runs the layer's shutdown and calls reboot(2) through the
+  base's busybox. apt: `90kw` (no recommends, pdiffs or pty), debconf
+  Noninteractive, the package lists of the image's date baked in
+  (`DEBIAN_LISTS`, compressed by `tools/apt-lz4` as apt does) and apt's
+  source cache made by the image's own apt at build time
+  (`guest/tools/vm-run.ts` on the base bundle), so `apt-get install`
+  works with no `apt-get update` first. The image's `policy-rc.d` stays.
+  `DEBIAN_PACKAGES` in build.sh (curl, ca-certificates, unzip) are
+  installed at build time by the image's apt in the same build VM, from
+  .debs the host fetches from snapshot.debian.org (checked against the
+  baked lists); the install's changes to the overlay's upper layer are
+  copied back into the tree.
+  Command not found installs as on Alpine (below), with bash's
+  `command_not_found_handle` (`/etc/profile.d/kw-apt.sh`, which gets the
+  arguments too; `KW_AUTO_APT=0` turns it off) and
+  `/usr/local/sbin/kw-apt-install`, which looks the name up in
+  `/usr/lib/kw-commands` (`NAME PACKAGE` per command of main, made at
+  build time from the snapshot's Contents files by `tools/commands.py`)
+  and runs `apt-get install --no-install-recommends`.
 
 ## Data disk template (`kernel/build.sh datadisk`)
 
 `vendor/build/disk/kwdata.kwsparse.gz`: an empty ext4 labelled `kwdata`, 4
 GiB, made with `mke2fs -t ext4 -b 4096 -L kwdata -m 0 -J size=8 -E
 lazy_itable_init=0,lazy_journal_init=0,root_owner=0:0,orphan_file_size=32K`
-and the ext4 features of `alpine-disk.sh`'s image (pinned in a generated
-`mke2fs.conf`), checked with `e2fsck -fn`, then encoded by
+and common ext4 host defaults (pinned in a generated `mke2fs.conf`),
+checked with `e2fsck -fn`, then encoded by
 `tools/kwsparse.mjs` (554 non-zero blocks, 17 KiB gzipped). The orphan
 file is 8 blocks instead of 256, because the kernel reads it one block at
 a time at every mount; give `orphan_file_size` a unit (a bare number is
 blocks). Reproducible: fixed `-U` and `hash_seed`, and
-`E2FSPROGS_FAKE_TIME`/`SOURCE_DATE_EPOCH`. `all` runs it before `bundle`
-and goes on with a warning without mke2fs.
+`E2FSPROGS_FAKE_TIME`/`SOURCE_DATE_EPOCH`. `all` runs it before the
+bundle and goes on with a warning without mke2fs.
 
 ## In the Alpine image
 
-- **Network setup**: the inittab runs `/etc/kw-net.sh`, which brings up
-  `lo` and, if eth0 exists, runs `udhcpc` (it writes `/etc/resolv.conf`).
-  The guest clock is host wall time, so TLS works.
+The files are in `guest/distro/alpine/rootfs/`.
+
+- **Network setup**: the kw layer's net (above). The guest clock is host
+  wall time, so TLS works.
 - **apk repositories**: apk starts with `main` only, because every apk
   command that loads the indexes parses all enabled ones (~0.65 s for main,
   ~2.7 s with community, 2026-11-15). The community line is in
@@ -90,15 +161,16 @@ and goes on with a warning without mke2fs.
   (`APKINDEX.<8 hex digits of sha1(index URL)>.tar.gz`, unless the page has
   pushed it), and on a hit the repository is enabled and apk reuses that
   file.
-- **`~/.local/bin` first on PATH** (`/etc/profile.d/kw-path.sh`): Alpine's
+- **`~/.local/bin` first on PATH** (`/etc/profile.d/kw-path.sh`, from the
+  kw layer): Alpine's
   `/etc/profile` sets a fixed PATH; this prepends `$HOME/.local/bin` for
   every login shell, and kwtty gives programs it starts directly the same
   PATH. Per-user installs go there (`pip install --user`, the fx and
   claude installers), and so do the page's stand-ins (web.md, Stand-ins).
-- **bwrap shim** (`/usr/local/bin/bwrap`, `guest/bwrap-shim.sh`): no
+- **bwrap shim** (`/usr/local/bin/bwrap`): no
   seccomp, so it drops `--seccomp FD` and runs `/usr/bin/bwrap` with the
   rest. GTK programs need it to load images (Xfce).
-- **curl shim** (`/usr/local/bin/curl`, `guest/curl-shim.sh`) over busybox
+- **curl shim** (`/usr/local/bin/curl`) over busybox
   wget, because the real curl costs about 2.4 MB of download and 5 MB of
   RAM. It handles only GET requests with `-L` whose result it can
   reproduce exactly (`curl -fsSL URL | sh`, `curl -fLo FILE URL`; options
@@ -111,9 +183,10 @@ and goes on with a warning without mke2fs.
   (armv5-armv7, little-endian; the kernel has no AArch32) run through
   qemu-user. The inittab runs `/etc/kw-binfmt.sh`, which registers the
   four ELF types (flag P, `CONFIG_BINFMT_MISC`) with the interpreter
-  `/etc/kw-qemu`, and WASI `.wasm` programs with `/usr/bin/kwwasi`, which
-  runs them on the host's wasm engine (js.md, WASI programs). **Guest only:
-  never run it on the host.**
+  `/etc/kw-qemu`. WASI `.wasm` programs go to `/usr/bin/kwwasi`, which
+  runs them on the host's wasm engine (js.md, WASI programs); the kw
+  layer's rc registers it. **Guest only: never run kw-binfmt.sh on the
+  host.**
   The first time an architecture is needed (as root, with a network, under
   a lock so parallel execs do not race apk) kw-qemu enables community and
   installs `qemu-ARCH` and a library root at qemu's default prefix
@@ -129,8 +202,12 @@ and goes on with a warning without mke2fs.
   installers that pick their download by `uname -m` (`curl -fsSL
   https://opencode.ai/install | kw-arch x86_64 bash`). Only the commands
   are faked (shims in `/usr/lib/kw-arch`, first on PATH), not `uname()`.
-- **Data disk**: `/etc/kw-data.sh` mounts a `kwdata` disk at `/data` and
-  starts the overlay root (data-disk.md).
+- **X.Org on the framebuffer**: no udev, so `/etc/X11/xorg.conf.d/10-kw-fb.conf`
+  and `20-kw-input.conf` (the kw layer) name the fbdev
+  driver and the evdev keyboard, mouse and tablet; `apk add xorg-server
+  xf86-video-fbdev xf86-input-evdev` and `X :0` use them.
+- **Data disk**: the base mounts a `kwdata` disk at `/data` and keeps the
+  root's changes in `/data/distros/alpine/` (data-disk.md).
 - **Known upstream crash, not ours**: `time nosuchcmd` prints status 127
   and then segfaults at address 0 (exit 139; checked 2026-11-19, busybox
   1.37.0-r31, musl 1.2.6-r3). busybox `time`'s vfork child calls `exit()`
@@ -144,7 +221,13 @@ and goes on with a warning without mke2fs.
   `qemu-aarch64` does not reproduce it, because qemu-user runs vfork as a
   plain fork.
 
-## Guest tools (`kernel/guest/*.c`)
+## Guest tools (`guest/src/*.c`)
+
+Built static by `guest/base/build.sh` with `zig cc -target
+aarch64-linux-musl -mcpu=generic` (ARMv8.0) into the kw layer; the test
+programs (`guest/src/test/`) into the second archive. New code must stay
+within what kwemu implements: check it with the coverage classifier
+(a64/isa.md).
 
 - `kwvsock connect PORT [CID]` and `kwvsock listen PORT` pipe stdin and
   stdout over a vsock connection.
@@ -175,60 +258,3 @@ and goes on with a warning without mke2fs.
   440 Hz on both channels, 660 Hz left and 880 Hz right, and prints every
   input event; `node test/glimmer-check.mjs --run` checks all three from
   the host (`--no-sound`: without a sound card).
-
-## Ubuntu (`kernel/build.sh ubuntu`, `guest/ubuntu-disk.sh`)
-
-Ubuntu Base 26.10 arm64 (glibc 2.44, dpkg, apt 3.3, perl-base, uutils
-coreutils; no init system, no python;
-`ubuntu-base-26.10-base-arm64.tar.gz` from
-`cdimage.ubuntu.com/ubuntu-base/releases/26.10/release/`, SHA-256 pinned in
-`tools/env.sh`, `UBUNTU_TARBALL=file` overrides) as
-`vendor/build/disk/ubuntu.ext4`, 2 GiB sparse (`DISK_SIZE`), about 165 MiB
-allocated, built like the Alpine disk. Its arm64 baseline is ARMv8.0
-(glibc sees `AT_HWCAP` 0x2209fb and no SVE, BTI or MOPS). The tarball has
-no device nodes, xattrs or file capabilities; its two hard links survive
-`mke2fs -d`; `ext4-owners.py` restores owners and setuid/setgid bits
-(`su`, `passwd`, `mount`, `unix_chkpwd` root:shadow,
-`/var/cache/apt/archives/partial` owned by `_apt`). The script adds:
-
-- `/sbin/init` -> `/usr/local/sbin/kw-init`, a bash script as PID 1: it
-  mounts `/proc`, `/sys`, `/dev/pts`, `/dev/shm` and `/run` (fstab), runs
-  `kw-net`, and starts `bash -l` on the console in its own session. When
-  that shell exits, or on `poweroff`/`reboot`/`halt` (wrappers in
-  `/usr/local/sbin` that signal PID 1, and defer to the system's own once
-  an init system is installed), it kills everything, remounts `/`
-  read-only (`kw-shutdown: / is clean`) and calls reboot(2) through perl.
-- `/usr/local/sbin/kw-net`: Ubuntu Base has neither iproute2 nor a DHCP
-  client, so this perl script sets lo up and eth0 to 10.0.2.15/24, gateway
-  10.0.2.2, with the classic ioctls; `/etc/resolv.conf` points at
-  10.0.2.3.
-- hostname, hosts, fstab, a `TERM` fix, and a drop-in that logs root in on
-  hvc0 once systemd's `serial-getty@hvc0` exists.
-
-```sh
-node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot          # root shell; poweroff
-node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot --append "console=hvc0 root=/dev/wda rw init=/bin/bash"
-node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --mem 1024          # persistent: apt-get update && apt-get install ...
-node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --mem 1024 --input '{5}apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv udev dbus && poweroff\n'
-```
-
-Measured 2026-11-18 (x86-64, Node 24, JIT on, `--mem 1024`): `apt-get
-update` (20.4 MB of indexes) 29 s; `apt-get install --no-install-recommends
-htop` 8 s; systemd, systemd-sysv, udev and dbus (13 packages) 23 s. After
-an apt run that replaced a file kw-init's bash has mapped (installing
-systemd does), the read-only remount at poweroff fails with "mount point
-is busy"; ext4's journal recovers at the next mount.
-
-**systemd** 261 runs as PID 1 once installed (`systemd-sysv` replaces
-`/sbin/init`; `init=/usr/local/sbin/kw-init` still boots the plain shell,
-with the network, which nothing configures under systemd yet). udev is
-needed: without it `dev-hvc0.device` never appears and the console getty
-times out after 90 s. 2026-11-18: `Startup finished in 183ms (kernel) +
-8.116s (userspace)` (graphical.target), `systemctl is-system-running`
-says `running`, no failed units, 38 processes; `poweroff` goes through
-systemd's shutdown. What it copes without: `bpf` (BPF_SYSCALL off) and
-`keyctl` (KEYS off) return ENOSYS (no BPF firewalling or device control,
-no session keyrings); no seccomp (`SystemCallFilter=` skipped), no IPv6, no
-`SO_PASSSEC`, only the `pids` cgroup controller, no modules, missing
-sysctls (`kernel/core_pattern`, IPv6 `use_tempaddr`, `yama/ptrace_scope`).
-The config it needs is in config.md.

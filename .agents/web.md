@@ -36,77 +36,190 @@ panel), `About.tsx`
 which `vite.config.ts` defines: the Linux release read from the committed
 kernel's banner, the kernel's release tag and the page's commit (empty
 where git is missing or the clone is too shallow). `web/public/vm-sw.js` is the page's
-service worker (the preview's relay), `web/server/vm.ts` the preview's server fallback.
+service worker (the preview's relay), `web/server/vm.ts` the preview's server fallback,
+`web/server/distros.ts` the built Node server's `/distros/` handler and
+`web/server/range.ts` the Range logic it shares with the dev server,
+`web/scripts/kernel.ts` what the page runs (below).
 `web/public/manifest.webmanifest` makes the page installable (standalone, black); its icons
 `icon-192.png`, `icon-512.png` (the whole logo at 6x and 16x), `icon-maskable-512.png` (inside the
 border, corners filled, opaque) and `apple-touch-icon.png` are `assets/logo.svg` rendered at 32 px
 and scaled nearest neighbour (`magick -filter point`).
 `web/vite.config.ts` holds the COOP/COEP headers (Nitro route rules, plus
-the dev server's own responses) and `__KW_BUILD__`.
+the dev server's own responses), `__KW_BUILD__`, `virtual:unkernel-kernel`
+(the kernel's URLs and the list of images), the dev server's `/distros/`
+middleware, and the build step that copies the images into the output
+(below).
 
-## The page's kernel: a local build in dev, the newest release in a build
+## The page's kernel and distro images
 
-- The page loads only `web/kernel/page/unkernel-alpine.wasm` (gitignored):
-  the lowered kernel with Alpine bundled, about 12 MB (7 MB gzipped). `splitKernel()`
-  (`web/scripts/kernel.ts`) makes it from `web/kernel/unkernel-alpine.wasm`
-  (the file the rest of this list is about) without its SMP patch section
-  (js.md, CPU threads), so it is byte for byte that file when there is
-  none (release bundles have one since 2026-11-17; testing.md). When there is one, it also writes
-  `web/kernel/page/unkernel-alpine-smp.wasm`, the SMP bundle the patch
-  makes, which the `unkernel:kernel-smp` plugin emits as its own hashed
-  asset and `src/sdk.ts` exports as `kernelSmpUrl` (null without it,
-  from `virtual:unkernel-smp-kernel`). Only a load with several CPUs
-  fetches it (Several CPUs, below). The dev server splits again when the file changes. Building or deploying the
-  page needs no kernel toolchain.
-- `pnpm dev` runs the file that is there, without a network check.
-  `kernel/build.sh bundle` (and so `kernel`, `smp`, `alpine`, `datadisk`,
-  `all`) copies its output there, so the dev server runs your latest local
-  build, with the SMP bundle once `smp` has built the SMP kernel.
-  Checked 2026-11-17 with `KW_KERNEL=` a bundle from the build path: the
-  built page had both assets (UP 11.48 MB, SMP 11.88 MB); with the newest
-  release (no patch) it had only the UP asset, with the deployed name.
-  Only when there is no file does it download one.
-- A page build (`pnpm build:web`, a deploy, the browser tests' build) always
-  takes the `unkernel-alpine.wasm` attached to the newest non-draft release
-  of `pithings/unkernel` (`.github/workflows/release.yml`), so a deploy
-  never ships a local kernel. It downloads unless the file's sha256 is that
-  release's.
-- `web/scripts/kernel.ts` does both, from the `unkernel:kernel` plugin's
-  `config` hook in `vite.config.ts`, so before `pnpm dev` serves or
-  `pnpm build:web` builds anything. The download runs at build time because GitHub
-  serves release assets without CORS (both the `github.com` redirect and
-  `release-assets.githubusercontent.com`), so the browser cannot fetch them,
-  and CDNs such as jsDelivr only serve files from the git tree.
-  `web/kernel/release.json` records the tag and sha256 of the last
-  download; a file that does not match it shows as `local` in the About
-  dialog. The GitHub API gives the newest release and the
-  asset's digest, which is checked. Without `GITHUB_TOKEN` (or `GH_TOKEN`)
-  the API allows 60 requests an hour per IP, so on any API failure it reads
-  the newest tag from `releases.atom` instead. If GitHub cannot be reached,
-  a build keeps the file if it is a release's. Otherwise the build fails.
-- `KW_KERNEL=<path>` uses that bundle in a build too (tag `local`), e.g.
-  `KW_KERNEL=../vendor/build/bundle/unkernel-alpine.wasm pnpm build:web` to
-  run the browser tests on a local kernel. `KW_KERNEL_RELEASE=<tag>` picks a
-  release instead of the newest, in dev too.
-- A release (the workflow, run by hand) changes a deployed page only once
-  the page is rebuilt.
-- The kernel must match the page: `fetchKernel()` reads the kernel's
-  kwemu ABI (`kw_abi_version()`, through `kernelInfo()` in
-  `kernel/tools/bundle.mjs`) and refuses a release whose number is not
-  `include/kw_emu.h`'s `KW_ABI_VERSION`, in a build and in dev (a local
-  file only gets a warning). The page's texts, demos (the Ubuntu demo's
-  arm64 tarball, the launcher's aarch64 packages) and the data disk's
-  guest-architecture reset are written for this checkout's guest, so a
-  release of another guest (the riscv64 releases carry ABI 8, the arm64
-  contract is 2) must not be deployed with it. Order after an ABI change:
-  merge, cut a release (the workflow), then deploy the page; a page build
-  before the release fails with that message (or give `KW_KERNEL` or a
-  matching `KW_KERNEL_RELEASE`).
+The page runs the base bundle `unkernel.wasm` (the kernel and the base
+initramfs, with the data disk template and the SMP patch section) and boots
+it with a read-only distro image (`alpine.erofs`, `debian.erofs`) that it
+attaches by URL and reads lazily with Range requests (the SDK's
+`createKernel({ distro })`, js.md, Disks). `pageSource()` in
+`web/scripts/kernel.ts` (described at its top) picks both when the dev
+server starts or a page build begins (the `unkernel:kernel` plugin's
+`config` hook in `vite.config.ts`, before anything is served or built), and
+logs which and why (a build between two lines of `=`). Building or
+deploying the page needs no kernel toolchain.
+
+- The source, in this order:
+  1. `KW_KERNEL=<file>` and/or `KW_DISTROS=<dir>` (relative to `web/`):
+     that base bundle and the images in that directory (`<name>.erofs`, or
+     `<name>.ext4` where there is no `.erofs`; `distros.json` there gives
+     image ids), the other part from the local build, whatever `KW_LOCAL`
+     says.
+  2. A local build, when one may be used: `KW_LOCAL=1` forces it,
+     `KW_LOCAL=0` forbids it, and by default it is used unless `CI` or
+     `VERCEL` is set (a deploy or CI build has no `vendor/` and must ship
+     a release). It needs `vendor/build/bundle/unkernel.wasm` (`kernel/build.sh
+     base`) and at least one image in `vendor/build/distro/`
+     (`kernel/build.sh distro`; both from `kernel/build.sh all`).
+  3. Else the newest non-draft release of `pithings/unkernel`
+     (`.github/workflows/release.yml`; `KW_KERNEL_RELEASE=<tag>` picks
+     one), which must carry `unkernel.wasm`, `distros.json` and every image
+     `distros.json` names. A release without them (every release before
+     the base bundle: `unkernel-alpine.wasm` only) fails the build with
+     what to do: build locally (`kernel/build.sh all`), cut a release, or
+     name a release that has them. So a deploy (Vercel) and CI ship a
+     release, never a local build.
+  1 and 2 show as "local build" in the About dialog, 3 as the release's tag.
+- A release is downloaded at build time (the dev server only when it has no
+  copy yet, and then without a network check), because GitHub serves
+  release assets without CORS (both the `github.com` redirect and
+  `release-assets.githubusercontent.com`), so the browser cannot fetch
+  them, and CDNs such as jsDelivr only serve files from the git tree. The
+  copy is `web/kernel/release/` (gitignored: `unkernel.wasm`,
+  `distros.json`, the images, `release.json` with the tag and every file's
+  sha256). Everything is checked in a temporary directory before it
+  replaces that copy (a rename), so a refused or broken release leaves
+  `web/kernel/` as it was: `distros.json` first (its `abi` must be
+  `include/kw_emu.h`'s `KW_ABI_VERSION`, its entries well formed), then
+  `unkernel.wasm` (the API's sha256 digest where there is one, wasm magic,
+  its own ABI from `kernelInfo()` in `kernel/tools/bundle.mjs`, its base
+  id against `distros.json`'s `base`, `bundleInfo()` in
+  `guest/tools/distros-json.mjs`), then each image (size and sha256 from
+  `distros.json`, and the API's digest). An image the copy already has
+  with that sha256 is reused, and a build whose newest release is the
+  copy's downloads nothing. The GitHub API gives the newest release and the
+  digests; without `GITHUB_TOKEN` (or `GH_TOKEN`) it allows 60 requests an
+  hour per IP, so on any API failure the build reads the newest tag from
+  `releases.atom` and downloads from the usual URLs (no digests; the
+  sha256 in `distros.json` still checks the images). If GitHub cannot be
+  reached, a build keeps the copy (when it is the tag asked for).
+  `KW_GITHUB_API` and `KW_GITHUB` replace `https://api.github.com` and
+  `https://github.com`, for a stand-in server. Checked 2026-11-19 against
+  such a stand-in: a complete release built and booted (Alpine, Debian),
+  a second build downloaded nothing, and a release without
+  `distros.json`, one without an image, one whose `distros.json` says
+  another ABI and one with a wrong image sha256 each failed with
+  `web/kernel/` unchanged; the real newest release (v0.1.0-261117-0e4b2ec)
+  fails with that message.
+- The kernel must match the page: a local base bundle whose kwemu ABI is
+  not `KW_ABI_VERSION` only gets a warning, a release is refused (above).
+  The page's texts and demos (the Ubuntu demo's arm64 tarball, the
+  launcher's aarch64 packages) are written for this checkout's guest.
+  Order after an ABI or guest change: merge, cut a release (the workflow),
+  then deploy the page; a page build that takes the newest release before
+  then (CI, Vercel, `KW_LOCAL=0`) fails (or give `KW_KERNEL` and
+  `KW_DISTROS`, `KW_LOCAL=1` or a matching `KW_KERNEL_RELEASE`). A
+  release changes a deployed page only once the page is rebuilt.
+- The kernel's URLs (`virtual:unkernel-kernel`'s `kernelUrl` and
+  `kernelSmpUrl`, which `src/sdk.ts` exports): `baseSplit()` takes the
+  SMP patch section off the bundle: the UP kernel is the bundle without it
+  (byte for byte the bundle when it has none), the SMP one the kernel the
+  patch makes with the same initramfs, command line and data disk template
+  (js/core/kpatch.ts; `kernelSmpUrl` is null without the section). A build
+  emits both from memory as hashed assets (`unkernel-<hash>.wasm`,
+  `unkernel-smp-<hash>.wasm`), so it never touches the dev server's files;
+  the dev server writes them to `web/kernel/page/<16 hex digits of the
+  bundle's sha256>/` (`splitBase()`; the four used last are kept, so dev
+  servers of different bundles do not overwrite each other) and serves
+  them as `/@fs/` files, split again when a local bundle changes. UP
+  visitors download only the UP kernel (8.4 MiB, about 4.7 MiB
+  compressed); only a load with several CPUs fetches the SMP one (Several
+  CPUs, below).
+- The images' URLs and caching, with `virtual:unkernel-kernel`'s
+  `distros` list (`{ name, url, size, imageId? }`, debian first;
+  `imageId` where `distros.json` gives it, else the page reads it from
+  `/run/kw-base`):
+  - A build names each image by its content,
+    `/distros/<name>-<16 hex digits of its sha256>.erofs`, and copies it
+    (a real file with the source's mtime; never anything else from its
+    directory, whose tar and ext4 files are 100 MB and more) into the
+    output's `public/distros/` (`.output/public/distros/`, on Vercel
+    `.vercel/output/static/distros/`) in the `unkernel:distro-images`
+    plugin, whose `buildApp` hook runs after Nitro's. That is after Nitro
+    compressed its public files and listed its static assets:
+    `compressPublicAssets` has no filter and compresses every file whose
+    type it does not know as text, and Nitro's static handler (which does
+    answer single ranges) would then send the `.br` variant. Such a URL
+    never changes content, so it is `cache-control: public,
+    max-age=31536000, immutable`, with the strong ETag
+    `"<hash>-<size in hex>"`, the same on every server and deploy. A new
+    image is a new URL, so a session suspended on the old one is not
+    offered (Suspend and resume).
+  - The built Node server answers them in `web/server/distros.ts` (a Nitro
+    handler for `/distros/**`, reading `../public/distros/` next to its
+    `index.mjs`). On Vercel the CDN serves them as static files (its
+    `config.json` has the `filesystem` handle before the function's
+    `/distros/` route), with its own Range support and ETag; the
+    `/distros/**` route rule adds CORP, and `unkernel:distro-images` adds
+    a route in the `hit` phase (a request a static file answered) that
+    sets the immutable Cache-Control, so a 404 from the function is never
+    cached. Checked 2026-11-19 in the build output only, not on a
+    deployment.
+  - The dev server answers `/distros/<name>.erofs` itself (the
+    `unkernel:kernel` plugin's middleware; Nitro's dev handler answers
+    public files br-compressed, in full and without Range support) from
+    the files the list names, wherever they are. A local image is rebuilt
+    in place, so these plain names are `cache-control: no-cache` with an
+    ETag from size and mtime. The SDK's opening request revalidates (a 304
+    while the image is unchanged); its other requests take the browser's
+    cached copy anyway (`force-cache` ignores `no-cache`), and after a
+    rebuild their old ETag fails the check against the opening one, so
+    they are fetched again (below). The list's sizes are read again when
+    an image changes (on the next page load). Earlier dev servers linked the images into
+    `web/public/distros/` (gitignored); that directory is unused, and in
+    Nitro's `ignore`.
+  - What the SDK asks of the server (js/core/block.ts `HttpBase`): it
+    opens an image with one Range request for its first 256 KiB with
+    `cache: "no-cache"` (the one request that revalidates), then reads the
+    prefetch the image's distro header names (Alpine: the whole image, one
+    plain GET; Debian: one streamed Range request of its first 13 MiB) and
+    lazy ranges, all `cache: "force-cache"`, comparing each response's
+    ETag with the opening one's and fetching a mismatch again with
+    `cache: "reload"`. So every response for an image, 200 and 206 alike,
+    must carry the same strong ETag, be cacheable (never `no-store`) and
+    not be content-encoded (a 200's Content-Length is checked against the
+    image's size).
+  - The dev middleware and the Node handler share `web/server/range.ts`:
+    no compression, 200 for a request without Range, 206 with
+    Content-Range for one range (a malformed or multi-range header gets
+    the whole file), 416 with `bytes */<size>` past the end, one ETag per
+    image on every response (a rebuilt image changes it, and the SDK's
+    strict `HttpBase` then refuses reads instead of mixing two images),
+    If-None-Match before Range (RFC 9110: a cached range revalidates with
+    a 304), If-Range, COOP/COEP/CORP, and 404 (`no-store`) for anything
+    else under `/distros/`. Vercel's CDN sends its own ETag; whether it is
+    the same on a 200 and a 206, and across its edges, is not checked (a
+    differing one costs a refetch, never a mixed image).
+  - Measured 2026-11-19, headless Chromium (Playwright's build), one
+    profile, the same load twice, `?data=0`, to the prompt: on the built
+    Node server Debian made 20 requests, 18.9 MiB, the first time (prompt
+    2.2 s); the second time only the opening request reached the network
+    (a 304, 423 bytes) and 19 came from the HTTP cache (prompt 0.52 s);
+    Alpine 2 requests, 4.1 MiB (0.36 s), then 1 on the network (304) and 1
+    from the cache (0.34 s). The dev server: the same counts (Debian's
+    second load 0.67 s).
 - `web/src/sdk.ts` imports `js/core/index.ts`, `js/web/memory.ts` and
   `js/web/platform.ts`, not `js/web.ts`, whose own bundled kernel would
-  become a second 10 MB asset. Its `kernelUrl` becomes a hashed Vite asset,
+  become a second 10 MB asset. Its `kernelUrl` is a hashed Vite asset,
   which the Node server sends precompressed (br, zstd, gzip). Compressed
   responses have no decoded length, so there is no download percentage.
+- `vite.config.ts` keeps the dev server from watching `.output/`,
+  `.vercel/`, `kernel/release/` and `kernel/page/`: a page build rewrites
+  `index.html` there, which would reload an open dev page and end its VM.
 
 ## Rules
 
@@ -186,7 +299,37 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 - The guest network is Wisp only. A page served from an origin outside the
   Wisp server's allow list needs its own Wisp server (js.md). A `ws://`
   server is blocked as mixed content on an `https://` page.
-- apk index prefetch (`apk.ts`, described at its top): once user space
+- The distro (above): `?distro=<name>` (default `debian`, else the first
+  image; an unknown name boots the default, with a warning line, a toast,
+  the Environment tab's Distro row and the option's note; `none` attaches
+  no image: the base shell). Its option is the Distro radios
+  (`#opt-distro-<name>`, `#opt-distro-none`, `#opt-distro-note`). Inline,
+  boot.ts opens the image with `openDistroDisk()` while the kernel
+  downloads, so the resume check sees the snapshot's disks (`[distro,
+  data]`); worker mode passes the URL. The image is the read-only
+  `/dev/wda`, the data disk `/dev/wdb`. The bundle's own command line is
+  used unless `?append=` gives one (`?root=` appends `kw.root=`). Once
+  user space runs, boot.ts reads `/run/kw-base` (guest/base/initramfs/init)
+  for the Distro and Root rows, About (the image id) and diagnostics'
+  config line (`distro=`, `image=`). Where a feature or text is Alpine's
+  (apk, wget, the README), it is gated on `cfg.guest === "alpine"` (Rules,
+  Stand-ins, Launcher). Failures: an image that does not open (404, a
+  server without Range, not erofs/ext4) is `ui.fail` (kind `distro`, with
+  a hint); a read that fails later (the image changed or the server
+  stopped; the guest gets EIO) is a non-fatal `KW.report`; the base's
+  base shell (`unkernel base shell (...): why` on the console) is a
+  warning row and a report. Checked 2026-11-19 with headless Chromium (a
+  scratch script, not in `web/test/`) on the built Node server and the dev
+  server, from a scratch build of the current sources: both distros, the
+  switch through Options and Reboot, per-distro changes on the data disk,
+  `?data=0`, `?worker=1`, `?smp=2`, `?root=initramfs`, `?distro=none` and
+  an unknown name, suspend and resume (inline and worker) and the refusal
+  across distros, the data disk reset (`KW.resetData()`), and the
+  failures above (404, no Range, a changed ETag, by request interception).
+  To the prompt, Debian 0.9 s and Alpine 0.3 s on the Node server with a
+  cold cache (caching above).
+- apk index prefetch (`apk.ts`, described at its top): on the alpine
+  image only. Once user space
   runs, the page pushes the guest's missing or stale APKINDEX files into
   `/var/cache/apk` through `vm.exec()`, so apk skips its own index download.
   That covers the enabled repositories and the lazy ones in
@@ -196,24 +339,29 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   them in the Cache API (`kw-apk-index-v1`), revalidated after 1 h. The
   pushed file's mtime is the time the mirror last confirmed it. Off with
   `?net=0`.
-- `/root/README` (intro notes) comes from the page, not the image:
+- `/root/README` (intro notes, about Alpine; not written on another
+  distro) comes from the page, not the image:
   `readme.ts` writes it through `vm.exec()` once user space runs. A stamp
   (`/var/lib/kw-readme`, the sha256 of the copy written) keeps it from
   overwriting a README the user edited or bringing back one they deleted;
   an unedited copy is replaced when the text changes. Keep its shortcuts
   and claims in step with the page.
 - The safe-mode explanation comes from watching the console for
-  `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md), and the notice
-  of a data disk reset after a change of guest architecture, which keeps
-  only `/root` (the guest's sentence as the panel note `data-reset-note`
-  and a toast; a check row "Data disk reset", "at this boot, /root kept")
-  from `kw-data: RESET:`.
+  `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md): the base's check
+  of the root with the data disk's changes failed, so this boot runs the
+  plain image on a tmpfs upper; the changes stay in
+  `/data/distros/<name>/upper`, and every boot checks them again. The
+  panel note (`data-safe-note`), a toast and the Root row say so, with
+  `kw-overlay status` and `kw-overlay discard`. `?root=initramfs` (the
+  Safe mode button) is the same for one boot by choice.
 - A guest `reboot` (halt code 2) reloads the page once the last data-disk
   save has committed, at most 3 times a minute per tab (sessionStorage
   `kw-auto-reboot`); then the page stays halted and says why.
 - Kernel messages go to the Kernel log tab; during boot only the newest
   shows on a transient line, and IMPORTANT ones (`js/core/console.ts`) are
-  written in full. Once user space prints, "Started Linux", the "Booted
+  written in full. Once user space prints, "Started Linux" (the kernel until
+  it runs `/init`), "Started Alpine" (the base mounting the image and the
+  distro's init; "Started the base shell" without one), the "Booted
   in" summary, two notes (the repository as an OSC 8 link, and how to
   open the demo launcher; not on a resumed session), with Pip from the
   logo (`assets/logo.svg`) in truecolor half blocks to their left when
@@ -328,7 +476,9 @@ with Resume and Boot fresh) before the kernel starts.
   `bytes` (the `encodeSnapshot()` Blob), written in one transaction. It
   never opens `kwdisk:kwdata-v1`.
 - Offered only when the kernel URL (a hashed asset: another release cannot
-  resume) and the device options (Display, Sound, Network, Data disk) are
+  resume), the distro image's URL (`meta.distro`; a build's names its
+  content, so another build of the same distro cannot resume) and the device
+  options (Display, Sound, Network, Data disk) are
   as saved, and inline when `snapshotDiskMismatch()` passes on the opened
   data disk. A disk that changed makes the session useless, so it is
   deleted then. In worker mode the worker checks the disk; a tab without
@@ -519,18 +669,21 @@ drag shared with the preview: `dragSplit()`); over the stage under 720 px.
 
 `shims.ts` writes `~/.local/bin/fx`, `claude` and `opencode` with one
 `vm.exec()` once user space runs, before a `?demo=` relaunch (boot.ts
-passes it the texts of `kw-shim.sh` and `kernel/guest/kw-path.sh` as Vite
+passes it the texts of `kw-shim.sh` and `guest/base/rootfs/etc/profile.d/kw-path.sh` as Vite
 `?raw` imports; shims.ts itself has none, so `test/api.test.ts` runs its
 shell text through the SDK). Each is `kw-shim.sh` with its name filled in;
 both files describe the rest at their top:
 
+- Alpine only (they download with wget, which Debian's image lacks):
+  boot.ts writes them only on the alpine image.
 - Writing: when the file is missing, or holds an older stand-in (`# kw-shim
   N` on line 2: bump N when kw-shim.sh changes). A program there (not a
   script, or a symlink) is never touched; one the user deleted comes back
   as a stand-in at the next start. Each write holds the stand-in's lock.
-  `/etc/profile.d/kw-path.sh` is written too when missing (a bundle from
-  before the image carried it). In the overlay's upper layer, so once per
-  data disk; once per boot with `?data=0`.
+  `/etc/profile.d/kw-path.sh` is written too when missing (the base's kw
+  layer carries it; a change in the upper layer can hide it). In the
+  overlay's upper layer, so once per data disk and distro; once per boot
+  with `?data=0`.
 - The first call installs the newest release, straight from the URLs the
   official installers use (fx.sh/setup.sh, claude.ai/install.sh,
   opencode.ai/v2/install; none of them is run), and is replaced by it: fx
@@ -609,9 +762,11 @@ because the login discards input typed ahead of its prompt. The preview opens on
 guest answers http on the first of its `ports`. Alpine's nginx default
 site also listens on `[::]:80`, which fails in the guest (no IPv6), so the
 nginx demo replaces it. A demo may carry repository sources as text (Vite `?raw` or
-`import.meta.glob`): Doom brings `kernel/guest/fbdoom` and its patches
-this way, and these GPL-2.0-or-later texts keep their license inside the
-MIT bundle. Files with absolute paths land outside the demo directory, and
+`import.meta.glob`): Doom brings `web/src/demos/doom/fbdoom` (fbDOOM built in
+the guest with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound; the
+first run took 22 s to the first frame, a later one 0.2 s, 2026-11-18) and
+its `patches/` this way, and these GPL-2.0-or-later texts keep their license
+(their SPDX headers) inside the MIT bundle. Files with absolute paths land outside the demo directory, and
 files from an earlier launch are never removed. A demo's `downloads`
 (url, SHA-256, size, guest path, an optional `unless` shell test) are
 fetched by the page before its window opens (`download.ts`, described at
@@ -630,7 +785,9 @@ default Wisp server) the riscv64 Ubuntu Base tarball (31 MB) took 1.5 to
 4.4 s to fetch and 0.2 s to push; the arm64 26.10 one (35 MB) took 0.3 s
 to push (Node SDK, 2026-11-18). A demo with `hidden` set is left out of the launcher. A demo runs once at a time: picking one whose window
 is open (a dot under its tile) shows that window. A demo whose `needs`
-(display, net, sound) the page's options rule out is dimmed, with why.
+(display, net, sound) the page's options rule out is dimmed, with why; so
+is one that needs Alpine (`packages`, `community` or `needs.alpine`: Ubuntu,
+Doom and fx) on another distro.
 Launching a demo sets `?demo=<id>` in the URL (`history.replaceState`), and
 a page with `?demo=` launches that demo once the guest is up, so a reload
 reopens the last demo launched; Reboot keeps it. Closing that demo's
@@ -675,12 +832,19 @@ Doom build come from the data disk on later tours. `KW.showcase` has
 
 ## Running and deploying
 
-- `pnpm dev`: Vite on port 8080, all interfaces. `pnpm build:web` writes
-  `web/.output/`, and `pnpm start:web` runs it (port 3000 unless `PORT=`).
-  `pnpm typecheck:web` type-checks it.
+- `pnpm dev`: Vite on port 8080, all interfaces, with the local build once
+  `kernel/build.sh all` (or `base` and `distro`) has run, else the newest
+  release (The page's kernel and distro images). `pnpm build:web` writes
+  `web/.output/` the same way (a build beside the main outputs:
+  `KW_KERNEL=<dir>/unkernel.wasm KW_DISTROS=<dir> pnpm build:web`), and
+  `pnpm start:web` runs it (port 3000 unless `PORT=`). `pnpm
+  typecheck:web` type-checks it.
 - On Vercel, Nitro detects the platform and writes `web/.vercel/output`.
   Elsewhere, `NITRO_PRESET=vercel pnpm build:web` produces the same for
-  `vercel deploy --prebuilt`.
+  `vercel deploy --prebuilt`. Vercel's build sets `VERCEL`, so it takes
+  the newest release: deploy only after a release with this layout
+  (unkernel.wasm, distros.json, the images) exists. The images are about
+  61 MB of static files (alpine 4.1, debian 56.9 MiB).
 - A LAN `http://` page is not a secure context: no clipboard API, no
   `deviceMemory`, no Web Locks, and no cross-origin isolation. It still
   works.
@@ -692,8 +856,9 @@ Agents run these only when asked. The page is tested by hand with
 
 `headless.mjs` (`pnpm test:web`: desktop with the JIT compiling and
 cross-origin isolation asserted, phone over LAN, nojspi, fetch404, modfail,
-lowmem booting to the shell at 128 MiB), `data.mjs` (data disk, overlay root, safe mode,
-second tab, export/reset/import) and `net.mjs` (needs the internet). Shared
+lowmem booting to the shell at 128 MiB), `data.mjs` (data disk, overlay root per distro,
+safe mode, second tab, export/reset/import) and `net.mjs` (needs the internet), both on
+`?distro=alpine` (apk, wget, Alpine's upper layer; `headless.mjs` runs the default image). Shared
 code is in `lib.mjs`. They drive Chromium over the DevTools protocol with no
 npm dependencies and start the built server (`--dev` starts the Vite dev
 server). They use the newest Playwright Chromium in `~/.cache/ms-playwright`

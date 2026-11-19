@@ -34,12 +34,15 @@ parts that are easy to get wrong.
 
 - Entries `js/node.ts`, `js/web.ts` and `js/cli.ts` become `dist/*.mjs`
   and `.d.mts`, with shared code in `dist/_chunks/`. A copy of
-  `vendor/build/bundle/unkernel-alpine.wasm` goes along, and the build
-  fails if the bundle is missing. `js/unkernel-alpine.wasm` is a symlink to
-  that bundle.
-- The build checks that `dist/web.mjs` reaches no Node built-in, and that
+  `vendor/build/bundle/unkernel.wasm` (the base bundle) goes along as
+  `dist/unkernel.wasm` (export `unkernel/unkernel.wasm`), and the build
+  fails if the bundle is missing. `js/unkernel.wasm` is a symlink to that
+  bundle. No distro image is in the package (Distro images, below).
+- The build checks that `dist/web.mjs` reaches no Node built-in, that
   each entry (not a shared chunk) computes
-  `new URL("./unkernel-alpine.wasm", import.meta.url)`.
+  `new URL("./unkernel.wasm", import.meta.url)`, and that `dist/node.mjs`
+  and `dist/cli.mjs` compute the package root (`new URL("..",
+  import.meta.url)`, for `fetchDistro()`) themselves.
 - It inlines the kernel workers (Packaging, below) and the CPU workers
   (`js/node/cpu-entry.ts`, started by `js/node/cpu.ts`, and
   `js/web/web-cpu-entry.ts`, started by `js/web/cpu.ts`; CPU threads,
@@ -61,7 +64,11 @@ parts that are easy to get wrong.
 
 - `createKernel()` (`js/core/instance.ts`) wraps the `Kernel` class
   (`js/core/kernel.ts`: imports, JSPI, IRQs). With no `kernel` option it
-  loads the bundle, and with no `net` option there is no network device.
+  loads the bundle, with no `distro` it boots the base shell
+  (busybox, the kw tools, kwtty; kernel/guest.md), and with no `net`
+  option there is no network device. Nothing in `createKernel()` downloads
+  a distro: the caller passes one (`fetchDistro()` on Node, a URL in
+  browsers).
 - Programs run in a running guest through `vm.spawn()` and `vm.exec()`
   (kwtty, below; over vsock, which is on unless `vsock: false`), on a pty
   or on pipes; `vm.connect()` and `vm.fetch()` reach TCP servers on the
@@ -126,7 +133,9 @@ parts that are easy to get wrong.
   mtime are the stamp. A CowDisk without a store can be in a snapshot only
   while unwritten and over a base with an identity (FileBase: path, size,
   mtime; HttpBase: URL, size, ETag). A disk without these methods (a
-  custom BlockDevice) makes `snapshot()` reject.
+  custom BlockDevice) makes `snapshot()` reject. The distro image
+  (Disks, below) is the snapshot's first disk; its identity is its
+  content (`DistroDisk`), with the underlying disk's stamp.
 - Devices in snapshots (`Kernel.saveDevices()`/`restoreDevices()`): each
   host class has `saveState()` and `restoreState()` for what the kernel
   told it once and does not tell a restored host again. A key in
@@ -268,7 +277,11 @@ parts that are easy to get wrong.
   `serveKernel()` too): `coreDevices` has the universal kinds,
   `js/node/devices.ts` and `js/web/devices.ts` add the platform ones. A
   `data` store the page cannot use gives a fresh in-memory disk with a
-  `notice`; nothing is cleared. Inline `createKernel` builds specs the
+  `notice`; nothing is cleared. An `http` spec with `readOnly` has no
+  overlay (`BaseDisk` over a strict `HttpBase`). The `distro` option
+  crosses as one more spec (`WorkerBootSpec.distro`), made on the owner
+  (`Platform.distroSpec`, so a relative URL resolves against the page);
+  the worker's disk indices skip it. Inline `createKernel` builds specs the
   same way, owns those disks and closes them at exit after their last
   save. Worker mode takes specs only: a `BlockDevice`, `NetDevice` or
   `NetBackend` object rejects with a `BootError` naming the spec to use.
@@ -547,7 +560,7 @@ parts that are easy to get wrong.
 ## WASI programs (prototype; `js/core/wasi-exec.ts`, `wasi-program.ts`)
 
 - The guest's executable wasm32-wasi files run on the host's engine:
-  binfmt_misc hands them to kwwasi (`kernel/guest/kwwasi.c`, whose top
+  binfmt_misc hands them to kwwasi (`guest/src/kwwasi.c`, whose top
   describes the protocol; a change goes in kwwasi.c and both files), which
   connects to vsock port 1021, sends argv, environment, the preopen and
   the module's identity (the module itself only when asked), and then does
@@ -691,14 +704,14 @@ parts that are easy to get wrong.
 - Do not feed a throughput test from busybox `head -c`: it copies a byte
   at a time (~22 MiB/s by itself).
 - Test: `test/api.test.ts` (inline and worker) with
-  `kernel/guest/kwvsock.c`; `VsockDevice.refuse` is the hook that refuses
+  `guest/src/kwvsock.c`; `VsockDevice.refuse` is the hook that refuses
   guest sends to exercise the kernel's retry path. Skipped when the kernel
   under test has no `wasm_driver_vsock_init` import;
   `UNKERNEL_TEST_KERNEL=path` runs the file against another bundle.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 
-- The host client of kwtty (`kernel/guest/kwtty.c`, `/usr/bin/kwtty
+- The host client of kwtty (`guest/src/kwtty.c`, `/usr/bin/kwtty
   serve`, respawned by inittab), which gives each connection its own pty
   and runs root's login shell, or a program, on it, or with PIPES runs it
   on stdin, stdout and stderr pipes. On a pty the API follows zigpty /
@@ -787,13 +800,14 @@ parts that are easy to get wrong.
   work. An unknown name fails Tattach with ENOENT, and so does a later
   Tattach on a bound connection that names another export. One backend
   mounted at two paths is two exports with a connection each. The guest's `kw9p NAME DIR [ro]`
-  (`kernel/guest/kw9p.c`) makes DIR (`mkdir -p`), refuses one that is
+  (`guest/src/kw9p.c`) makes DIR (`mkdir -p`), refuses one that is
   already a mount point (EBUSY), connects to CID 2 and mounts 9p with
   `trans=fd` on the socket, source `kw9p:NAME`, and fixed options
   `cache=readahead,metatimeout=1000,noxattr,access=client,msize=131072`.
   It prints errors as `kw9p: what: text (errno N)` and the SDK maps N to a
-  `MountError`. The Ubuntu and Alpine disk images ship neither kwtty nor
-  kw9p.
+  `MountError`. kwtty and kw9p are in the base's kw layer, so every
+  distro and the base shell have them; a root without the base (a
+  `--disk` root, `initrd: null`) does not.
 - The server and the handlers run on the owner, as vsock does. A mount
   runs `kw9p` through `execSubprocess()`. `spawn()` and `exec()` wait
   until createKernel's mounts are done, so a first `exec()` sees them. An
@@ -946,7 +960,7 @@ parts that are easy to get wrong.
   import returned, and a refresh only after the new list's attach, so
   ShmDevice never copies from a freed page. At exit everything is dropped
   and handles end with "exit".
-- Test: `test/api.test.ts` (inline and worker) with `kernel/guest/kwshm.c`.
+- Test: `test/api.test.ts` (inline and worker) with `guest/src/kwshm.c`.
   Skipped when the kernel has no kwshm.
 
 ## Disks (`js/core/block.ts`)
@@ -954,9 +968,62 @@ parts that are easy to get wrong.
 - `BlockHost` serves kwblk. Backends: `FileDisk` (`js/node/disk.ts`,
   `readSync`/`writeSync` straight into kernel memory, flush =
   `fdatasync`, no discard), `HttpBase` (read-only HTTP Range base in
-  256 KiB chunks, kept in memory), `CowDisk` (a 4 KiB copy-on-write overlay
+  256 KiB chunks, kept in memory; `open()` fetches the first chunk, then
+  the `prefetch` below), `CowDisk` (a 4 KiB copy-on-write overlay
   over a base, in memory or in IndexedDB through `IdbStore` in
-  `js/web/disk.ts`), `ZeroBase` and `SparseBase`.
+  `js/web/disk.ts`), `ZeroBase`, `SparseBase` and `BaseDisk` (a base read
+  directly, read-only). `HttpBase` with `strict` refuses a range whose
+  total size or ETag (or Last-Modified) differs from what `open()` saw,
+  so a changed image fails reads instead of mixing two images.
+- `HttpBase` `prefetch` (default: the image's distro header, distro.ts;
+  a number overrides it, `false` turns it off; the `http` spec's and
+  `openDistroDisk()`'s `prefetch`): `open()` starts one streaming request
+  for `[0, prefetch)`, a plain GET without Range when it is the whole
+  image. Each chunk is kept as its bytes arrive; a read inside the window
+  waits for them, a read after it is a lazy range. The response is
+  checked for size and validator, strict or not; a failure leaves the
+  missing chunks to lazy ranges. `stats` (`HttpBaseStats`, also on
+  `BaseDisk` and `DistroDisk`): requests, bytes, lazy requests, the
+  prefetch's size, bytes and state.
+- The distro image (`js/core/distro.ts`; `createKernel({ distro })`, the
+  CLI's `--distro`): an erofs or ext4 file system labelled kwroot that the
+  base initramfs of the bundle (`unkernel.wasm`) mounts under the root
+  overlay (contract: guest/README.md, kernel/guest.md). It is attached as
+  /dev/wda, before `disks`, whose indices (DiskState, `onDiskError`,
+  `detachDisk()`) stay those of `disks`. A path or URL becomes a spec
+  through `Platform.distroSpec`: Node a read-only `file` (or `http`),
+  browsers a read-only `http` spec, read in 256 KiB chunks with no
+  IndexedDB copy, after the prefetch its distro header asks for (written by
+  guest/lib/image.sh: Alpine's whole image; Debian's first 3 MiB, its
+  metadata and the data a boot reads, which the build lays out in front;
+  a boot from a URL then makes one lazy request, for the device's last
+  block, which is probed at boot; 2026-11-19). Without a header (lazy reads only), Alpine's erofs needed 8
+  requests, 1.6 MiB, to a working `exec()`, Debian's 42 requests,
+  13.5 MiB (local server, 2026-11-19). `DistroInfo` carries the header's
+  distro, image id and prefetch.
+  `DistroDisk` wraps any of them: writes fail, and `open()` reads the
+  first 64 KiB for the file system, label, UUID and a hash (cyrb53, since
+  `crypto.subtle` needs a secure context), the identity a snapshot
+  records. `openDistroDisk()` (node.ts, web.ts) opens one ahead, for
+  `snapshotDiskMismatch()`. Without an initramfs and `cmdline`,
+  `createKernel` refuses a distro. `test/distro.test.ts`
+  (`pnpm test:distro`) boots each built image.
+- Distro images by name (`js/node/distro-fetch.ts`, `fetchDistro(name,
+  opts)` in node.ts, the CLI's `--distro NAME`): in a source checkout
+  (the package root has `kernel/build.sh`) `vendor/build/distro/NAME.erofs`
+  (or `.ext4`), never a download; otherwise `distros.json` (guest/README.md)
+  and `NAME.erofs` from the GitHub release `v<package.json version>`
+  (`UNKERNEL_RELEASE_URL`: another release directory), into
+  `$UNKERNEL_CACHE_DIR`, else `$XDG_CACHE_HOME/unkernel`, else
+  `~/.cache/unkernel`, else `<tmpdir>/unkernel-cache`, under `v<version>/`
+  (`url-<hash>/` for an overridden URL). The download goes to a part file,
+  hashed on the way, and is renamed once size and SHA-256 match the index;
+  a cached file is used after the same check, and the index from the cache
+  when the network fails. Errors are `DistroFetchError` (`offline` when the
+  network failed and nothing usable was cached). The package root and
+  version come from the entry's `new URL("..", import.meta.url)`. The web
+  entry has no downloader: GitHub release assets send no CORS headers, so a
+  page hosts its images and passes their URLs.
 - `CowDisk` with a store loads lazily: memory holds only the blocks written
   since their last committed save. Writes to one block apply in submission
   order, so a stale fetch never overwrites a newer write.

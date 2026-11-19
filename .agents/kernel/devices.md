@@ -200,7 +200,7 @@ the id to the host over any channel.
 ## 9p (host file systems)
 
 Host file systems use the stock 9p client with the fd transport: no driver
-and no host import (host `js/core/9p.ts`, guest `kernel/guest/kw9p.c`).
+and no host import (host `js/core/9p.ts`, guest `guest/src/kw9p.c`).
 `kw9p NAME DIR [ro]` connects an AF_VSOCK socket to the host (CID 2, port
 564) and mounts 9P2000.L with `trans=fd,rfdno=S,wfdno=S`,
 `cache=readahead` and `metatimeout=1000`; the client takes its own

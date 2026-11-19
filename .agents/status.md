@@ -4,14 +4,6 @@ Remove items when they are done.
 
 ## Not in the image
 
-`kernel/guest/fbdoom` and `fbdoom-patches/`: fbDOOM built in the guest
-with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound. The page's
-launcher reaches it: its Doom demo writes the script and the patches into
-the guest (Vite `?raw`), which builds it there. On the aarch64 guest
-(Alpine's tcc 0.9.27_git20250619 for aarch64; Node SDK, direct network,
-fresh data disk, 2026-11-18) the first run took 22 s to the game's first
-frame, the 81 files compiling in 6 s; a later run starts in 0.2 s.
-
 The FreeDOS launcher demo (`web/src/demos/dos.ts`, hidden) boots the FreeDOS
 1.2 boot floppy in Alpine's qemu-system-i386 with the curses display. On
 the riscv64 guest it was too slow for the launcher (about 70 s from qemu's
@@ -22,7 +14,7 @@ recompiles. Not yet run on the aarch64 guest (Alpine has qemu-system-i386
 and qemu-ui-curses 11.0.3 for aarch64).
 
 WASI programs on the host's engine (prototype; js.md, WASI programs):
-`kernel/guest/kwwasi.c` is a binfmt_misc
+`guest/src/kwwasi.c` is a binfmt_misc
 interpreter for `\0asm\1\0\0\0` that sends argv, environment, the preopen
 and the module's identity over vsock port 1021 (the module only when the
 host has not compiled it for that identity) and then does the program's
@@ -37,10 +29,10 @@ messages to and from JSPI Suspending imports. A kill of kwwasi
 once, mid computation too; a worker whose program ended by itself is kept
 idle for the next one (two at most). Programs are left out of snapshots:
 they do not block one, and after a restore kwwasi exits 126 ("lost the
-connection to the host"), also while it waits for stdin. alpine.sh builds
-kwwasi and kw-binfmt.sh registers it, but no image with them has been
-built yet; `node test/wasi-binfmt.ts [--worker] [--messages]` brings
-kwwasi in through a mount and registers it by hand. It passes inline, in
+connection to the host"), also while it waits for stdin. The base's kw
+layer has kwwasi and its rc registers it; `node test/wasi-binfmt.ts
+[--worker] [--messages]` (on Alpine) installs a fresh build through a
+mount and registers it by hand if needed. It passes inline, in
 a worker and with `UNKERNEL_TEST_CPUS=2`, on the shared path and with
 `--messages` (2026-11-19, aarch64; the snapshot part with one CPU only, since an
 SMP kernel has no KW_PARK), and the built CLI (`pnpm build`,
@@ -175,17 +167,14 @@ Open:
    show its own terminal windows, web.md). Check first: SharedWorker on Chrome for
    Android, and JSPI inside one. A service worker is unsuitable, since
    browsers stop idle ones.
-6. **Ubuntu**: Ubuntu Base 26.10 arm64 boots from a disk (`kernel/build.sh
-   ubuntu`, kernel/guest.md), apt works, and systemd boots to
-   multi-user.target once installed from apt; the page's Ubuntu demo runs
-   the same tarball in a chroot on Alpine. Next: network under systemd
-   (systemd-networkd or a kw-net unit), a prebuilt systemd image, BPF,
-   keys, IPv6 and cgroup controllers if a service needs them (costs in
-   kernel/config.md), the ENOSYS and illegal-instruction logging run on 26.10,
-   and kw-init's poweroff after an apt run that replaced a file its bash
-   maps (the read-only remount fails as busy). 26.10 is an interim
-   release (support ends mid-2027): pin the next one, or 26.04.x LTS,
-   before then.
+6. **glibc distros and systemd**: Debian 13 is a distro image
+   (`--distro debian`, kernel/guest.md) with apt; the page's Ubuntu demo
+   runs Ubuntu Base in a chroot on Alpine. systemd (once installed from
+   apt) booted Ubuntu Base 26.10 to multi-user.target on 2026-11-18; no
+   image ships it. Next: systemd as a distro's init with the kw layer's
+   network, BPF, keys, IPv6 and cgroup controllers if a service needs them
+   (costs in kernel/config.md), the ENOSYS and illegal-instruction logging
+   run on Debian.
 7. **Stack switching.** The wasm stack-switching proposal is at Phase 3,
    behind a flag in V8 and missing from WebKit (Node 26:
    `--experimental-wasm-wasmfx`). With a module-defined memory and stub
@@ -364,7 +353,7 @@ Open:
 - **aarch64: the release workflow has not run its build path yet.** New
   in CI are the arm64 patch series (a new kernel tree and build: every
   kernel cache misses), the package rebuild with Bootlin's aarch64 gcc
-  (alpine-opt.sh downloads 163 MB; 79 s on 16 cores locally, 2026-11-18),
+  (guest/distro/alpine/opt/build.sh downloads 163 MB; 79 s on 16 cores locally, 2026-11-18),
   the aarch64 minirootfs, the guest programs from `zig cc`, and abitest.
   Before the first aarch64 release it needs one smoke run (`release`
   unchecked), which shows its time on a hosted runner and whether
@@ -402,7 +391,7 @@ Open:
 - **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
   --seccomp FD` fails, and GTK programs that load images through glycin
   abort. Workaround in the image: `/usr/local/bin/bwrap`
-  (`kernel/guest/bwrap-shim.sh`) drops the seccomp arguments. The fix is
+  (`guest/distro/alpine/rootfs/usr/local/bin/bwrap`) drops the seccomp arguments. The fix is
   seccomp in the arch (a syscall entry hook and the `asm/syscall.h`
   helpers); remove the shim then.
 - **kwfb: mmap racing a mode change.** An `mmap` of `/dev/fb0` racing a

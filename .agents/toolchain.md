@@ -70,7 +70,7 @@ The API differs from 0.13-0.15. Examples of all of these are in
   `timeconst.h` with `HZ == 0` ("Totally bogus HZ value!"). Put the real
   tools first on `PATH` for such runs.
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
-- `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`;
+- `guest/distro/alpine/opt/build.sh` (run by the Alpine image's build;
   `KW_ALPINE_OPT=0` skips it) also needs meson, ninja, pkg-config, patch,
   lua 5.x, perl with FindBin, IPC::Cmd and File::Compare, xz (Bootlin's
   tarball) and sha512sum (the APKBUILDs' source sums) (guest-packages.md),
@@ -80,13 +80,15 @@ The API differs from 0.13-0.15. Examples of all of these are in
 
 ## Pinned downloads
 
-The kernel base commit and the LLVM tag and commit are in build.sh. The
-SHA-256 sums for Binaryen 133, the Alpine 3.24.4 aarch64 minirootfs and
-Ubuntu Base 26.10 arm64 are in build.sh and `kernel/tools/env.sh`
-(`ALPINE_TARBALL=file` overrides the download). wterm (`@wterm/dom`
+The kernel base commit and the LLVM tag and commit are in build.sh, and
+so is the SHA-256 sum for Binaryen 133; the guest's (the Alpine 3.24.4 aarch64
+minirootfs, Debian, busybox-static, erofs-utils, lz4, zstd) in
+`guest/**/pins.sh` (erofs-utils is patched: `guest/tools/erofs-utils-patches/`,
+data in tar order and the metadata zone in front, for the distro images'
+layout; guest/README.md) (`ALPINE_TARBALL=file` overrides the download). wterm (`@wterm/dom`
 0.5.10, Apache-2.0) is an npm dependency of `web/`, pinned exactly and
 locked in `pnpm-lock.yaml` (see web.md).
-`kernel/guest/alpine-opt.sh` pins Bootlin's aarch64 musl gcc
+`guest/distro/alpine/opt/build.sh` pins Bootlin's aarch64 musl gcc
 (bleeding-edge 2026.08-1, gcc 16.2), the Alpine apks of its sysroot, and
 per package the aports commit and APKBUILD (whose sha512sums cover the
 sources).

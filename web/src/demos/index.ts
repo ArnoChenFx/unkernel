@@ -24,6 +24,5 @@ import sshfs from "./sshfs.ts";
 import tmux from "./tmux.ts";
 import ubuntu from "./ubuntu.ts";
 import valkey from "./valkey.ts";
-import windows from "./windows.ts";
 
-export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, fx, sshfs, nginx, node, nitro, python, postgres, sqlite, valkey, radio, speak, aquarium, dos, doom, windows];
+export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, fx, sshfs, nginx, node, nitro, python, postgres, sqlite, valkey, radio, speak, aquarium, dos, doom];

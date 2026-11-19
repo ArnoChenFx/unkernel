@@ -4,24 +4,23 @@ Remove items when they are done.
 
 ## Not in the image
 
-`kernel/guest/fbdoom`, `fbdoom-patches/`, `dosbox` and `dosbox-build/`:
-fbDOOM built in the guest with tcc, and DOSBox 0.74-3 on a patched static
-SDL 1.2, both on `/dev/fb0` with evdev input and `/dev/dsp` sound. The
-page's launcher reaches fbDOOM: its Doom demo writes the script and the
-patches into the guest (Vite `?raw`), which builds it there. DOSBox still
-waits for a way to distribute prebuilt guest packages: its launcher demo
-(Windows 3.1 from archive.org, `web/src/demos/windows.ts`) is hidden, and
-building it in the guest (`dosbox-build/guest-build.sh`, g++ -O1) had
-built SDL and 16 of DOSBox's ~250 files after 16 minutes, so a whole
-build would take hours (2026-11-15).
+`kernel/guest/fbdoom` and `fbdoom-patches/`: fbDOOM built in the guest
+with tcc, on `/dev/fb0` with evdev input and `/dev/dsp` sound. The page's
+launcher reaches it: its Doom demo writes the script and the patches into
+the guest (Vite `?raw`), which builds it there. On the aarch64 guest
+(Alpine's tcc 0.9.27_git20250619 for aarch64; Node SDK, direct network,
+fresh data disk, 2026-11-18) the first run took 22 s to the game's first
+frame, the 81 files compiling in 6 s; a later run starts in 0.2 s.
 
 The FreeDOS launcher demo (`web/src/demos/dos.ts`, hidden) boots the FreeDOS
 1.2 boot floppy in Alpine's qemu-system-i386 with the curses display. It
-works but is too slow for the launcher: as shipped, the floppy took about
-70 s from qemu's start to the prompt (CLI, 2026-11-15). A stripped
-FDCONFIG.SYS and AUTOEXEC.BAT, and resuming from a qemu state saved at
-the prompt (in the demo now), did not make it fast enough on the page.
-qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
+worked on the riscv64 guest but was too slow for the launcher: as shipped,
+the floppy took about 70 s from qemu's start to the prompt (CLI,
+2026-11-15). A stripped FDCONFIG.SYS and AUTOEXEC.BAT, and resuming from a
+qemu state saved at the prompt (in the demo now), did not make it fast
+enough on the page. qemu's TCG keeps writing new code, which kwemu
+interprets or recompiles. Alpine has qemu-system-i386 and qemu-ui-curses
+for aarch64 (11.0.3); the demo has not been run on the aarch64 guest.
 
 ## Roadmap
 

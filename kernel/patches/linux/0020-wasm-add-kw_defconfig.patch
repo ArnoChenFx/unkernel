@@ -1,4 +1,4 @@
-From 7f31046471678a4da946e20e5d30e7797c76fa5d Mon Sep 17 00:00:00 2001
+From ce26088b8e90f1da986ee0e988615df8073484c1 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:10 +0000
 Subject: [PATCH] wasm: add kw_defconfig
@@ -18,6 +18,10 @@ modules, initramfs, hvc console, printk):
   OVERLAY_FS       a writable root over the initramfs, upper layer on
                    the data disk; the optional features stay off, since
                    the lower layer is unpacked again at every boot
+  EROFS_FS         a distro's read-only root image on kwblk, zstd
+                   compressed (lz4 maps scattered pages with vm_map_ram,
+                   which the flat vmalloc cannot do); xattrs with POSIX
+                   ACLs and security.* (file capabilities)
   9P_FS, NET_9P_FD host file systems: a guest program connects AF_VSOCK
                    to the host and mounts trans=fd on it (NET_9P
                    selects NETFS_SUPPORT; no virtio transport)
@@ -48,16 +52,16 @@ calls. Built with FRAME_WARN=1024, no other function warns.
 
 Signed-off-by: Pooya Parsa <pooya@pi0.io>
 ---
- arch/wasm/configs/kw_defconfig | 153 +++++++++++++++++++++++++++++++++
- 1 file changed, 153 insertions(+)
+ arch/wasm/configs/kw_defconfig | 165 +++++++++++++++++++++++++++++++++
+ 1 file changed, 165 insertions(+)
  create mode 100644 arch/wasm/configs/kw_defconfig
 
 diff --git a/arch/wasm/configs/kw_defconfig b/arch/wasm/configs/kw_defconfig
 new file mode 100644
-index 00000000000..0e1809fd2b4
+index 00000000000..351501c323f
 --- /dev/null
 +++ b/arch/wasm/configs/kw_defconfig
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,165 @@
 +# unkernel: wasm64 kernel, emulated riscv64 user mode (kwemu)
 +# CONFIG_LOCALVERSION_AUTO is not set
 +CONFIG_DEFAULT_HOSTNAME="unkernel"
@@ -192,7 +196,19 @@ index 00000000000..0e1809fd2b4
 +CONFIG_SYSFS=y
 +CONFIG_TMPFS=y
 +CONFIG_TMPFS_POSIX_ACL=y
-+# CONFIG_MISC_FILESYSTEMS is not set
++# erofs: a distro's read-only root image on kwblk, compressed with zstd;
++# xattrs with ACLs and security.* (file capabilities). lz4, which
++# EROFS_FS_ZIP always brings, fails here: it maps scattered pages with
++# vmap/vm_map_ram, which VMALLOC_FLAT cannot (ENOMEM). microLZMA is off.
++CONFIG_MISC_FILESYSTEMS=y
++CONFIG_EROFS_FS=y
++CONFIG_EROFS_FS_XATTR=y
++CONFIG_EROFS_FS_POSIX_ACL=y
++CONFIG_EROFS_FS_SECURITY=y
++CONFIG_EROFS_FS_BACKED_BY_FILE=y
++CONFIG_EROFS_FS_ZIP=y
++# CONFIG_EROFS_FS_ZIP_LZMA is not set
++CONFIG_EROFS_FS_ZIP_ZSTD=y
 +# 9p over a file descriptor (trans=fd), such as an AF_VSOCK socket to a file
 +# server on the host; the network file systems menu holds 9P_FS, and nothing
 +# else in it is on

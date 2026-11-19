@@ -1,4 +1,4 @@
-From 782bc9c2d08888e11d0586ae535d4e4fcd564208 Mon Sep 17 00:00:00 2001
+From 9a4a5b07a3aa4754ac228150f3ccd9b82935c201 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -153,7 +153,7 @@ index 49049055794..8512b7e3cae 100644
  KCFLAGS += -nostdlib -fno-builtin
  KCFLAGS += -march=wasm64
 diff --git a/arch/wasm/configs/kw_defconfig b/arch/wasm/configs/kw_defconfig
-index 0e1809fd2b4..c57106f46df 100644
+index 351501c323f..a7ffb040f47 100644
 --- a/arch/wasm/configs/kw_defconfig
 +++ b/arch/wasm/configs/kw_defconfig
 @@ -1,4 +1,4 @@

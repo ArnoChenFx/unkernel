@@ -17,7 +17,7 @@ parameters, documented at its top), `store.ts` (the UI state, read with
 drive, plus `rebootUrl()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
-it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
+it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `shims.ts` and `kw-shim.sh` (the fx, claude and opencode stand-ins; Stand-ins below), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
 `preview.ts` (the guest preview's page side), `fx.ts` (the fx coding
@@ -487,6 +487,63 @@ drag shared with the preview: `dragSplit()`); over the stage under 720 px.
 - Checked by hand, plus a scratch run on 2026-11-16 (headless Chromium,
   built page): the panel docks and hides, Vercel sign-in reaches the device
   code, the narrow layout covers the stage. No browser test.
+- The guest's own `fx` command is a stand-in (Stand-ins below); the hidden
+  fx demo (`?demo=fx`, `src/demos/fx.ts`) just runs it.
+
+## Stand-ins (fx, claude, opencode)
+
+`shims.ts` writes `~/.local/bin/fx`, `claude` and `opencode` with one
+`vm.exec()` once user space runs, before a `?demo=` relaunch (boot.ts
+passes it the texts of `kw-shim.sh` and `kernel/guest/kw-path.sh` as Vite
+`?raw` imports; shims.ts itself has none, so `test/api.test.ts` runs its
+shell text through the SDK). Each is `kw-shim.sh` with its name filled in;
+both files describe the rest at their top:
+
+- Writing: when the file is missing, or holds an older stand-in (`# kw-shim
+  N` on line 2: bump N when kw-shim.sh changes). A program there (not a
+  script, or a symlink) is never touched; one the user deleted comes back
+  as a stand-in at the next start. Each write holds the stand-in's lock.
+  `/etc/profile.d/kw-path.sh` is written too when missing (a bundle from
+  before the image carried it). In the overlay's upper layer, so once per
+  data disk; once per boot with `?data=0`.
+- The first call installs the newest release, straight from the URLs the
+  official installers use (fx.sh/setup.sh, claude.ai/install.sh,
+  opencode.ai/v2/install; none of them is run), and is replaced by it: fx
+  in place (`~/.local/bin/fx`), claude as `claude install` lays it out
+  (`~/.local/share/claude/versions/VER`, symlinked from `~/.local/bin`),
+  opencode in `~/.opencode/bin` (symlinked). `KW_FX_VERSION`,
+  `KW_CLAUDE_VERSION` (also `stable`) and `KW_OPENCODE_VERSION` pin one.
+  Checked: claude against its manifest's SHA-256 and size, opencode against
+  the npm registry's sha512; fx publishes no checksums, so only gzip's CRC
+  and the ELF header (as its own installer). The download streams through
+  the hash into a temporary file next to the final one (no copy in /tmp),
+  after a free-space check; one install at a time per tool; a cut-off one
+  leaves nothing; without a network the stand-in says so and exits 127.
+  It installs zstd and pigz with apk when it can (unpacking 3x faster), and
+  works without them. Downloads run with `OPENSSL_armcap=0`: the image's
+  libcrypto ignores NEON and the crypto extensions anyway, but a stock
+  libcrypto3 (`apk upgrade`, `apk fix`) uses them, and kwemu interprets
+  them (guest-packages.md).
+- Sizes and times (Node CLI and SDK, 512 MiB, data disk, 2026-11-18): fx
+  4.5 MB download, 6.9 MB, first call 2.5 s, later ones 0.01 s; claude
+  2.1.327 127 MB (`.zst`), 357 MB, 23 s, then `--version` 0.2 s, `--help`
+  6 s; opencode 2.3.2 120 MB, 248 MB, 22 s, then `--version` 6 s (its own
+  startup). All three also run at 256 MiB. Without a data disk the root is
+  in RAM (230 MiB free at 512 MiB): fx installs, claude and opencode refuse
+  with a message; at 1 GiB claude fits.
+- claude's own auto-updater is left on: it may download a newer version
+  into `~/.local/share/claude/versions` in the background and keep the old
+  one until it cleans up, so up to twice its size on the data disk.
+- The guest downloads everything itself (wget, TLS in the guest, through
+  Wisp on the page). download.ts could not help much: downloads.claude.ai
+  sends no CORS headers and is https only; registry.npmjs.org and
+  releases.fx.sh send `Access-Control-Allow-Origin: *`, but the guest's TLS
+  is not the bottleneck any more (claude's `.zst` in 11 s and opencode's
+  tarball in 4 s through the default Wisp server from a server host,
+  2026-11-18).
+- Checked with the SDK (the exact `vm.exec()`, then each tool from a login
+  shell and directly) and in `test/api.test.ts` (no network). The page
+  itself was not opened.
 
 ## Launcher
 

@@ -34,7 +34,11 @@ Things to try
   htop              Or just type the command: if it is missing, the
                     package that provides it is installed for you
                     (KW_AUTO_APK=0 turns that off).
-  glimmer           A tiny game, with graphics and sound.
+  claude, opencode, fx
+                    Coding agents, installed into ~/.local/bin the
+                    first time you run one (claude and opencode are
+                    250-360 MB, so they need the data disk).
+  glimmer          A tiny game, with graphics and sound.
   python3 -m http.server 8000
                     Guest web servers open in the page's preview
                     (Ctrl-A p).

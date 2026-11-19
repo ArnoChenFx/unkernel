@@ -573,9 +573,12 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   ARMv8.2 path (SHA512H and AdvSIMD) is all generic ops, its integer path
   is compiled: `openssl speed -evp sha512` 10 MB/s against 128 MB/s with
   `kw.isa=-sha512` (2026-11-18, a64.md, Crypto). The fix is JIT
-  translation of the AdvSIMD integer ops and SHA512H/H2/SU0/SU1; SHA-256
-  is already faster on its hardware path (26 against 3 MB/s, its fallback
-  is NEON).
+  translation of the AdvSIMD integer ops and SHA512H/H2/SU0/SU1. The
+  same holds for every other OpenSSL path that HWCAP selects (SHA-256 26
+  MB/s on its hardware path, 3 on NEON, 57 on its integer path; AES,
+  GHASH, ChaCha20-Poly1305 likewise), so the image's rebuilt libcrypto
+  ignores HWCAP (guest-packages.md); programs with their own OpenSSL or
+  crypto code still see the capabilities.
 - **One timing-sensitive case in `pnpm test:api`** failed now and then
   on the decoded-op tier bundle (2026-11-17; not seen in 4 runs on the
   JIT bundle, 2026-11-18): the inline `display, evdev and sound` case
@@ -585,13 +588,34 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 - **aarch64 image: not yet rerun.** The Ubuntu arm64 disk, x86_64, i386
   and arm binaries through qemu-user (riscv64 works: a static riscv64
   program installed qemu-riscv64 and its library root on first run, 60 s,
-  and then ran in 0.4 s, 2026-11-17), the `KW_ALPINE_OPT=1` rebuild, and
-  the page.
-- **GNU ld binaries exec slower** (measured on the riscv64 guest). Alpine
-  links everything with GNU ld, whose one R+X segment for code and
-  read-only data cost about 0.5 ms per exec under riscv64 kwemu against
-  lld's layout (guest-packages.md). The cause on the kwemu or kernel side
-  is not known. Not measured on aarch64.
+  and then ran in 0.4 s, 2026-11-17), and the page. The page's fx,
+  claude and opencode stand-ins (web.md, Stand-ins) are checked through
+  the SDK only; in a browser, writing claude's 357 MB and opencode's
+  248 MB to the IndexedDB data disk has not been timed. The ubuntu and
+  sqlite demos are still written for riscv64.
+- **GNU ld binaries exec slower.** Alpine links everything with GNU ld,
+  whose one R+X segment for code and read-only data cost about 0.5 ms per
+  exec under riscv64 kwemu against lld's layout; on aarch64 about 0.07
+  ms (busybox, 150 execs 230 against 220 ms, 2026-11-18;
+  guest-packages.md). The cause on the kwemu or kernel side is not known.
+- **aarch64 is still slower than riscv64 where nothing is interpreted.**
+  With the rebuilt packages (guest-packages.md, 2026-11-18) the apk
+  commands that parse the index take 11-22% longer than on riscv64,
+  although they run about 12% fewer instructions (qemu: `apk search -q
+  busybox` 234M A64 against 267M riscv64; ash, sort, gzip and gunzip
+  9-20% fewer) and almost no generic ops (0.05-0.1%). A `-Dkwemu-stats`
+  kernel shows where it goes: apk runs 20-26% of its instructions
+  interpreted (blocks below the compile threshold, and the rest of a pass
+  after a hand-back; hand-backs mostly at loads, `ldr64_i`, `ldp64`,
+  `stp64`, then generic ops), an ash loop 10-15% (190-235K generic
+  hand-backs in about 430M instructions: musl's memset `dup`/`movi` and
+  malloc's `ldaxr`/`stlxr`), sort and gzip 5-9% (busybox `seq`: its `double` arithmetic and musl's
+  printf, which formats through 128-bit `long double` in libgcc's soft
+  float: `fmov`, `fcmpe`, `ucvtf`, `mrs` FPCR for the rounding mode). Candidates, by the share they cover: the
+  per-instruction cost of compiled A64 code against riscv64's (NZCV and
+  flag-setting ops are 15-20% of the mix), the loads that hand back,
+  then the exclusives and scalar FP moves as JIT ops, then musl's
+  AdvSIMD memset.
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
   nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
   `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but

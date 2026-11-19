@@ -27,7 +27,7 @@ The riscv CPU is kept in src/cpu and src/emu for reference
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, apk handling |
-| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`, off by default on aarch64): build, numbers, traps |
+| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`alpine-opt.sh`): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
 | [.agents/testing.md](.agents/testing.md) | the full test matrix, for releases or when asked |
 | [.agents/status.md](.agents/status.md) | roadmap, open issues, work not yet in the image |
@@ -105,11 +105,11 @@ Details are in the area files.
   check `$KOUT/.config` after a change.
 - `js/core` stays universal: no `node:` imports, no unguarded DOM APIs
   (js.md).
-- With `KW_ALPINE_OPT=1` the image's busybox, zlib, openssl and
-  apk-tools are rebuilt from pinned aports commits
-  (`kernel/guest/alpine-opt.sh`; off by default on aarch64). An Alpine
-  update needs new pins there; with the rebuild on, `alpine.sh` stops
-  until they match (guest-packages.md).
+- The image's busybox, zlib, openssl and apk-tools are rebuilt from
+  pinned aports commits (`kernel/guest/alpine-opt.sh`; `KW_ALPINE_OPT=0`
+  keeps Alpine's builds), without FP or AdvSIMD code in hot paths and
+  with libcrypto on its integer code. An Alpine update needs new pins
+  there; `alpine.sh` stops until they match (guest-packages.md).
 - Guest C programs in the image (`kernel/guest/*.c`) are built for the
   generic ARMv8.0 CPU. Check new code with the coverage classifier
   (a64.md, Coverage tool): it lists what kwemu rejects (later architecture

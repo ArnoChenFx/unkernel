@@ -22,6 +22,7 @@ import type { AddressInfo } from "node:net";
 import { availableParallelism, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { SHIM_TOOLS, shimsExec } from "../web/src/shims.ts";
 
 const spec = process.env.UNKERNEL_DIST ? "unkernel" : "../js/node.ts";
 const sdk: typeof import("../js/node.ts") = await import(spec);
@@ -1286,6 +1287,44 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			const cwd = await k.vm.exec("pwd", [], { cwd: "/tmp", env: { X: "1" } });
 			assert.equal(cwd.stdout, "/tmp\n");
 			await assert.rejects(k.vm.exec("/no/such/program"), (e: Error & { code?: string }) => e.code === "EREMOTE" && /exec \/no\/such\/program/.test(e.message));
+		});
+
+		test("PATH: ~/.local/bin, then /etc/profile's, for programs kwtty starts and for login shells (kwtty.c, kw-path.sh)", async () => {
+			const want = "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n";
+			assert.equal((await k.vm.exec("sh", ["-c", 'echo "$PATH"'])).stdout, want);
+			assert.equal((await k.vm.exec("sh", ["-lc", 'echo "$PATH"'])).stdout, want);
+		});
+
+		test("the page's stand-ins (web/src/shims.ts): written once, replaced only by a newer one, never over a program; without a network one exits 127 and installs nothing", async () => {
+			const texts = {
+				shim: readFileSync(new URL("../web/src/kw-shim.sh", import.meta.url), "utf8"),
+				pathSh: readFileSync(new URL("../kernel/guest/kw-path.sh", import.meta.url), "utf8"),
+			};
+			const write = async (t = texts) => {
+				const { args, input } = shimsExec(t);
+				const r = await k.vm.exec("/bin/sh", args, { input });
+				assert.equal(r.exitCode, 0, r.stderr);
+				return r.stdout;
+			};
+			const bin = "/root/.local/bin";
+			await k.vm.exec("rm", ["-rf", "/root/.local"]);
+			// The image has /etc/profile.d/kw-path.sh, so only the stand-ins are written.
+			assert.equal(await write(), SHIM_TOOLS.map((n) => `${bin}/${n}\n`).join(""));
+			assert.equal(await write(), "");
+			for (const n of SHIM_TOOLS) {
+				const r = await k.vm.exec("sh", ["-c", `head -n 2 ${bin}/${n}; test -x ${bin}/${n} && sh -n ${bin}/${n} && grep -c '^tool=${n}$' ${bin}/${n}`]);
+				assert.equal(r.stdout, "#!/bin/sh\n# kw-shim 1\n1\n", r.stderr);
+			}
+			// A program in place of a stand-in (a symlink here) stays; a newer stand-in replaces older ones.
+			await k.vm.exec("ln", ["-sf", "/bin/busybox", `${bin}/claude`]);
+			assert.equal(await write({ ...texts, shim: texts.shim.replace(/^# kw-shim \d+$/m, "# kw-shim 999") }), `${bin}/fx\n${bin}/opencode\n`);
+			assert.equal((await k.vm.exec("readlink", [`${bin}/claude`])).stdout, "/bin/busybox\n");
+			// No network in this suite: found through kwtty's PATH, the first call exits 127 and leaves only the stand-ins.
+			const r = await k.vm.exec("fx", ["--version"]);
+			assert.equal(r.exitCode, 127);
+			assert.match(r.stderr, /^fx: not installed yet, and installing it needs a network/);
+			assert.equal((await k.vm.exec("sh", ["-c", "ls -A /root/.local /root/.local/bin"])).stdout, "/root/.local:\nbin\n\n/root/.local/bin:\nclaude\nfx\nopencode\n");
+			await k.vm.exec("rm", ["-rf", "/root/.local"]);
 		});
 
 		test("exec(): binary output byte for byte, input through stdin then EOF, 300 KB each way", async () => {

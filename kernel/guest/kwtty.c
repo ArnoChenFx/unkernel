@@ -896,7 +896,6 @@ out:
 
 static void __attribute__((noreturn)) session(int s)
 {
-	static const char path[] = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
 	const char *home = "/", *user = "root", *shell = "/bin/sh", *base, *file;
 	unsigned char h[HDR], *p, opened[14];
 	struct open_req o = { 0 };
@@ -957,17 +956,21 @@ static void __attribute__((noreturn)) session(int s)
 		refuse(s, "out of memory");
 	argv[1] = NULL;
 	{
-		char *d[5];
+		char *d[6];
 
+		/* PATH: a login shell's (/etc/profile, then kw-path.sh), so that
+		 * programs started directly find /usr/local/bin and ~/.local/bin. */
 		if (asprintf(&d[0], "HOME=%s", home) < 0 ||
 		    asprintf(&d[1], "USER=%s", user) < 0 ||
 		    asprintf(&d[2], "LOGNAME=%s", user) < 0 ||
 		    asprintf(&d[3], "SHELL=%s", shell) < 0 ||
-		    asprintf(&d[4], "TERM=%s", o.term) < 0)
+		    asprintf(&d[4], "TERM=%s", o.term) < 0 ||
+		    asprintf(&d[5], "PATH=%s/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			     strcmp(home, "/") ? home : "") < 0)
 			refuse(s, "out of memory");
 		for (int i = 0; i < 4; i++)
 			env_set(env, &nenv, d[i]);
-		env_set(env, &nenv, (char *)path);
+		env_set(env, &nenv, d[5]);
 		/* Programs on pipes get TERM only when the host gives it. */
 		if (!o.pipes || o.has_term)
 			env_set(env, &nenv, d[4]);

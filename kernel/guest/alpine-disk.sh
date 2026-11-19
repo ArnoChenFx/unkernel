@@ -35,8 +35,8 @@ rm -rf "$stage"
 mkdir -p "$stage"
 tar -xzf "$ALPINE_TARBALL" -C "$stage" --no-same-owner 2>/dev/null || true
 chmod -R u+rwX "$stage"
-# busybox, zlib, openssl and apk-tools rebuilt for kwemu with
-# KW_ALPINE_OPT=1 (see alpine.sh; off by default).
+# busybox, zlib, openssl and apk-tools rebuilt for kwemu (see alpine.sh;
+# KW_ALPINE_OPT=0 keeps Alpine's builds).
 "$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk with main only, community in /etc/kw-apk-lazy (see alpine.sh).
 r="$stage/etc/apk/repositories"
@@ -106,10 +106,11 @@ grep -qx hvc0 "$stage/etc/securetty" 2>/dev/null || echo hvc0 >> "$stage/etc/sec
 # TERM: busybox init gives the console vt102 (no colors); the page's xterm.js
 # and the CLI's host terminal are xterm-compatible.
 printf '%s\n' 'case $TERM in linux|vt102|"") export TERM=xterm-256color ;; esac' > "$stage/etc/profile.d/kw-term.sh"
-# Home (/root, not busybox init's /), the prompt, and installing missing
-# commands with apk.
+# Home (/root, not busybox init's /), the prompt, ~/.local/bin on PATH, and
+# installing missing commands with apk.
 from_alpine_sh etc/profile.d/kw-home.sh HOME=/root
 from_alpine_sh etc/profile.d/kw-prompt.sh PS1
+install -m 644 "$root/kernel/guest/kw-path.sh" "$stage/etc/profile.d/kw-path.sh"
 from_alpine_sh etc/profile.d/kw-apk.sh command_not_found_handle
 from_alpine_sh etc/kw-apk-install APKINDEX
 from_alpine_sh etc/kw-apk-enable kw-apk-lazy

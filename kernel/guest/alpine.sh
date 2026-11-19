@@ -57,10 +57,11 @@ chmod 1777 "$stage/tmp" "$stage/var/tmp"
 # and upgrading libcrypto3 or libssl3 brings them back.
 rm -rf "$stage/usr/lib/engines-3" "$stage/usr/lib/ossl-modules/legacy.so" \
 	"$stage/etc/ssl/openssl.cnf.dist" "$stage/etc/ssl/ct_log_list.cnf.dist"
-# With KW_ALPINE_OPT=1: busybox, zlib, libcrypto, libssl, libapk and apk
-# rebuilt for kwemu's CPU (gcc 16 -O2, linked with lld), from the same
-# source as these packages; see alpine-opt.sh. Off by default for aarch64
-# (Alpine's own builds). alpine-disk.sh does the same.
+# busybox, zlib, libcrypto, libssl, libapk and apk rebuilt for kwemu's CPU
+# (gcc 16 -O2, integer registers only where a file allows, lld; libcrypto on
+# its integer code paths), from the same source as these packages; see
+# alpine-opt.sh. KW_ALPINE_OPT=0 keeps Alpine's builds. alpine-disk.sh does
+# the same.
 "$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk starts with main only. Every apk command that loads the indexes parses
 # all of them, and community (21k packages to main's 6k) makes that ~2.7 s
@@ -158,6 +159,9 @@ cat > "$stage/etc/profile.d/kw-prompt.sh" <<'EOF'
 PS1='\[\033[36m\]\w \[\033[35m\]⇒\[\033[0m\] '
 export PS1
 EOF
+# ~/.local/bin first on PATH (kernel/guest/kw-path.sh): /etc/profile sets a
+# fixed PATH, and profile.d runs after it. alpine-disk.sh does the same.
+install -m 644 "$root/kernel/guest/kw-path.sh" "$stage/etc/profile.d/kw-path.sh"
 # Command not found (e.g. node, htop): install whatever provides it with
 # `apk add cmd:NAME` (in gray) when there is a network, then run it. Alpine's
 # busybox ash calls command_not_found_handle with the name only, so the

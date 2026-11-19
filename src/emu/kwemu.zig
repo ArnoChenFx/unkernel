@@ -1143,9 +1143,18 @@ fn kw_debug_stats(cpu: *Cpu, out: *Stats) callconv(.c) void {
 }
 /// -Dkwemu-stats with the JIT only (not part of the ABI): the struct kw_cpu
 /// whose emit buffer is `buf` (the pointer kw_host_jit_compile receives),
-/// so a host can find the cpu to pass to kw_debug_stats.
-fn kw_debug_cpu_of_jit_buf(buf: usize) callconv(.c) usize {
+/// so a host can find the cpu to pass to kw_debug_stats. src/a64/run.zig
+/// exports it too.
+pub fn kw_debug_cpu_of_jit_buf(buf: usize) callconv(.c) usize {
     return buf - (@offsetOf(Cpu, "priv") + @offsetOf(Priv, "jit") + @offsetOf(jc.State, "buf"));
+}
+
+// Named for the filter of the wasm64+jit unit tests (build.zig), which import it.
+test "a64 jit: kw_debug_cpu_of_jit_buf finds the cpu of its emit buffer" {
+    if (!jc.enabled) return error.SkipZigTest;
+    const cpu = try std.testing.allocator.create(Cpu);
+    defer std.testing.allocator.destroy(cpu);
+    try std.testing.expectEqual(@intFromPtr(cpu), kw_debug_cpu_of_jit_buf(@intFromPtr(&cpu.priv.jit.buf)));
 }
 fn kw_abi_version() callconv(.c) u32 {
     return abi_version;

@@ -9,11 +9,15 @@
 # APKBUILDs build them, except:
 #   - gcc 16 (Bootlin's aarch64 musl toolchain, used with a sysroot of
 #     Alpine's own packages: musl-dev is the image's musl) at -O2 for
-#     armv8-a, where Alpine uses gcc 15 at -Os (busybox: -Oz and
-#     -finline-limit=0);
+#     armv8-a without the vectorizer, and with -mgeneral-regs-only for every
+#     file that has no float types, where Alpine uses gcc 15 at -Os
+#     (busybox: -Oz and -finline-limit=0): kwemu's JIT compiles integer
+#     code and interprets FP and AdvSIMD instructions;
 #   - linked with lld, not GNU ld (whose one R+X segment for code and
-#     read-only data made each exec ~0.5 ms slower under riscv64 kwemu),
-#     with RELR relocations; busybox is not PIE (apk is, as in Alpine).
+#     read-only data makes each exec slower under kwemu), with RELR
+#     relocations; busybox is not PIE (apk is, as in Alpine);
+#   - libcrypto ignores AT_HWCAP: it runs its integer code, not the NEON
+#     and crypto-extension code (OPENSSL_armcap still overrides).
 # Numbers, traps and the update procedure: .agents/guest-packages.md.
 #
 #   kernel/guest/alpine-opt.sh                 build all (again)
@@ -22,11 +26,9 @@
 #                                              stage (alpine.sh, alpine-disk.sh);
 #                                              builds first if out of date
 #
-# Off by default on aarch64: --install does nothing (Alpine's builds stay)
-# unless KW_ALPINE_OPT=1. The tuning was measured for riscv64 kwemu with its
-# JIT; the A64 kwemu has no JIT yet (.agents/guest-packages.md). A stage
-# from an ALPINE_TARBALL override whose versions differ keeps Alpine's
-# builds too. Building needs an x86_64 host (the gcc toolchain).
+# KW_ALPINE_OPT=0 keeps Alpine's builds (--install does nothing); so does a
+# stage from an ALPINE_TARBALL override whose versions differ. Building
+# needs an x86_64 host (the gcc toolchain).
 #
 # Output: vendor/build/alpine-opt/root/ (installed files, as in the image;
 # the build trees are under vendor/build/alpine-opt/src/). zlib and openssl
@@ -70,9 +72,15 @@ GCC_TC=aarch64--musl--bleeding-edge-2026.08-1
 GCC_TC_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/$GCC_TC.tar.xz"
 GCC_TC_SHA256=aa465cba276340e377b881dfdd1429db01d8b2f170a309ed2c25158d3b44f447
 
-# ARMv8.0 (what kwemu runs). gcc's default -moutline-atomics stays: its
-# helpers use LSE only when AT_HWCAP has ATOMICS, which kwemu never sets.
-OPT_CFLAGS="-O2 -march=armv8-a"
+# ARMv8.0 (what kwemu runs). kwemu's JIT compiles integer, load/store and
+# branch instructions; FP and AdvSIMD data processing are `generic` ops that
+# it hands back to the interpreter one by one, and a compiled block stops at
+# the first. gcc -O2 vectorizes (-ftree-vectorize, gcc 12 and later) and
+# spills general registers to FP registers (fmov): busybox's sha256sum ran
+# 44% generic ops and ten times slower than Alpine's -Os build. So: no
+# vectorizer, and -mgeneral-regs-only for every file that compiles with it
+# (the cc wrapper, setup()); files with float types build without it.
+OPT_CFLAGS="-O2 -march=armv8-a -fno-tree-vectorize"
 # --undefined-version: lld rejects version scripts naming symbols a link
 # does not define, which GNU ld allows (zlib's configure test does that).
 OPT_LDFLAGS="-Wl,--as-needed,-O1,--sort-common -Wl,-z,pack-relative-relocs -Wl,--undefined-version"
@@ -153,9 +161,41 @@ setup() {
 	# (busybox's build tools) is zig cc, which finds the host's libc by
 	# asking $CC, so its wrapper unsets that.
 	printf '#!/bin/sh\nexec "%s" ld.lld "$@"\n' "$zig" > "$b/bin/lld/ld.lld"
+	# Each C compile (-c of a .c file) first with -mgeneral-regs-only (no FP
+	# or AdvSIMD registers in the code gcc generates), and again without it
+	# if that fails, which is what a file using float types does. A
+	# variadic function built that way does not save the FP argument
+	# registers, so a double passed to it is lost (busybox awk's printf
+	# printed 0.00): kw-gro.h makes va_start fail to compile under
+	# -mgeneral-regs-only, which sends such files down the second path too.
+	# The first attempt's messages are shown only when it succeeds.
+	cat > "$b/bin/kw-gro.h" <<-'EOF'
+	/* alpine-opt.sh: va_start needs the FP registers (see there) */
+	#include <stdarg.h>
+	static inline __attribute__((always_inline)) void kw_gro_va_start(void)
+	{
+		__asm__ volatile("" :: "w"(0.0));
+	}
+	#undef va_start
+	#if (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)
+	#define va_start(...) (kw_gro_va_start(), __builtin_c23_va_start(__VA_ARGS__))
+	#else
+	#define va_start(v, l) (kw_gro_va_start(), __builtin_va_start(v, l))
+	#endif
+	EOF
 	cat > "$b/bin/cc" <<-EOF
 	#!/bin/sh
-	exec "$tc-gcc" --sysroot="$sysroot" -fuse-ld=lld -B"$b/bin/lld/" "\$@"
+	set -- --sysroot="$sysroot" -fuse-ld=lld -B"$b/bin/lld/" "\$@"
+	c= src=
+	for a; do case "\$a" in -c) c=1 ;; *.c) src=1 ;; esac; done
+	if [ -n "\$c" ] && [ -n "\$src" ]; then
+		log=\$(mktemp)
+		if "$tc-gcc" -mgeneral-regs-only -include "$b/bin/kw-gro.h" "\$@" 2> "\$log"; then
+			cat "\$log" >&2; rm -f "\$log"; exit 0
+		fi
+		rm -f "\$log"
+	fi
+	exec "$tc-gcc" "\$@"
 	EOF
 	printf '#!/bin/sh\nunset CC\nexec "%s" cc "$@"\n' "$zig" > "$b/bin/host-cc"
 	chmod +x "$b/bin/cc" "$b/bin/host-cc" "$b/bin/lld/ld.lld"
@@ -204,9 +244,28 @@ build_zlib() {
 build_openssl() {
 	fetch openssl
 	unpack openssl "openssl-${ver%-r*}.tar.gz" "openssl-${ver%-r*}"
-	# As the APKBUILD's native build (threads on). The riscv64 build had
-	# crypto/sha/sha256.c at -Os here (faster under that kwemu's JIT); on
-	# aarch64 OpenSSL's SHA-256 is assembly (sha256-armv8.S).
+	# libcrypto picks its aarch64 code from AT_HWCAP: the AES, PMULL, SHA-1,
+	# SHA-256 and SHA-3 instructions and NEON (vpaes, GHASH, ChaCha20,
+	# Poly1305), all of them generic ops under kwemu. Its integer paths
+	# (the scalar assembly and the C code) are compiled by the JIT and
+	# faster for every algorithm (.agents/guest-packages.md): ChaCha20-
+	# Poly1305 about 30x, SHA-1 4x, SHA-256 2x, AES 1.5-2x. So the default
+	# capability set is empty; OPENSSL_armcap in the environment still
+	# overrides it, as upstream.
+	patch -s -p1 <<-'EOF'
+	--- a/crypto/armcap.c
+	+++ b/crypto/armcap.c
+	@@ -264,6 +264,8 @@
+	         OPENSSL_armcap_P = (unsigned int)strtoul(e, NULL, 0);
+	         return;
+	     }
+	+    /* unkernel: kwemu runs the integer paths faster (alpine-opt.sh) */
+	+    return;
+
+	 #if defined(__APPLE__)
+	 #if !defined(__aarch64__)
+	EOF
+	# As the APKBUILD's native build (threads on).
 	cat > "$b/bin/cc-openssl" <<-EOF
 	#!/bin/sh
 	exec "$b/bin/cc" "\$@"
@@ -258,7 +317,7 @@ build_apk_tools() {
 
 build() {
 	local p t f
-	[ "$(uname -m)" = x86_64 ] || { echo "alpine-opt: building needs an x86_64 host (Bootlin's gcc); without KW_ALPINE_OPT=1 the images keep Alpine's builds" >&2; exit 1; }
+	[ "$(uname -m)" = x86_64 ] || { echo "alpine-opt: building needs an x86_64 host (Bootlin's gcc); KW_ALPINE_OPT=0 keeps Alpine's builds" >&2; exit 1; }
 	for t in meson ninja pkg-config patch perl; do
 		command -v $t > /dev/null || { echo "alpine-opt: need $t" >&2; exit 1; }
 	done
@@ -286,8 +345,8 @@ build() {
 # audit` lists them); upgrading a package brings Alpine's build back.
 install_into() {
 	local stage=$1 db="$1/lib/apk/db/installed" p f want have
-	if [ "${KW_ALPINE_OPT:-0}" != 1 ]; then
-		echo "alpine-opt: keeping Alpine's builds (KW_ALPINE_OPT=1 installs the rebuild)"
+	if [ "${KW_ALPINE_OPT:-1}" = 0 ]; then
+		echo "alpine-opt: KW_ALPINE_OPT=0, keeping Alpine's builds"
 		return
 	fi
 	[ "$(cat "$b/.stamp" 2> /dev/null)" = "$stamp" ] || build $pkgs

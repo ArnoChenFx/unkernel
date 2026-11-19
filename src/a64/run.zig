@@ -138,9 +138,12 @@ pub fn exportAbi() void {
     @export(&kw_host_reset, .{ .name = "kw_host_reset" });
     // Not part of the ABI: the reference loop for differential tests (the
     // harness's --lockstep and --ref), and the counters of a -Dkwemu-stats
-    // build.
+    // build, with the lookup from an emit buffer to its cpu that a host
+    // (js/core/jit.ts) needs to read them.
     @export(&kw_debug_run_ref, .{ .name = "kw_debug_run_ref" });
     if (kwemu.stats_on) @export(&kw_debug_stats, .{ .name = "kw_debug_stats" });
+    if (kwemu.stats_on and @import("../emu/jitcore.zig").enabled)
+        @export(&kwemu.kw_debug_cpu_of_jit_buf, .{ .name = "kw_debug_cpu_of_jit_buf" });
 }
 
 fn kw_debug_run_ref(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {

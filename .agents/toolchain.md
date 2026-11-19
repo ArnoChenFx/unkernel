@@ -67,8 +67,9 @@ The API differs from 0.13-0.15. Examples of all of these are in
   tools first on `PATH` for such runs.
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
 - `kernel/guest/alpine-opt.sh` (run by `alpine.sh` and `alpine-disk.sh`;
-  it builds only with `KW_ALPINE_OPT=1`) also needs meson, ninja, pkg-config, patch, lua 5.x, and perl with
-  FindBin, IPC::Cmd and File::Compare (guest-packages.md).
+  `KW_ALPINE_OPT=0` skips it) also needs meson, ninja, pkg-config, patch,
+  lua 5.x, and perl with FindBin, IPC::Cmd and File::Compare
+  (guest-packages.md).
 - `setup.sh` runs only ELF binaries for its version checks, so a wrapper
   that installs packages on first use is never triggered.
 

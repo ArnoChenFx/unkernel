@@ -123,7 +123,7 @@ and `stats` are separate and not part of `all`):
   without mke2fs warns and goes on.
 * **alpine** (`guest/alpine.sh`), the only initramfs, `vendor/build/initramfs/alpine.cpio`, and `alpine-test.cpio`, which always has kwtest and kwbench:
   * The Alpine minirootfs 3.24.4 (version and checksum pinned in `tools/env.sh`, `ALPINE_TARBALL=file` overrides). It gets a small `/init` and an inittab with `hvc0::respawn:-/bin/sh` and `::respawn:/usr/bin/kwtty serve` (see vsock).
-  * Every package is Alpine's own aarch64 build. `KW_ALPINE_OPT=1` swaps in busybox, zlib, libcrypto, libssl, libapk and apk rebuilt from the same sources (`guest/alpine-opt.sh`: gcc 16 `-O2 -march=armv8-a`, linked with lld), in the disk image too; on riscv64 with its JIT that made shell scripts about 20% faster and apk about 11% (2026-11-16), and it is off until the A64 kwemu has a JIT. Details in `.agents/guest-packages.md`.
+  * busybox, zlib, libcrypto, libssl, libapk and apk are the same Alpine packages rebuilt for kwemu's CPU (`guest/alpine-opt.sh`: gcc 16 `-O2 -march=armv8-a` without the vectorizer and with integer registers only where a file allows it, linked with lld; libcrypto on its integer code instead of the NEON and crypto-extension code that kwemu interprets). That made an ash loop about 11% faster, gzip and gunzip 30-50%, `apk add` of larger packages 11%, OpenSSL's SHA-256 2.3x, AES-GCM 1.7x and ChaCha20-Poly1305 30x as fast (2026-11-18); `KW_ALPINE_OPT=0` keeps Alpine's builds. Every other package is Alpine's own aarch64 build. The disk image gets them too. Details in `.agents/guest-packages.md`.
   * `/usr/bin/kwtest` and `/usr/bin/kwbench` (`guest/kwtest.c`, `guest/kwbench.c`), built static with `zig cc -target aarch64-linux-musl -mcpu=generic` (ARMv8.0), so they run as `/init` (`rdinit=/usr/bin/kwtest`; it powers off, or halts on a failure) or from the shell. They come as a second cpio archive after the image's, which the kernel unpacks after the first. With `KW_RELEASE=1` (set by the release workflow) `alpine.sh` leaves them out of `alpine.cpio`, so release bundles, the npm package and the deployed page have no kwtest; boot a release bundle with `--initrd alpine-test` to run it. The choice is in `alpine.sh`, not `build.sh`, because `build.sh` is part of CI's kernel cache key. Both archives have the same image id (`/usr/lib/kw-image`), which leaves the test programs out.
   * `/usr/bin/glimmer`, built the same way (see Display, input and sound), and so are `/usr/bin/kwvsock`, `/usr/bin/kwshm`, `/usr/bin/kwtty` and `/usr/bin/kw9p` (see vsock, Host file systems and Shared memory).
   * The cpio archive is written by `tools/mkcpio.py`; no root is needed.
@@ -260,6 +260,14 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
   pushed it there), and on a hit the repository is enabled and apk reuses
   that file rather than downloading it again. kw-qemu enables community too
   (for `qemu-ARCH`).
+* **`~/.local/bin` comes first on PATH** (`/etc/profile.d/kw-path.sh`,
+  `kernel/guest/kw-path.sh`): Alpine's `/etc/profile` sets a fixed PATH,
+  and this adds `$HOME/.local/bin` in front of it for every login shell
+  (the console, terminal sessions, `sh -l`); kwtty gives programs it starts
+  directly the same PATH (see vsock). Per-user installs go there (`pip
+  install --user`, the fx and claude installers), and so do the page's
+  stand-ins for fx, claude and opencode, which install the real program
+  on their first call (.agents/web.md, Stand-ins).
 * **bwrap** is a shim too (`/usr/local/bin/bwrap`,
   `kernel/guest/bwrap-shim.sh`): the kernel has no seccomp, so it drops
   `--seccomp FD` and runs bubblewrap's `/usr/bin/bwrap` with the rest. GTK
@@ -612,7 +620,10 @@ default; the page offers all three.
   guest program can take it): each connection gets its own pty, with its
   own size and resizes, and root's login shell or the program the host
   names on it (argv, working directory, environment), and a hangup when
-  the host closes. With the PIPES option the program gets stdin, stdout
+  the host closes. The environment starts with HOME, USER, LOGNAME, SHELL,
+  TERM (on a pty, or when the host sets it) and a login shell's PATH
+  (`$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
+  so a program started directly finds what a shell would. With the PIPES option the program gets stdin, stdout
   and stderr pipes instead, in a session of its own (a hangup goes to its
   process group), and EOF closes its stdin. With the CONNECT option there
   is no program: kwtty connects to a TCP port on 127.0.0.1 and then

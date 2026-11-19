@@ -25,6 +25,9 @@ import { forgetDemo, launchFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.ts";
 import { writeReadme } from "./readme.ts";
+import { writeShims } from "./shims.ts";
+import SHIM from "./kw-shim.sh?raw";
+import PATH_SH from "../../kernel/guest/kw-path.sh?raw";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
@@ -346,8 +349,11 @@ export function start(): void {
 	});
 	KW.windows = windows;
 	KW.ready = () => guestReady;
+	// The fx, claude and opencode stand-ins in ~/.local/bin (shims.ts), written
+	// before a ?demo= relaunch, which may run one.
+	const shimsWritten = guestReady.then((vm) => writeShims(vm, { shim: SHIM, pathSh: PATH_SH }, (m) => ui.log(m, "h")));
 	// ?demo=<id>: launch that demo again (launcher.ts sets it when one launches).
-	void guestReady.then(launchFromUrl, () => {});
+	void shimsWritten.then(launchFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
 	if (cfg.net) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
 	// Intro notes in /root/README, once per data disk (readme.ts).

@@ -24,7 +24,6 @@ programs).
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
 | [.agents/data-disk.md](.agents/data-disk.md) | the persistent data disk, overlay root, safe mode, image updates |
-| [.agents/guest-packages.md](.agents/guest-packages.md) | busybox, zlib, openssl, apk-tools rebuilt for kwemu (`guest/distro/alpine/opt/build.sh`): build, numbers, traps |
 | [.agents/toolchain.md](.agents/toolchain.md) | patched wasm-ld, Binaryen, Zig 0.16, host tools, pinned downloads |
 | [.agents/testing.md](.agents/testing.md) | quick checks per area, CLI exit codes, the full matrix, release CI |
 | [.agents/status.md](.agents/status.md) | roadmap and open issues; read only for planning, or when asked |

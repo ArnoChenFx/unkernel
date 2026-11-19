@@ -360,9 +360,7 @@ Open:
 
 - **aarch64: the release workflow has not run its build path yet.** New
   in CI are the arm64 patch series (a new kernel tree and build: every
-  kernel cache misses), the package rebuild with Bootlin's aarch64 gcc
-  (guest/distro/alpine/opt/build.sh downloads 163 MB; 79 s on 16 cores locally, 2026-11-18),
-  the aarch64 minirootfs, the guest programs from `zig cc`, and abitest.
+  kernel cache misses), the aarch64 minirootfs, the guest programs from `zig cc`, and abitest.
   Before the first aarch64 release it needs one smoke run (`release`
   unchecked), which shows its time on a hosted runner and whether
   kwtest's timing checks hold there with the A64 JIT.
@@ -384,7 +382,7 @@ Open:
   host.** The image's libcrypto now picks its code from HWCAP and the
   kernel enables SHA512 by default, because the JIT translates those
   paths (aes-128-gcm 99 MB/s, sha256 157, sha512 217 against 24, 59, 131
-  on the integer paths; 2026-11-18, guest-packages.md). A host whose
+  on the integer paths; 2026-11-18, a64/performance.md). A host whose
   engine has no SIMD (V8 on an x86-64 without SSE4.1) runs them as
   interpreter calls, 2-13x slower than the integer paths would be; such a
   host could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0`.

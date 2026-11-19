@@ -151,9 +151,8 @@ are `kernel/build.sh all`'s, split so that each cache is saved after its
 part. Re-running a release skips what exists (the tag, the npm version)
 and uploads only the assets an existing GitHub release lacks, publishing
 it if a cut-off run left it a draft. Caches: the
-toolchain, the kernel tree and builds, the downloads, and the rebuilt
-Alpine packages (keyed on `guest/distro/alpine/opt/build.sh` and the
-Alpine pins); the workflow's header lists their keys.
+toolchain, the kernel tree and builds, and the downloads; the workflow's
+header lists their keys.
 
 Not in the workflow, so only the full matrix covers them: kwtest without
 the JIT on 2 CPUs, the api tests with `UNKERNEL_TEST_CPUS=2`, `zig build

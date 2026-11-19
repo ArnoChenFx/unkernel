@@ -15,7 +15,6 @@ is unrelated: kwemu's own test programs.
 guest/build.sh base                  # vendor/build/initramfs/base.cpio (+ base-test.cpio)
 guest/build.sh distro [NAME...]      # vendor/build/distro/NAME.{erofs,ext4,id}; default: all; then index
 guest/build.sh index                 # vendor/build/distro/distros.json for the images there
-guest/build.sh opt [NAME [ARG...]]   # a distro's package rebuild (distro/NAME/opt/build.sh)
 guest/build.sh list                  # the distros and their versions
 kernel/build.sh base                 # base, then the bundle vendor/build/bundle/unkernel.wasm
 kernel/build.sh distro [NAME...]     # the same as guest/build.sh distro
@@ -30,7 +29,7 @@ kernel/build.sh distro [NAME...]     # the same as guest/build.sh distro
 | `tools/` | host tools: `mkcpio.py` (cpio archives), `mktree.py` (an image's tar stream and id), `erofs-utils.sh` (pinned mkfs.erofs, with `erofs-utils-patches/`), `erofs-trace.py` (the files a traced boot read), `distros-json.mjs` (the index), `vm-run.ts` (run a command in an image at build time); `pins.sh` (erofs-utils, lz4, zstd) |
 | `src/` | the guest programs in the base's kw layer: `kwtty`, `kw9p`, `kwvsock`, `kwshm`, `kwwasi`; `glimmer`, which every distro image gets (`install_common`, `lib/stage.sh`); `src/test/`: `kwtest`, `kwbench`, `abitest` (base-test.cpio) |
 | `base/` | `build.sh`, `pins.sh` (static busybox), `initramfs/` (the cpio root: `/init`, the base shell), `rootfs/` (the kw layer, `/kw/layer`: on top of every distro's root) |
-| `distro/NAME/` | `build.sh`, `pins.sh`, `rootfs/` (files added to the image); Alpine: `opt/build.sh` (busybox, zlib, openssl, apk-tools rebuilt for kwemu); Debian: `tools/` (apt-lz4) |
+| `distro/NAME/` | `build.sh`, `pins.sh`, `rootfs/` (files added to the image); Debian: `tools/` (apt-lz4) |
 
 `distros.json` (written by `guest/build.sh distro` and `index`, and
 refreshed by `kernel/build.sh base`, `kernel`, `smp`, `lower` and
@@ -92,12 +91,10 @@ base's cpio files and, with `kernel/build.sh base`, `unkernel.wasm`; not
 copied to `web/kernel/`), `KW_DISTRO_OUT` (images and staging trees),
 `KW_DISTRO_FORMATS` (`erofs ext4`), `KW_EROFS_COMPRESS`, `KW_EROFS_OPTS`,
 `KW_EXT4_SLACK`, `KW_RELEASE=1` (base.cpio without the test programs),
-`NAME_TARBALL=file` (another upstream tarball), `KW_ALPINE_OPT=0` (Alpine's
-own builds), `KW_ALPINE_OPT_DIR` (the rebuild's cache, default
-`vendor/build/alpine-opt`), `KW_DEBIAN_APT_CACHE=0`, `KW_DISTRO_HINT=0`
-(no distro header, no boot layout), `KW_DISTRO_TRACE=1` (boot the image
-here and record `distro/NAME/boot-files` again: what a boot reads, laid
-out first in the erofs image), `KW_PREFETCH_WHOLE_MAX`. A build beside the
+`NAME_TARBALL=file` (another upstream tarball), `KW_DEBIAN_APT_CACHE=0`,
+`KW_DISTRO_HINT=0` (no distro header, no boot layout), `KW_DISTRO_TRACE=1`
+(boot the image here and record `distro/NAME/boot-files` again: what a
+boot reads, laid out first in the erofs image), `KW_PREFETCH_WHOLE_MAX`. A build beside the
 main outputs:
 
 ```sh

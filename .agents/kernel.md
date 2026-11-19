@@ -435,9 +435,8 @@ the quick loop and never builds SMP.
   `KWEMU=` or `KWEMU_SMP=` count as built from the checkout's sources.
 - **Overrides**: `KSRC` (the tree), `KOUT`, `KOUT_SMP`, and `KW_BUILD` (the
   output root, default `vendor/build`: kernels, kwemu-smp and kwemu-stats,
-  initramfs, the data disk template, bundle, distro images; the toolchain's `vendor/build/lld22` and
-  the Alpine package rebuild's cache stay; `KW_BASE_OUT` and
-  `KW_DISTRO_OUT` move the base and the distro images, guest/README.md).
+  initramfs, the data disk template, bundle, distro images; the toolchain's
+  `vendor/build/lld22` stays; `KW_BASE_OUT` and `KW_DISTRO_OUT` move the base and the distro images, guest/README.md).
   The CLI, `pnpm build` and the tests read `vendor/build`, so pass them
   paths (`--kernel`, `--distro`, `UNKERNEL_TEST_KERNEL`,
   `UNKERNEL_TEST_DISTRO_DIR`). `KWEMU=path` takes a prebuilt

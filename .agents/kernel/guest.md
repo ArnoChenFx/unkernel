@@ -5,9 +5,8 @@ What goes into the guest (`guest/`, layout and conventions in
 initramfs; the default of the SDK, the CLI and the npm package) boots a
 distro image, a read-only erofs or ext4 file system the host attaches,
 under an overlay root, or the base shell without one. Below: base
-initramfs, kw layer, distro images, guest tools. The rebuilt Alpine
-packages are in guest-packages.md, the data disk and overlay root in
-data-disk.md.
+initramfs, kw layer, distro images, guest tools. The data disk and
+overlay root are in data-disk.md.
 
 ## Base initramfs (`kernel/build.sh base`, `guest/base/`)
 
@@ -116,8 +115,8 @@ network).
   unofficial-builds.nodejs.org (the project's own builder,
   linux-arm64-musl). The musl build links `libgcc_s.so.1`, the glibc one
   `libatomic.so.1`; when one is missing the shim installs its package
-  first, as root, with apk (`libgcc`) or apt-get (`libatomic1`); both
-  images have them (ALPINE_PACKAGES, DEBIAN_PACKAGES). The
+  first, as root, with apk (`libgcc`) or apt-get (`libatomic1`); Debian's
+  image has libatomic1 (DEBIAN_PACKAGES), Alpine's has no libgcc. The
   `.tar.gz` (63 MB for 26.13.1, against 33 MB `.tar.xz`), unpacked with
   pigz on Alpine; about 230 MB unpacked. Node CLI, 1 GiB, no data disk,
   2026-11-19, node 26.13.1: Alpine first call 18.3 s (libgcc and pigz
@@ -142,8 +141,7 @@ network).
   C code (`OPENSSL_armcap=0`) made a 50 MB TLS 1.3 download over the host
   loopback no faster (AES-128-GCM 10.5-13.1 s against 9.2-11.6 s,
   ChaCha20-Poly1305 9.4-9.9 against 9.6-10.7; the network path and the
-  pipeline dominate) and costs AES 4x in `openssl speed`
-  (guest-packages.md).
+  pipeline dominate) and costs AES 4x in `openssl speed`.
 - Earlier pages wrote shims into `~/.local/bin` (`# kw-shim N` on line
   2), which the data disk keeps on Alpine. They still work, come first on
   PATH, and are replaced by the program they install; the kw layer's
@@ -189,17 +187,15 @@ debugfs from the stream). Each image has label `kwroot`,
 layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
 `createKernel()` (Node, 2026-11-19).
 
-- **Alpine** (`distro/alpine/`): the minirootfs with the rebuilt packages
-  (`opt/build.sh`), busybox init with `etc/inittab` (the layer's rc,
+- **Alpine** (`distro/alpine/`): the minirootfs as Alpine builds it
+  (stock busybox, zlib, openssl and apk-tools), busybox init with `etc/inittab` (the layer's rc,
   welcome and net, `/etc/kw-binfmt.sh` for qemu-user, a shell on hvc0,
   `kwtty serve`, the layer's shutdown), and what "In the Alpine image"
   below lists. OpenSSL's engines, `legacy.so` and `*.dist` stay (the image
   is paged in on demand, not RAM-resident). An `apk add` cut off
-  mid-install needs no cleanup (data-disk.md). `ALPINE_PACKAGES` in
-  `pins.sh` (libgcc) are installed at build time as Debian's (below): the
-  image's apk in a build VM adds the pinned `.apk` files the host fetched,
-  and the changes to the overlay's upper layer are copied back into the
-  tree.
+  mid-install needs no cleanup (data-disk.md). The build adds no
+  packages and boots no VM; what else a program needs comes from apk on
+  first use (the shim's libgcc, above).
 - **Debian** (`distro/debian/`): debian:trixie-slim (pinned in
   `pins.sh`), Debian's own builds in full. `/sbin/init` ->
   `/usr/local/sbin/kw-init`, a bash PID 1: the layer's rc, welcome and

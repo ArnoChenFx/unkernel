@@ -37,9 +37,6 @@
 #               systems, erofs-utils, lz4 and zstd (checksums are verified
 #               anyway); key: env.sh, build.sh and the guest's pins
 #               (guest/**/pins.sh)
-#   alpine-opt  the rebuilt busybox, zlib, openssl and apk-tools (installed
-#               files only, ~9 MB; ~4 min to rebuild); key:
-#               guest/distro/alpine/opt/build.sh and the Alpine pins
 #   zig, pnpm   by their setup actions
 name: Release
 
@@ -139,8 +136,7 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs \
-            meson pkg-config lua5.4 patch
+            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs patch
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -281,24 +277,6 @@ jobs:
           ls -l vendor/build/bundle/unkernel.wasm vendor/build/initramfs/base.cpio vendor/build/initramfs/base-test.cpio
           sha256sum vendor/build/bundle/unkernel.wasm
 
-      # busybox, zlib, openssl and apk-tools rebuilt for kwemu
-      # (guest/distro/alpine/opt/build.sh, run by the Alpine image's build).
-      # Its stamp is the hash of the script without its comments plus
-      # ALPINE_VERSION (guest/distro/alpine/pins.sh); the key hashes both
-      # files, so on a hit --install only copies files: it reads root/, .stamp
-      # and the APKBUILDs. Exact key only: a fallback restore could bring a
-      # stale build. Its host tools (meson, lua, ...) are in the host tools
-      # step, which setup.sh --check verifies; the gcc toolchain is downloaded.
-      - name: Restore the rebuilt Alpine packages
-        id: alpine-opt
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            vendor/build/alpine-opt/root
-            vendor/build/alpine-opt/.stamp
-            vendor/downloads/alpine-opt/*/APKBUILD
-          key: alpine-opt-${{ runner.os }}-${{ hashFiles('guest/distro/alpine/opt/build.sh', 'guest/distro/alpine/pins.sh') }}
-
       # alpine.erofs and debian.erofs (and .ext4, not released), their ids
       # and distros.json, after the base bundle: the Debian image boots on it
       # to make apt's source cache, and distros.json takes its ABI and base
@@ -330,20 +308,6 @@ jobs:
             }
             console.log(`ok: abi ${j.abi}, ${j.base}, ${j.distros.map((d) => `${d.file} ${d.image}`).join(", ")}`);
           '
-
-      - name: Save the rebuilt Alpine packages
-        if: steps.alpine-opt.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            vendor/build/alpine-opt/root
-            vendor/build/alpine-opt/.stamp
-            vendor/downloads/alpine-opt/*/APKBUILD
-          key: ${{ steps.alpine-opt.outputs.cache-primary-key }}
-      # Keep the rebuild's downloads (~165 MB: gcc, sources) out of the
-      # downloads cache below; only the APKBUILDs are needed again.
-      - name: Drop the package rebuild's downloads
-        run: find vendor/downloads/alpine-opt -type f ! -name APKBUILD -delete 2>/dev/null || true
 
       - name: Save downloads
         if: steps.downloads.outputs.cache-hit != 'true'

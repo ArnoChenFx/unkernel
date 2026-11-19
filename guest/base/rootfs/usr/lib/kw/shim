@@ -32,7 +32,7 @@
 #             the newest LTS in its index.json (or KW_NODE_VERSION=lts|
 #             latest|MAJOR|X.Y.Z); the tree in ~/.local/share/node/vVERSION,
 #             its bin/node, npm and npx symlinked from ~/.local/bin. Alpine
-#             needs libgcc for it (in the image; else installed with apk).
+#             needs libgcc for it (installed with apk).
 #             npm install -g goes into that tree.
 #   bun       https://registry.npmjs.org/@oven/bun-PLATFORM/-/bun-PLATFORM-VERSION.tgz
 #             (what npm install -g bun installs: the same program as
@@ -195,8 +195,8 @@ node)
 	url=$N/v$ver/$top.tar.gz
 	dir=$HOME/.local/share/node file=v$ver size=240000000 links="node npm npx"
 	unpack() { tar -xzof - -C "$part"; }  # -o: not the tarball's owners
-	# The musl build links libgcc_s, the glibc one libatomic (both images
-	# have them: ALPINE_PACKAGES, DEBIAN_PACKAGES).
+	# The musl build links libgcc_s (not in Alpine's image), the glibc one
+	# libatomic (in Debian's: DEBIAN_PACKAGES).
 	if [ -n "$libc" ]; then needlib libgcc_s.so.1 libgcc libgcc-s1; else needlib libatomic.so.1 libatomic libatomic1; fi ;;
 bun)
 	t=linux-$bunarch$libc

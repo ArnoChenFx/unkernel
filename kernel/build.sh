@@ -69,10 +69,8 @@
 #
 # Environment:
 #   KW_BUILD=dir   build output root instead of vendor/build (every output above but
-#                  the toolchain's vendor/build/lld22; the Alpine package rebuild
-#                  (guest/distro/alpine/opt/build.sh) also stays in vendor/build/alpine-opt,
-#                  a cache that its stamp keys, unless KW_ALPINE_OPT_DIR=dir),
-#                  e.g. with KSRC to build a branch without touching the main outputs.
+#                  the toolchain's vendor/build/lld22), e.g. with KSRC to build a branch
+#                  without touching the main outputs.
 #                  The CLI, the SDK build and the tests read vendor/build: give them
 #                  paths (--kernel, --distro, UNKERNEL_TEST_KERNEL, UNKERNEL_TEST_DISTRO_DIR)
 #   KW_BASE_OUT=dir  `base` (and the bundle refresh of `kernel`, `smp`, `lower`, `datadisk`)

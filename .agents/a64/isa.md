@@ -288,6 +288,6 @@ of busybox, musl, apk, zlib, libssl and libcrypto, 209286):
   are scalar SCVTF/UCVTF/FCVTZS/FCVTZU on D registers (busybox `sleep`)
   and `fneg v.2d` (musl's libm), implemented in `simd_fp.zig`.
 
-The image's busybox, zlib, libcrypto, libssl and apk are rebuilt
-(guest-packages.md): no vectorized or FP-spilling code in hot paths;
-libcrypto picks its AES, PMULL, SHA and NEON code from HWCAP.
+The image's busybox, zlib, libcrypto, libssl and apk are Alpine's builds
+(`-Os`, almost free of vectorized code); libcrypto picks its AES, PMULL,
+SHA and NEON code from HWCAP.

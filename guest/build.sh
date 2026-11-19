@@ -14,9 +14,6 @@
 #                                     index of every image there, with the
 #                                     base bundle's ABI and base id
 #                                     (tools/distros-json.mjs)
-#   guest/build.sh opt [NAME [ARG...]]  a distro's package rebuild
-#                                     (distro/NAME/opt/build.sh ARG...),
-#                                     default: every distro that has one
 #   guest/build.sh list               the distros and their pinned versions
 #
 # A distro is a directory distro/NAME/ with build.sh and pins.sh; nothing
@@ -67,18 +64,6 @@ distro)
 	index
 	;;
 index) index ;;
-opt)
-	if [ $# -gt 0 ]; then
-		n=$1
-		shift
-		[ -x "$guest/distro/$n/opt/build.sh" ] || { echo "guest/build.sh: distro '$n' has no opt/build.sh" >&2; exit 2; }
-		"$guest/distro/$n/opt/build.sh" "$@"
-	else
-		for n in $(distros); do
-			[ ! -x "$guest/distro/$n/opt/build.sh" ] || "$guest/distro/$n/opt/build.sh"
-		done
-	fi
-	;;
 list)
 	for n in $(distros); do
 		v=$(N=$(echo "$n" | tr a-z A-Z); . "$guest/distro/$n/pins.sh"; eval echo "\${${N}_VERSION:-?}")
@@ -86,7 +71,7 @@ list)
 	done
 	;;
 *)
-	echo "usage: guest/build.sh base | distro [NAME...] | index | opt [NAME [ARG...]] | list" >&2
+	echo "usage: guest/build.sh base | distro [NAME...] | index | list" >&2
 	exit 2
 	;;
 esac

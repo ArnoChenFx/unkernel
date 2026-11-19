@@ -86,8 +86,9 @@ runs): `npm --version` 3.91 and 3.54, `npx --version` 3.53 and 3.55, `npx
 `--cpus 2`: `npm --version` 3.47 and 2.99. Compiled share: npm 44%, `node
 -e 0` 63%, V8 loops 80-92%.
 
-**OpenSSL** (2026-11-18, UP bundle, the image's rebuilt libcrypto, `openssl
-speed -evp ALG -bytes 16384 -seconds 2`, MB/s, medians of 3 boots;
+**OpenSSL** (2026-11-18, UP bundle, libcrypto built with gcc `-O2`; the
+image now has Alpine's `-Os` build, whose NEON and crypto paths are the
+same assembly; `openssl speed -evp ALG -bytes 16384 -seconds 2`, MB/s, medians of 3 boots;
 "integer" is `OPENSSL_armcap=0`, "NEON + crypto" what HWCAP selects on a
 SIMD host, "no SIMD" the same code as interpreter calls):
 

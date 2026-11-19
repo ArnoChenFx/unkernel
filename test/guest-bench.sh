@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa
 #
-# The apk and shell bench that .agents/a64/performance.md and guest-packages.md quote:
+# The apk and shell bench that .agents/a64/performance.md quotes:
 # 20 commands, each timed in the guest from /proc/uptime (10 ms steps).
 # Run it inside the guest (a network for apk; it installs jq, git and
 # python3), e.g. with the directory mounted:

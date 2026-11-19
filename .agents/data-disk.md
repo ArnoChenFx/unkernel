@@ -63,7 +63,7 @@ missing).
   `.apk.<hash>` temporaries and up to 17 MiB of unpacked but unregistered
   files; other apk commands worked meanwhile, and running the same `apk
   add` again installed the packages, removed every temporary, and left
-  `apk audit` clean (apart from the rebuilt packages, guest-packages.md).
+  `apk audit` clean.
   What stays until then is unowned files, harmless to apk, which
   overwrites unowned files.
 - At poweroff the distro's init runs `/usr/lib/kw/shutdown`: with `/data`

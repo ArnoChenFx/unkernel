@@ -70,11 +70,6 @@ The API differs from 0.13-0.15. Examples of all of these are in
   `timeconst.h` with `HZ == 0` ("Totally bogus HZ value!"). Put the real
   tools first on `PATH` for such runs.
 - Do not hard-code `/usr/bin` paths or home-directory fallbacks.
-- `guest/distro/alpine/opt/build.sh` (run by the Alpine image's build;
-  `KW_ALPINE_OPT=0` skips it) also needs meson, ninja, pkg-config, patch,
-  lua 5.x, perl with FindBin, IPC::Cmd and File::Compare, xz (Bootlin's
-  tarball) and sha512sum (the APKBUILDs' source sums) (guest-packages.md),
-  and an x86_64 host for Bootlin's gcc.
 - `setup.sh` runs only ELF binaries for its version checks, so a wrapper
   that installs packages on first use is never triggered.
 
@@ -88,7 +83,3 @@ data in tar order and the metadata zone in front, for the distro images'
 layout; guest/README.md) (`ALPINE_TARBALL=file` overrides the download). wterm (`@wterm/dom`
 0.5.10, Apache-2.0) is an npm dependency of `web/`, pinned exactly and
 locked in `pnpm-lock.yaml` (see web.md).
-`guest/distro/alpine/opt/build.sh` pins Bootlin's aarch64 musl gcc
-(bleeding-edge 2026.08-1, gcc 16.2), the Alpine apks of its sysroot, and
-per package the aports commit and APKBUILD (whose sha512sums cover the
-sources).

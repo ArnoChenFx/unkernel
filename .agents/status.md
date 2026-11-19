@@ -559,26 +559,26 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **aarch64: AdvSIMD arithmetic, FMA and crypto are calls of the
-  interpreter in compiled code.** The A64 JIT (a64.md, JIT) translates
-  every ALU, memory and branch op, the frequent FP moves, compares and
-  AdvSIMD moves, and scalar FP arithmetic and conversions (with a fast
-  path that needs FPCR's defaults and calls the interpreter off it; double
-  FMUL, FDIV and FSQRT only once FPSR.IXC is set) inline (generic.zig);
-  the other generic ops are calls of the reference interpreter through
-  the kernel's function table, with the module's registers spilled around
-  them (2026-11-18).
-- **aarch64: SHA512 is off by default (`kw.isa=+sha512` turns it on),
-  because OpenSSL's SHA-512 is 12.5x slower with HWCAP_SHA512.** Its
-  ARMv8.2 path (SHA512H and AdvSIMD) is all generic ops, its integer path
-  is compiled: `openssl speed -evp sha512` 10 MB/s against 128 MB/s with
-  `kw.isa=-sha512` (2026-11-18, a64.md, Crypto). The fix is JIT
-  translation of the AdvSIMD integer ops and SHA512H/H2/SU0/SU1. The
-  same holds for every other OpenSSL path that HWCAP selects (SHA-256 26
-  MB/s on its hardware path, 3 on NEON, 57 on its integer path; AES,
-  GHASH, ChaCha20-Poly1305 likewise), so the image's rebuilt libcrypto
-  ignores HWCAP (guest-packages.md); programs with their own OpenSSL or
-  crypto code still see the capabilities.
+- **aarch64: FMA, AdvSIMD FP, exclusives and system instructions are
+  calls of the interpreter in compiled code.** The A64 JIT (a64.md, JIT)
+  translates every ALU, memory and branch op, the frequent FP moves,
+  compares and AdvSIMD moves, scalar FP arithmetic and conversions (with
+  a fast path that needs FPCR's defaults and calls the interpreter off
+  it; double FMUL, FDIV and FSQRT only once FPSR.IXC is set) inline
+  (generic.zig), and where the host compiles SIMD the integer AdvSIMD
+  ops, LD1/ST1, LDP/STP of V registers, AES, PMULL, SHA1, SHA256 and
+  SHA512 (vec.zig); the other generic ops are calls of the reference
+  interpreter through the kernel's function table, with the module's
+  registers spilled around them (2026-11-18). The largest count left is
+  V8's LDAR/STLR/LDXR/STXR (a64.md, What is left).
+- **aarch64: OpenSSL's NEON and crypto paths need wasm SIMD in the
+  host.** The image's libcrypto now picks its code from HWCAP and the
+  kernel enables SHA512 by default, because the JIT translates those
+  paths (aes-128-gcm 99 MB/s, sha256 157, sha512 217 against 24, 59, 131
+  on the integer paths; 2026-11-18, guest-packages.md). A host whose
+  engine has no SIMD (V8 on an x86-64 without SSE4.1) runs them as
+  interpreter calls, 2-13x slower than the integer paths would be; such a
+  host could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0`.
 - **One timing-sensitive case in `pnpm test:api`** failed now and then
   on the decoded-op tier bundle (2026-11-17; not seen in 4 runs on the
   JIT bundle, 2026-11-18): the inline `display, evdev and sound` case

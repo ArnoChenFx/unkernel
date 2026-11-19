@@ -43,13 +43,8 @@ gray= reset=
 [ -t 2 ] && gray='\033[90m' reset='\033[0m'
 say() { printf "${gray}%s${reset}\n" "$tool: $*" >&2; }
 die() { printf '%s\n' "$tool: $*" >&2; exit 127; }
-# get URL: the body on stdout, quiet; fails on an HTTP error. OpenSSL's C
-# code: the image's libcrypto takes it anyway, but a stock libcrypto3 (after
-# `apk upgrade` or `apk fix`) picks its NEON and crypto-extension code, which
-# kwemu interprets. With the stock one this cut opencode's 120 MB download
-# (ChaCha20-Poly1305) from 28 s to 2.5 s, claude's 127 MB (AES-GCM) from 14 s
-# to 10 s; with the image's it changes nothing (2026-11-18).
-get() { OPENSSL_armcap=0 wget -q -U kw-shim -O - "$1"; }
+# get URL: the body on stdout, quiet; fails on an HTTP error.
+get() { wget -q -U kw-shim -O - "$1"; }
 # pkg CMD: CMD is there, or apk installs it now (as root). Only for speed:
 # without it the install still works, slower.
 pkg() {

@@ -520,10 +520,14 @@ both files describe the rest at their top:
   after a free-space check; one install at a time per tool; a cut-off one
   leaves nothing; without a network the stand-in says so and exits 127.
   It installs zstd and pigz with apk when it can (unpacking 3x faster), and
-  works without them. Downloads run with `OPENSSL_armcap=0`: the image's
-  libcrypto ignores NEON and the crypto extensions anyway, but a stock
-  libcrypto3 (`apk upgrade`, `apk fix`) uses them, and kwemu interprets
-  them (guest-packages.md).
+  works without them. Downloads use libcrypto's own choice of code
+  (AT_HWCAP: AES, PMULL, NEON), which kwemu's JIT translates; forcing
+  its C code (`OPENSSL_armcap=0`, done here until 2026-11-18, when those
+  paths were interpreted) made a 50 MB TLS 1.3 download over the host
+  loopback no faster (AES-128-GCM 10.5-13.1 s against 9.2-11.6 s,
+  ChaCha20-Poly1305 9.4-9.9 against 9.6-10.7; the network path and the
+  pipeline dominate) and costs AES 4x in `openssl speed`
+  (guest-packages.md).
 - Sizes and times (Node CLI and SDK, 512 MiB, data disk, 2026-11-18): fx
   4.5 MB download, 6.9 MB, first call 2.5 s, later ones 0.01 s; claude
   2.1.327 127 MB (`.zst`), 357 MB, 23 s, then `--version` 0.2 s, `--help`

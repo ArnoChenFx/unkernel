@@ -450,6 +450,13 @@ parts that are easy to get wrong.
   that V8's lazy compile of it happens inside the import, in kwemu's
   compile window, where other CPUs do not wait for this one (kwemu.md,
   JIT on several harts).
+- `JitHost.caps()` offers SIMD (bit 5, `CAP_SIMD`) when
+  `WebAssembly.validate` accepts a small module with v128 code
+  (`jitSimd()`, exported by the SDK, asked once per host). Every engine with JSPI has SIMD; V8
+  on an x86-64 without SSE4.1 refuses it, and kwemu then keeps the i64
+  register locals and calls its interpreter for AdvSIMD and crypto
+  (a64.md, AdvSIMD and crypto in compiled code). The test host
+  (`test/kwemu-jit-host.mjs`) offers it unless `KWEMU_JIT_SIMD=0`.
 - `sched_yield` is a Suspending import here too (the kernel yields on
   every CPU, kernel.md, SMP): it returns through `yieldToEventLoop()`.
   This thread otherwise never reaches its event loop (it idles in the

@@ -40,6 +40,7 @@ const tier = @import("../tier.zig");
 const cm = @import("common.zig");
 const opexec = @import("../opexec.zig");
 const gen = @import("generic.zig");
+const vec = @import("vec.zig");
 const Cpu = kwemu.Cpu;
 const Block = kwemu.Block;
 const H = O.H;
@@ -102,8 +103,9 @@ pub const At = struct {
 
 /// The module's A64 emission state (`Emit.x`): one part per family.
 pub const EmitExt = struct {
-    /// Position of the padded local count (`locals`), patched once the
-    /// code is emitted.
+    /// Position of the padded local count of the i64 group (`locals`; with
+    /// SIMD the v128 and i32 groups' counts follow at + 6 and + 12),
+    /// patched once the code is emitted.
     locals_at: usize = 0,
     /// A `generic` call ran last: regs in memory are current and the
     /// register locals are not; the next op of a family (and every exit,
@@ -114,6 +116,7 @@ pub const EmitExt = struct {
     bits: bits.Ext = .{},
     mem: mem.Ext = .{},
     branch: branch.Ext = .{},
+    vec: vec.Ext = .{},
 };
 
 pub const Family = enum { alu, bits, mem, branch, none };
@@ -146,7 +149,7 @@ pub fn supported(o: Op) bool {
         .bits => bits.supported(o),
         .mem => mem.supported(o),
         .branch => branch.supported(o),
-        .none => jc.table_ok or gen.decode(o.aux()) != null,
+        .none => jc.table_ok or gen.decode(o.aux()) != null or vec.decode(o.aux()) != null,
     };
 }
 
@@ -157,14 +160,18 @@ pub fn usage(o: Op) Use {
         .mem => mem.usage(o),
         .branch => branch.usage(o),
         // A call spills and reloads what the module holds (`generic`).
-        .none => if (gen.decode(o.aux())) |f| gen.usage(f) else .{},
+        .none => if (gen.decode(o.aux())) |f| gen.usage(f) else if (vec.decode(o.aux())) |v| vec.usage(v) else .{},
     };
 }
 
 pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) void {
     const at: At = .{ .k = k, .pc = pc, .b = b, .self_loop = self_loop };
     const fast = if (family(o.h) == .none) gen.decode(o.aux()) else null;
-    if (e.x.stale and (family(o.h) != .none or fast != null)) {
+    const vv: ?vec.V = if (family(o.h) == .none and fast == null) vec.decode(o.aux()) else null;
+    const vok = if (vv) |v| vec.enabled(e, v) else false;
+    // A pending AESE/AESD is consumed by its AESMC/AESIMC, else written now.
+    if (!(vok and vec.consumes(e, vv.?))) vec.flush(e);
+    if (e.x.stale and (family(o.h) != .none or fast != null or vok)) {
         reload(e);
         e.x.stale = false;
     }
@@ -173,7 +180,7 @@ pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bo
         .bits => bits.emit(e, o, at),
         .mem => mem.emit(e, o, at),
         .branch => branch.emit(e, o, at),
-        .none => if (fast) |f| gen.emit(e, f, at) else generic(e, o, at),
+        .none => if (fast) |f| gen.emit(e, f, at) else if (vok) vec.emit(e, vv.?, at) else if (e.table) generic(e, o, at) else e.handBack(at.k, at.pc),
     }
 }
 
@@ -222,10 +229,7 @@ fn spill(e: *Emit, u: Use) void {
         if (u.write & (@as(u32, 1) << @intCast(s)) != 0) store(e, W.i64_store, 3, @intCast(s), cm.local(@intCast(s)));
     }
     for (0..32) |n| {
-        if (u.vwrite & (@as(u32, 1) << @intCast(n)) == 0) continue;
-        const lo: u8 = @intCast(O.v0_slot + 2 * n);
-        store(e, W.i64_store, 3, lo, cm.local(lo));
-        store(e, W.i64_store, 3, lo + 1, cm.local(lo + 1));
+        if (u.vwrite & (@as(u32, 1) << @intCast(n)) != 0) cm.storeV(e, @intCast(n));
     }
     if (u.tpidr_write) store(e, W.i64_store, 3, O.tpidr_slot, cm.local(O.tpidr_slot));
     if (u.flags_write) store(e, W.i64_store32, 2, O.nzcv_slot, cm.l_nzcv);
@@ -264,6 +268,7 @@ pub fn blockUse(o: []const Op) Use {
 
 pub fn beginMember(e: *Emit, o: []const Op) void {
     e.x.stale = false; // a member is entered with its locals current
+    vec.beginMember(e);
     alu.beginMember(e, o);
     bits.beginMember(e, o);
     mem.beginMember(e, o);
@@ -271,6 +276,7 @@ pub fn beginMember(e: *Emit, o: []const Op) void {
 }
 
 pub fn sync(e: *Emit) void {
+    vec.sync(e); // a pending AESE/AESD (never with stale locals)
     if (e.x.stale) reload(e); // on this path only
     alu.sync(e);
     bits.sync(e);
@@ -282,6 +288,7 @@ pub fn sync(e: *Emit) void {
 /// emitted (a self-loop's back edge; jitcore.zig): alu.zig skips NZCV when
 /// the block writes it before anything reads it or can leave.
 pub fn syncHead(e: *Emit) void {
+    vec.sync(e);
     if (e.x.stale) reload(e);
     alu.syncHead(e);
     bits.sync(e);
@@ -295,22 +302,38 @@ pub fn helperCount(e: *Emit, use: Use) u32 {
     return 0;
 }
 
-/// One group of i64 locals; its count is patched in `emitHelpers` once the
-/// code is emitted (up to the highest local it uses, `Emit.top`).
+/// One group of i64 locals, with SIMD followed by a v128 and an i32 group
+/// (common.zig); the counts are patched in `emitHelpers` once the code is
+/// emitted (up to the highest local it uses, `Emit.top`; a group may be
+/// empty).
 pub fn locals(e: *Emit, region: bool) void {
     _ = region; // the region locals are among the first (common.zig)
-    e.op(0x01);
+    e.op(if (e.simd) 0x03 else 0x01);
     e.x.locals_at = e.reserve();
     e.op(W.i64_t);
+    if (!e.simd) return;
+    _ = e.reserve(); // locals_at + 6
+    e.op(0x7b); // v128
+    _ = e.reserve(); // locals_at + 12
+    e.op(W.i32_t);
+}
+
+fn patchCount(e: *Emit, at: usize, n: u32) void {
+    var v = n;
+    for (0..5) |i| {
+        e.buf[at + i] = @as(u8, @truncate(v & 0x7f)) | (if (i < 4) @as(u8, 0x80) else 0);
+        v >>= 7;
+    }
 }
 
 pub fn emitHelpers(e: *Emit) void {
     if (!e.ok) return;
-    var v: u32 = @max(e.top + 1, jc.l_jl + 2) - (jc.l_jl + 1);
-    for (0..5) |i| {
-        e.buf[e.x.locals_at + i] = @as(u8, @truncate(v & 0x7f)) | (if (i < 4) @as(u8, 0x80) else 0);
-        v >>= 7;
-    }
+    const first = jc.l_jl + 1;
+    const end = @max(e.top + 1, jc.l_jl + 2); // one past the last local used
+    if (!e.simd) return patchCount(e, e.x.locals_at, end - first);
+    patchCount(e, e.x.locals_at, @min(end, cm.l_vbase) - first);
+    patchCount(e, e.x.locals_at + 6, std.math.clamp(end, cm.l_vbase, cm.l_w) - cm.l_vbase);
+    patchCount(e, e.x.locals_at + 12, @max(end, cm.l_w) - cm.l_w);
 }
 
 fn load(e: *Emit, opc: u8, alignment: u8, slot: u8, l: u32) void {
@@ -333,10 +356,7 @@ pub fn prologue(e: *Emit, use: Use) void {
     }
     const vlive = use.vread | use.vwrite;
     for (0..32) |n| {
-        if (vlive & (@as(u32, 1) << @intCast(n)) == 0) continue;
-        const lo: u8 = @intCast(O.v0_slot + 2 * n);
-        load(e, W.i64_load, 3, lo, cm.local(lo));
-        load(e, W.i64_load, 3, lo + 1, cm.local(lo + 1));
+        if (vlive & (@as(u32, 1) << @intCast(n)) != 0) cm.loadV(e, @intCast(n));
     }
     if (use.tpidr_read or use.tpidr_write) load(e, W.i64_load, 3, O.tpidr_slot, cm.local(O.tpidr_slot));
     // regs.nzcv is the low half of its slot (fpcr the high half).
@@ -348,10 +368,7 @@ pub fn epilogue(e: *Emit, use: Use) void {
         if (use.write & (@as(u32, 1) << @intCast(s)) != 0) store(e, W.i64_store, 3, @intCast(s), cm.local(@intCast(s)));
     }
     for (0..32) |n| {
-        if (use.vwrite & (@as(u32, 1) << @intCast(n)) == 0) continue;
-        const lo: u8 = @intCast(O.v0_slot + 2 * n);
-        store(e, W.i64_store, 3, lo, cm.local(lo));
-        store(e, W.i64_store, 3, lo + 1, cm.local(lo + 1));
+        if (use.vwrite & (@as(u32, 1) << @intCast(n)) != 0) cm.storeV(e, @intCast(n));
     }
     if (use.tpidr_write) store(e, W.i64_store, 3, O.tpidr_slot, cm.local(O.tpidr_slot));
     if (use.flags_write) store(e, W.i64_store32, 2, O.nzcv_slot, cm.l_nzcv);
@@ -391,6 +408,7 @@ pub fn poll(e: *Emit) void {
 
 test {
     _ = gen;
+    _ = vec;
     _ = alu;
     _ = bits;
     _ = mem;

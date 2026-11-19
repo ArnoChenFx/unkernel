@@ -90,11 +90,18 @@ pub const cap_mem32: u32 = 2;
 pub const cap_eager: u32 = 4;
 pub const cap_shared: u32 = 8;
 pub const cap_table: u32 = 16;
+/// The engine compiles fixed-width SIMD (v128 locals and instructions):
+/// the ISA may emit them (A64: V registers in v128 locals, AdvSIMD and
+/// crypto translated inline). A host sets it only after validating a module
+/// with SIMD instructions (V8 on x86-64 needs SSE4.1).
+pub const cap_simd: u32 = 32;
 
 /// The host offers env.table (cap_table), so the ISA may translate ops into
 /// calls of kwemu functions (A64: `generic` ops). Set by every CPU's
 /// `askHost`; all CPUs of a kernel have the same kind of host.
 pub var table_ok: bool = false;
+/// The host compiles SIMD (cap_simd); set like `table_ok`.
+pub var simd_ok: bool = false;
 /// Most blocks in one compiled region (see "regions" below).
 pub const max_members = 16;
 
@@ -184,24 +191,25 @@ pub const State = if (enabled) extern struct {
     page: [npool]u64,
     /// Per pool entry: module size in bytes.
     size: [npool]u16,
-    /// AES tables riscv's compiled Zkne/Zknd ops read cpu-relative
-    /// (`AesTab`; unused by A64).
+    /// AES tables the compiled AES ops read cpu-relative (`AesTab`;
+    /// riscv's Zkne/Zknd, A64's AESE/AESD/AESMC/AESIMC).
     aes: AesTab,
     buf: [buf_size]u8,
 } else extern struct {};
 
-/// Tables for riscv's compiled AES ops, filled by `init` from core.aes
+/// Tables for the compiled AES ops (riscv, A64), filled by `init` from core.aes
 /// (compiled code may only address cpu-relative data, never the library's
 /// own constants). te[x]: MixColumns of the column (S[x], 0, 0, 0); a byte
 /// in row r contributes rotl(te[x], 8 r). td[x]: InvMixColumns of (S^-1[x],
 /// 0, 0, 0). im[x]: InvMixColumns of (x, 0, 0, 0). s, is: the S-box and its
-/// inverse.
+/// inverse. mc[x]: MixColumns of (x, 0, 0, 0).
 pub const AesTab = extern struct {
     te: [256]u32,
     td: [256]u32,
     im: [256]u32,
     s: [256]u8,
     is: [256]u8,
+    mc: [256]u32,
 };
 
 // ---- slots -----------------------------------------------------------------------
@@ -241,6 +249,7 @@ fn blockIndex(cpu: *Cpu, b: *const Block) u32 {
 fn askHost(st: *State) void {
     st.caps = kw_host_jit_caps();
     table_ok = st.caps & cap_available != 0 and st.caps & cap_table != 0;
+    simd_ok = st.caps & cap_available != 0 and st.caps & cap_simd != 0;
     st.threshold = if (st.caps & cap_available == 0)
         never
     else if (st.caps & cap_eager != 0)
@@ -286,6 +295,7 @@ pub fn init(cpu: *Cpu) void {
         t.im[i] = A.invMixColumn(@intCast(i));
         t.s[i] = A.sbox[i];
         t.is[i] = A.inv_sbox[i];
+        t.mc[i] = A.mixColumn(@intCast(i));
     }
 }
 
@@ -912,6 +922,8 @@ pub fn Jit(comptime I: type) type {
             shared: bool = false,
             /// The module imports the kernel's function table (cap_table).
             table: bool = false,
+            /// The engine compiles SIMD (cap_simd).
+            simd: bool = false,
             /// The module's register usage (what its prologue loads), from
             /// before the prologue on.
             use: ?*const Use = null,
@@ -970,9 +982,24 @@ pub fn Jit(comptime I: type) type {
                     v >>= 7;
                 }
             }
+            /// The CPU whose block is being compiled (the owner of `buf`).
+            pub fn cpu(e: *const Emit) *Cpu {
+                const priv: *@FieldType(Cpu, "priv") = @alignCast(@fieldParentPtr("jit", @as(*State, @alignCast(@fieldParentPtr("buf", e.buf)))));
+                return @alignCast(@fieldParentPtr("priv", priv));
+            }
             pub fn k64(e: *Emit, v: u64) void {
                 e.op(W.i64_const);
                 e.sleb(@bitCast(v));
+            }
+            /// A SIMD instruction (prefix 0xfd, opcode as a u32 LEB).
+            pub fn vop(e: *Emit, code: u32) void {
+                e.op(0xfd);
+                e.uleb(code);
+            }
+            /// A SIMD lane instruction (extract/replace_lane) with its lane.
+            pub fn vlane(e: *Emit, code: u32, lane: u8) void {
+                e.vop(code);
+                e.op(lane);
             }
             pub fn k32(e: *Emit, v: i32) void {
                 e.op(W.i32_const);
@@ -1506,7 +1533,7 @@ pub fn Jit(comptime I: type) type {
             const self_loop = rg == null and full and I.selfLoop(all[all.len - 1], b);
 
             const caps = cpu.priv.jit.caps;
-            var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = caps & cap_mem32 != 0, .shared = caps & cap_shared != 0, .table = caps & cap_table != 0 };
+            var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = caps & cap_mem32 != 0, .shared = caps & cap_shared != 0, .table = caps & cap_table != 0, .simd = caps & cap_simd != 0 };
             e.rg = rg;
             // b's per-member state (a region's members set their own).
             I.beginMember(&e, all[0..u]);

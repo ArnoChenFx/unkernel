@@ -235,7 +235,7 @@ pub fn kind(comptime h: ops.H, gen: Gen, opt: Opt) !void {
             for (0..31) |k| if (T.regs.x[k] != Rf.regs.x[k]) std.debug.print("  x{d}: 0x{x} vs 0x{x}\n", .{ k, T.regs.x[k], Rf.regs.x[k] });
             if (T.regs.sp != Rf.regs.sp) std.debug.print("  sp: 0x{x} vs 0x{x}\n", .{ T.regs.sp, Rf.regs.sp });
             if (T.regs.nzcv != Rf.regs.nzcv) std.debug.print("  nzcv: 0x{x} vs 0x{x}\n", .{ T.regs.nzcv, Rf.regs.nzcv });
-            for (0..32) |k| if (T.regs.v[k] != Rf.regs.v[k]) std.debug.print("  v{d} differs\n", .{k});
+            for (0..32) |k| if (T.regs.v[k] != Rf.regs.v[k]) std.debug.print("  v{d}: 0x{x:0>32} vs 0x{x:0>32}\n", .{ k, T.regs.v[k], Rf.regs.v[k] });
             if (T.regs.tpidr_el0 != Rf.regs.tpidr_el0 or T.regs.fpsr != Rf.regs.fpsr or T.regs.fpcr != Rf.regs.fpcr) std.debug.print("  tpidr/fpsr/fpcr differ\n", .{});
             std.debug.print("  program:", .{});
             for (prog[0..i]) |w| std.debug.print(" {x:0>8}", .{w});

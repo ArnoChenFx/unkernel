@@ -1,4 +1,4 @@
-From db4c076f477148ab0d37ec682aa966e85cb75934 Mon Sep 17 00:00:00 2001
+From b01175ba2af5eabce76980cbfe7d43e8f087d331 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 02:42:59 +0000
 Subject: [PATCH] wasm: kwemu ABI 13: SHA-3
@@ -54,7 +54,7 @@ index 4737a256fb2..39004b6bf02 100644
  /* The KW_ISA_* features this kwemu build implements. */
  uint64_t kw_isa_supported(void);
 diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
-index 62ca85f58dd..c570edd4be4 100644
+index b52ca8664f8..ef54fc24620 100644
 --- a/arch/wasm/kernel/cpu.c
 +++ b/arch/wasm/kernel/cpu.c
 @@ -17,7 +17,7 @@
@@ -74,15 +74,15 @@ index 62ca85f58dd..c570edd4be4 100644
  	{ "sha512",	HWCAP_SHA512,	KW_ISA_SHA512 },
  };
  
-@@ -75,7 +76,7 @@ u64 kw_isa_enabled(void)
+@@ -69,7 +70,7 @@ u64 kw_isa_enabled(void)
   * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
   * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
   * implements it; the names are those of the Features line (aes, pmull,
 - * sha1, sha2, crc32, atomics, sha512; "lse" is atomics too). For example
 + * sha1, sha2, crc32, atomics, sha3, sha512; "lse" is atomics too). For example
   * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
-  * sha512 starts off (KW_ISA_DEFAULT_OFF): kw.isa=+sha512 turns it on.
   * kwemu runs SHA512 only together with SHA2 (kw_set_isa drops it
+  * otherwise), so -sha2 turns both off.
 -- 
 2.56.0
 

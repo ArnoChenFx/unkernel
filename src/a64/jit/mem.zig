@@ -179,6 +179,17 @@ fn host(e: *Emit) void {
     e.addr();
 }
 
+/// With SIMD: a v128 load or store at the address operand on the stack.
+fn vmem(e: *Emit, code: u32, off: u64) void {
+    e.vop(code);
+    e.uleb(0);
+    e.uleb(off);
+}
+/// The V register whose low half is slot s.
+fn vreg(s: u8) u8 {
+    return (s - ops.v0_slot) / 2;
+}
+
 fn loadOp(size: u64, signed: bool) u8 {
     return switch (size) {
         1 => if (signed) W.i64_load8_s else W.i64_load8_u,
@@ -272,9 +283,7 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
             e.tlbCheck(at.k, at.pc, r_off, n);
             e.mem(loadOp(n, false), 0, 0);
             if (o.e == 1) writeback(e, o); // the base is an X register
-            cm.set(e, o.a);
-            e.k64(0);
-            cm.set(e, o.a + 1);
+            cm.setScalar(e, o.a);
         },
         .ldr_q_i, .ldr_q_w, .ldr_q_r => {
             switch (o.h) {
@@ -283,12 +292,17 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
                 else => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
             }
             e.tlbCheck(at.k, at.pc, r_off, 16);
-            keepHost(e);
-            e.mem(W.i64_load, 0, 0);
-            cm.set(e, o.a);
-            host(e);
-            e.mem(W.i64_load, 0, 8);
-            cm.set(e, o.a + 1);
+            if (e.simd) {
+                vmem(e, cm.S.v128_load, 0);
+                cm.setV(e, vreg(o.a));
+            } else {
+                keepHost(e);
+                e.mem(W.i64_load, 0, 0);
+                cm.set(e, o.a);
+                host(e);
+                e.mem(W.i64_load, 0, 8);
+                cm.set(e, o.a + 1);
+            }
             if (o.h == .ldr_q_w) writeback(e, o);
         },
         .str_q_i, .str_q_w, .str_q_r => {
@@ -298,26 +312,40 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
                 else => vaReg(e, o.b, o.c, o.e, o.f, o.imm),
             }
             e.tlbCheck(at.k, at.pc, w_off, 16);
-            keepHost(e);
-            cm.get(e, o.a);
-            e.mem(W.i64_store, 0, 0);
-            host(e);
-            cm.get(e, o.a + 1);
-            e.mem(W.i64_store, 0, 8);
+            if (e.simd) {
+                cm.getV(e, vreg(o.a));
+                vmem(e, cm.S.v128_store, 0);
+            } else {
+                keepHost(e);
+                cm.get(e, o.a);
+                e.mem(W.i64_store, 0, 0);
+                host(e);
+                cm.get(e, o.a + 1);
+                e.mem(W.i64_store, 0, 8);
+            }
             if (o.h == .str_q_w) writeback(e, o);
         },
         .ldp_q, .ldp_q_w => {
             if (o.h == .ldp_q_w) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
             e.tlbCheck(at.k, at.pc, r_off, 32);
             keepHost(e);
-            e.mem(W.i64_load, 0, 0);
-            cm.set(e, o.a);
-            // Rt's halves, then Rt2's: Rt2 wins when they are equal.
-            const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
-            for (rest) |p| {
+            if (e.simd) {
+                // Rt, then Rt2: Rt2 wins when they are equal.
+                vmem(e, cm.S.v128_load, 0);
+                cm.setV(e, vreg(o.a));
                 host(e);
-                e.mem(W.i64_load, 0, p[0]);
-                cm.set(e, p[1]);
+                vmem(e, cm.S.v128_load, 16);
+                cm.setV(e, vreg(o.c));
+            } else {
+                e.mem(W.i64_load, 0, 0);
+                cm.set(e, o.a);
+                // Rt's halves, then Rt2's: Rt2 wins when they are equal.
+                const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
+                for (rest) |p| {
+                    host(e);
+                    e.mem(W.i64_load, 0, p[0]);
+                    cm.set(e, p[1]);
+                }
             }
             if (o.h == .ldp_q_w) writeback(e, o);
         },
@@ -325,13 +353,21 @@ pub fn emit(e: *Emit, o: Op, at: At) void {
             if (o.h == .stp_q_w) vaIndex(e, o, o.e) else vaImm(e, o.b, o.imm);
             e.tlbCheck(at.k, at.pc, w_off, 32);
             keepHost(e);
-            cm.get(e, o.a);
-            e.mem(W.i64_store, 0, 0);
-            const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
-            for (rest) |p| {
+            if (e.simd) {
+                cm.getV(e, vreg(o.a));
+                vmem(e, cm.S.v128_store, 0);
                 host(e);
-                cm.get(e, p[1]);
-                e.mem(W.i64_store, 0, p[0]);
+                cm.getV(e, vreg(o.c));
+                vmem(e, cm.S.v128_store, 16);
+            } else {
+                cm.get(e, o.a);
+                e.mem(W.i64_store, 0, 0);
+                const rest = [3]struct { u64, u8 }{ .{ 8, o.a + 1 }, .{ 16, o.c }, .{ 24, o.c + 1 } };
+                for (rest) |p| {
+                    host(e);
+                    cm.get(e, p[1]);
+                    e.mem(W.i64_store, 0, p[0]);
+                }
             }
             if (o.h == .stp_q_w) writeback(e, o);
         },

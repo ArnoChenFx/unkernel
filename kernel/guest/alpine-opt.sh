@@ -12,12 +12,11 @@
 #     armv8-a without the vectorizer, and with -mgeneral-regs-only for every
 #     file that has no float types, where Alpine uses gcc 15 at -Os
 #     (busybox: -Oz and -finline-limit=0): kwemu's JIT compiles integer
-#     code and interprets FP and AdvSIMD instructions;
+#     code best and calls its interpreter for the FP and vectorized code
+#     it does not translate;
 #   - linked with lld, not GNU ld (whose one R+X segment for code and
 #     read-only data makes each exec slower under kwemu), with RELR
-#     relocations; busybox is not PIE (apk is, as in Alpine);
-#   - libcrypto ignores AT_HWCAP: it runs its integer code, not the NEON
-#     and crypto-extension code (OPENSSL_armcap still overrides).
+#     relocations; busybox is not PIE (apk is, as in Alpine).
 # Numbers, traps and the update procedure: .agents/guest-packages.md.
 #
 #   kernel/guest/alpine-opt.sh                 build all (again)
@@ -244,27 +243,9 @@ build_zlib() {
 build_openssl() {
 	fetch openssl
 	unpack openssl "openssl-${ver%-r*}.tar.gz" "openssl-${ver%-r*}"
-	# libcrypto picks its aarch64 code from AT_HWCAP: the AES, PMULL, SHA-1,
-	# SHA-256 and SHA-3 instructions and NEON (vpaes, GHASH, ChaCha20,
-	# Poly1305), all of them generic ops under kwemu. Its integer paths
-	# (the scalar assembly and the C code) are compiled by the JIT and
-	# faster for every algorithm (.agents/guest-packages.md): ChaCha20-
-	# Poly1305 about 30x, SHA-1 4x, SHA-256 2x, AES 1.5-2x. So the default
-	# capability set is empty; OPENSSL_armcap in the environment still
-	# overrides it, as upstream.
-	patch -s -p1 <<-'EOF'
-	--- a/crypto/armcap.c
-	+++ b/crypto/armcap.c
-	@@ -264,6 +264,8 @@
-	         OPENSSL_armcap_P = (unsigned int)strtoul(e, NULL, 0);
-	         return;
-	     }
-	+    /* unkernel: kwemu runs the integer paths faster (alpine-opt.sh) */
-	+    return;
-
-	 #if defined(__APPLE__)
-	 #if !defined(__aarch64__)
-	EOF
+	# libcrypto picks its aarch64 code from AT_HWCAP, as upstream: kwemu's
+	# JIT compiles the AES, PMULL, SHA and NEON instructions, and those
+	# paths are faster than the integer ones (.agents/guest-packages.md).
 	# As the APKBUILD's native build (threads on).
 	cat > "$b/bin/cc-openssl" <<-EOF
 	#!/bin/sh

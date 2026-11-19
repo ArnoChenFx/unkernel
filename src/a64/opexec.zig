@@ -195,6 +195,7 @@ noinline fn execGeneric(cpu: *Cpu, x: [*]u64, raw: u32, pc: u64) Next {
     kwemu.count(cpu, "generic_ops", 1);
     if (kwemu.stats_on) cpu.priv.stats.jit.hb_gen[tier.Ax.gen_class + tier.genClass(raw)] += 1;
     if (kwemu.stats_on) cpu.priv.stats.op_hist[tier.fp_base + tier.fpForm(raw)] += 1;
+    if (kwemu.stats_on) kwemu.countGenWord(cpu, raw, false);
     const regs: *Regs = @ptrCast(@alignCast(x));
     regs.pc = pc;
     const s: c.St = .{ .r = regs, .h = &cpu.priv.hart, .m = cpu };
@@ -218,6 +219,7 @@ noinline fn execGeneric(cpu: *Cpu, x: [*]u64, raw: u32, pc: u64) Next {
 /// into decoded code, IC IVAU).
 pub fn jitGeneric(x: u64, cpu: u64, raw: u64, pc: u64) callconv(.c) u64 {
     const cp: *Cpu = @ptrFromInt(@as(usize, @intCast(cpu)));
+    if (kwemu.stats_on) kwemu.countGenWord(cp, @truncate(raw), true);
     return switch (execGeneric(cp, @ptrFromInt(@as(usize, @intCast(x))), @truncate(raw), pc)) {
         .cont => 0,
         .stop => blk: {

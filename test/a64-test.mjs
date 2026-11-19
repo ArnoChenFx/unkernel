@@ -153,6 +153,7 @@ const modes = [
   ["wasm64", (elf, args) => runWasm(elf, args)],
   ["wasm64+jit", (elf, args) => runWasm(elf, args, jitModule, createJitHost({ eager: true }))],
   ["wasm64+jit/thr", (elf, args) => runWasm(elf, args, jitModule, createJitHost())],
+  ["wasm64+jit/nosimd", (elf, args) => runWasm(elf, args, jitModule, createJitHost({ eager: true, simd: false }))],
   ["lockstep", runLockstep],
 ];
 if (jit32Module) modes.splice(4, 0, ["wasm32+jit", (elf, args) => runWasm(elf, args, jit32Module, createJitHost({ eager: true, mem32: true }))]);

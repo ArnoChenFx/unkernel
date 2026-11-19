@@ -547,11 +547,11 @@ async function dumpFrame(file: string): Promise<void> {
 // prints with --stats, from the layout in src/emu/kwemu.zig (Stats) and the
 // exit counter indices in src/emu/jit.zig (Jx).
 function printKwemuStats(k: KwemuStats): void {
-	const nk = 192, base = k.words.length - 64, ic = Math.max(k.icount, 1);
+	const nk = 192, base = 11 + 2 * nk + 2 + 40, ic = Math.max(k.icount, 1);
 	const w = (i: number): number => k.words[i] ?? 0, jx = (i: number): number => w(base + i);
 	process.stderr.write(`[kwemu] instret=${k.icount} compiled insns=${(w(11 + nk) * 100 / ic).toFixed(2)}% handbacks=${w(12 + nk)}\n`);
 	process.stderr.write(`[kwemu-exits] entries=${jx(0)} handbacks=${jx(1)} side=${jx(2)} (region ${jx(25)}) direct=${jx(3)} jalr=${jx(4)} stop=${jx(24)}\n`);
-	process.stderr.write(`[kwemu-jx] ${k.words.slice(base).join(" ")}\n`);
+	process.stderr.write(`[kwemu-jx] ${k.words.slice(base, base + 64).join(" ")}\n`);
 	process.stderr.write(`[kwemu-stats] lookups_slow=${w(0)} revalidated=${w(1)} decoded=${w(2)} resets=${w(3)} blocks=${w(4)} ` +
 		`insns/block=${(w(5) / Math.max(w(4), 1)).toFixed(2)} single_steps=${w(6)} walks r/w/x=${w(7)}/${w(8)}/${w(9)} generic=${w(10)}\n`);
 }

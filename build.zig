@@ -285,9 +285,18 @@ pub fn build(b: *std.Build) void {
     unit_a64_wasm_run.addFileArg(unit_a64_wasm.getEmittedBin());
     unit_a64_wasm_run.addArgs(&.{ "--name", "a64" });
     unit_a64_wasm_run.has_side_effects = true;
+    // Again with a host that offers no SIMD (jitcore.zig cap_simd): the
+    // i64 register locals and generic calls instead of v128 code.
+    const unit_a64_wasm_nosimd = b.addSystemCommand(&.{"node"});
+    unit_a64_wasm_nosimd.addFileArg(b.path("test/kwemu-unit-wasm.mjs"));
+    unit_a64_wasm_nosimd.addFileArg(unit_a64_wasm.getEmittedBin());
+    unit_a64_wasm_nosimd.addArgs(&.{ "--name", "a64-nosimd" });
+    unit_a64_wasm_nosimd.setEnvironmentVariable("KWEMU_JIT_SIMD", "0");
+    unit_a64_wasm_nosimd.has_side_effects = true;
     const test_step = b.step("test", "Run the A64 unit tests (native, and wasm64 with the JIT) and the A64 guests (native, wasm64, wasm64 with the JIT) against qemu-aarch64");
     test_step.dependOn(&b.addRunArtifact(unit_a64).step);
     test_step.dependOn(&unit_a64_wasm_run.step);
+    test_step.dependOn(&unit_a64_wasm_nosimd.step);
     test_step.dependOn(&a64_e2e.step);
     if (riscv_legacy) {
         const test_riscv = b.step("test-riscv", "Run the riscv unit tests (native, and wasm64 with the JIT tier); reference code only");

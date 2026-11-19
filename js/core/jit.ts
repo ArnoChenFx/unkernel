@@ -11,7 +11,8 @@
 //                                    (tests only; never set here), bit 3
 //                                    shared memory, bit 4 the kernel's table
 //                                    is offered as env.table
-//                                    (always, here)
+//                                    (always, here), bit 5 the engine
+//                                    compiles fixed-width SIMD (v128)
 //   kw_host_jit_compile(ptr, len, slot, flags) -> i32
 //                                    compile the module at ptr (it imports
 //                                    env.memory and maybe env.table, exports
@@ -99,7 +100,8 @@ export interface KwemuStats {
 	/**
 	 * kwemu.Stats as 64-bit words, in the layout of src/emu/kwemu.zig: 11
 	 * counters, op_hist[192], JIT insns, hand-backs, hb[192], hb_gen[40],
-	 * jx[64] (indices in src/emu/jit.zig Jx).
+	 * jx[64] (indices in src/emu/jit.zig Jx), gen_words[3 * 512] (A64:
+	 * `generic` ops by word, kwemu.zig countGenWord).
 	 */
 	words: number[];
 }
@@ -158,6 +160,21 @@ const CAP_MEM32 = 2;
 const CAP_SHARED = 8;
 /** The kernel's function table is offered to modules as env.table. */
 const CAP_TABLE = 16;
+/** The engine compiles fixed-width SIMD: kwemu may emit v128 code. */
+const CAP_SIMD = 32;
+/**
+ * A module whose function returns i8x16.popcnt(i8x16.splat(0)): engines
+ * without SIMD (V8 on an x86-64 without SSE4.1) do not validate it.
+ */
+const SIMD_PROBE = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+/** Whether this engine compiles fixed-width SIMD (cap bit 5). */
+export function jitSimd(): boolean {
+	try {
+		return WebAssembly.validate(SIMD_PROBE);
+	} catch {
+		return false;
+	}
+}
 /** kw_host_jit_compile flags bit 0: f(x, 0, irqp, jl) returns 0 at once. */
 const WARM = 1;
 /** kwemu's emit buffer is 16 KiB; anything much larger is not from kwemu. */
@@ -165,7 +182,7 @@ const MAX_MODULE = 1 << 20;
 /** Failure messages logged before going quiet. */
 const MAX_LOGGED = 5;
 /** Words in kwemu.Stats with -Dkwemu-stats (src/emu/kwemu.zig), and the offset of icount in struct kw_cpu. */
-const KWEMU_STATS_WORDS = 11 + 192 + 2 + 192 + 40 + 64;
+const KWEMU_STATS_WORDS = 11 + 192 + 2 + 192 + 40 + 64 + 3 * 512;
 const KW_CPU_ICOUNT = 32;
 /** Uncollected freed modules from which every compile and free prompts a collection. */
 const RETAINED_NUDGE = 256;
@@ -206,6 +223,8 @@ export class JitHost {
 	/** -Dkwemu-stats kernels: the stats-only exports, and the emit buffer of the first compile. */
 	#debugStats: ((cpu: bigint, out: bigint) => void) | undefined;
 	#cpuOfBuf: ((buf: bigint) => bigint) | undefined;
+	/** The engine compiles SIMD (asked once, at the first kw_host_jit_caps). */
+	#simd: boolean | undefined;
 	#buf: number | undefined;
 
 	constructor(opts: JitHostOptions) {
@@ -258,7 +277,7 @@ export class JitHost {
 		// while this host's JavaScript runs.
 		const cpu = this.#cpuOfBuf(BigInt(of));
 		// The emit buffer (16 KiB) is free between compiles: copy the
-		// counters (4008 bytes) into it, then read them.
+		// counters (16296 bytes) into it, then read them.
 		this.#debugStats(cpu, BigInt(this.#buf));
 		const v = new DataView(this.#opts.memory().buffer);
 		const words: number[] = [];
@@ -285,7 +304,8 @@ export class JitHost {
 			return 0;
 		}
 		const shared = typeof SharedArrayBuffer !== "undefined" && this.#opts.memory().buffer instanceof SharedArrayBuffer;
-		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0) | CAP_TABLE;
+		this.#simd ??= jitSimd();
+		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0) | CAP_TABLE | (this.#simd ? CAP_SIMD : 0);
 	}
 
 	compile(ptr: bigint | number, len: bigint | number, slot: number, flags = 0): number {

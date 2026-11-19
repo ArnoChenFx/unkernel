@@ -15,13 +15,15 @@ musl stays Alpine's, and so does everything else, including ssl_client and
 scanelf.
 
 What the rebuild avoids: kwemu's JIT compiles integer, load/store and
-branch instructions, and hands every FP, AdvSIMD, crypto, exclusive and
-system instruction back to the interpreter as a `generic` op; a compiled
-block runs only up to its first one (a64.md, JIT). Alpine's `-Os` code is
-almost free of them, but gcc's `-O2` is not (the vectorizer, FP registers
-as spill space, scalar AdvSIMD idioms such as `uqsub`), and libcrypto
-picks its NEON and crypto-extension code from AT_HWCAP, which kwemu
-advertises.
+branch instructions best; FP and AdvSIMD code is translated only in part
+(scalar FP with a fast path, and where the host has wasm SIMD the integer
+AdvSIMD and crypto instructions; a64.md, JIT), and the rest are calls of
+the interpreter (`generic` ops). Alpine's `-Os` code is almost free of
+them, but gcc's `-O2` is not (the vectorizer, FP registers as spill
+space, scalar AdvSIMD idioms such as `uqsub`). libcrypto keeps
+upstream's choice of its NEON and crypto-extension code from AT_HWCAP:
+with the JIT's AdvSIMD and crypto translation those paths are the fast
+ones (Measurements).
 
 ## How it is built
 
@@ -62,12 +64,15 @@ advertises.
   on the first attempt, whose `va_start` uses an FP register operand; a
   file that defines a variadic function then fails that attempt and is
   built without `-mgeneral-regs-only` (busybox's `ash.c` among them).
-- **libcrypto runs its integer code.** A patch in the script makes
-  `OPENSSL_cpuid_setup` return with no capabilities unless the
-  `OPENSSL_armcap` environment variable sets them (as upstream): no NEON,
-  AES, PMULL, SHA-1, SHA-256 or SHA-3 code, so AES is `aes_core.c`, GHASH
-  the 4-bit table code, SHA and ChaCha20/Poly1305 the scalar assembly.
-  Under kwemu that is faster for every algorithm (Measurements).
+- **libcrypto picks its code from AT_HWCAP**, unpatched: AES, PMULL
+  (GHASH), SHA-1, SHA-256, SHA-512 and NEON (ChaCha20, Poly1305) as
+  kwemu advertises them (`OPENSSL_armcap=0x8fd`; `OPENSSL_armcap` in the
+  environment still overrides). Until 2026-11-18 a patch here returned no
+  capabilities, because those paths were interpreter calls and slower
+  than the integer code; with the JIT's translation (a64.md, AdvSIMD and
+  crypto in compiled code) they are 1.2-8x faster (Measurements). A host
+  without wasm SIMD (or `--no-jit`) runs them as interpreter calls again,
+  which is slower for most of them (Measurements).
 - **The linker.** lld (zig's `ld.lld`, through `-fuse-ld=lld -B`), not
   GNU ld, with `-z pack-relative-relocs` (RELR; musl supports it) and
   `--undefined-version`. busybox is not PIE. apk is PIE (gcc's default
@@ -128,8 +133,7 @@ advertises.
 1. Take each package's new `c:` commit from the new image's apk database.
 2. Update `commit`, `apkbuild_sha256` and the sysroot apks (versions and
    SHA-256) in the script.
-3. Check that the APKBUILD's configure options still match the script's,
-   and that the armcap patch still applies (the script stops if not).
+3. Check that the APKBUILD's configure options still match the script's.
 
 ## Measurements
 
@@ -167,27 +171,45 @@ extraction (zlib, SHA-256) are where the installs gain. `sort` and
 `gzip` here include busybox `seq`, whose `double` arithmetic is
 generic ops in every build.
 
+With libcrypto on its HWCAP paths and the JIT translating them
+(2026-11-18, UP bundle, medians of 5 boots interleaved against the same
+JIT with the image's libcrypto still patched to its integer paths and
+SHA512 off): `apk add python3` 4.08 to 3.36 s, `apk add git` 2.34 to
+2.10, `apk update` 1.26 to 1.23, the other rows within noise; sum of the
+20 rows of `vendor/hand-build/bench-cmds.sh` 23.71 to 22.55 s. Package
+installs verify SHA-256 and download over TLS (AES-GCM).
+
 **OpenSSL in the image** (`openssl speed -evp ALG -bytes 16384
 -seconds 2`, MB/s; public key in operations/s; the rebuild's `openssl`
-command against the image's libcrypto; 2 boots each, medians). riscv64
-is main's rebuilt libcrypto with its Zkn/Zbkb code.
+command against the image's libcrypto). riscv64 is main's rebuilt
+libcrypto with its Zkn/Zbkb code; "integer paths" is the rebuilt
+libcrypto while a patch hid AT_HWCAP from it (2 boots, medians), "HWCAP
+paths" the image now (2026-11-18, the JIT with AdvSIMD and crypto
+translation and SHA512 on, `OPENSSL_armcap=0x8fd`; medians of 3 boots,
+a64.md, AdvSIMD and crypto in compiled code).
 
-| | riscv64 | aarch64, Alpine's | **aarch64, rebuilt** |
-| --- | ---: | ---: | ---: |
-| sha256 | 46 | 26 | **59** |
-| sha512 | 137 | 117 | **125** |
-| sha1 | 118 | 33 | **151** |
-| aes-128-gcm | 53 | 14 | **24** |
-| aes-256-gcm | 48 | 11 | **20** |
-| aes-256-ctr | 52 | 14 | **25** |
-| aes-128-cbc | 92 | 21 | **43** |
-| chacha20-poly1305 | 71 | 5 | **162** |
-| rsa2048 sign / verify | 49 / 2380 | 83 / 3070 | **55-79 / 3060** |
-| ecdsa p256 sign / verify | 39 / 51 | 1950 / 800 | **2030 / 715** |
-| x25519 | 2410 | 2600 | **3130** |
+| | riscv64 | aarch64, Alpine's (before the translation) | aarch64, integer paths | **aarch64, HWCAP paths** |
+| --- | ---: | ---: | ---: | ---: |
+| sha256 | 46 | 26 | 59 | **157** |
+| sha512 | 137 | 117 | 125 | **217** |
+| sha1 | 118 | 33 | 151 | **324** |
+| aes-128-gcm | 53 | 14 | 24 | **99** |
+| aes-256-gcm | 48 | 11 | 20 | **80** |
+| aes-256-ctr | 52 | 14 | 25 | **137** |
+| aes-128-cbc | 92 | 21 | 43 | **190** |
+| chacha20-poly1305 | 71 | 5 | 162 | **203** |
+| rsa2048 sign / verify | 49 / 2380 | 83 / 3070 | 55-79 / 3060 | **81 / 3060** (one boot; 82 / 3120 with `OPENSSL_armcap=0`) |
+| ecdsa p256 sign / verify | 39 / 51 | 1950 / 800 | 2030 / 715 | 2030 / 715 (no NEON code; not rerun) |
+| x25519 | 2410 | 2600 | 3130 | 3130 (no NEON code; not rerun) |
 
-AES stays at half riscv64's speed: riscv64's AES round instructions are
-compiled by its JIT, aarch64's `aes_core.c` does 16 table loads a round.
+Without wasm SIMD in the host (the JIT calls the interpreter for AdvSIMD
+and crypto) the HWCAP paths are the slow ones (2026-11-18, one boot,
+`-seconds 1`): aes-128-gcm 14 against 24 MB/s on the integer path,
+sha256 24 against 57, sha512 10 against 122, chacha20-poly1305 5
+against 159. With `--no-jit` (interpreter only) they are faster for AES
+(13 against 3) and SHA-256 (24 against 7), even for SHA-512 (10 against
+11) and slower for ChaCha20-Poly1305 (5 against 12). Every engine with
+JSPI has SIMD; the trade is made for it.
 
 **Correctness** (2026-11-18): digests (md5, sha1, sha224 to sha512,
 sha512-256, sha3-256, shake128, blake2b512) and `openssl enc` (AES CBC,
@@ -196,7 +218,19 @@ default and with `OPENSSL_armcap` set, equal the host's openssl, and
 decryption round-trips; TLS 1.3 (AES-128-GCM, AES-256-GCM,
 ChaCha20-Poly1305) and TLS 1.2 (ECDHE-ECDSA with AES-GCM, ChaCha20,
 AES-CBC) against a host `openssl s_server` carried 270 KB each way
-intact. busybox's testsuite in the guest: the same 13 failures as
+intact. With the HWCAP paths compiled by the JIT (2026-11-18, the image's
+unpatched libcrypto, SHA512 on, UP bundle): in the guest, the digests
+(md5, sha1, sha224, sha256, sha384, sha512, sha512-256, sha3-256,
+shake128), `openssl enc` (AES-128/256-CBC, AES-128/192/256-CTR, ECB, CFB,
+OFB, ChaCha20, each also decrypted again: 135 round trips), GMAC
+(AES-128-GCM, AES-256-GCM) and HMAC-SHA256 of 15 lengths (1 byte to 2.9
+MB, around the 16, 64 and 128-byte block sizes) equal the host's openssl
+line for line, by default and with `OPENSSL_armcap=0`; TLS 1.3
+(AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) and TLS 1.2 (ECDHE-RSA with
+AES-128-GCM, AES-256-CBC, ChaCha20-Poly1305) carried 2.9 MB intact in
+both directions (the guest as client of a host `s_server -WWW`, and as
+server for a host `s_client`). busybox's testsuite in the guest: the
+same 13 failures as
 Alpine's busybox (wget without a network, `hostname -d`, timezone data,
 three sed cases, cpio hardlinks, unzip, strings, an awk gsub case), all
 other tests pass with both.
@@ -268,27 +302,30 @@ SHA-1 crypto instructions of the index signature check) and execute
 about the same number of instructions (232M against 234M for `apk search
 -q busybox`). Their time is the JIT's own (below).
 
-**OpenSSL per capability** (`openssl speed -evp ALG -bytes 16384
--seconds 1`, MB/s, Alpine's libcrypto, one run each, `OPENSSL_armcap`
-set in the environment; 0x8bd is what kwemu's HWCAP gives it):
+**OpenSSL per capability** (2026-11-18, `openssl speed -evp ALG -bytes
+16384 -seconds 1`, MB/s, the image's libcrypto, one run each,
+`OPENSSL_armcap` set in the environment, the JIT with AdvSIMD and crypto
+translation, SHA512 on; 0x8fd is what kwemu's HWCAP gives it now):
 
-| algorithm | 0x8bd (NEON + AES, PMULL, SHA1, SHA2, SHA3) | 0x1 (NEON) | 0x25 (NEON, AES, PMULL) | 0x10 (SHA2) | **0** |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| sha256 | 25.4 | 3.1 | 3.1 | 25.3 | **56.9** |
-| sha1 | 30.5 | 139 | 151 | 151 | **146** |
-| sha512 | 117 | 113 | 112 | 109 | **115** |
-| aes-128-gcm | 14.0 | 3.0 | 13.7 | 18.9 | **19.9** |
-| aes-256-ctr | 12.3 | 2.3 | 14.0 | 19.5 | **20.9** |
-| aes-128-cbc | 19.6 | 1.9 | 20.7 | 28.5 | **33.3** |
-| chacha20-poly1305 | 4.4 | 4.7 | 4.6 | 163 | **167** |
-| md5 | 304 | 336 | 334 | 303 | **326** |
+| algorithm | **0x8fd** (NEON + AES, PMULL, SHA1, SHA2, SHA512, SHA3) | 0x1 (NEON) | 0x25 (NEON, AES, PMULL) | 0x3d (0x25 + SHA1, SHA2) | 0x10 (SHA2) | 0 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| sha256 | **163** | 88 | 89 | 153 | 163 | 61 |
+| sha1 | **350** | 156 | 155 | 354 | 147 | 158 |
+| sha512 | **215** | 107 | 119 | 117 | 117 | 118 |
+| aes-128-gcm | **90** | 42 | 94 | 94 | 24 | 23 |
+| aes-256-ctr | **138** | 159 | 137 | 136 | 24 | 25 |
+| aes-128-cbc | **194** | 126 | 194 | 184 | 44 | 44 |
+| chacha20-poly1305 | **186** | 199 | 207 | 205 | 163 | 167 |
+| md5 | **331** | 343 | 341 | 338 | 330 | 335 |
 
-The NEON paths (vpaes, the NEON SHA-256 and GHASH, ChaCha20 for long
-inputs) are the slowest: each AdvSIMD instruction is a generic op. The
-crypto-extension instructions do a lot per op, but each still hands the
-block back, and the integer code around them is short. With 0 everything
-runs compiled. SHA-512 is integer in every column (HWCAP_SHA512 is off,
-status.md).
+Every algorithm is fastest, or within one run's noise of it, with the
+full set; only AES-CTR is faster on NEON alone (bitsliced AES, 159
+against 138), which the AES bit cannot be taken away for without losing
+GCM (42 against 90) and CBC. Before the translation (the same table with
+Alpine's libcrypto, 2026-11-18) every capability bit made OpenSSL slower
+(full set: sha256 25, aes-128-gcm 14, chacha20-poly1305 4.4 MB/s against
+57, 20 and 167 with none), because each AdvSIMD and crypto instruction
+was an interpreter call.
 
 ## What did not help, or was worse
 
@@ -307,9 +344,11 @@ status.md).
 - **`-mno-outline-atomics`.** Inline LL/SC instead of the helper calls:
   no gain (apk startup 480 against 450 ms, the rest flat). Exclusives are
   generic ops either way.
-- **Capability subsets for OpenSSL.** No algorithm is faster with any
-  capability bit set (table above), so the patch clears them all instead
-  of masking some.
+- **Hiding capabilities from OpenSSL** (a patch that left
+  `OPENSSL_armcap` empty, until 2026-11-18): right while AdvSIMD and
+  crypto instructions were interpreter calls, 1.2-8x slower than
+  upstream's choice since the JIT translates them (per-capability table
+  above). Masking single bits gains nothing either.
 - **GNU ld** (stock Alpine binaries): 150 execs of busybox 230 ms
   against 220 ms with lld, about 0.07 ms per exec on aarch64 (riscv64
   measured 0.5 ms, 2026-11-16).

@@ -978,9 +978,9 @@ MTE, PAC, BTI, GCS or POE.
   right: `armv8` turns every optional feature off, `-aes` one off, `+aes`
   (or `aes`) one back on; the names are the Features line's (`lse` also
   names `atomics`). kwemu keeps SHA512 only with SHA2, so `-sha2` turns
-  both off. SHA512 starts off and needs `+sha512` (OpenSSL's ARMv8.2
-  SHA-512 path is interpreted and far slower than its compiled integer
-  path; a64.md). User space picks code paths from these (OpenSSL
+  both off. Every feature kwemu implements starts on (SHA512 too, since
+  the JIT translates OpenSSL's SHA-512 path; a64.md, Crypto and CRC32).
+  User space picks code paths from these (OpenSSL
   reads AT_HWCAP), so nothing beyond what kwemu runs is ever listed: no
   SVE, SM3/SM4, RNG, PAC or BTI.
 - Address space: user page tables keep the Sv39 format kwemu walks, and

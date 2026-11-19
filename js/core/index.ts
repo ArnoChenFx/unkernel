@@ -20,7 +20,7 @@ export { checkJspi, checkSupport } from "./support.ts";
 export type { SupportReport } from "./support.ts";
 export { BootError, download, loadBytes, loadKernelModule } from "./load.ts";
 export type { BootFailStage, BytesSource, DownloadProgress, KernelSource, LoadOptions } from "./load.ts";
-export { JitHost } from "./jit.ts";
+export { JitHost, jitSimd } from "./jit.ts";
 export { DEFAULT_DISPLAY_SIZE, DisplayHost, FOURCC_XRGB8888, frameToPpm, xrgbToRgba } from "./display.ts";
 export type { DisplayFrame, DisplayHostOptions, DisplayMode, DisplayOption, DisplaySize, DisplayStats } from "./display.ts";
 export { ABS_MAX, ABS_X, ABS_Y, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, DOM_CODE_TO_LINUX, EV_ABS, EV_KEY, EV_REL, EV_SYN, INPUT_KEYBOARD, INPUT_MOUSE, INPUT_TABLET, InputHost, REL_WHEEL, REL_X, REL_Y, domButtonToLinux, domCodeToLinux } from "./input.ts";

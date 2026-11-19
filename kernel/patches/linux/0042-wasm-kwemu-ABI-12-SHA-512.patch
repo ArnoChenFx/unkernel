@@ -1,4 +1,4 @@
-From e60003e43957f1f1c319b9385064b640b8d1c770 Mon Sep 17 00:00:00 2001
+From 113b64e433f3fa9c20b96c89c40533a8e2ce2c27 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 02:15:20 +0000
 Subject: [PATCH] wasm: kwemu ABI 12: SHA-512
@@ -11,8 +11,8 @@ ID_AA64ISAR0_EL1.SHA2 reads 2. kw.isa=-sha512 turns it off, and so does
 kw.isa=-sha2.
 ---
  arch/wasm/include/asm/kw_emu.h | 14 ++++++++------
- arch/wasm/kernel/cpu.c         | 18 ++++++++++++++----
- 2 files changed, 22 insertions(+), 10 deletions(-)
+ arch/wasm/kernel/cpu.c         | 11 +++++++----
+ 2 files changed, 15 insertions(+), 10 deletions(-)
 
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
 index cd5124d668b..4737a256fb2 100644
@@ -61,7 +61,7 @@ index cd5124d668b..4737a256fb2 100644
  /* The KW_ISA_* features this kwemu build implements. */
  uint64_t kw_isa_supported(void);
 diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
-index b31a38b8f41..62ca85f58dd 100644
+index b31a38b8f41..b52ca8664f8 100644
 --- a/arch/wasm/kernel/cpu.c
 +++ b/arch/wasm/kernel/cpu.c
 @@ -17,7 +17,7 @@
@@ -73,7 +73,7 @@ index b31a38b8f41..62ca85f58dd 100644
   * not run (OpenSSL and gcc's outline atomics pick code paths from these
   * bits).
   *
-@@ -49,10 +49,17 @@ static const struct kw_isa_ext kw_isa_exts[] = {
+@@ -49,10 +49,11 @@ static const struct kw_isa_ext kw_isa_exts[] = {
  	{ "crc32",	HWCAP_CRC32,	KW_ISA_CRC32 },
  	{ "atomics",	HWCAP_ATOMICS,	KW_ISA_LSE,	"lse" },
  	{ "cpuid",	HWCAP_CPUID,	0 },	/* only if KW_HWCAP_CPUID */
@@ -82,25 +82,18 @@ index b31a38b8f41..62ca85f58dd 100644
  
 -/* The KW_ISA_* features the command line leaves on. */
 -static u64 kw_isa_want __initdata = ~0ULL;
-+/*
-+ * The KW_ISA_* features the command line leaves on. SHA512 is off unless
-+ * kw.isa=+sha512 asks for it: kwemu interprets the SHA512 and AdvSIMD
-+ * instructions of OpenSSL's ARMv8.2 code one by one but compiles the
-+ * integer code OpenSSL uses without it, which is about 12 times faster.
-+ */
-+#define KW_ISA_DEFAULT_OFF	KW_ISA_SHA512
-+static u64 kw_isa_want __initdata = ~(u64)KW_ISA_DEFAULT_OFF;
++/* The KW_ISA_* features the command line leaves on (all of them). */
++static u64 kw_isa_want __initdata = ~(u64)0;
  /* What user space sees; the defaults are ARMv8.0-A with FP and AdvSIMD. */
  static char kw_isa_str[128] __ro_after_init = "fp asimd";
  unsigned long kw_elf_hwcap __ro_after_init = HWCAP_FP | HWCAP_ASIMD;
-@@ -68,8 +75,11 @@ u64 kw_isa_enabled(void)
+@@ -68,8 +69,10 @@ u64 kw_isa_enabled(void)
   * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
   * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
   * implements it; the names are those of the Features line (aes, pmull,
 - * sha1, sha2, crc32, atomics; "lse" is atomics too). For example
 + * sha1, sha2, crc32, atomics, sha512; "lse" is atomics too). For example
   * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
-+ * sha512 starts off (KW_ISA_DEFAULT_OFF): kw.isa=+sha512 turns it on.
 + * kwemu runs SHA512 only together with SHA2 (kw_set_isa drops it
 + * otherwise), so -sha2 turns both off.
   */

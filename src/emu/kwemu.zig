@@ -201,7 +201,38 @@ pub const JitStats = extern struct {
     hb_gen: [40]u64 = @splat(0),
     /// How compiled code is entered and left, regions included (see jit.Jx).
     jx: [64]u64 = @splat(0),
+    /// `generic` ops by word with the Rd and Rn fields cleared (A64,
+    /// `countGenWord`): `gen_words_n` open-addressed entries of three words
+    /// (the key | 1 << 32, executions, of those calls from compiled code);
+    /// the last entry counts what finds no free entry.
+    gen_words: [3 * gen_words_n]u64 = @splat(0),
 };
+
+pub const gen_words_n = 512;
+
+/// -Dkwemu-stats: count one execution of the `generic` op `raw` in
+/// JitStats.gen_words, or (`from_jit`) one call of it from compiled code.
+pub fn countGenWord(cpu: *Cpu, raw: u32, from_jit: bool) void {
+    if (!stats_on) return;
+    const t = &cpu.priv.stats.jit.gen_words;
+    const key = @as(u64, raw & 0xffff_fc00) | 1 << 32;
+    var i: usize = @intCast(((raw >> 10) *% 0x9e37_79b1) >> 23);
+    var probes: usize = 0;
+    while (true) : (probes += 1) {
+        if (probes == 16) {
+            i = gen_words_n - 1;
+            break;
+        }
+        if (i == gen_words_n - 1) i = 0;
+        if (t[3 * i] == key) break;
+        if (t[3 * i] == 0) {
+            t[3 * i] = key;
+            break;
+        }
+        i += 1;
+    }
+    t[3 * i + 1 + @intFromBool(from_jit)] += 1;
+}
 
 /// Bucket of a `generic` instruction for JitStats.hb_gen: OP-FP funct5
 /// (0..31), SYSTEM (32), AMO (33), MISC-MEM (34), FMA (35), FP load/store
@@ -1016,7 +1047,7 @@ comptime {
     std.debug.assert(@sizeOf(usize) == 8); // pointer field in kw_cpu
     std.debug.assert(@sizeOf(Cpu) <= cpu_size);
     // harness.zig reads this layout
-    std.debug.assert(@sizeOf(Stats) == (11 + 192 + (if (stats_on) 2 + 192 + 40 + 64 else 0)) * 8);
+    std.debug.assert(@sizeOf(Stats) == (11 + 192 + (if (stats_on) 2 + 192 + 40 + 64 + 3 * gen_words_n else 0)) * 8);
     if (stats_on) std.debug.assert(jc.Jx.end <= 64);
     std.debug.assert(cpu_size == c.KW_CPU_SIZE);
     std.debug.assert(abi_version == c.KW_ABI_VERSION);

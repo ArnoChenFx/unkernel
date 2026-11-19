@@ -12,20 +12,22 @@
 // available: caps bit 0 (false: kwemu never compiles, the interpreter alone
 // runs); eager: caps bit 2 (compile on first entry); mem32: caps bit 1 (the module
 // was lowered with wasm-opt --memory64-lowering); table: caps bit 4 (each
-// module gets the instance's table as env.table; default true); strict: a compile into a
+// module gets the instance's table as env.table; default true); simd: caps bit 5
+// (kwemu may emit v128 code; default true, `KWEMU_JIT_SIMD=0` in the
+// environment turns it off); strict: a compile into a
 // slot that is already installed is an error (it is legal after a second
 // kw_cpu_init, which forgets its slots). Errors are collected in stats.errors.
 // Every compile also calls the new f with cpu = 0, which must return 0 at
 // once (what js/core/jit.ts does to have V8 compile it inside the call), and
 // then the export kwemu_test_compile_hook, if the instance has one (the unit
 // tests' stand-in for another CPU acting during a compile).
-export function createJitHost({ available = true, eager = false, mem32 = false, strict = false, table: table_ = true } = {}) {
+export function createJitHost({ available = true, eager = false, mem32 = false, strict = false, table: table_ = true, simd = process.env.KWEMU_JIT_SIMD !== "0" } = {}) {
   let mem, table, hook, big = true;
   const saved = new Map();
   const stats = { compiles: 0, frees: 0, failures: 0, bytes: 0, compileNs: 0n, errors: [] };
   const idx = (slot) => (big ? BigInt(slot) : slot);
   const imports = {
-    kw_host_jit_caps: () => (available ? 1 : 0) | (mem32 ? 2 : 0) | (eager ? 4 : 0) | (table_ ? 16 : 0),
+    kw_host_jit_caps: () => (available ? 1 : 0) | (mem32 ? 2 : 0) | (eager ? 4 : 0) | (table_ ? 16 : 0) | (simd ? 32 : 0),
     kw_host_jit_compile(ptr, len, slot, flags) {
       const t0 = process.hrtime.bigint();
       try {

@@ -285,9 +285,7 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
         .from_x => {
             cm.get(e, xs(f.n));
             andMask(e, f.mask);
-            cm.set(e, vlo(f.d));
-            e.k64(0);
-            cm.set(e, vlo(f.d) + 1);
+            cm.setScalar(e, vlo(f.d));
         },
         .ins64 => {
             cm.get(e, xs(f.n));
@@ -295,11 +293,32 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
         },
         .movi => {
             e.k64(f.k);
-            cm.set(e, vlo(f.d));
-            e.k64(if (f.q) f.k else 0);
-            cm.set(e, vlo(f.d) + 1);
+            if (e.simd and f.q) {
+                e.vop(cm.S.i64x2_splat);
+                cm.setV(e, f.d);
+            } else if (e.simd or !f.q) {
+                cm.setScalar(e, vlo(f.d));
+            } else {
+                cm.set(e, vlo(f.d));
+                e.k64(f.k);
+                cm.set(e, vlo(f.d) + 1);
+            }
         },
-        .logic => {
+        .logic => if (e.simd) {
+            cm.getV(e, f.n);
+            cm.getV(e, f.m);
+            switch (f.op) {
+                0 => e.vop(cm.S.v128_and),
+                1 => e.vop(cm.S.v128_andnot),
+                2 => e.vop(cm.S.v128_or),
+                3 => {
+                    e.vop(cm.S.v128_not);
+                    e.vop(cm.S.v128_or);
+                },
+                else => e.vop(cm.S.v128_xor),
+            }
+            cm.setVq(e, f.d, f.q);
+        } else {
             // The halves of n and m go through l_t first: d may be n or m.
             for (0..2) |h| {
                 if (h == 1 and !f.q) {
@@ -330,6 +349,11 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
             if (f.k != 1) {
                 e.k64(f.k);
                 e.op(W.i64_mul);
+            }
+            if (e.simd) {
+                e.vop(cm.S.i64x2_splat);
+                cm.setVq(e, f.d, f.q);
+                return;
             }
             e.set(cm.l_t);
             e.get(cm.l_t);
@@ -399,15 +423,11 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
                 },
                 else => {},
             }
-            cm.set(e, vlo(f.d));
-            e.k64(0);
-            cm.set(e, vlo(f.d) + 1);
+            cm.setScalar(e, vlo(f.d));
         },
         .fimm => {
             e.k64(f.k);
-            cm.set(e, vlo(f.d));
-            e.k64(0);
-            cm.set(e, vlo(f.d) + 1);
+            cm.setScalar(e, vlo(f.d));
         },
         .fcsel => {
             const m: u64 = if (f.h == 1) ~@as(u64, 0) else 0xffff_ffff;
@@ -417,9 +437,7 @@ pub fn emit(e: *Emit, f: Fast, at: At) void {
             andMask(e, m);
             alu.cond(e, @intCast(f.k));
             e.op(W.select);
-            cm.set(e, vlo(f.d));
-            e.k64(0);
-            cm.set(e, vlo(f.d) + 1);
+            cm.setScalar(e, vlo(f.d));
         },
     }
 }
@@ -504,6 +522,15 @@ fn fop(e: *Emit, dbl: bool, d: u8, s_: u8) void {
     e.op(if (dbl) d else s_);
 }
 
+/// The i64 local holding slot `slot` (a V half): its own local, or with
+/// SIMD a copy in `scratch`.
+fn srcLocal(e: *Emit, slot: u8, scratch: u32) u32 {
+    if (!e.simd) return cm.local(slot);
+    cm.get(e, slot);
+    e.set(scratch);
+    return scratch;
+}
+
 /// Push the i32 "the raw bits in local l are a normal number with a biased
 /// exponent of 2 .. max - 1".
 fn inRange(e: *Emit, l: u32, dbl: bool) void {
@@ -581,7 +608,7 @@ fn fpSlow(e: *Emit, f: Fast, at: At) void {
         if (r == ops.zr) continue;
         e.get(jc.l_x);
         e.addr();
-        e.get(cm.local(r));
+        cm.get(e, r);
         e.mem(W.i64_store, 3, cm.off(r));
     }
     e.get(jc.l_x);
@@ -590,14 +617,12 @@ fn fpSlow(e: *Emit, f: Fast, at: At) void {
     e.k64(at.pc);
     e.callTable(@intFromPtr(&opexec.jitGeneric));
     e.op(W.drop);
-    const wr: [2]u8 = if (f.kind == .cvtz) .{ xs(f.d), ops.zr } else .{ vlo(f.d), vlo(f.d) + 1 };
-    for (wr) |r| {
-        if (r == ops.zr) continue;
-        e.get(jc.l_x);
-        e.addr();
-        e.mem(W.i64_load, 3, cm.off(r));
-        e.set(cm.local(r));
-    }
+    if (f.kind != .cvtz) return cm.loadV(e, f.d);
+    if (xs(f.d) == ops.zr) return;
+    e.get(jc.l_x);
+    e.addr();
+    e.mem(W.i64_load, 3, cm.off(xs(f.d)));
+    cm.set(e, xs(f.d));
 }
 
 /// FADD, FSUB, FMUL, FDIV, FSQRT, SCVTF, UCVTF, FCVTZS, FCVTZU, FCVT (see
@@ -609,8 +634,8 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
     const t1 = cm.l_t + 1;
     const t2 = cm.l_t + 2;
     const t3 = cm.l_t + 3;
-    const ln = if (f.kind == .cvtf) 0 else cm.local(vlo(f.n));
-    const lm = if (f.kind == .farith) cm.local(vlo(f.m)) else 0;
+    const ln = if (f.kind == .cvtf) 0 else srcLocal(e, vlo(f.n), cm.l_t + 4);
+    const lm = if (f.kind == .farith) srcLocal(e, vlo(f.m), cm.l_t + 5) else 0;
     // Pushes the i32 "fast path"; leaves the result in t0, inexact in t1.
     switch (f.kind) {
         .farith => {
@@ -773,9 +798,7 @@ fn fpFast(e: *Emit, f: Fast, at: At) void {
     e.op(W.i32_and);
     e.open(W.@"if", W.void_t);
     e.get(t0);
-    cm.set(e, vlo(f.d));
-    e.k64(0);
-    cm.set(e, vlo(f.d) + 1);
+    cm.setScalar(e, vlo(f.d));
     // FPSR.IXC |= inexact
     e.get(t1);
     e.k64(@ctz(c.FPSR_IXC));
@@ -809,7 +832,7 @@ fn cvtz(e: *Emit, f: Fast, at: At) void {
     const t0 = cm.l_t;
     const t1 = cm.l_t + 1;
     const t2 = cm.l_t + 2;
-    const ln = cm.local(vlo(f.n));
+    const ln = srcLocal(e, vlo(f.n), cm.l_t + 4);
     if (f.h == 1) pushF(e, ln, true) else pushSD(e, ln);
     e.op(Fo.i64_reinterpret);
     e.set(t2);

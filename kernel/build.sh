@@ -57,7 +57,8 @@
 #   vendor/build/disk/alpine.ext4   Alpine root file system image for kwblk (`disk`)
 #   vendor/build/disk/kwdata.kwsparse.gz  empty ext4 "kwdata" data disk template (`datadisk`)
 #   vendor/build/disk/ubuntu.ext4  Ubuntu Base 26.10 root file system image (`ubuntu`)
-#   vendor/build/initramfs/         alpine.cpio (also holds /usr/bin/kwtest and kwbench)
+#   vendor/build/initramfs/         alpine.cpio (also holds /usr/bin/kwtest, abitest and kwbench;
+#                                   with KW_RELEASE=1 only alpine-test.cpio does)
 #   vendor/build/bundle/            unkernel-alpine.wasm (vmlinux32.wasm + alpine.cpio + cmdline
 #                                   + the data disk template + the SMP patch in custom sections);
 #                                   the default of the CLI (js/cli.ts) and the SDK, and copied to
@@ -514,7 +515,8 @@ disk_is_current() {
 	local img="$build/disk/alpine.ext4" f
 	[ -f "$img" ] || return 1
 	for f in "$root/kernel/guest/alpine-disk.sh" "$root/kernel/guest/alpine.sh" \
-		"$root/kernel/guest/curl-shim.sh" "$root/kernel/guest/kw-data.sh" "$root/kernel/tools/ext4-owners.py" \
+		"$root/kernel/guest/alpine-opt.sh" "$root/kernel/guest/curl-shim.sh" "$root/kernel/guest/bwrap-shim.sh" \
+		"$root/kernel/guest/kw-data.sh" "$root/kernel/guest/kw-path.sh" "$root/kernel/tools/ext4-owners.py" \
 		"$root/kernel/tools/env.sh"; do
 		[ "$img" -nt "$f" ] || return 1
 	done

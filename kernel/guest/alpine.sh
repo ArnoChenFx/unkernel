@@ -6,10 +6,12 @@
 # /init mounts the pseudo filesystems and hands over to busybox init with a
 # login-less shell on hvc0; with a disk labelled kwdata, mounted at /data,
 # the root becomes an overlay that keeps every change on it (kw-overlay).
-# It also carries the kernel smoke test and benchmark (static, so they work
-# as /init too), except with KW_RELEASE=1 (release bundles; see the end of
+# It also carries the kernel tests and benchmark (static, so they work as
+# /init too), except with KW_RELEASE=1 (release bundles; see the end of
 # this file). vendor/build/initramfs/alpine-test.cpio always has them:
 #   rdinit=/usr/bin/kwtest    kernel/guest/kwtest.c, powers off (halts on a failure)
+#   rdinit=/usr/bin/abitest   kernel/guest/abitest.c, the arm64 user ABI without a libc
+#                             (exec registers, signal frame, clone); the same
 #   rdinit=/usr/bin/kwbench   kernel/guest/kwbench.c, rough guest speed
 # Always in the image:
 #   /usr/bin/glimmer        kernel/guest/glimmer.c, a small game on /dev/fb0, evdev and
@@ -58,10 +60,9 @@ chmod 1777 "$stage/tmp" "$stage/var/tmp"
 rm -rf "$stage/usr/lib/engines-3" "$stage/usr/lib/ossl-modules/legacy.so" \
 	"$stage/etc/ssl/openssl.cnf.dist" "$stage/etc/ssl/ct_log_list.cnf.dist"
 # busybox, zlib, libcrypto, libssl, libapk and apk rebuilt for kwemu's CPU
-# (gcc 16 -O2, integer registers only where a file allows, lld; libcrypto on
-# its integer code paths), from the same source as these packages; see
-# alpine-opt.sh. KW_ALPINE_OPT=0 keeps Alpine's builds. alpine-disk.sh does
-# the same.
+# (gcc 16 -O2 without the vectorizer, integer registers only where a file
+# allows, lld), from the same source as these packages; see alpine-opt.sh.
+# KW_ALPINE_OPT=0 keeps Alpine's builds. alpine-disk.sh does the same.
 "$root/kernel/guest/alpine-opt.sh" --install "$stage"
 # apk starts with main only. Every apk command that loads the indexes parses
 # all of them, and community (21k packages to main's 6k) makes that ~2.7 s
@@ -471,14 +472,16 @@ cc_guest=("$zig" cc -target aarch64-linux-musl -mcpu=generic -static -O2 -s)
 for t in glimmer kwvsock kwshm kwtty kw9p; do
 	"${cc_guest[@]}" -o "$stage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
-# The kernel smoke test and benchmark (see the top of this file) are not in
-# the image: they go into a second archive, below.
+# The kernel tests and benchmark (see the top of this file) are not in the
+# image: they go into a second archive, below. abitest has no libc.
 tstage="$out/kwtest-root"
 rm -rf "$tstage"
 mkdir -p "$tstage/usr/bin"
 for t in kwtest kwbench; do
 	"${cc_guest[@]}" -o "$tstage/usr/bin/$t" "$root/kernel/guest/$t.c"
 done
+"$zig" cc -target aarch64-linux-none -mcpu=generic -nostdlib -ffreestanding -static -O2 \
+	-fno-stack-protector -s -o "$tstage/usr/bin/abitest" "$root/kernel/guest/abitest.c"
 
 # Image id, for the overlay root (overlay/root.sh): a hash of the tree (names,
 # modes, links, contents; no times or owners), so an identical rebuild keeps
@@ -487,7 +490,7 @@ id=$(tar -C "$stage" --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner 
 echo "alpine-$ALPINE_VERSION-$id" > "$stage/usr/lib/kw-image"
 echo "image id: alpine-$ALPINE_VERSION-$id"
 
-# alpine-test.cpio is the image plus kwtest and kwbench: two archives back
+# alpine-test.cpio is the image plus the test programs: two archives back
 # to back, which the kernel unpacks in turn (the second adds its files).
 # alpine.cpio, which kernel/build.sh bundles, is the same, or with
 # KW_RELEASE=1 (the release workflow) the image alone. The image id above
@@ -499,10 +502,10 @@ cat "$out/alpine-image.cpio" "$out/kwtest.cpio" > "$out/alpine-test.cpio"
 rm "$out/kwtest.cpio"
 if [ "${KW_RELEASE:-0}" = 1 ]; then
 	mv "$out/alpine-image.cpio" "$out/alpine.cpio"
-	echo "initramfs: $out/alpine.cpio (KW_RELEASE=1: without kwtest and kwbench)"
+	echo "initramfs: $out/alpine.cpio (KW_RELEASE=1: without kwtest, abitest and kwbench)"
 else
 	rm "$out/alpine-image.cpio"
 	cp "$out/alpine-test.cpio" "$out/alpine.cpio"
-	echo "initramfs: $out/alpine.cpio (with kwtest and kwbench; KW_RELEASE=1 leaves them out)"
+	echo "initramfs: $out/alpine.cpio (with kwtest, abitest and kwbench; KW_RELEASE=1 leaves them out)"
 fi
-echo "initramfs with kwtest and kwbench: $out/alpine-test.cpio"
+echo "initramfs with kwtest, abitest and kwbench: $out/alpine-test.cpio"

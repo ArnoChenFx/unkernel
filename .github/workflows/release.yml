@@ -292,7 +292,7 @@ jobs:
             vendor/build/alpine-opt/.stamp
             vendor/downloads/alpine-opt/*/APKBUILD
           key: ${{ steps.alpine-opt.outputs.cache-primary-key }}
-      # Keep the rebuild's downloads (~190 MB: gcc, sources) out of the
+      # Keep the rebuild's downloads (~165 MB: gcc, sources) out of the
       # downloads cache below; only the APKBUILDs are needed again.
       - name: Drop the package rebuild's downloads
         run: find vendor/downloads/alpine-opt -type f ! -name APKBUILD -delete 2>/dev/null || true
@@ -323,6 +323,16 @@ jobs:
           node js/cli.ts --timeout 900 --smp 2 --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
             --append "console=hvc0 rdinit=/usr/bin/kwtest" </dev/null | tee kwtest.log
           grep -q 'kwtest: 0 failure(s)' kwtest.log
+
+      # The arm64 user ABI without a libc (kernel/guest/abitest.c), on the
+      # UP kernel and on the SMP kernel with 2 CPUs.
+      - name: abitest (UP, SMP)
+        run: |
+          for cpus in 1 2; do
+            node js/cli.ts --timeout 300 --smp "$cpus" --kernel vendor/build/bundle/unkernel-alpine.wasm --initrd alpine-test \
+              --append "console=hvc0 rdinit=/usr/bin/abitest" </dev/null | tee abitest.log
+            grep -q 'abitest: 0 failure(s)' abitest.log
+          done
 
       - name: Typecheck
         run: pnpm typecheck

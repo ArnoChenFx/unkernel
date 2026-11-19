@@ -50,7 +50,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f)
 enum { NR_write = 64, NR_exit_group = 94, NR_kill = 129, NR_rt_sigaction = 134, NR_rt_sigreturn = 139,
        NR_getpid = 172, NR_clone = 220, NR_execve = 221, NR_wait4 = 260, NR_mmap = 222, NR_munmap = 215,
        NR_reboot = 142, NR_uname = 160, NR_pipe2 = 59, NR_read = 63, NR_setitimer = 103, NR_exit = 93,
-       NR_futex = 98, NR_personality = 92 };
+       NR_futex = 98, NR_personality = 92, NR_nanosleep = 101 };
 
 void *memset(void *d, int c, unsigned long n) { char *p = d; while (n--) *p++ = c; return d; }
 void *memcpy(void *d, const void *s, unsigned long n) { char *p = d; const char *q = s; while (n--) *p++ = *q++; return d; }
@@ -304,9 +304,13 @@ static void tests(const struct entry_regs *entry, const char *self, char **envp)
 	/* a child writes after the parent's read has been restarted */
 	pid = sys(NR_clone, SIGCHLD, 0, 0, 0, 0);
 	if (pid == 0) {
-		/* busy wait until the parent got its alarm, then write */
-		for (volatile long i = 0; i < 3000000; i++)
-			;
+		/*
+		 * Write after the parent's 20 ms alarm: a 100 ms sleep, so on the
+		 * same clock and not on how fast this process runs (a busy loop
+		 * ran out before the alarm once the JIT compiled it).
+		 */
+		long ts[2] = { 0, 100000000 };
+		sys(NR_nanosleep, ts, 0);
 		sys(NR_write, pfd[1], "x", 1);
 		sys(NR_exit_group, 5);
 	}

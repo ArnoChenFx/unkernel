@@ -76,7 +76,7 @@ check() {
 	for t in clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-ranlib llvm-readelf llvm-strip; do
 		tool "$t" "part of LLVM (clang, lld, llvm packages)" && note "$t" ok
 	done
-	for t in cmake ninja gcc make flex bison bc m4 python3 git curl tar gzip bzip2 sha256sum; do
+	for t in cmake ninja gcc make flex bison bc m4 python3 git curl tar gzip bzip2 xz sha256sum sha512sum; do
 		tool "$t" && note "$t" ok
 	done
 	for t in mke2fs debugfs e2fsck; do
@@ -125,6 +125,13 @@ check() {
 		note pnpm "found (pnpm install, then pnpm dev for the browser page)"
 	else
 		note pnpm "not found (optional, for the SDK build and the browser page: https://pnpm.io/installation)"
+	fi
+	# Optional: zig build test also runs the A64 test guests under
+	# qemu-aarch64 (QEMU_AARCH64=) and compares; without it, kwemu only.
+	if [ -n "${QEMU_AARCH64:-}" ] || [ -n "$(real_bin qemu-aarch64)" ]; then
+		note qemu-aarch64 "found (zig build test compares the A64 guests with it)"
+	else
+		note qemu-aarch64 "not found (optional, for zig build test's comparison: qemu-user)"
 	fi
 	# Optional: the browser tests (web/test/*.mjs) need Chromium.
 	if [ -n "${CHROME:-}" ] || [ -n "$(real_bin chromium)" ] ||

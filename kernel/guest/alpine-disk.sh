@@ -115,6 +115,7 @@ from_alpine_sh etc/profile.d/kw-apk.sh command_not_found_handle
 from_alpine_sh etc/kw-apk-install APKINDEX
 from_alpine_sh etc/kw-apk-enable kw-apk-lazy
 install -m 755 "$root/kernel/guest/curl-shim.sh" "$stage/usr/local/bin/curl"
+install -m 755 "$root/kernel/guest/bwrap-shim.sh" "$stage/usr/local/bin/bwrap"
 chmod 755 "$stage/etc/kw-apk-install" "$stage/etc/kw-apk-enable"
 # x86_64, riscv64, i386 and arm binaries through qemu-user (binfmt_misc),
 # and kw-arch to fake uname -m for installers.

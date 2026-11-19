@@ -152,6 +152,7 @@ fn kw_debug_run_ref(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {
 /// Word by word through volatile pointers (a struct copy would call memmove).
 fn kw_debug_stats(cpu: *Cpu, out: *kwemu.Stats) callconv(.c) void {
     const n = @sizeOf(kwemu.Stats) / 8;
+    @import("tier.zig").axCore(cpu);
     const src: *volatile [n]u64 = @ptrCast(&cpu.priv.stats);
     const dst: *volatile [n]u64 = @ptrCast(out);
     for (0..n) |i| dst[i] = src[i];

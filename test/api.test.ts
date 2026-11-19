@@ -490,7 +490,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const logs: string[] = [];
 		const host = new sdk.JitHost({ memory: () => memory, memory64: () => false, log: (m) => logs.push(m), retainedNudge: 2, retainedLimit: 4 });
 		host.attach({ __indirect_function_table: table });
-		assert.equal(host.caps(), 3);
+		assert.equal(host.caps(), 3 | 16); // available, 32-bit memory, env.table
 		// Finalizers never run inside one synchronous loop, so nothing is collected here.
 		const results: number[] = [];
 		for (let i = 0; i < 6; i++) {

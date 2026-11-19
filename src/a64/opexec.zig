@@ -193,6 +193,7 @@ inline fn stored(r: u32) Next {
 
 noinline fn execGeneric(cpu: *Cpu, x: [*]u64, raw: u32, pc: u64) Next {
     kwemu.count(cpu, "generic_ops", 1);
+    if (kwemu.stats_on) cpu.priv.stats.jit.hb_gen[tier.Ax.gen_class + tier.genClass(raw)] += 1;
     const regs: *Regs = @ptrCast(@alignCast(x));
     regs.pc = pc;
     const s: c.St = .{ .r = regs, .h = &cpu.priv.hart, .m = cpu };
@@ -205,6 +206,24 @@ noinline fn execGeneric(cpu: *Cpu, x: [*]u64, raw: u32, pc: u64) Next {
         },
         .jump => unreachable, // every A64 branch has its own op
         .trap => if (cpu.priv.hart.trap == .counter) .counter else .trap,
+    };
+}
+
+/// A `generic` op called from compiled code (jit/emit.zig, `generic`;
+/// through the kernel's function table, so it has the type of a compiled
+/// function): x = &regs.x, with the registers written back; returns 0
+/// (retired), 1 (not executed: a fault, a trap, MRS CNTVCT_EL0; the
+/// interpreter runs it again) or 2 (retired, the block must end: a store
+/// into decoded code, IC IVAU).
+pub fn jitGeneric(x: u64, cpu: u64, raw: u64, pc: u64) callconv(.c) u64 {
+    const cp: *Cpu = @ptrFromInt(@as(usize, @intCast(cpu)));
+    return switch (execGeneric(cp, @ptrFromInt(@as(usize, @intCast(x))), @truncate(raw), pc)) {
+        .cont => 0,
+        .stop => blk: {
+            cp.priv.smc = 0;
+            break :blk 2;
+        },
+        else => 1,
     };
 }
 
@@ -642,7 +661,11 @@ pub fn runOps(o0: [*]const Op, x: [*]u64, cpu: *Cpu, end_pc: u64, pc0: u64, n: u
     while (true) {
         switch (@as(H, @enumFromInt(@as(u8, @truncate(w))))) {
             inline else => |h| {
-                if (kwemu.stats_on) cpu.priv.stats.op_hist[@intFromEnum(h)] += 1;
+                if (kwemu.stats_on) {
+                    cpu.priv.stats.op_hist[@intFromEnum(h)] += 1;
+                    const g = &cpu.priv.stats.jit.hb_gen;
+                    if (h != .goto) g[@intCast(g[tier.Ax.cur])] += 1;
+                }
                 const r = doOp(h, w, o, x, cpu, end_pc);
                 if (r != .cont) {
                     if (r == .done and x[ops.zr] == pc0 and left >= n and tier.quiet(cpu)) {

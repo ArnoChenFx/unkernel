@@ -8,10 +8,14 @@
 //
 //   kw_host_jit_caps() -> u32        bit 0 available, bit 1 32-bit memory
 //                                    (the lowered vmlinux32.wasm), bit 2 eager
-//                                    (tests only; never set here)
+//                                    (tests only; never set here), bit 3
+//                                    shared memory, bit 4 the kernel's table
+//                                    is offered as env.table
+//                                    (always, here)
 //   kw_host_jit_compile(ptr, len, slot, flags) -> i32
 //                                    compile the module at ptr (it imports
-//                                    env.memory, exports "f") and install "f"
+//                                    env.memory and maybe env.table, exports
+//                                    "f") and install "f"
 //                                    in table slot `slot`; 0 ok, -1 failed;
 //                                    flags bit 0: f(cpu = 0) returns at once
 //   kw_host_jit_free(slot)           put the slot's original function back
@@ -152,6 +156,8 @@ export interface JitHostOptions {
 const CAP_AVAILABLE = 1;
 const CAP_MEM32 = 2;
 const CAP_SHARED = 8;
+/** The kernel's function table is offered to modules as env.table. */
+const CAP_TABLE = 16;
 /** kw_host_jit_compile flags bit 0: f(x, 0, irqp, jl) returns 0 at once. */
 const WARM = 1;
 /** kwemu's emit buffer is 16 KiB; anything much larger is not from kwemu. */
@@ -279,7 +285,7 @@ export class JitHost {
 			return 0;
 		}
 		const shared = typeof SharedArrayBuffer !== "undefined" && this.#opts.memory().buffer instanceof SharedArrayBuffer;
-		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0);
+		return CAP_AVAILABLE | (this.#opts.memory64() ? 0 : CAP_MEM32) | (shared ? CAP_SHARED : 0) | CAP_TABLE;
 	}
 
 	compile(ptr: bigint | number, len: bigint | number, slot: number, flags = 0): number {
@@ -305,7 +311,7 @@ export class JitHost {
 			// API takes no shared views; V8 accepts them, others need not).
 			const view = new Uint8Array(mem.buffer, p, n);
 			const module = new WebAssembly.Module(mem.buffer instanceof ArrayBuffer ? view : view.slice());
-			const f = new WebAssembly.Instance(module, { env: { memory: mem } }).exports.f;
+			const f = new WebAssembly.Instance(module, { env: { memory: mem, table: table as unknown as WebAssembly.Table } }).exports.f;
 			if (typeof f !== "function") throw new Error("the module exports no function f");
 			// cpu = 0: f returns at once, after V8 has compiled it (flags bit 0).
 			if (flags & WARM) (f as (x: bigint, cpu: bigint, irqp: bigint, jl: bigint) => bigint)(0n, 0n, 0n, 0n);

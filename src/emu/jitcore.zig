@@ -20,11 +20,14 @@
 //!       module: the generated code imports a 32-bit memory and wraps every
 //!       address); bit 2: eager (compile on the first entry; tests);
 //!       bit 3: the memory is shared (the generated code declares its
-//!       import shared, with the largest maximum of its type).
-//!       Called once, by kw_cpu_init.
+//!       import shared, with the largest maximum of its type); bit 4: the
+//!       host also offers the kernel's function table as env.table, which a
+//!       module may import to call kwemu functions (`Emit.callTable`).
+//!       Called by kw_cpu_init (and kw_host_reset).
 //!   kw_host_jit_compile(ptr, len, slot: u32, flags: u32) -> i32
-//!       Compile the `len` bytes at `ptr` (a module importing env.memory and
-//!       exporting function "f") and install "f" into table slot `slot`.
+//!       Compile the `len` bytes at `ptr` (a module importing env.memory,
+//!       and env.table where bit 4 of the caps says so, and exporting
+//!       function "f") and install "f" into table slot `slot`.
 //!       0 = installed, < 0 = failed (the slot is left as it was). flags
 //!       bit 0 (`compile_warm`): f(x, 0, irqp, jl) returns 0 at once, so the
 //!       host may call it to make a lazy engine compile f inside the call.
@@ -86,6 +89,12 @@ pub const cap_available: u32 = 1;
 pub const cap_mem32: u32 = 2;
 pub const cap_eager: u32 = 4;
 pub const cap_shared: u32 = 8;
+pub const cap_table: u32 = 16;
+
+/// The host offers env.table (cap_table), so the ISA may translate ops into
+/// calls of kwemu functions (A64: `generic` ops). Set by every CPU's
+/// `askHost`; all CPUs of a kernel have the same kind of host.
+pub var table_ok: bool = false;
 /// Most blocks in one compiled region (see "regions" below).
 pub const max_members = 16;
 
@@ -231,6 +240,7 @@ fn blockIndex(cpu: *Cpu, b: *const Block) u32 {
 /// Ask the host what it offers and set the compile threshold from it.
 fn askHost(st: *State) void {
     st.caps = kw_host_jit_caps();
+    table_ok = st.caps & cap_available != 0 and st.caps & cap_table != 0;
     st.threshold = if (st.caps & cap_available == 0)
         never
     else if (st.caps & cap_eager != 0)
@@ -854,6 +864,11 @@ pub fn Jit(comptime I: type) type {
             mem32: bool,
             /// The kernel's memory is shared (cap_shared): the import says so.
             shared: bool = false,
+            /// The module imports the kernel's function table (cap_table).
+            table: bool = false,
+            /// The module's register usage (what its prologue loads), from
+            /// before the prologue on.
+            use: ?*const Use = null,
             /// Open blocks/loops/ifs; the exit block is the outermost.
             nest: u32 = 0,
             /// Highest local index the code got, set or teed so far (an ISA
@@ -989,6 +1004,15 @@ pub fn Jit(comptime I: type) type {
             pub fn brExit(e: *Emit) void {
                 e.op(W.br);
                 e.uleb(e.nest - 1);
+            }
+            /// Call the kwemu function at table index `f` (type 0: four i64
+            /// arguments on the stack, an i64 result) through env.table.
+            pub fn callTable(e: *Emit, f: u64) void {
+                std.debug.assert(e.table);
+                if (e.mem32) e.k32(@intCast(f)) else e.k64(f);
+                e.op(0x11); // call_indirect
+                e.uleb(0); // type 0
+                e.uleb(0); // table 0
             }
             /// Leave with pc = npc and result code `code` (branch to the exit
             /// with `brExit`, or fall through to it at the block's end).
@@ -1401,7 +1425,8 @@ pub fn Jit(comptime I: type) type {
             const full = u == all.len;
             const self_loop = rg == null and full and I.selfLoop(all[all.len - 1], b);
 
-            var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = cpu.priv.jit.caps & cap_mem32 != 0, .shared = cpu.priv.jit.caps & cap_shared != 0 };
+            const caps = cpu.priv.jit.caps;
+            var e: Emit = .{ .buf = &cpu.priv.jit.buf, .mem32 = caps & cap_mem32 != 0, .shared = caps & cap_shared != 0, .table = caps & cap_table != 0 };
             e.rg = rg;
             // b's per-member state (a region's members set their own).
             I.beginMember(&e, all[0..u]);
@@ -1421,11 +1446,20 @@ pub fn Jit(comptime I: type) type {
             // memory (flags | 3) needs a maximum, which an import matches when the
             // memory's is not larger: 65536 pages (4 GiB) for memory32, 262144
             // (16 GiB, the kernel's --max-memory) for memory64.
-            e.ops(&.{ 0x02, if (e.shared) 0x12 else 0x0f, 0x01, 0x03, 'e', 'n', 'v', 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02 });
+            // With cap_table also env.table: funcref, min 0, table64 unless the
+            // kernel was lowered (memory64 and table64 lowering go together).
+            const table_len = 14; // the entry below
+            const mem_len: u8 = if (e.shared) 0x12 else 0x0f;
+            e.ops(&.{ 0x02, mem_len + (if (e.table) @as(u8, table_len) else 0), if (e.table) 0x02 else 0x01 });
+            e.ops(&.{ 0x03, 'e', 'n', 'v', 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02 });
             if (e.shared)
                 e.ops(&.{ if (e.mem32) 0x03 else 0x07, 0x00, 0x80, 0x80, if (e.mem32) 0x04 else 0x10 })
             else
                 e.ops(&.{ if (e.mem32) 0x00 else 0x04, 0x00 });
+            if (e.table) {
+                e.ops(&.{ 0x03, 'e', 'n', 'v', 0x05, 't', 'a', 'b', 'l', 'e', 0x01, 0x70 });
+                e.ops(&.{ if (e.mem32) 0x00 else 0x04, 0x00 });
+            }
             // functions: f (type 0), then the helpers (type 1)
             e.ops(&.{ 0x03, @intCast(1 + nfn), @intCast(nfn), 0x00 });
             for (1..nfn) |_| e.op(0x01);
@@ -1450,6 +1484,7 @@ pub fn Jit(comptime I: type) type {
             e.op(W.@"return");
             e.close();
 
+            e.use = &use;
             I.prologue(&e, use);
             e.open(W.block, W.void_t); // exit
             if (rg) |r| emitMembers(&e, cpu, r) else {

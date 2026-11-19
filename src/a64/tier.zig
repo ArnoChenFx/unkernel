@@ -302,6 +302,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         var o = first;
         // Budget runOps may spend on further self-loop passes.
         var cap = left;
+        if (kwemu.stats_on) axReason(cpu, Ax.never);
         if (jc.enabled) {
             const go = jit.C.ready(cpu, blk);
             if (go == .again) {
@@ -333,7 +334,16 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 jc.handedBack(cpu);
                 o = first + code;
                 cap = 0;
-            } else if (blk.jx.st != jc.never) cap = @min(left, blk.jx.st);
+                if (kwemu.stats_on) {
+                    const dyn = jit.supported(first[code]);
+                    axReason(cpu, if (dyn) Ax.tail_dyn else Ax.tail_static);
+                    ax(cpu, if (dyn) Ax.hb_dyn else Ax.hb_static, 1);
+                    if (first[code].h == .generic) ax(cpu, Ax.hb_class + genClass(first[code].aux()), 1);
+                }
+            } else if (blk.jx.st != jc.never) {
+                cap = @min(left, blk.jx.st);
+                if (kwemu.stats_on) axReason(cpu, Ax.countdown);
+            }
         }
         x[ops.zr] = 0; // XZR while the ops run (compiled code left pc there)
         // Self-loop passes that fit `cap` run inside runOps.
@@ -380,6 +390,89 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
         if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
         _ = epochCheck(cpu);
     }
+}
+
+/// -Dkwemu-stats, A64: why instructions ran outside compiled code, in
+/// JitStats.hb_gen (riscv's classes of generic hand-backs; A64 does not use
+/// those). Interpreted instructions (ops other than `goto`) by the state of
+/// their block: never compiled (`never`: its first op is not translated, its
+/// compile failed, or no JIT), counting towards the threshold (`countdown`),
+/// the rest of a pass after compiled code handed back an op that is not
+/// translated (`tail_static`) or a translated one (`tail_dyn`: a data-TLB
+/// miss, a store into a code page); the hand-backs of each kind; countdown
+/// progress (instructions) and blocks lost when a counting block is
+/// replaced in the block table (`lost_drop`) or by an arena reset
+/// (`lost_reset`); the core's compile counters (copied by kw_debug_stats).
+pub const Ax = struct {
+    pub const never = 0;
+    pub const countdown = 1;
+    pub const tail_static = 2;
+    pub const tail_dyn = 3;
+    pub const hb_static = 4;
+    pub const hb_dyn = 5;
+    pub const lost_drop = 6;
+    pub const lost_reset = 7;
+    pub const blocks_lost_drop = 8;
+    pub const blocks_lost_reset = 9;
+    /// jc.State: compiles, skips, fails, shortened, evictions, frees,
+    /// grows + exit_grows, members_total.
+    pub const core = 10;
+    /// Hand-backs of `generic` ops by class (`genClass`), then generic ops
+    /// executed by class.
+    pub const hb_class = 19;
+    pub const gen_class = 29;
+    /// Index of the reason runOps counts its ops under.
+    pub const cur = 39;
+};
+
+/// -Dkwemu-stats: class of a `generic` op's raw word (Ax.hb_class + i):
+/// 0 scalar FP, 1 AdvSIMD copy/immediate/permute, 2 AdvSIMD arithmetic,
+/// 3 AdvSIMD structure loads/stores, 4 crypto, 5 exclusives and
+/// load-acquire/store-release, 6 other loads/stores (LSE, ...), 7 system
+/// (MRS, MSR, barriers, DC, IC), 8 data-processing register (CRC32), 9 other.
+pub fn genClass(raw: u32) usize {
+    return switch (decode.route(raw)) {
+        .fp => 0,
+        .simd_move => 1,
+        .simd_arith => 2,
+        .simd_ldst => 3,
+        .crypto => 4,
+        .ldst => if (raw & 0x3f00_0000 == 0x0800_0000) 5 else 6,
+        .branch => 7,
+        .dp_reg => 8,
+        else => 9,
+    };
+}
+
+inline fn ax(cpu: *Cpu, i: usize, n: u64) void {
+    if (kwemu.stats_on) cpu.priv.stats.jit.hb_gen[i] += n;
+}
+inline fn axReason(cpu: *Cpu, r: usize) void {
+    if (kwemu.stats_on) cpu.priv.stats.jit.hb_gen[Ax.cur] = r;
+}
+
+/// -Dkwemu-stats: a counting block is about to be discarded.
+pub fn axLost(cpu: *Cpu, b: *const Block, reset: bool) void {
+    if (!kwemu.stats_on or !jc.enabled) return;
+    const s = b.jx.st;
+    if (b.pc == std.math.maxInt(u64) or s == jc.never or s >= jc.compiled) return;
+    ax(cpu, if (reset) Ax.lost_reset else Ax.lost_drop, cpu.priv.jit.threshold -| s);
+    ax(cpu, if (reset) Ax.blocks_lost_reset else Ax.blocks_lost_drop, 1);
+}
+
+/// -Dkwemu-stats: copy the core's compile counters into the Ax words.
+pub fn axCore(cpu: *Cpu) void {
+    if (!kwemu.stats_on or !jc.enabled) return;
+    const j = &cpu.priv.jit;
+    const g = &cpu.priv.stats.jit.hb_gen;
+    g[Ax.core + 0] = j.compiles;
+    g[Ax.core + 1] = j.skips;
+    g[Ax.core + 2] = j.fails;
+    g[Ax.core + 3] = j.shortened;
+    g[Ax.core + 4] = j.evictions;
+    g[Ax.core + 5] = j.frees;
+    g[Ax.core + 6] = j.grows + j.exit_grows;
+    g[Ax.core + 7] = j.members_total;
 }
 
 /// -Dkwemu-stats: account one call into compiled code that entered block

@@ -111,6 +111,7 @@ const mark_wild = std.math.maxInt(u64);
 
 const exec = @import("exec.zig");
 const a64_state = @import("../a64/state.zig");
+const a64_tier = @import("../a64/tier.zig");
 const Op = exec.Op;
 /// The ISA-neutral JIT core (block state, slots, cache hooks) and riscv's
 /// emitter (its `run` below).
@@ -540,6 +541,7 @@ pub const Cpu = extern struct {
 
     pub fn resetCache(self: *Cpu) void {
         count(self, "resets", 1);
+        if (stats_on) for (&self.priv.blocks) |*b| a64_tier.axLost(self, b, true);
         if (jc.enabled) jc.releaseAll(self);
         // Volatile stores: no memset import in the wasm object.
         const bs: [*]volatile Block = &self.priv.blocks;
@@ -700,6 +702,7 @@ pub const Cpu = extern struct {
         };
         const b = &self.priv.blocks[set + way];
         if (self.priv.ops_used + D.max_slots > nops) self.resetCache();
+        if (stats_on) a64_tier.axLost(self, b, false);
         if (jc.enabled) jc.drop(self, b); // its code belongs to the old contents
         D.decode(self, b, pc, host);
         b.tgen = gen;

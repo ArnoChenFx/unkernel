@@ -217,6 +217,14 @@ fn produced(e: *Emit, at: At, kind: Kind, bk: ?u64, ccmp: bool, def: u4) void {
     }
 }
 
+/// l_nzcv holds NZCV now (a `generic` call loaded it from regs.nzcv).
+pub fn exactNow(e: *Emit) void {
+    e.x.alu.kind = .exact;
+    e.x.alu.bk = null;
+    e.x.alu.ccmp = false;
+    e.x.alu.synced = true;
+}
+
 pub fn sync(e: *Emit) void {
     if (e.x.alu.synced) return;
     materialise(e);

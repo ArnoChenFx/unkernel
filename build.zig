@@ -172,6 +172,10 @@ pub fn build(b: *std.Build) void {
     harness_jit.export_table = true;
     harness_jit.root_module.linkLibrary(lib_wasm_jit);
     b.installArtifact(harness_jit); // zig-out/bin/kwemu-harness-jit.wasm
+    // The object a kernel links with the JIT (kernel/build.sh's default), so
+    // that test/a64-test.mjs can check its imports too.
+    const obj_wasm_jit = if (jit) obj_wasm else b.addObject(.{ .name = "kwemu-jit", .root_module = kwemuModule(b, wasm64, lib_optimize, kw_h_wasm, kw_opts_jit_mod) });
+    b.getInstallStep().dependOn(&b.addInstallLibFile(obj_wasm_jit.getEmittedBin(), "kwemu-jit.o").step);
 
     // Hard-float guests: riscv64-linux-musl, default CPU = rv64gc (lp64d).
     if (riscv_legacy) for (gc_guests) |name| {

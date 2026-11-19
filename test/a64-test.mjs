@@ -48,13 +48,16 @@ const cases = [
 let failed = 0;
 
 // ---- wasm64 object: only the imports the kernel link provides -----------------
-{
-  const obj = await WebAssembly.compile(await readFile(join(prefix, "lib", "kwemu.o")));
+// (kwemu.o as built, and kwemu-jit.o: the same with the JIT tier, which
+// imports the JIT host and nothing else; a large struct copy there becomes
+// a memcpy call the kernel does not link).
+for (const name of ["kwemu.o", "kwemu-jit.o"]) {
+  const obj = await WebAssembly.compile(await readFile(join(prefix, "lib", name)));
   const bad = WebAssembly.Module.imports(obj).filter((i) => i.kind === "function" && !i.name.startsWith("kw_host_jit_"));
   if (bad.length) {
     failed++;
-    console.log(`FAIL a64 kwemu.o imports functions: ${bad.map((i) => i.name).join(", ")} (u128 shifts/multiplies? see src/a64/common.zig)`);
-  } else console.log("ok   a64 kwemu.o imports no functions");
+    console.log(`FAIL a64 ${name} imports functions: ${bad.map((i) => i.name).join(", ")} (u128 shifts/multiplies, struct copies of 64 bytes or more? see src/a64/common.zig)`);
+  } else console.log(`ok   a64 ${name} imports no functions`);
 }
 
 // ---- runners ------------------------------------------------------------------

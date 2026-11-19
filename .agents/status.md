@@ -558,16 +558,12 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **aarch64: the JIT compiles only a few op kinds so far.** kw_run runs
-  a decoded-op tier (a64.md): on the Alpine image about 3.3-4.9x the
-  reference interpreter (`apk search` over the main index 1.1 s, riscv64
-  with its JIT 0.75 s; 2026-11-17), the wasm64 harness 245-295 MIPS on
-  integer code. The A64 JIT (a64.md, JIT) runs on the ISA-neutral core
-  shared with riscv, is in the kernel build and translates every ALU,
-  memory and branch op; on the image it is 1.6-2.3x the tier alone (an
-  ash loop 2.5 s against 4.0 s, sort 3.1 s against 7.1 s, 2026-11-18).
-  AdvSIMD, FP, system, exclusive, LSE and crypto instructions stay
-  generic ops (the reference interpreter).
+- **aarch64: AdvSIMD arithmetic, FP arithmetic and crypto are calls of
+  the interpreter in compiled code.** The A64 JIT (a64.md, JIT) translates
+  every ALU, memory and branch op and the frequent FP moves, compares and
+  AdvSIMD moves inline (generic.zig); the other generic ops are calls of
+  the reference interpreter through the kernel's function table, with the
+  module's registers spilled around them (2026-11-18).
 - **aarch64: SHA512 is off by default (`kw.isa=+sha512` turns it on),
   because OpenSSL's SHA-512 is 12.5x slower with HWCAP_SHA512.** Its
   ARMv8.2 path (SHA512H and AdvSIMD) is all generic ops, its integer path
@@ -598,24 +594,17 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   exec under riscv64 kwemu against lld's layout; on aarch64 about 0.07
   ms (busybox, 150 execs 230 against 220 ms, 2026-11-18;
   guest-packages.md). The cause on the kwemu or kernel side is not known.
-- **aarch64 is still slower than riscv64 where nothing is interpreted.**
-  With the rebuilt packages (guest-packages.md, 2026-11-18) the apk
-  commands that parse the index take 11-22% longer than on riscv64,
-  although they run about 12% fewer instructions (qemu: `apk search -q
-  busybox` 234M A64 against 267M riscv64; ash, sort, gzip and gunzip
-  9-20% fewer) and almost no generic ops (0.05-0.1%). A `-Dkwemu-stats`
-  kernel shows where it goes: apk runs 20-26% of its instructions
-  interpreted (blocks below the compile threshold, and the rest of a pass
-  after a hand-back; hand-backs mostly at loads, `ldr64_i`, `ldp64`,
-  `stp64`, then generic ops), an ash loop 10-15% (190-235K generic
-  hand-backs in about 430M instructions: musl's memset `dup`/`movi` and
-  malloc's `ldaxr`/`stlxr`), sort and gzip 5-9% (busybox `seq`: its `double` arithmetic and musl's
-  printf, which formats through 128-bit `long double` in libgcc's soft
-  float: `fmov`, `fcmpe`, `ucvtf`, `mrs` FPCR for the rounding mode). Candidates, by the share they cover: the
-  per-instruction cost of compiled A64 code against riscv64's (NZCV and
-  flag-setting ops are 15-20% of the mix), the loads that hand back,
-  then the exclusives and scalar FP moves as JIT ops, then musl's
-  AdvSIMD memset.
+- **aarch64 apk is still slower than riscv64.** With the rebuilt
+  packages and the JIT's generic calls and inline forms (2026-11-18,
+  a64.md, Where apk's time goes) the apk commands take 6-25% longer than
+  on riscv64, although they run about 12% fewer instructions; sort is
+  level, gzip 10% faster, the ash loop 10% slower. apk runs 13-22% of its
+  instructions in blocks still counting down to the compile threshold;
+  a lower threshold and a heat table across processes did not pay
+  (compiles cost about 0.3 ms each). The ranked levers left are in
+  a64.md (JIT, What is left): apk's countdown share, NZCV
+  materialisation, entries into compiled code, the malloc lock's
+  exclusives.
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
   nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
   `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but

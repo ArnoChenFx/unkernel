@@ -23,7 +23,7 @@ Run the row for what you changed, and no more.
 | Host file systems (9p, `kw9p`) | `pnpm test:9p`; `pnpm test:api` (after a kw9p change, `kernel/build.sh base` first) |
 | Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh base` first) |
 | Network | `pnpm test:net` |
-| SMP code (`CONFIG_SMP` paths, per-CPU data, IPIs, CPU parking, `js/core/cpu.ts`; kernel/smp.md) | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--smp 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
+| SMP code (`CONFIG_SMP` paths, per-CPU data, IPIs, CPU parking, `js/core/cpu.ts`; kernel/smp.md) | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--cpus 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
 | Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |
 | Page (`web/`) | `pnpm typecheck:web`; `pnpm build:web` |
 
@@ -52,7 +52,7 @@ contains changes to that area.
 | Area | Run |
 | --- | --- |
 | Emulator (`src/`, `test/guest/`, `include/`) | `zig build test` (it also reruns the wasm64 unit tests and the guests on a JIT host without wasm SIMD, `a64-nosimd` and `wasm64+jit/nosimd`) and `zig build test -Dkwemu-atomics=true`, then the kernel row |
-| Kernel or `kw_emu.h` | `kernel/build.sh kernel` and `kernel/build.sh smp`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"`, the same with `--kernel vendor/build/kernel/vmlinux`, and both again with `--no-jit` (expect `kwtest: 0 failure(s)`, exit 0); kwtest once more with `kw.isa=armv8` appended (the `isa` checks then expect SIGILL) and once with `--no-vsock`; abitest the same way (`rdinit=/usr/bin/abitest`, `abitest: 0 failure(s)`, exit 0; kernel/tests.md) with and without the JIT and with `--smp 2`; the SMP kernel (below); `node test/wasi-node.ts` (`PASS`) |
+| Kernel or `kw_emu.h` | `kernel/build.sh kernel` and `kernel/build.sh smp`; `node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"`, the same with `--kernel vendor/build/kernel/vmlinux`, and both again with `--no-jit` (expect `kwtest: 0 failure(s)`, exit 0); kwtest once more with `kw.isa=armv8` appended (the `isa` checks then expect SIGILL) and once with `--no-vsock`; abitest the same way (`rdinit=/usr/bin/abitest`, `abitest: 0 failure(s)`, exit 0; kernel/tests.md) with and without the JIT and with `--cpus 2`; the SMP kernel (below); `node test/wasi-node.ts` (`PASS`) |
 | Bundle, kernel patch, `build.sh` | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch`; after a change to the stamps or the build, two clean builds into different `KW_BUILD` roots give the same `vmlinux32.wasm` files and bundle (`sha256sum`) |
 | JIT (`src/emu/jitcore.zig`, `src/a64/jit/`, `js/core/jit.ts`) | the two rows above; `zig build test -Dkwemu-a64-fuzz=20000` (the A64 block fuzz, natively and on the JIT with and without SIMD; `-Dkwemu-a64-fuzz-seed=S` for other programs; a64/jit.md); Alpine with real work under JIT, `--no-jit` and a host without wasm SIMD, comparing outputs (`seq 30000 \| sort -rn \| md5sum`, `tar cf - /lib \| gzip \| md5sum` (with `--exclude=lib/apk` after an `apk add`: apk's database holds install times), `sha256sum`, awk FP output, and with `apk add openssl` digests and ciphers against the host's `openssl`); `node --expose-gc --test test/api.test.ts`. A host without SIMD: preload a module that makes `WebAssembly.validate` refuse `jitSimd()`'s 31-byte probe (js/core/jit.ts), `node --import file:///PATH/nosimd.mjs js/cli.ts ...` |
 | Anything a real userland sees | `node js/cli.ts --timeout 120 --input '{8}uname -a; apk --version\n{2}poweroff\n'`; `pnpm test:distro` |
@@ -72,12 +72,12 @@ every runner (`ok   a64 <runner> <guest> = qemu`).
 The SMP kernel (kernel/smp.md; `kernel/build.sh smp` puts it in the
 bundle) runs the same checks:
 
-- kwtest with `--smp 2`, `--smp 4` and `--smp 2 --no-jit` (add `--display
+- kwtest with `--cpus 2`, `--cpus 4` and `--cpus 2 --no-jit` (add `--display
   --shm` for its kwfb and kwshm checks), and once on one CPU (`--kernel
   vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test`);
-- abitest with `--smp 2`;
+- abitest with `--cpus 2`;
 - `UNKERNEL_TEST_CPUS=2 pnpm test:api` (the snapshot tests skip);
-- `node test/glimmer-check.mjs --run --kernel <it> --smp 2` (on Alpine;
+- `node test/glimmer-check.mjs --run --kernel <it> --cpus 2` (on Alpine;
   `--distro none` for the base shell).
 
 kwtest's `smp:`, `lse smp:`, `excl smp:`, `move:` and `jit:` checks race

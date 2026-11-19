@@ -381,7 +381,7 @@ parts that are easy to get wrong.
 
 - An SMP kernel (kernel/smp.md) imports `wasm_init_flag`,
   `wasm_cpu_count` and `wasm_cpu_start`. `CreateKernelOptions.cpus` (CLI
-  `--smp N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
+  `--cpus N`, which implies `--worker`; `WorkerBootSpec.cpus`) sets how many
   CPUs `Kernel` offers. A UP kernel ignores it with a log line, so does a
   platform without `Platform.spawnCpu` or one whose `Platform.whyNoCpus()`
   gives a reason for the kernel's thread (browsers: below);
@@ -424,7 +424,7 @@ parts that are easy to get wrong.
   the lock that orders the writes (hp->lock, the console lock), so the
   ring's order is the kernel's. A reader takes every committed record in
   one chunk.
-  - Worker mode with the shared transport (the CLI's `--smp`, the page):
+  - Worker mode with the shared transport (the CLI's `--cpus`, the page):
     the owner reads it (`WorkerKernel`, `ConsoleRingReader`), woken by
     `Atomics.waitAsync` on any commit when it found nothing last time,
     else when an eighth of the ring is full or after 2 ms (a poll of 4 ms
@@ -512,7 +512,7 @@ parts that are easy to get wrong.
   and type indices and data addresses renumbered to the target's by
   `js/core/kremap.ts`, then a bsdiff-style byte diff; 1.37 MB raw, 0.76
   MB gzip, 0.67 MB brotli, 2026-11-17). With more than one CPU asked
-  (`cpus`, CLI `--smp N`), `loadKernelModule({ smp: true })` (and the
+  (`cpus`, CLI `--cpus N`), `loadKernelModule({ smp: true })` (and the
   CLI) reads the bundle's bytes (no streaming compile), applies the patch
   (`js/core/kpatch.ts` `smpKernelFromBundle()`: base length and SHA-256,
   result SHA-256 checked; about 0.2 s and +50 MiB transient in Node) and
@@ -571,7 +571,8 @@ parts that are easy to get wrong.
   the name it was called by. `serveWasiPrograms(vm.vsock, opts)` (exported
   by `js/node.ts` from `js/node/wasi.ts`, by `js/web.ts` from
   `js/web/wasi.ts`; core's `serveWasiProgramsWith()` takes the spawner)
-  listens there; the CLI's `--wasi` calls it.
+  listens there; the CLI's `--wasi` calls it, and the page always
+  (web/src/boot.ts).
 - The owner (`wasi-exec.ts`) is wherever `vm.vsock`'s VsockHost runs: the
   kernel's thread inline, the owner's thread in worker mode and with
   several CPUs. It parses START, gets the module (below), checks its

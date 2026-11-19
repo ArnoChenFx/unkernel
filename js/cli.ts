@@ -41,7 +41,7 @@ const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--distro al
        [--disk image.ext4[:ro]|URL[:ro]]... [--snapshot]
        [--data FILE [--data-template FILE.kwsparse.gz]]
        [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
-       [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]] [--smp N]
+       [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]] [--cpus N]
        [--mount HOSTDIR:GUESTPATH[:ro]]... [--forward HOSTPORT:GUESTPORT]... [--wasi]
        [--restore FILE]
 
@@ -112,7 +112,7 @@ through shared memory (read by the worker while the kernel runs);
 yields, up to 20 ms while the guest is busy), --worker=shared insists on
 shared memory. PCM and everything else are messages either way.
 
---smp N gives an SMP kernel (one built with CONFIG_SMP: kw_smp.config)
+--cpus N gives an SMP kernel (one built with CONFIG_SMP: kw_smp.config)
 N CPUs, each another instance of the kernel in its own thread on a shared
 memory, each with its own JIT; it implies --worker, and --stats prints the
 JIT counters per CPU. A UP kernel runs on one CPU (a log line says so). An SMP kernel has every device
@@ -249,9 +249,9 @@ const timeout = Number(opt("timeout", "0"));
 const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;
 const workerArg = args.find((a) => a === "--worker" || a.startsWith("--worker="));
-const smpCpus = Number(opt("smp", "1"));
+const smpCpus = Number(opt("cpus", "1"));
 if (!Number.isInteger(smpCpus) || smpCpus < 1 || smpCpus > 32) {
-	process.stderr.write("[host] --smp N: 1 to 32 CPUs\n");
+	process.stderr.write("[host] --cpus N: 1 to 32 CPUs\n");
 	process.exit(1);
 }
 // SMP: every CPU in a worker, CPU 0 in the kernel worker.
@@ -267,7 +267,7 @@ let module: WebAssembly.Module;
 let kernelHasErofs = false;
 try {
 	let bytes: Uint8Array = readFileSync(kernelPath);
-	// --smp N with a bundle that carries an SMP patch (kernel/tools/bundle.mjs --smp): boot the SMP kernel it makes.
+	// --cpus N with a bundle that carries an SMP patch (kernel/tools/bundle.mjs --smp): boot the SMP kernel it makes.
 	if (smpCpus > 1) {
 		const tp = performance.now();
 		const smp = await smpKernelFromBundle(bytes);

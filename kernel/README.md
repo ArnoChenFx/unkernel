@@ -45,7 +45,7 @@ Downloads are pinned (`build.sh`, `tools/env.sh`, `guest/**/pins.sh`).
 node js/cli.ts                                                    # Alpine on the bundle; Ctrl-] quits; --help lists options
 node js/cli.ts --distro debian                                    # Debian; --distro none: the base shell
 node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"     # kernel tests as /init (no distro)
-node js/cli.ts --smp 2 --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the same on the SMP kernel
+node js/cli.ts --cpus 2 --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the same on the SMP kernel
 node js/cli.ts --kernel vendor/build/kernel/vmlinux --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the wasm64 build (with base.cpio)
 node js/cli.ts --data /tmp/kwdata.img                             # with the data disk at /data (changes persist)
 ```

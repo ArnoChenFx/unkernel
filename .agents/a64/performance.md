@@ -83,7 +83,7 @@ is blocks counting down to the threshold, hand-backs (data-TLB misses)
 runs): `npm --version` 3.91 and 3.54, `npx --version` 3.53 and 3.55, `npx
 --yes cowsay hi` 38.0 and 14.6, `node -e 0` 0.69 and 0.64, a JSON loop
 4.12; Bun `bun -e` x10 0.65, `bun run t.ts` x5 0.79. SMP kernel with
-`--smp 2`: `npm --version` 3.47 and 2.99. Compiled share: npm 44%, `node
+`--cpus 2`: `npm --version` 3.47 and 2.99. Compiled share: npm 44%, `node
 -e 0` 63%, V8 loops 80-92%.
 
 **OpenSSL** (2026-11-18, UP bundle, the image's rebuilt libcrypto, `openssl

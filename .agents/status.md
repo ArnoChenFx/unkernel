@@ -36,7 +36,7 @@ mount and registers it by hand if needed. It passes inline, in
 a worker and with `UNKERNEL_TEST_CPUS=2`, on the shared path and with
 `--messages` (2026-11-19, aarch64; the snapshot part with one CPU only, since an
 SMP kernel has no KW_PARK), and the built CLI (`pnpm build`,
-`dist/cli.mjs --wasi`, inline and `--smp 2`) ran programs on the shared
+`dist/cli.mjs --wasi`, inline and `--cpus 2`) ran programs on the shared
 path (a Ctrl-C through it was tried on the message path only). Preview 0
 modules (`wasi_unstable`) run adapted (js.md): wasienv's Lua 5.4 shell
 (`@antonz/lua-wasi`) runs scripts, file I/O with seeks, stdin and its
@@ -235,7 +235,7 @@ Open:
      CPU running user code still waits until that CPU's host thread runs
      again (kwload's `shoot` 2-36 s at 4-8 CPUs beside 24 spinners);
      nothing in the guest can shorten it, so fewer guest CPUs than free
-     host cores is the remedy (a CLI warning for `--smp` above
+     host cores is the remedy (a CLI warning for `--cpus` above
      `os.availableParallelism()` is not built). Spinlocks taken out of
      turn have no starvation bound (a waiter that has waited,
      say, 1 ms could take a ticket; nothing measured needs it), and
@@ -252,7 +252,7 @@ Open:
    - Browsers (2026-11-17; js.md, CPU threads; web.md, Several CPUs):
      `js/web/cpu.ts` starts each CPU as a Web Worker, nested in worker
      mode's kernel worker (CPU 0 must be able to block, so not on a
-     page's main thread), and the page has a CPUs option (`?smp=N`, off
+     page's main thread), and the page has a CPUs option (`?cpus=N`, off
      by default) that loads the SMP bundle only then and falls back to
      one CPU. Run in headless Chromium (2 and 4 CPUs: boot, a terminal
      window, glimmer, the JIT on every CPU, parallel loops scaling) and

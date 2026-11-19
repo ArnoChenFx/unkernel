@@ -121,6 +121,7 @@ export function createUi(cfg: Config) {
 		safeNote: cfg.root === "initramfs"
 			? "Safe mode: the root is the plain image (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in /data/overlay/upper. kw-overlay status explains, kw-overlay discard starts over from the image."
 			: null,
+		resetNote: null,
 		ctrl: false, keysOn: false, pasteOpen: false, ask: null, prefix: false,
 		fontPref, fontSize: cfg.fontSize, copyText: null,
 		display: { attached: false, shown: true, width: 0, height: 0, keyboard: false, mouse: false, tablet: false,
@@ -307,6 +308,16 @@ export function createUi(cfg: Config) {
 			});
 			ui.check("overlay", "Root", "warn", "safe mode", reason);
 			ui.toast(`Safe mode: ${reason}. Root changes are paused; kw-overlay restore brings them back.`);
+		},
+
+		/**
+		 * The guest reset the data disk, written by a guest of another architecture, keeping only /root
+		 * (boot.ts saw "kw-data: RESET: <note>").
+		 */
+		archReset(note: string) {
+			$.set({ resetNote: note });
+			ui.check("arch-reset","Data disk reset", "warn", /\/root was kept/.test(note) ? "at this boot, /root kept" : "at this boot", note);
+			ui.toast(note);
 		},
 
 		diagText,

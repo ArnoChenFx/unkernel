@@ -71,6 +71,8 @@ export interface UiState {
 	disk: { used: number; size: number; saved: boolean } | null;
 	/** The safe-mode explanation in the Data disk section, or null. */
 	safeNote: string | null;
+	/** The guest reset the data disk at this boot (a guest of another architecture wrote it): why, or null. */
+	resetNote: string | null;
 	/** The key bar's Ctrl is armed. */
 	ctrl: boolean;
 	/** The key bar is showing (phones, on-screen keyboard up). */

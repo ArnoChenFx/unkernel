@@ -428,6 +428,24 @@ wrapper scripts (`tools/env.sh`, `use_real_host_tools`).
   `mke2fs -t ext4 -b 4096 -L kwdata -m 0 -J size=8 -E lazy_itable_init=0,lazy_journal_init=0 data.ext4 4G`,
   then `node js/cli.ts --data data.ext4` (or `--data new.img`, created
   from the template).
+* **Guest architecture:** `/data/.kw-arch` names the architecture
+  (`/etc/apk/arch`) of the guest that uses the disk, written at its first
+  mount. Right after mounting, `kw-data.sh` resets a disk of another
+  architecture (a riscv64 image wrote every disk saved before the aarch64
+  guest): its marker names one, or, without a marker, the upper layer's
+  apk database or system ELF files show one. Root's home in the upper
+  layer (`/data/overlay/upper/root`) is kept as it is, unscanned;
+  everything else but `lost+found` is deleted: installed packages, apk's
+  database, `/etc`, `/usr`, `/var`, other homes, the rest of `/data`. All
+  of it is set aside in `/data/.kw-reset` first and the home moved back
+  into a new upper layer, so a cut-off reset is finished at the next boot
+  without losing `/root`. Then the marker is written, and the boot goes on
+  with the overlay root, printing
+  `kw-data: RESET: Installed packages and system changes were reset (this disk was written by the riscv64 guest, the guest is now aarch64). /root was kept.`
+  (the page also shows it in its Data disk section and a toast). A disk
+  without a marker and without such evidence is adopted.
+  `kw.root=initramfs` defers a reset that has not started. Details in
+  `.agents/data-disk.md` (Guest architecture).
 * **Overlay root** (`kernel/guest/overlay/`): with a data disk the whole
   root is writable and persistent through overlayfs
   (`CONFIG_OVERLAY_FS`, no optional features). Lower layer: the initramfs

@@ -439,6 +439,116 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		}
 	});
 
+	test("data disk of another guest architecture: reset once with a message, keeping only /root, also after a cut-off reset; a disk of this one is kept (kernel/guest/kw-data.sh)", async (t) => {
+		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
+		try {
+			const module = await WebAssembly.compile(readFileSync(kernelFile));
+			const file = path.join(dir, "data.img");
+			await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
+			const RESET = /kw-data: RESET: Installed packages and system changes were reset \(this disk was written by the (\w+) guest, the guest is now (\w+)\)\.( \/root was kept\.)?\n/;
+			/** One boot (kw.root=initramfs with `plain`): run `cmd` at the prompt, power off; the console and the command's output. */
+			const run = async (cmd: string, plain = false) => {
+				const disk = new FileDisk(file);
+				const vm = await boot(t, { kernel: module, disks: [disk], log: () => {},
+					...(plain ? { cmdline: "console=hvc0 rdinit=/init kw.root=initramfs" } : {}) });
+				const { s, waitFor } = screen(vm);
+				await waitFor(PROMPT);
+				const at = s.text.length;
+				vm.write(`${cmd}; echo ran-$((6*7))\n`);
+				await waitFor(/ran-42/, at);
+				const clean = (x: string) => x.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "");
+				const out = clean(s.text.slice(at));
+				vm.write("poweroff\n");
+				assert.equal((await vm.exited).code, 0);
+				disk.close();
+				return { console: clean(s.text.slice(0, at)), out };
+			};
+			const list = "echo ls: $(ls -A /data | tr '\\n' ' '); echo arch: $(cat /data/.kw-arch 2>/dev/null)";
+			// Root's home as the merged root shows it: names, modes, owners, types, contents, the link's target.
+			const home = "echo B-$((40+2)); cd /root && find . ! -name .ash_history | sort | while read -r f; do stat -c '%n %a %u:%g %F' \"$f\"; done; " +
+				"cat sub/deep/f.txt .dotfile; readlink link; cd /; echo E-$((40+2))";
+			const homeOf = (out: string) => /B-42\n([^]*?)E-42/.exec(out)?.[1];
+			const pkgs = "echo pkgs: $(apk info 2>/dev/null | sort | tr '\\n' ' ')";
+			const pkgsOf = (out: string) => /^pkgs: (.*)$/m.exec(out)?.[1];
+			const gone = "for f in /etc/kw-test.conf /home/alice /usr/bin/kw-pkg /usr/lib/kw-pkg /data/mine; do [ -e $f ] && echo left: $f; done";
+
+			// A new disk is adopted and marked. On it: a home with a nested directory, a symlink, a dotfile (another
+			// owner) and modes; changes outside /root (/etc, /home, a package's files), a directory at the top of
+			// /data, and the apk database of the other architecture, with the marker removed.
+			let r = await run(`${list}; echo this: $(cat /etc/apk/arch); ${pkgs}; ` +
+				"mkdir -p /root/sub/deep && echo deep > /root/sub/deep/f.txt && chmod 750 /root/sub && echo dot > /root/.dotfile && chmod 600 /root/.dotfile && " +
+				"chown 1:1 /root/.dotfile && ln -s sub/deep/f.txt /root/link && echo run > /root/run.sh && chmod 755 /root/run.sh; " +
+				"echo etc > /etc/kw-test.conf; mkdir -p /home/alice /usr/lib/kw-pkg && echo a > /home/alice/a && echo bin > /usr/bin/kw-pkg && mkdir /data/mine; " +
+				`${home}; rm /data/.kw-arch; printf 'P:musl\\nV:1\\nA:%s\\n\\n' $OTHER > /lib/apk/db/installed; sync`
+					.replace("$OTHER", "$(case $(cat /etc/apk/arch) in riscv64) echo aarch64 ;; *) echo riscv64 ;; esac)"));
+			const arch = /this: (\w+)/.exec(r.out)?.[1]!, other = arch === "riscv64" ? "aarch64" : "riscv64";
+			assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`), "a new disk is marked at its first boot");
+			assert.doesNotMatch(r.console, /kw-data:/);
+			const image = pkgsOf(r.out), saved = homeOf(r.out);
+			assert.ok(image && /busybox/.test(image), r.out);
+			assert.ok(saved, r.out);
+			assert.match(saved, /^\. 700 0:0 directory\n\.\/\.dotfile 600 1:1 regular file\n\.\/link 777 0:0 symbolic link\n\.\/run\.sh 755 0:0 regular file\n\.\/sub 750 0:0 directory\n\.\/sub\/deep 755 0:0 directory\n\.\/sub\/deep\/f\.txt 644 0:0 regular file\ndeep\ndot\nsub\/deep\/f\.txt\n$/);
+			/** The checks after each reset: the message (with /root kept), only the overlay and the marker on /data, the same home. */
+			const resetKept = (r: { console: string; out: string }, what: string) => {
+				assert.deepEqual(RESET.exec(r.console)?.slice(1), [other, arch, " /root was kept."], `${what}: ${r.console.slice(-800)}`);
+				assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`), what);
+				assert.equal(homeOf(r.out), saved, `${what}: /root as it was`);
+			};
+
+			// kw.root=initramfs leaves it as it was and says so. Then cut a reset off after its first move (the
+			// overlay, home and all, set aside; /data/mine not yet).
+			r = await run(`${list}; mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && sync`, true);
+			assert.match(r.console, new RegExp(`kw-data: this disk was written by the ${other} guest, the guest is now ${arch}: installed packages and system changes are reset \\(/root is kept\\) at the next boot without kw\\.root=initramfs`));
+			assert.match(r.out, /ls: lost\+found mine overlay\narch:\n/);
+
+			// The next boot finishes the reset: /root is back, the rest is gone, apk has the image's packages.
+			r = await run(`${list}; ${home}; ${gone}; ${pkgs}; echo etc2 > /etc/kw-test.conf`);
+			resetKept(r, "cut after the first move");
+			assert.doesNotMatch(r.out, /^left: /m);
+			assert.equal(pkgsOf(r.out), image, "apk's database is the image's");
+
+			// Cut off after the home was moved back into a new upper layer, before the marker.
+			await run(`mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && mkdir -p /data/overlay/upper && ` +
+				"mv /data/.kw-reset/0/overlay/upper/root /data/overlay/upper/ && rm /data/.kw-arch && sync", true);
+			r = await run(`${list}; ${home}; ${gone}; mkdir -p /data/.kw-reset/0/x && echo ${other} > /data/.kw-reset/from && echo keep > /data/keep.txt && sync`);
+			resetKept(r, "cut after the home was back");
+			assert.doesNotMatch(r.out, /^left: /m, "/etc/kw-test.conf of the boot before is gone");
+
+			// Cut off after the marker (above): only the set-aside directory goes. Then one cut off after the new upper
+			// layer was made, before the home was moved into it.
+			r = await run(`${list}; ${home}; cat /data/keep.txt`);
+			assert.deepEqual(RESET.exec(r.console)?.slice(1), [other, arch, " /root was kept."]);
+			assert.match(r.out, new RegExp(`ls: \\.kw-arch keep\\.txt lost\\+found overlay\\narch: ${arch}\\n`));
+			assert.equal(homeOf(r.out), saved);
+			await run(`mkdir -p /data/.kw-reset/0 && echo ${other} > /data/.kw-reset/from && mv /data/overlay /data/.kw-reset/0/ && mkdir -p /data/overlay/upper && rm /data/.kw-arch && sync`, true);
+			r = await run(`${list}; ${home}; echo ${other} > /data/.kw-arch; sync`);
+			resetKept(r, "cut before the home was back");
+
+			// A marker naming the other architecture resets, keeping /root.
+			r = await run(`${list}; ${home}; echo same > /etc/kw-same.conf; rm /data/.kw-arch; cp /bin/busybox /usr/bin/kw-elf; sync`);
+			resetKept(r, "marker of the other architecture");
+
+			// A disk of this architecture (here unmarked, with an ELF file of this one) keeps its changes. Then the
+			// home in the upper layer becomes a whiteout and an ELF file of the other architecture appears.
+			r = await run(`${list}; ${home}; cat /etc/kw-same.conf`);
+			assert.doesNotMatch(r.console, /kw-data:/);
+			assert.match(r.out, new RegExp(`ls: \\.kw-arch lost\\+found overlay\\narch: ${arch}\\n`));
+			assert.equal(homeOf(r.out), saved);
+			assert.match(r.out, /\nsame\n/);
+			await run(`rm -rf /data/overlay/upper/root /data/.kw-arch && mknod /data/overlay/upper/root c 0 0 && ` +
+				`printf '\\177ELF\\2\\1\\1\\0\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\${other === "riscv64" ? "363" : "267"}\\0' > /data/overlay/upper/usr/bin/kw-elf; sync`, true);
+			r = await run(`${list}; ls -A /root | grep -v ash_history; echo root-$(stat -c %F /root)`);
+			const m = RESET.exec(r.console);
+			assert.deepEqual(m?.slice(1), [other, arch, undefined], "nothing to keep: no /root was kept");
+			assert.match(r.out, /\nroot-directory\n/, "/root is the image's again");
+			assert.doesNotMatch(r.out, /run\.sh|\.dotfile|sub/);
+			r = await run(list);
+			assert.doesNotMatch(r.console, /kw-data:/, "once");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("jit option: kwemu's JIT tier compiles hot guest code when on (the default) and nothing when off", async (t) => {
 		// sha256 over busybox (~1 MiB) runs well past the 2^17-instruction threshold.
 		const run = async (jit: boolean | undefined) => {

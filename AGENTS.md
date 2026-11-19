@@ -116,6 +116,9 @@ Details are in the area files.
   features: SVE, SM3, SM4, ...).
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
+  The one sanctioned discard is the guest's reset of a disk written by
+  another guest architecture, which deletes all but root's home
+  (data-disk.md, Guest architecture).
 
 ## Changing things
 

@@ -182,7 +182,11 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   an unedited copy is replaced when the text changes. Keep its shortcuts
   and claims in step with the page.
 - The safe-mode explanation comes from watching the console for
-  `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md).
+  `kw-overlay: SAFE MODE:` (`boot.ts`, see data-disk.md), and the notice
+  of a data disk reset after a change of guest architecture, which keeps
+  only `/root` (the guest's sentence as the panel note `data-reset-note`
+  and a toast; a check row "Data disk reset", "at this boot, /root kept")
+  from `kw-data: RESET:`.
 - A guest `reboot` (halt code 2) reloads the page once the last data-disk
   save has committed, at most 3 times a minute per tab (sessionStorage
   `kw-auto-reboot`); then the page stays halted and says why.

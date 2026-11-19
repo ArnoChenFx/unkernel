@@ -475,15 +475,24 @@ export function start(): void {
 		else if (!cfg.verbose && (replay += t).length > 65536) replay = replay.slice(-49152);
 	}
 	const KSTAMP_RE = /^\[ *\d+\.\d+\] */;
-	// The guest's boot-health check fell back to safe mode (kernel/guest/overlay/root.sh).
-	let userTail = "", safeSeen = false;
+	// The guest's boot-health check fell back to safe mode (kernel/guest/overlay/root.sh),
+	// or it reset a data disk written by a guest of another architecture (kernel/guest/kw-data.sh).
+	let userTail = "", safeSeen = false, resetSeen = false;
+	const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "").trim();
 	function watchUser(t: string) {
-		if (safeSeen) return;
+		if (safeSeen && resetSeen) return;
 		userTail = (userTail + t).slice(-2048);
-		const m = /kw-overlay: SAFE MODE: ([^\r\n]*)\r?\n/.exec(userTail);
+		const r = resetSeen ? null : /kw-data: RESET: ([^\r\n]*)\r?\n/.exec(userTail);
+		if (r) {
+			resetSeen = true;
+			const note = plain(r[1]!);
+			ui.hostLog(`[host] the guest reset the data disk: ${note}`);
+			ui.archReset(note);
+		}
+		const m = safeSeen ? null : /kw-overlay: SAFE MODE: ([^\r\n]*)\r?\n/.exec(userTail);
 		if (!m) return;
 		safeSeen = true;
-		const reason = m[1]!.replace(/\x1b\[[0-9;]*m/g, "").trim();
+		const reason = plain(m[1]!);
 		ui.hostLog(`[host] the guest booted in safe mode: ${reason}`);
 		ui.safeMode(reason);
 	}

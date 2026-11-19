@@ -1167,6 +1167,18 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     in comes out exactly once), LDUMAXAL, a CASA/SWPL lock around a plain
     increment and a 128-bit CASPAL counter; every total must be exact,
     and on several CPUs the threads must have run on two at least.
+  - `excl smp:` (on one CPU too): one thread per CPU (2 to 4) counts
+    50000 times in its own halfword of one shared word (LDXRH/STXRH: a
+    wider store would lose a neighbour's counts) and, all of them, in a
+    shared halfword (LDAXRH/STLXRH), byte (LDXRB/STLXRB), word
+    (LDAXR/STXR) and doubleword (LDXR/STLXR) and, with HWCAP_ATOMICS, a
+    byte and halfword by LDADDB/LDADDLH beside them; two threads pass
+    20000 messages (plain stores of the data, then a sequence number by
+    STLR of X, W, H and B in turn, read by LDAR of the same size and
+    acknowledged by STLR). Every count must be exact, every message's data
+    seen, and on several CPUs the threads must have run on two at least.
+    The loops run compiled (exclusives are inline in compiled code,
+    a64.md).
   - `move:` (more than one CPU online; skipped otherwise; SMP above):
     2 threads per CPU (at most 8) started on CPU 0 and then allowed
     everywhere run `fphot()` for 2 s and must sit evenly on every CPU at
@@ -1201,7 +1213,7 @@ dependencies are not met silently; both configs pass as of 2026-11-17).
     the code while it is not executable (it must fault), and never
     crash.
     `kwtest smp` (as `rdinit=/usr/bin/kwtest -- smp`) runs only
-    `uaccess:`, `smp:`, `lse smp:`, `move:` and `jit:`.
+    `uaccess:`, `smp:`, `lse smp:`, `excl smp:`, `move:` and `jit:`.
 - abitest (`kernel/guest/abitest.c`): a freestanding arm64 ABI test (no
   libc, no exclusives, no TLS), so it runs before a libc does and is the
   only test that sees the registers exec leaves (all of x0..x30, V0..V31,

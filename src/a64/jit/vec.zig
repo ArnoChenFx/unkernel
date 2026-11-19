@@ -48,6 +48,10 @@ const Cpu = kwemu.Cpu;
 pub const Kind = enum(u8) {
     /// Vd = code(Vn, Vm), one lane op
     bin,
+    /// USHL (x 0), SSHL (x 1) by register on S or D lanes (vector, scalar
+    /// D): each lane by the signed low byte of Vm's lane, lane by lane in
+    /// i64 (wasm shifts take one count for all lanes)
+    shlreg,
     /// MLA, MLS: Vd = code2(Vd, code(Vn, Vm))
     mla,
     /// CMTST: (Vn & Vm) != 0 per lane
@@ -314,6 +318,11 @@ fn threeSame(raw: u32, sc: bool) ?V {
     } else if (z == 3 and !v.q) return null;
     switch (opcode) {
         0b10000 => v.code = if (u) op_sub[z] else op_add[z],
+        0b01000 => { // USHL, SSHL (B and H lanes stay calls)
+            if (z < 2) return null;
+            v.k = .shlreg;
+            v.x = @intFromBool(!u);
+        },
         0b10001 => if (u) {
             v.code = op_eq[z];
         } else {
@@ -358,6 +367,81 @@ fn threeSame(raw: u32, sc: bool) ?V {
         else => return null,
     }
     return v;
+}
+
+/// USHL/SSHL lane by lane (simd_int.shlReg without rounding or
+/// saturation): s = the signed low byte of Vm's lane; s >= 0: a << s (0 from
+/// the element size on); s < 0: a >> -s, logical (0 from the element size
+/// on) or arithmetic (the sign from the element size on). S lanes go through
+/// i64 zero- or sign-extended, which gives the same low 32 bits.
+fn shlReg(e: *Emit, v: V) void {
+    const d64 = v.size == 3;
+    const lanes: u8 = if (d64) (if (v.q) 2 else 1) else (if (v.q) 4 else 2);
+    const es: u64 = if (d64) 64 else 32;
+    const signed = v.x == 1;
+    for (0..lanes) |i| {
+        const li: u8 = @intCast(i);
+        get(e, v.n);
+        if (d64) e.vlane(cm.S.i64x2_extract_lane, li) else {
+            e.vlane(cm.S.i32x4_extract_lane, li);
+            e.op(if (signed) W.i64_ext_s else W.i64_ext_u);
+        }
+        e.set(lu); // a
+        get(e, v.m);
+        if (d64) e.vlane(cm.S.i64x2_extract_lane, li) else {
+            e.vlane(cm.S.i32x4_extract_lane, li);
+            e.op(W.i64_ext_u);
+        }
+        e.k64(56);
+        e.op(W.i64_shl);
+        e.k64(56);
+        e.op(W.i64_shr_s);
+        e.set(lu + 1); // s
+        // left: s < es ? a << s : 0
+        e.get(lu);
+        e.get(lu + 1);
+        e.op(W.i64_shl);
+        e.k64(0);
+        e.get(lu + 1);
+        e.k64(es);
+        e.op(W.i64_lt_s);
+        e.op(W.select);
+        // right, by n = -s
+        e.get(lu);
+        e.k64(0);
+        e.get(lu + 1);
+        e.op(W.i64_sub);
+        e.tee(lu + 2);
+        if (signed) {
+            e.k64(es - 1);
+            e.get(lu + 2);
+            e.k64(es);
+            e.op(W.i64_lt_s);
+            e.op(W.select);
+            e.op(W.i64_shr_s);
+        } else {
+            e.op(W.i64_shr_u);
+            e.k64(0);
+            e.get(lu + 2);
+            e.k64(es);
+            e.op(W.i64_lt_s);
+            e.op(W.select);
+        }
+        e.get(lu + 1);
+        e.k64(0);
+        e.op(W.i64_ge_s);
+        e.op(W.select);
+        e.set(lu + 3 + @as(u32, @intCast(i)));
+    }
+    k128(e, 0, 0);
+    for (0..lanes) |i| {
+        e.get(lu + 3 + @as(u32, @intCast(i)));
+        if (d64) e.vlane(cm.S.i64x2_replace_lane, @intCast(i)) else {
+            e.op(W.i32_wrap);
+            e.vlane(cm.S.i32x4_replace_lane, @intCast(i));
+        }
+    }
+    cm.setVq(e, v.d, v.q);
 }
 
 fn across(raw: u32) ?V {
@@ -797,7 +881,7 @@ fn xs(r: u8) u8 {
 pub fn usage(v: V) Use {
     const nm = vr(v.n).with(vr(v.m));
     return switch (v.k) {
-        .bin, .cmtst, .cmhu64, .pair, .pmull => nm.with(vw(v.d)),
+        .bin, .shlreg, .cmtst, .cmhu64, .pair, .pmull => nm.with(vw(v.d)),
         .un, .cmz, .shift, .shll, .across, .paird, .aesmc, .aesimc, .sha1h => vr(v.n).with(vw(v.d)),
         .sra, .ins_shift, .narrow, .aese, .aesd, .sha256su0, .sha1su1, .sha512su0 => vr(v.n).with(vr(v.d)).with(vw(v.d)),
         .bsl, .long, .mla, .sha1c, .sha1p, .sha1m, .sha1su0, .sha256h, .sha256h2, .sha256su1, .sha512h, .sha512h2, .sha512su1 => nm.with(vr(v.d)).with(vw(v.d)),
@@ -904,6 +988,7 @@ pub fn emit(e: *Emit, v: V, at: At) void {
             vop(e, v.code2);
             cm.setVq(e, v.d, v.q);
         },
+        .shlreg => shlReg(e, v),
         .cmtst => {
             get(e, v.n);
             get(e, v.m);
@@ -1870,8 +1955,8 @@ fn genArith(r: std.Random, out: []u32, pc: u64) usize {
     const size = r.uintLessThan(u32, 4) << 22;
     const rr = (vm << 16) | (vn << 5) | vd;
     out[0] = switch (r.uintLessThan(u32, 13)) {
-        0, 1 => 0x0e20_0400 | q | u | size | (pick(r, u32, &.{ 0b10000, 0b10001, 0b00110, 0b00111, 0b01100, 0b01101, 0b10011, 0b00010, 0b10100, 0b10101, 0b10111, r.uintLessThan(u32, 24) }) << 11) | rr, // three same
-        2 => 0x5e20_0400 | u | (if (r.uintLessThan(u32, 4) == 0) size else 3 << 22) | (pick(r, u32, &.{ 0b10000, 0b10001, 0b00110, 0b00111, 0b01100 }) << 11) | rr, // scalar three same
+        0, 1 => 0x0e20_0400 | q | u | size | (pick(r, u32, &.{ 0b10000, 0b10001, 0b00110, 0b00111, 0b01100, 0b01101, 0b10011, 0b00010, 0b10100, 0b10101, 0b10111, 0b01000, r.uintLessThan(u32, 24) }) << 11) | rr, // three same
+        2 => 0x5e20_0400 | u | (if (r.uintLessThan(u32, 4) == 0) size else 3 << 22) | (pick(r, u32, &.{ 0b10000, 0b10001, 0b00110, 0b00111, 0b01100, 0b01000 }) << 11) | rr, // scalar three same
         3, 4 => 0x0e20_0800 | q | u | size | (pick(r, u32, &.{ 0, 1, 5, 8, 9, 10, 11, 18, 4 }) << 12) | (vn << 5) | vd, // two-reg misc
         5 => 0x0e30_0800 | q | u | size | (pick(r, u32, &.{ 0x1b, 0x0a, 0x1a, 0x03 }) << 12) | (vn << 5) | vd, // across lanes
         6 => 0x0e20_0000 | q | u | (r.uintLessThan(u32, 3) << 22) | (pick(r, u32, &.{ 0xc, 0x8, 0xa, 0, 1, 2, 3, 4, 0xe }) << 12) | rr, // three different

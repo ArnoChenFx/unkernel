@@ -618,7 +618,25 @@ const st_i = [4]H{ .str8_i, .str16_i, .str32_i, .str64_i };
 const st_w = [4]H{ .str8_w, .str16_w, .str32_w, .str64_w };
 const st_r = [4]H{ .str8_r, .str16_r, .str32_r, .str64_r };
 
+/// The op of an integer load whose destination (Rt or a pair's Rt2) is XZR,
+/// which the tier leaves `generic` (a load into slot 32 would clobber the
+/// XZR that ops read there): the JIT translates it with the load kind,
+/// whose write to XZR it drops (jit/emit.zig). V8 pops its padding register
+/// this way (`ldp xzr, x30, [sp], #16`). Null for every other word.
+pub fn xzrLoad(inst: u32, pc: u64) ?Op {
+    if (bits(inst, 28, 25) & 0b0101 != 0b0100) return null; // not a load/store
+    if (inst & 0xbe00_0000 == 0x0c00_0000 or inst & 0x3f00_0000 == 0x0800_0000) return null;
+    const d = if (inst & 0x3b00_0000 == 0x1800_0000) literalZ(inst, pc, true) else if (inst & 0x3800_0000 == 0x2800_0000) pairZ(inst, pc, true) else if (inst & 0x3800_0000 == 0x3800_0000) singleZ(inst, pc, true) else return null;
+    return switch (d.op.h) {
+        .ldr8_i, .ldr16_i, .ldr32_i, .ldr64_i, .ldr8_w, .ldr16_w, .ldr32_w, .ldr64_w, .ldr8_r, .ldr16_r, .ldr32_r, .ldr64_r, .ldp32, .ldp64, .ldp32_w, .ldp64_w => if (d.op.a == zr or d.op.c == zr and (d.op.h == .ldp32 or d.op.h == .ldp64 or d.op.h == .ldp32_w or d.op.h == .ldp64_w)) d.op else null,
+        else => null,
+    };
+}
+
 fn literal(inst: u32, pc: u64) Decoded {
+    return literalZ(inst, pc, false);
+}
+fn literalZ(inst: u32, pc: u64, comptime zr_ok: bool) Decoded {
     const va = pc +% c.sextN(@as(u64, bits(inst, 23, 5)) << 2, 21);
     const t = c.rd(inst);
     const opc = bits(inst, 31, 30);
@@ -631,7 +649,7 @@ fn literal(inst: u32, pc: u64) Decoded {
         };
     }
     if (opc == 3) return nop(); // PRFM (literal)
-    if (t == 31) return generic(inst, pc, false);
+    if (t == 31 and !zr_ok) return generic(inst, pc, false);
     return switch (opc) {
         0 => mk(.ldr32_i, xz(t), zr, 0, 0, 0, 0, 0, va),
         1 => mk(.ldr64_i, xz(t), zr, 0, 0, 0, 0, 0, va),
@@ -640,6 +658,9 @@ fn literal(inst: u32, pc: u64) Decoded {
 }
 
 fn pair(inst: u32, pc: u64) Decoded {
+    return pairZ(inst, pc, false);
+}
+fn pairZ(inst: u32, pc: u64, comptime zr_ok: bool) Decoded {
     const idx = bits(inst, 25, 23); // 0 no-allocate, 1 post, 2 offset, 3 pre
     if (idx > 3) return generic(inst, pc, false);
     const opc = bits(inst, 31, 30);
@@ -656,7 +677,7 @@ fn pair(inst: u32, pc: u64) Decoded {
     const wb = idx == 1 or idx == 3;
     const pre: u8 = @intFromBool(idx != 1);
     if (!simd) {
-        if (load and (t == 31 or t2 == 31)) return generic(inst, pc, false);
+        if (load and (t == 31 or t2 == 31) and !zr_ok) return generic(inst, pc, false);
         const h: H = if (load)
             (if (scale == 3) (if (wb) H.ldp64_w else .ldp64) else (if (wb) H.ldp32_w else .ldp32))
         else if (scale == 3) (if (wb) H.stp64_w else .stp64) else (if (wb) H.stp32_w else .stp32);
@@ -672,6 +693,9 @@ fn pair(inst: u32, pc: u64) Decoded {
 }
 
 fn single(inst: u32, pc: u64) Decoded {
+    return singleZ(inst, pc, false);
+}
+fn singleZ(inst: u32, pc: u64, comptime zr_ok: bool) Decoded {
     const Mode = enum { imm, post, pre, regoff };
     const mode: Mode = if (bit(inst, 24)) .imm else if (!bit(inst, 21)) switch (bits(inst, 11, 10)) {
         1 => .post,
@@ -745,7 +769,7 @@ fn single(inst: u32, pc: u64) Decoded {
             .regoff => mk(.ldr_v, v, n, rm, scale, 2, x.s1, x.s2, x.mask),
         };
     }
-    if (t == 31) return generic(inst, pc, false); // a load into XZR still accesses memory
+    if (t == 31 and !zr_ok) return generic(inst, pc, false); // a load into XZR still accesses memory
     const width: u8 = @as(u8, 8) << @intCast(scale);
     const sx: u8 = if (kind == .zext) 0 else 64 - width;
     const sx32: u8 = @intFromBool(kind == .sext32);

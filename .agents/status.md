@@ -559,8 +559,8 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **aarch64: FMA, AdvSIMD FP, exclusives and system instructions are
-  calls of the interpreter in compiled code.** The A64 JIT (a64.md, JIT)
+- **aarch64: FMA, AdvSIMD FP and system instructions are calls of the
+  interpreter in compiled code.** The A64 JIT (a64.md, JIT)
   translates every ALU, memory and branch op, the frequent FP moves,
   compares and AdvSIMD moves, scalar FP arithmetic and conversions (with
   a fast path that needs FPCR's defaults and calls the interpreter off
@@ -569,8 +569,10 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   ops, LD1/ST1, LDP/STP of V registers, AES, PMULL, SHA1, SHA256 and
   SHA512 (vec.zig); the other generic ops are calls of the reference
   interpreter through the kernel's function table, with the module's
-  registers spilled around them (2026-11-18). The largest count left is
-  V8's LDAR/STLR/LDXR/STXR (a64.md, What is left).
+  registers spilled around them (2026-11-18). Exclusives, LDAR/STLR and
+  the LSE atomics are inline too, with wasm atomics in SMP builds
+  (atomic.zig); pairs and CASP stay calls. The largest counts left are
+  FMADD and DC ZVA (a64.md, What is left).
 - **aarch64: OpenSSL's NEON and crypto paths need wasm SIMD in the
   host.** The image's libcrypto now picks its code from HWCAP and the
   kernel enables SHA512 by default, because the JIT translates those
@@ -605,10 +607,12 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
   level, gzip 10% faster, the ash loop 10% slower. apk runs 13-24% of its
   instructions in blocks still counting down to the compile threshold
   (node's npm 55%); a lower threshold and a heat table across processes
-  did not pay (compiles cost about 0.3 ms each). The ranked levers left
-  are in a64.md (JIT, What is left): cold code (the interpreter, decodes),
-  `run`'s entry path and region prologues (about 5% each of the apk/shell
-  rows), NZCV materialisation (about 3%), the malloc lock's exclusives.
+  did not pay (compiles cost about 0.3 ms each), nor did a bigger exec
+  TLB, a 16 MiB `KW_CPU_SIZE` or chaining interpreted blocks in `runOps`
+  (2026-11-18). The ranked levers left are in a64.md (JIT, What is
+  left): cold code (`runOps` itself, first decodes of each new process),
+  `run`'s entry path and region prologues (about 5% each of the
+  apk/shell rows), NZCV materialisation (about 3%).
 - **node's shared libraries** (brotli, zstd, simdutf, simdjson, c-ares,
   nghttp2) are Alpine's builds. On riscv64, V8 could emit Zba/Zbb with
   `--riscv-b-extension` (kwemu.md: -6.5% on an integer JS benchmark), but

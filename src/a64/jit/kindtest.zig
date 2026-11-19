@@ -214,6 +214,11 @@ pub fn kind(comptime h: ops.H, gen: Gen, opt: Opt) !void {
         var bad = kt != kr or T.cpu.icount != Rf.cpu.icount or !std.mem.eql(u8, std.mem.asBytes(&T.regs), std.mem.asBytes(&Rf.regs));
         if (kt != mach.EV_BUDGET and !std.mem.eql(u8, std.mem.asBytes(&T.cpu.ev), std.mem.asBytes(&Rf.cpu.ev))) bad = true;
         if (!std.mem.eql(u8, T.mem[0..@intCast(T.next)], Rf.mem[0..@intCast(Rf.next)])) bad = true;
+        // The exclusive monitor (excl.zig; jit/atomic.zig opens and closes it).
+        const th = &T.cpu.priv.hart;
+        const rh = &Rf.cpu.priv.hart;
+        if (th.resv != rh.resv or th.resv_val != rh.resv_val or T.cpu.priv.a64.excl_size != Rf.cpu.priv.a64.excl_size or
+            T.cpu.priv.a64.excl_val2 != Rf.cpu.priv.a64.excl_val2) bad = true;
         // What was decoded and compiled.
         const arena = T.cpu.opArena(ops.Op);
         for (&T.cpu.priv.blocks) |*b| {
@@ -237,6 +242,10 @@ pub fn kind(comptime h: ops.H, gen: Gen, opt: Opt) !void {
             if (T.regs.nzcv != Rf.regs.nzcv) std.debug.print("  nzcv: 0x{x} vs 0x{x}\n", .{ T.regs.nzcv, Rf.regs.nzcv });
             for (0..32) |k| if (T.regs.v[k] != Rf.regs.v[k]) std.debug.print("  v{d}: 0x{x:0>32} vs 0x{x:0>32}\n", .{ k, T.regs.v[k], Rf.regs.v[k] });
             if (T.regs.tpidr_el0 != Rf.regs.tpidr_el0 or T.regs.fpsr != Rf.regs.fpsr or T.regs.fpcr != Rf.regs.fpcr) std.debug.print("  tpidr/fpsr/fpcr differ\n", .{});
+            std.debug.print("  monitor: resv 0x{x} val 0x{x} size {d} val2 0x{x} vs 0x{x} 0x{x} {d} 0x{x}\n", .{
+                th.resv,                    th.resv_val, T.cpu.priv.a64.excl_size, T.cpu.priv.a64.excl_val2,
+                rh.resv,                    rh.resv_val, Rf.cpu.priv.a64.excl_size, Rf.cpu.priv.a64.excl_val2,
+            });
             std.debug.print("  program:", .{});
             for (prog[0..i]) |w| std.debug.print(" {x:0>8}", .{w});
             std.debug.print("\n", .{});

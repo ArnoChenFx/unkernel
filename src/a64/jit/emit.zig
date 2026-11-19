@@ -41,6 +41,7 @@ const cm = @import("common.zig");
 const opexec = @import("../opexec.zig");
 const gen = @import("generic.zig");
 const vec = @import("vec.zig");
+const atomic = @import("atomic.zig");
 const Cpu = kwemu.Cpu;
 const Block = kwemu.Block;
 const H = O.H;
@@ -149,7 +150,7 @@ pub fn supported(o: Op) bool {
         .bits => bits.supported(o),
         .mem => mem.supported(o),
         .branch => branch.supported(o),
-        .none => jc.table_ok or gen.decode(o.aux()) != null or vec.decode(o.aux()) != null,
+        .none => jc.table_ok or gen.decode(o.aux()) != null or atomic.decode(o.aux()) != null or xzrLoad(o) != null or vec.decode(o.aux()) != null,
     };
 }
 
@@ -160,18 +161,21 @@ pub fn usage(o: Op) Use {
         .mem => mem.usage(o),
         .branch => branch.usage(o),
         // A call spills and reloads what the module holds (`generic`).
-        .none => if (gen.decode(o.aux())) |f| gen.usage(f) else if (vec.decode(o.aux())) |v| vec.usage(v) else .{},
+        .none => if (gen.decode(o.aux())) |f| gen.usage(f) else if (atomic.decode(o.aux())) |a| atomic.usage(a) else if (xzrLoad(o)) |l| mem.usage(l) else if (vec.decode(o.aux())) |v| vec.usage(v) else .{},
     };
 }
 
 pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bool) void {
     const at: At = .{ .k = k, .pc = pc, .b = b, .self_loop = self_loop };
     const fast = if (family(o.h) == .none) gen.decode(o.aux()) else null;
-    const vv: ?vec.V = if (family(o.h) == .none and fast == null) vec.decode(o.aux()) else null;
+    const aa: ?atomic.A = if (family(o.h) == .none and fast == null) atomic.decode(o.aux()) else null;
+    const aok = if (aa) |a| atomic.enabled(e, a) else false;
+    const zl: ?Op = if (family(o.h) == .none and fast == null and aa == null) xzrLoad(o) else null;
+    const vv: ?vec.V = if (family(o.h) == .none and fast == null and aa == null and zl == null) vec.decode(o.aux()) else null;
     const vok = if (vv) |v| vec.enabled(e, v) else false;
     // A pending AESE/AESD is consumed by its AESMC/AESIMC, else written now.
     if (!(vok and vec.consumes(e, vv.?))) vec.flush(e);
-    if (e.x.stale and (family(o.h) != .none or fast != null or vok)) {
+    if (e.x.stale and (family(o.h) != .none or fast != null or aok or zl != null or vok)) {
         reload(e);
         e.x.stale = false;
     }
@@ -180,8 +184,15 @@ pub fn emitOp(e: *Emit, o: Op, k: usize, pc: u64, b: *const Block, self_loop: bo
         .bits => bits.emit(e, o, at),
         .mem => mem.emit(e, o, at),
         .branch => branch.emit(e, o, at),
-        .none => if (fast) |f| gen.emit(e, f, at) else if (vok) vec.emit(e, vv.?, at) else if (e.table) generic(e, o, at) else e.handBack(at.k, at.pc),
+        .none => if (fast) |f| gen.emit(e, f, at) else if (aok) atomic.emit(e, aa.?, at) else if (zl) |l| mem.emit(e, l, at) else if (vok) vec.emit(e, vv.?, at) else if (e.table) generic(e, o, at) else e.handBack(at.k, at.pc),
     }
+}
+
+/// A load into XZR (`generic` in the tier, ops.xzrLoad) as its load kind,
+/// whose write to XZR mem.zig drops.
+fn xzrLoad(o: Op) ?Op {
+    const l = O.xzrLoad(@truncate(o.aux()), o.imm) orelse return null;
+    return if (mem.supported(l)) l else null;
 }
 
 /// A `generic` op: the reference interpreter runs it (`opexec.jitGeneric`,
@@ -408,6 +419,7 @@ pub fn poll(e: *Emit) void {
 
 test {
     _ = gen;
+    _ = atomic;
     _ = vec;
     _ = alu;
     _ = bits;
@@ -666,6 +678,56 @@ fn genFp(r: std.Random, out: []u32, pc: u64) usize {
         return 3;
     }
     return 1;
+}
+
+/// Integer loads into XZR (ops.xzrLoad: generic in the tier, the load kind
+/// in the JIT): LDP/LDPSW with Rt or Rt2 = XZR (offset, pre, post), LDR
+/// X/W/B/H/SW (unsigned offset, pre, post, register offset) and LDR
+/// (literal) into XZR, from a base set by ADD on any data page, the
+/// read-only one, the unmapped one, at page ends and misaligned; the
+/// other register of a pair now and then the base.
+fn genXzrLoad(r: std.Random, out: []u32, pc: u64) usize {
+    _ = pc;
+    const a: u32 = 25 + r.uintLessThan(u32, 3);
+    const b: u32 = switch (r.uintLessThan(u32, 10)) {
+        0 => 23,
+        1 => 24,
+        2 => 31,
+        else => 20 + r.uintLessThan(u32, 3),
+    };
+    const off: u32 = switch (r.uintLessThan(u32, 4)) {
+        0 => 4096 - 8 - 64 * r.uintLessThan(u32, 2), // the page end (x21, x22 sit mid-page: 2048 more)
+        1 => r.uintLessThan(u32, 64),
+        else => 8 * r.uintLessThan(u32, 32),
+    };
+    out[0] = 0x9100_0000 | ((off & 0xfff) << 10) | (b << 5) | a; // add xA, xB, #off
+    const n = if (r.uintLessThan(u32, 8) == 0) 31 else a;
+    const other = if (r.uintLessThan(u32, 6) == 0) n else kt.dst(r);
+    const imm7 = r.uintLessThan(u32, 8) -% 4 & 0x7f;
+    const imm9 = (r.uintLessThan(u32, 64) -% 32) & 0x1ff;
+    const pairs = [_]u32{ 0xa940_0000, 0xa8c0_0000, 0xa9c0_0000, 0x2940_0000, 0x28c0_0000, 0x29c0_0000, 0x6940_0000, 0x68c0_0000, 0x69c0_0000 };
+    out[1] = switch (r.uintLessThan(u32, 8)) {
+        0, 1, 2, 3 => blk: {
+            const w = pairs[r.uintLessThan(usize, pairs.len)] | (imm7 << 15) | (n << 5);
+            break :blk if (r.boolean()) w | (31 << 10) | other else w | (other << 10) | 31;
+        },
+        4 => @as(u32, switch (r.uintLessThan(u32, 5)) {
+            0 => 0xf940_0000,
+            1 => 0xb940_0000,
+            2 => 0x3940_0000,
+            3 => 0x7940_0000,
+            else => 0xb980_0000,
+        }) | (r.uintLessThan(u32, 8) << 10) | (n << 5) | 31, // ldr xzr/wzr, [xN, #imm]
+        5 => (if (r.boolean()) @as(u32, 0xf840_0400) else 0xf840_0c00) | (imm9 << 12) | (n << 5) | 31, // post, pre
+        6 => 0xf860_6800 | (kt.anyReg(r) << 16) | (n << 5) | 31, // ldr xzr, [xN, xM]
+        else => 0x5800_0000 | (r.uintLessThan(u32, 64) << 5) | 31, // ldr xzr, literal
+    };
+    return 2;
+}
+
+test "a64 jit: generic, loads into XZR" {
+    try kt.kind(.generic, genXzrLoad, .{});
+    try kt.kind(.generic, genXzrLoad, .{ .warm_tlb = true, .seed = 2, .words = 60 });
 }
 
 test "a64 jit: generic, scalar FP fast paths" {

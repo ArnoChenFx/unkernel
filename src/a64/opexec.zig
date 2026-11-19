@@ -661,29 +661,32 @@ pub fn runOps(o0: [*]const Op, x: [*]u64, cpu: *Cpu, end_pc: u64, pc0: u64, n: u
     var o = o0;
     var w = word(o);
     // One central dispatch (a plain loop around the switch); see kwemu.md.
+    // What follows an op that does not continue is outside the switch, so
+    // `inline else` does not copy it into every kind that can leave (a64.md,
+    // Numbers: the smaller function runs cold code 4-8% faster).
     while (true) {
-        switch (@as(H, @enumFromInt(@as(u8, @truncate(w))))) {
-            inline else => |h| {
+        const r: Next = switch (@as(H, @enumFromInt(@as(u8, @truncate(w))))) {
+            inline else => |h| blk: {
                 if (kwemu.stats_on) {
                     cpu.priv.stats.op_hist[@intFromEnum(h)] += 1;
                     const g = &cpu.priv.stats.jit.hb_gen;
                     if (h != .goto) g[@intCast(g[tier.Ax.cur])] += 1;
                 }
-                const r = doOp(h, w, o, x, cpu, end_pc);
-                if (r != .cont) {
-                    if (r == .done and x[ops.zr] == pc0 and left >= n and tier.quiet(cpu)) {
-                        left -= n;
-                        x[ops.zr] = 0;
-                        o = o0;
-                        w = word(o);
-                        continue;
-                    }
-                    return .{ .next = r, .op = o, .left = left };
-                }
-                o += 1;
-                w = word(o);
+                break :blk doOp(h, w, o, x, cpu, end_pc);
             },
+        };
+        if (r != .cont) {
+            if (r == .done and x[ops.zr] == pc0 and left >= n and tier.quiet(cpu)) {
+                left -= n;
+                x[ops.zr] = 0;
+                o = o0;
+                w = word(o);
+                continue;
+            }
+            return .{ .next = r, .op = o, .left = left };
         }
+        o += 1;
+        w = word(o);
     }
 }
 

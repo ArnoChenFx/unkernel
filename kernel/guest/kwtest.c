@@ -2762,6 +2762,133 @@ static void lse_smp_checks(void)
 }
 
 /*
+ * Exclusives and load-acquire/store-release of every size on several CPUs
+ * (also on one, where preemption interleaves the threads), long enough for
+ * their loops to run compiled (the JIT translates them inline, a64.md):
+ * each thread counts in its own halfword of one shared word by LDXRH/STXRH
+ * (a store wider than its access would lose a neighbour's counts), all of
+ * them in a shared halfword (LDAXRH/STLXRH), a shared byte (LDXRB/STLXRB)
+ * and a shared word and doubleword (LDAXR/STXR, LDXR/STLXR), and with LSE
+ * also in a shared byte and halfword by LDADDB/LDADDH and the word by a
+ * CAS loop; thread 0 and 1 pass messages: data by plain stores, then a
+ * sequence number by STLR (W, X, B, H in turn), which the other reads by
+ * LDAR and acknowledges by STLR after checking the data.
+ */
+#define EX_ITERS 50000
+#define EX_MSGS 20000
+static struct {
+	uint64_t own;		/* four 16-bit counters */
+	uint64_t pad0[7];
+	uint16_t h;
+	uint8_t b, lb;
+	uint16_t lh;
+	uint32_t w;
+	uint64_t x;
+	uint64_t pad1[6];
+	uint64_t data[4];
+	uint64_t seq, ack;
+	volatile int go;
+	int bad_msgs;
+} ex_sh __attribute__((aligned(64)));
+
+#define EXCL_INC(T, LD, ST, R, p) do { \
+	T v_; unsigned f_; \
+	do __asm__ volatile(LD " %" R "0, [%2]\n\tadd %" R "0, %" R "0, #1\n\t" ST " %w1, %" R "0, [%2]" \
+			    : "=&r"(v_), "=&r"(f_) : "r"(p) : "memory"); while (f_); \
+} while (0)
+
+static void *ex_worker(void *arg)
+{
+	uint64_t id = (uint64_t)(uintptr_t)arg, cpus = 0, v;
+	int lse = !!(getauxval(AT_HWCAP) & (1UL << 8));
+	uint16_t *own = (uint16_t *)&ex_sh.own + id;
+	unsigned cpu;
+
+	while (!ex_sh.go)
+		;
+	for (int i = 0; i < EX_ITERS; i++) {
+		EXCL_INC(uint32_t, "ldxrh", "stxrh", "w", own);
+		EXCL_INC(uint32_t, "ldaxrh", "stlxrh", "w", &ex_sh.h);
+		EXCL_INC(uint32_t, "ldxrb", "stlxrb", "w", &ex_sh.b);
+		EXCL_INC(uint32_t, "ldaxr", "stxr", "w", &ex_sh.w);
+		EXCL_INC(uint64_t, "ldxr", "stlxr", "x", &ex_sh.x);
+		if (lse) {
+			__asm__ volatile(LSE_EXT "ldaddb %w1, %w0, [%2]" : "=&r"(v) : "r"(1), "r"(&ex_sh.lb) : "memory");
+			__asm__ volatile(LSE_EXT "ldaddlh %w1, %w0, [%2]" : "=&r"(v) : "r"(1), "r"(&ex_sh.lh) : "memory");
+		}
+		if (!(i & 4095) && !syscall(SYS_getcpu, &cpu, NULL, NULL) && cpu < 64)
+			cpus |= 1UL << cpu;
+	}
+	/* Messages between thread 0 (sends) and 1 (acknowledges). */
+	for (uint64_t k = 1; id < 2 && k <= EX_MSGS; k++) {
+		int spins = 0;
+
+		if (id == 0) {
+			for (int j = 0; j < 4; j++)
+				ex_sh.data[j] = k * 7 + j;
+			switch (k & 3) {
+			case 0: __asm__ volatile("stlr %0, [%1]" :: "r"(k), "r"(&ex_sh.seq) : "memory"); break;
+			case 1: __asm__ volatile("stlr %w0, [%1]" :: "r"(k), "r"(&ex_sh.seq) : "memory"); break;
+			case 2: __asm__ volatile("stlrh %w0, [%1]" :: "r"(k), "r"(&ex_sh.seq) : "memory"); break;
+			default: __asm__ volatile("stlrb %w0, [%1]" :: "r"(k), "r"(&ex_sh.seq) : "memory"); break;
+			}
+			do {
+				__asm__ volatile("ldar %0, [%1]" : "=r"(v) : "r"(&ex_sh.ack) : "memory");
+				if (++spins > 1000)
+					sched_yield();
+			} while (v != k);
+		} else {
+			for (;;) {
+				switch (k & 3) {
+				case 0: __asm__ volatile("ldar %0, [%1]" : "=r"(v) : "r"(&ex_sh.seq) : "memory"); break;
+				case 1: __asm__ volatile("ldar %w0, [%1]" : "=r"(v) : "r"(&ex_sh.seq) : "memory"); break;
+				case 2: __asm__ volatile("ldarh %w0, [%1]" : "=r"(v) : "r"(&ex_sh.seq) : "memory"); break;
+				default: __asm__ volatile("ldarb %w0, [%1]" : "=r"(v) : "r"(&ex_sh.seq) : "memory"); break;
+				}
+				if (v == ((k & 3) == 0 ? k : (k & 3) == 1 ? (uint32_t)k : (k & 3) == 2 ? (uint16_t)k : (uint8_t)k))
+					break;
+				if (++spins > 1000)
+					sched_yield();
+			}
+			for (int j = 0; j < 4; j++)
+				ex_sh.bad_msgs += ex_sh.data[j] != k * 7 + j;
+			__asm__ volatile("stlr %0, [%1]" :: "r"(k), "r"(&ex_sh.ack) : "memory");
+		}
+	}
+	return (void *)(uintptr_t)cpus;
+}
+
+static void excl_smp_checks(void)
+{
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	int n = online < 2 ? 2 : online > 4 ? 4 : (int)online, made = 1, lse = !!(getauxval(AT_HWCAP) & (1UL << 8));
+	unsigned long cpus = 0;
+	pthread_t th[4];
+	void *r;
+
+	memset((void *)&ex_sh, 0, sizeof(ex_sh));
+	for (int i = 1; i < n; i++)
+		made += !pthread_create(&th[i], NULL, ex_worker, (void *)(uintptr_t)i);
+	ex_sh.go = 1;
+	cpus = (unsigned long)ex_worker((void *)0);
+	for (int i = 1; i < n; i++)
+		if (!pthread_join(th[i], &r))
+			cpus |= (unsigned long)r;
+	uint64_t total = (uint64_t)n * EX_ITERS, own_ok = 1;
+	for (int i = 0; i < 4; i++)
+		own_ok &= ((ex_sh.own >> (16 * i)) & 0xffff) == (i < n ? EX_ITERS : 0);
+	CHECK(made == n && own_ok && ex_sh.h == (uint16_t)total && ex_sh.b == (uint8_t)total &&
+	      ex_sh.w == total && ex_sh.x == total &&
+	      (!lse || (ex_sh.lb == (uint8_t)total && ex_sh.lh == (uint16_t)total)) &&
+	      !ex_sh.bad_msgs && ex_sh.ack == EX_MSGS && (online < 2 || __builtin_popcountl(cpus) >= 2),
+	      "excl smp: %d threads on %ld CPUs (%#lx): own halfwords %#lx, ldaxrh %u, ldxrb %u, ldaxr %u, ldxr %lu, "
+	      "ldaddb %u, ldaddlh %u (want %u each, %#x, %#x), %d bad of %d stlr/ldar messages",
+	      made, online, cpus, (unsigned long)ex_sh.own, ex_sh.h, ex_sh.b, ex_sh.w, (unsigned long)ex_sh.x,
+	      ex_sh.lb, ex_sh.lh, (unsigned)total, (unsigned)(uint16_t)total, (unsigned)(uint8_t)total,
+	      ex_sh.bad_msgs, EX_MSGS);
+}
+
+/*
  * Moving tasks (SMP, more than one CPU online): a user task moves to
  * another CPU where it is switched out on its way to user mode, and starts
  * there on a fresh kernel stack (kernel.md, SMP). Its registers, FP state
@@ -3797,6 +3924,7 @@ int main(int argc, char **argv)
 		uaccess_checks();
 		smp_checks();
 		lse_smp_checks();
+		excl_smp_checks();
 		move_checks();
 		jit_smp_checks();
 		goto done;
@@ -3920,6 +4048,7 @@ int main(int argc, char **argv)
 	park_checks();
 	smp_checks();
 	lse_smp_checks();
+	excl_smp_checks();
 	move_checks();
 	jit_smp_checks();
 #endif

@@ -563,37 +563,59 @@ pub const Cpu = extern struct {
 
     /// Record that `mask` chunks of `page` hold decoded code.
     fn markCode(self: *Cpu, page: u64, mask: u64) void {
-        if (!self.markChunks(page, mask)) return;
-        // Stores to this page must now take the slow path.
-        for (&self.priv.tlb_w) |*e| {
-            if (e.tag != invalid_tag and e.tag & code_flag == 0 and (e.tag << page_shift) +% e.add == page)
-                e.tag |= code_flag;
+        switch (self.markChunks(page, mask)) {
+            .none => {},
+            // Stores to this page must now take the slow path.
+            .page => for (&self.priv.tlb_w) |*e| {
+                if (e.tag != invalid_tag and e.tag & code_flag == 0 and (e.tag << page_shift) +% e.add == page)
+                    e.tag |= code_flag;
+            },
+            // The slot became wild, or a wild slot got its first bits:
+            // every page that hashes to it counts as marked now (isMarked),
+            // so flag all their entries.
+            .slot => {
+                const idx = (page >> page_shift) & (nmarks - 1);
+                for (&self.priv.tlb_w) |*e| {
+                    if (e.tag != invalid_tag and e.tag & code_flag == 0 and ((((e.tag << page_shift) +% e.add) >> page_shift) & (nmarks - 1)) == idx)
+                        e.tag |= code_flag;
+                }
+            },
         }
     }
 
-    /// The mark part of `markCode`; false if the page's write-TLB entries
-    /// need no new flag.
-    fn markChunks(self: *Cpu, page: u64, mask: u64) bool {
+    const Scan = enum { none, page, slot };
+
+    /// The mark part of `markCode`: which write-TLB entries need the flag
+    /// now. A slot keyed by one page flags that page's entries when its
+    /// first bits are set (later fills check `isMarked`; a store clears an
+    /// entry's flag only when the slot has no marked chunk left), so more
+    /// chunks of a marked page need no scan. A wild slot (two pages or more
+    /// share it) marks every page that hashes to it while its mask is not
+    /// 0: when it becomes wild, or gets bits again after a store cleared
+    /// them all, the entries of all those pages are flagged once; after
+    /// that every fill and every entry of them is flagged already. (Before
+    /// 2026-11-18 every mark of a wild slot scanned: about 300K scans of
+    /// the 1024 entries per `npm --version`.)
+    fn markChunks(self: *Cpu, page: u64, mask: u64) Scan {
         const m = self.markSlot(page);
         const key = page | 1;
+        const was = m.mask;
         if (m.key == key) {
-            // Only when the slot is this page's alone: then its write-TLB
-            // entries were flagged when its first bits were set (or at
-            // fill; a store clears an entry's flag only when the page has
-            // no marked chunk left), so more chunks of a marked page need
-            // no scan. In a wild slot the bits may be another page's, and
-            // this page's entries may predate them.
-            const was = m.mask;
             m.mask |= mask;
-            return was == 0;
-        } else if (m.key != mark_wild) {
-            if (m.key == 0 or m.mask == 0) {
-                m.key = key;
-                m.mask = 0;
-            } else m.key = mark_wild;
+            return if (was == 0) .page else .none;
         }
+        if (m.key == mark_wild) {
+            m.mask |= mask;
+            return if (was == 0) .slot else .none;
+        }
+        if (m.key == 0 or was == 0) {
+            m.key = key;
+            m.mask = mask;
+            return .page;
+        }
+        m.key = mark_wild;
         m.mask |= mask;
-        return true;
+        return .slot;
     }
 
     /// A store of `len` bytes at host address `host` (in a code-flagged

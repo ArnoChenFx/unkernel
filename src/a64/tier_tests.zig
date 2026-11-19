@@ -133,6 +133,56 @@ test "a64 tier: a store through a writable alias of an exec-only mapping" {
     try t.expectEqual(@as(u64, 5), m.regs.x[0]);
 }
 
+test "a64 tier: stores into code of pages that share a wild mark slot" {
+    // Three code pages whose host pages hash to one mark slot (16 MiB
+    // apart): A, then C makes the slot wild, then D is decoded into it. D's
+    // write-TLB entry (through a writable alias) was filled before anything
+    // was marked, so it must have been flagged when the slot became wild;
+    // decoding D itself scans nothing.
+    var m = try Machine.initSize(t.allocator, 56 << 20);
+    defer m.deinit();
+    const pa_a = m.frame();
+    const pa_c = pa_a + (16 << 20);
+    const pa_d = pa_a + (32 << 20);
+    m.next = (pa_d - mach.pa_base) + 4096;
+    m.map(0x10000, pa_a, R | X);
+    m.map(0x20000, pa_c, R | X);
+    m.map(0x30000, pa_d, R | X);
+    m.map(0x40000, pa_d, R | W);
+    m.code(0x50000, &.{ A.strw(3, 2, 0), A.svc });
+    const put = struct {
+        fn f(mm: *Machine, va: u64, imm: u32) void {
+            const w = [_]u32{ A.addi(0, 0, imm), A.svc };
+            @memcpy(mm.at(va)[0..8], std.mem.sliceAsBytes(&w));
+        }
+    }.f;
+    const go = struct {
+        fn f(mm: *Machine, pc: u64) !u64 {
+            mm.regs.x[0] = 0;
+            mm.regs.pc = pc;
+            try expectEv(mm, mach.EV_SYSCALL, mm.run(100));
+            return mm.regs.x[0];
+        }
+    }.f;
+    const store = struct {
+        fn f(mm: *Machine, va: u64, v: u64) !void {
+            mm.regs.x[2] = va;
+            mm.regs.x[3] = v;
+            mm.regs.pc = 0x50000;
+            try expectEv(mm, mach.EV_SYSCALL, mm.run(100));
+        }
+    }.f;
+    put(&m, 0x10000, 1);
+    put(&m, 0x20000, 2);
+    put(&m, 0x30000, 3);
+    try store(&m, 0x40800, 0); // D's write-TLB entry, before any mark
+    try t.expectEqual(@as(u64, 1), try go(&m, 0x10000));
+    try t.expectEqual(@as(u64, 2), try go(&m, 0x20000)); // the slot becomes wild
+    try t.expectEqual(@as(u64, 3), try go(&m, 0x30000));
+    try store(&m, 0x40000, A.addi(0, 0, 7)); // through the alias
+    try t.expectEqual(@as(u64, 7), try go(&m, 0x30000));
+}
+
 test "a64 tier: kernel rewrite + flush, COW copy, set_pgd, and a rewrite made visible only by IC IVAU" {
     var m = try Machine.init(t.allocator);
     defer m.deinit();

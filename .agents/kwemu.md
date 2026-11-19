@@ -91,7 +91,10 @@ is the reference loop), `-Dkwemu-a64-fuzz=N` and `-Dkwemu-a64-fuzz-seed`
   stale block is revalidated (same pc, same host address, same raw bits)
   or re-decoded. Guest stores are tracked exactly: pages holding code sit
   in a hashed filter with a 64-byte-chunk bitmap, and their write-TLB
-  entries carry `code_flag`, which sends stores to the slow path. A store
+  entries carry `code_flag`, which sends stores to the slow path. A
+  filter slot two pages share is wild and marks every page hashing to it;
+  the write TLB is scanned only when a slot changes state (a64.md, The
+  op arena). A store
   into a marked chunk retires the page's generations and ends the current
   block, so SMC takes effect at the next instruction.
 - **Several harts** (an SMP kernel, kernel.md, SMP; ABI 7): each CPU has

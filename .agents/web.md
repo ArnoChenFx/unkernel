@@ -449,7 +449,7 @@ other options.
   CPUs 0 and 1 in order either way; the default load unchanged.
 - No Suspend: the SMP kernel cannot park. `KW.suspend` stays unset (so
   the status line has no pause icon), the dialog footer has no
-  `#suspend`, and Ctrl-A s says why. A suspended session (always a UP
+  `#suspend`, and Ctrl-A z says why. A suspended session (always a UP
   one) is offered before the download: "Resume on 1 CPU" reloads once on
   one CPU (`bootUpOnce()` with `kw-resume`) and resumes it; "Boot on N
   CPUs" boots SMP and, when the session has a data disk, deletes it (that
@@ -474,7 +474,7 @@ other options.
 
 ## Suspend and resume
 
-Not with several CPUs (above). Suspend (Ctrl-A s, `s` in the dialog, the dialog footer's `#suspend`, the
+Not with several CPUs (above). Suspend (Ctrl-A z, `z` in the dialog, the dialog footer's `#suspend`, the
 status line's pause icon `#bar-suspend` while the system runs, or
 `KW.suspend()` without asking) saves the running machine with the SDK's
 `snapshot({ stop: true })` (js.md, Snapshots), inline or in worker mode, and

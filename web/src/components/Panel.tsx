@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The dialog: a terminal-style window over the stage, above the status
 // line, with its title in the top border. Tabs: System (Options), Guest
-// (the data disk, the guest preview), Environment (the checks), Kernel log,
+// (the terminal font size, the data disk, the guest preview), Environment (the checks), Kernel log,
 // Errors (the fatal one first, with its title) and Keys (the shortcuts). Footer: the keys that work here, Copy diagnostics,
 // Suspend and Reboot. shortcuts.ts drives it from the keyboard.
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
@@ -11,9 +11,9 @@ import { lastPreviewPort, openPreview, previewSupported } from "../preview.ts";
 import { APPLE, CHORD, COMMANDS, DIALOG_KEYS, PREFIX, codeLabel } from "../shortcuts.ts";
 import { useStore, type Check, type Tab } from "../store.ts";
 import { fmtT } from "../ui.ts";
-import { Options } from "./Options.tsx";
+import { FontSize, Options } from "./Options.tsx";
 
-const TABS: Array<[Tab, string, string]> = [["status", "k", "System"], ["guest", "g", "Guest"], ["env", "i", "Environment"], ["log", "l", "Kernel log"], ["errors", "e", "Errors"], ["keys", "?", "Keys"]];
+const TABS: Array<[Tab, string, string]> = [["status", "s", "System"], ["guest", "g", "Guest"], ["env", "i", "Environment"], ["log", "l", "Kernel log"], ["errors", "e", "Errors"], ["keys", "?", "Keys"]];
 const TITLE: Record<Tab, string> = { status: "system", guest: "guest", env: "environment", log: "kernel log", errors: "errors", keys: "keys" };
 
 export function Panel() {
@@ -56,7 +56,7 @@ export function Panel() {
 							className="inline-flex h-6 items-center gap-1.5 px-2 text-muted transition-colors hover:bg-hover hover:text-fg aria-selected:bg-fg aria-selected:text-black"
 							onClick={() => ui.selectTab(id)}
 						>
-							<span className="opacity-60 max-sm:hidden">{key}</span>{label}
+							<KeyLabel k={key} label={label} />
 							{id === "errors" && errors > 0 && <span id="err-count" className={tab === "errors" ? "" : "text-err"}>{errors}</span>}
 						</button>
 					))}
@@ -68,6 +68,8 @@ export function Panel() {
 						<Options />
 					</section>
 					<section data-pane="guest" {...pane("guest")}>
+						<H3>Terminal</H3>
+						<FontSize />
 						<H3>Data disk</H3>
 						<DataDisk />
 						<H3>Preview</H3>
@@ -84,7 +86,7 @@ export function Panel() {
 
 				<div className="flex flex-none items-center gap-2 border-t border-line px-3 py-2 select-none">
 					<p className="min-w-0 flex-1 truncate text-[11.5px] text-faint max-md:hidden">
-						<K>esc</K> close <K>k g i l e ?</K> tabs <K>c</K> copy <K>s</K> suspend <K>r</K> reboot
+						<K>esc</K> close <K>s g i l e ?</K> tabs <K>c</K> copy <K>z</K> suspend <K>r</K> reboot
 					</p>
 					<button id="copy" type="button" className="btn btn-sm max-md:flex-1" onClick={() => ui.copyDiagnostics()}>Copy diagnostics</button>
 					{/* The SMP kernel cannot be saved (no parking): no Suspend with several CPUs. */}
@@ -95,6 +97,13 @@ export function Panel() {
 			</aside>
 		</>
 	);
+}
+
+/** A tab's label with its key's letter underlined (System: S); a key not in the label (Keys: ?) goes before it. */
+function KeyLabel({ k, label }: { k: string; label: string }) {
+	const i = label.toLowerCase().indexOf(k);
+	if (i < 0) return <><span className="opacity-60 max-sm:hidden">{k}</span>{label}</>;
+	return <span>{label.slice(0, i)}<span className="underline underline-offset-2">{label[i]}</span>{label.slice(i + 1)}</span>;
 }
 
 /** A key, as the footer and the Keys tab show it. */

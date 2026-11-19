@@ -16,7 +16,7 @@
 //   ⌘K on Apple devices (free there: the terminal sends nothing for ⌘) and
 //   Ctrl-Shift-O everywhere (Ctrl-K is readline's kill-line, so not that);
 // - Ctrl-A p opens the guest preview (preview.ts), or hides and shows it;
-//   Ctrl-A s suspends (session.ts: the next load offers to resume).
+//   Ctrl-A z suspends (session.ts: the next load offers to resume).
 // While a dialog is open the keys act on it directly (DIALOG_KEYS) and
 // never reach the terminal or the guest under it.
 //
@@ -95,8 +95,8 @@ export const COMMANDS: Command[] = [
 	{ keys: ["0", "t"], chord: "Digit0", label: "Window 0: the console (closes the dialog)", run: () => selectWindow(0) },
 	{ keys: ["n", "c"], label: "New terminal window (1 to 9: its own shell)", run: newWindow },
 	{ keys: ["x"], label: "Close the current terminal window (asks first)", run: () => void closeWindow() },
-	{ keys: ["k"], label: "System: options for the next boot", run: () => KW.ui!.openPanel("status") },
-	{ keys: ["g"], label: "Guest: data disk, preview", run: () => KW.ui!.openPanel("guest") },
+	{ keys: ["s"], label: "System: options for the next boot", run: () => KW.ui!.openPanel("status") },
+	{ keys: ["g"], label: "Guest: font size, data disk, preview", run: () => KW.ui!.openPanel("guest") },
 	{ keys: ["i"], label: "Environment: browser, memory, storage, JIT", run: () => KW.ui!.openPanel("env") },
 	{ keys: ["l"], label: "Kernel log", run: () => KW.ui!.openPanel("log") },
 	{ keys: ["e"], label: "Errors", run: () => KW.ui!.openPanel("errors") },
@@ -109,19 +109,19 @@ export const COMMANDS: Command[] = [
 	{ keys: ["p"], label: "Preview a web server in the guest (the last port, or 8000; again hides or shows it)", run: togglePreview },
 	{ keys: ["y"], label: "Copy diagnostics (in a dialog, c also)", run: () => KW.ui!.copyDiagnostics() },
 	{ keys: ["r"], label: "Reboot (asks first)", run: () => KW.ui!.confirmReboot() },
-	{ keys: ["s"], label: "Suspend: save the system in this browser and stop (asks first; the next load offers to resume)", run: () => void KW.ui!.confirmSuspend() },
+	{ keys: ["z"], label: "Suspend: save the system in this browser and stop (asks first; the next load offers to resume)", run: () => void KW.ui!.confirmSuspend() },
 	{ keys: ["a"], label: "About: credits and the build", run: openAbout },
 ];
 
 /** In an open dialog, without the prefix. */
 export const DIALOG_KEYS: Array<[string, string]> = [
-	["k g i l e ?", "System, Guest, Environment, Kernel log, Errors, Keys"],
+	["s g i l e ?", "System, Guest, Environment, Kernel log, Errors, Keys"],
 	["← →  [ ]", "Previous, next tab"],
 	["↑ ↓", "Scroll"],
 	["Tab  ⇧Tab", "Move between controls (they stay in the dialog)"],
 	["c", "Copy diagnostics"],
 	["r", "Reboot (asks first)"],
-	["s", "Suspend (asks first)"],
+	["z", "Suspend (asks first)"],
 	["Esc  q", "Close"],
 ];
 
@@ -197,14 +197,14 @@ export function installShortcuts(): () => void {
 		if (onButton && (e.key === "Enter" || e.key === " ")) return;
 		swallow(e); // nothing reaches the terminal under the dialog
 		const i = TABS.indexOf(s.tab);
-		const tab = ({ k: "status", g: "guest", i: "env", l: "log", e: "errors", "?": "keys" } as Record<string, Tab>)[e.key];
+		const tab = ({ s: "status", g: "guest", i: "env", l: "log", e: "errors", "?": "keys" } as Record<string, Tab>)[e.key];
 		if (tab) ui.selectTab(tab);
 		else if (e.key === "ArrowLeft" || e.key === "[") ui.selectTab(TABS[(i + TABS.length - 1) % TABS.length]!);
 		else if (e.key === "ArrowRight" || e.key === "]") ui.selectTab(TABS[(i + 1) % TABS.length]!);
 		else if (e.key === "q") ui.closePanel();
 		else if (e.key === "c") ui.copyDiagnostics();
 		else if (e.key === "r") ui.confirmReboot();
-		else if (e.key === "s") void ui.confirmSuspend();
+		else if (e.key === "z") void ui.confirmSuspend();
 		else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
 			const body = document.getElementById("pbody");
 			body?.scrollBy({ top: (e.key === "ArrowDown" ? 1 : -1) * 48 });

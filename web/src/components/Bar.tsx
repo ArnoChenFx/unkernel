@@ -200,7 +200,7 @@ export function Bar() {
 				{prefix ? (
 					<>
 						<span className="flex flex-none items-center bg-warn px-1.5 font-semibold text-black">{PREFIX_SHORT}</span>
-						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · y copy · s suspend · r reboot · ? keys · esc cancel</span>
+						<span className="flex items-center truncate px-1.5 text-faint max-sm:hidden">n new · x close · y copy · z suspend · r reboot · ? keys · esc cancel</span>
 					</>
 				) : <Seg on={panel === "keys"} title={`Keyboard shortcuts: ${PREFIX}, then a key (${PREFIX} ?)`} label="Keyboard shortcuts" onClick={() => ui.togglePanel("keys")} className="text-[11px] opacity-50 hover:opacity-100 max-sm:hidden">{PREFIX_SHORT}</Seg>}
 			</div>
@@ -231,7 +231,7 @@ export function Bar() {
 				)}
 				{suspended
 					? <Seg id="bar-resume" title="Resume the suspended system" label="Resume" onClick={ui.resume} className="text-ok max-sm:hidden"><PlayIcon /></Seg>
-					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="s" label="Suspend" onClick={() => void ui.confirmSuspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
+					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="z" label="Suspend" onClick={() => void ui.confirmSuspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
 				<Seg id="bar-reboot" title="Reboot (asks first while the system runs)" hint="r" label="Reboot" onClick={() => void ui.confirmReboot()} className="max-sm:hidden"><RebootIcon /></Seg>
 				<About hint={<Hint k="a" />} className="max-sm:hidden" />
 				<More />
@@ -240,11 +240,11 @@ export function Bar() {
 				    the state's name is only in the tooltip and for screen readers. */}
 				<button
 					id="status" type="button" aria-pressed={panel === "status"} aria-haspopup="dialog" aria-controls="panel"
-					title={`System: ${label} (${PREFIX} k)`} aria-label={`Status: ${label}`}
+					title={`System: ${label} (${PREFIX} s)`} aria-label={`Status: ${label}`}
 					className="relative inline-flex h-full flex-none items-center gap-1.5 px-1.5 transition-colors hover:bg-hover aria-pressed:bg-hover max-sm:hidden"
 					onClick={(e) => { mouseBlur(e); ui.togglePanel("status"); }}
 				>
-					<Hint k="k" />
+					<Hint k="s" />
 					<SysIcon />
 					<span id="status-label" className="sr-only">{label}</span>
 				</button>

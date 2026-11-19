@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The suspended session: Suspend (Ctrl-A s, KW.suspend()) saves the running
+// The suspended session: Suspend (Ctrl-A z, KW.suspend()) saves the running
 // machine with the SDK's snapshot({ stop: true }) and keeps it here, in
 // IndexedDB "kwsnap:session-v1" (its own database; the data disk's
 // kwdisk:kwdata-v1 is never touched here); the next load offers to resume

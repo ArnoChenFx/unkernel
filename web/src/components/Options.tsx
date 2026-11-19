@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Options in the System tab: one control per URL parameter (config.ts)
-// except ?simulate. Reboot loads the page with them (ui.rebootUrl()); Font
-// size applies at once and is kept in localStorage. Terminal style: on/off
-// options are [x] check boxes, Network and Distro are (•) radio choices,
-// CPUs, Memory and Font size are sliders over their counts and sizes. The
+// except ?simulate. Reboot loads the page with them (ui.rebootUrl()).
+// Terminal style: on/off options are [x] check boxes, Network and Distro are
+// (•) radio choices, CPUs and Memory are sliders over their counts and sizes.
+// FontSize, in the Guest tab, is the same kind of slider; it applies at once
+// and is kept in localStorage. The
 // CPUs slider is disabled, with the reason, where the page cannot boot more
 // than one (config.ts smpBlocker()). Distro (?distro=) lists the page's images and none.
 //
@@ -122,7 +123,6 @@ const FONTS = [11, 12, 13, 14, 15, 16, 18];
 export function Options() {
 	const ui = KW.ui!, cfg = KW.config;
 	const o = useStore((s) => s.options);
-	const fontPref = useStore((s) => s.fontPref);
 	const form = useRef<HTMLFormElement>(null);
 
 	useEffect(() => {
@@ -146,14 +146,6 @@ export function Options() {
 		note: n === cfg.memAutoMiB ? "auto" : undefined,
 	}));
 	const memValue = o.mem === String(cfg.memAutoMiB) ? "auto" : o.mem;
-	// Font size stops, the same way: auto's size marked, and a size from a pinch.
-	const autoPx = autoFont();
-	const px = [...new Set([...FONTS, autoPx, ...(fontPref !== "auto" ? [Number(fontPref)] : [])])].sort((a, b) => a - b);
-	const fonts: Stop[] = px.map((n) => ({
-		value: n === autoPx ? "auto" : String(n), tick: String(n),
-		label: n === autoPx ? `Auto (${n} px)` : `${n} px`, note: n === autoPx ? "auto" : undefined,
-	}));
-	const fontValue = fontPref === String(autoPx) ? "auto" : fontPref;
 
 	// CPUs: 1, 2, 4, 8, 16 up to the host's threads, the host's threads themselves (the most
 	// there is to try), the suggested count and a ?cpus= that is none of them. Past the
@@ -224,12 +216,28 @@ export function Options() {
 			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] items-start gap-x-12 gap-y-5">
 				<Slider id="opt-cpus" name="cpus" label="CPUs" value={o.cpus} stops={cpus} disabled={!!cfg.smpBlocked} note={cpuNote} noteId="opt-cpus-note" warnNote={cpuWarn} />
 				<Slider id="opt-mem" name="mem" label="Memory" value={memValue} stops={mem} />
-				<Slider id="opt-font" name="font" label="Font size" value={fontValue} stops={fonts} />
 			</div>
 			<Field label="Kernel command line" wide>
 				<input id="opt-append" name="append" type="text" autoCapitalize="off" autoComplete="off" spellCheck={false} placeholder={DEFAULT_CMDLINE}
 					value={o.append} onChange={onField} onKeyDown={enter} className="field h-8 px-2.5 text-[12.5px]" />
 			</Field>
 		</form>
+	);
+}
+
+/** The terminal font size (Guest tab): applied at once, no reboot. Stops like Memory's: auto's size marked, and a size from a pinch. */
+export function FontSize() {
+	const fontPref = useStore((s) => s.fontPref);
+	const autoPx = autoFont();
+	const px = [...new Set([...FONTS, autoPx, ...(fontPref !== "auto" ? [Number(fontPref)] : [])])].sort((a, b) => a - b);
+	const fonts: Stop[] = px.map((n) => ({
+		value: n === autoPx ? "auto" : String(n), tick: String(n),
+		label: n === autoPx ? `Auto (${n} px)` : `${n} px`, note: n === autoPx ? "auto" : undefined,
+	}));
+	const fontValue = fontPref === String(autoPx) ? "auto" : fontPref;
+	return (
+		<div className="max-w-sm">
+			<Slider id="opt-font" name="font" label="Font size" value={fontValue} stops={fonts} />
+		</div>
 	);
 }

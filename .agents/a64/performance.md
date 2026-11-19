@@ -151,12 +151,16 @@ it could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0` (status.md).
   and LSE 14% (`casa`, `ldar`, `ldadd*`), stores 17%. Generic executions
   are 0.47% of instructions, nearly all in interpreted blocks. 283
   nursery resets; 1.97M of 3.2M decodes re-decode blocks a reset
-  discarded. About two thirds of compiles are `shortened` (the first emit
-  overflowed the 16 KiB buffer), because `candidate()` takes any decoded
-  block that is not compiled yet as a region member, with no heat test.
-  The tuning in Rejected designs (threshold, ring, `KW_CPU_SIZE`) fixes
-  these counters without changing the time: the countdown share comes
-  from a flat profile, not from thrashing.
+  discarded. Compiles are cheap: `claude --help` spends about 150 ms of
+  its 3.3-3.6 s in the host's compiles (`stats().jit.compileMs`, about 440
+  modules of 8 KiB, 0.34 ms each). Two thirds of them are `shortened` (the
+  first emit overflowed the 16 KiB buffer), because `candidate()` takes any
+  decoded block that is not compiled yet as a region member. Those members
+  do run: leaving out the cold ones costs compiled share. The tuning in
+  Rejected designs (threshold, ring, `KW_CPU_SIZE`, region members) fixes
+  these counters without changing the time: the countdown share comes from
+  a flat profile, not from thrashing, and code compiled at the margin runs
+  little faster than the interpreter (about 23 instructions per entry).
 - **apk.** Outside compiled code nearly all is blocks counting down
   (13-27% of instructions): about half the warm-up of blocks that do get
   compiled (compiles x 2^17), the rest blocks that never reach the
@@ -195,18 +199,13 @@ it could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0` (status.md).
    transfers needs a runtime kind for the checked entry's stop path.
 4. **FMADD inline**: needs fparith's emulated FMA inline (no wasm FMA);
    worth at most about 2% of the gzip row.
-5. **Cheaper compiles for lukewarm code** (2026-11-19, from Claude Code):
-   a heat test in `candidate()` (members need some countdown progress) or
-   a smaller `region_max` for a region's first compile. A lower threshold
-   only pays if compiles get cheaper: at about 0.6 ms per near-16 KiB
-   module under Liftoff, break-even is about 2^17 instructions per module.
-   Expect fewer `shortened` compiles and less `bytes` and `compileMs`.
-6. **Interpreter per-op cost on cold code**: `runOps` runs about 6.5 ns
+5. **Interpreter per-op cost on cold code**: `runOps` runs about 6.5 ns
    per op on Claude Code against 3.4 ns on the hot benches, and `kw_run`
    costs about 13 ns per block (`lookupIn`, `ready`, the `runOps` call,
    refunds, the irq poll). Untested: whether that is dispatch mispredicts
    or data misses on the 16-byte ops and the block table (`perf stat` of
-   `--no-jit --help` on the host). Misses would point to denser ops.
+   `--no-jit --help` on the host; needs `kernel.perf_event_paranoid` 2 or
+   lower). Misses would point to denser ops.
 
 The shared-core levers (bigger regions, self-loop exits, threshold) are in
 kwemu.md, Next steps.
@@ -224,6 +223,7 @@ interleaved.
 | Error unions from non-inlined slow paths inside `runOps` | each result slot is a shadow-stack frame slot set up on every call (~50 wasm instructions); plain integer results: mem +7%, interp +4% |
 | No cross-CPU invalidation | kwtest's cross-CPU rewrite check ran 751695 of 877496 calls stale (a64/tier.md, Coherence) |
 | JIT threshold 2^15 or 2^13 | 2^15 within noise; 2^13 apk rows 5-25% slower: extra compiles (~0.3 ms each) cost more than they move into compiled code. With countdowns kept across resets 2^15 made npm 5.93 against 4.86 s. Claude Code `--help` (2026-11-19): 2^16 3.7-4.0 s and 2^15 4.2-4.4 s against 3.3-3.4 (compiled 62% and 67% against 54.5%; 2-4x the compiles, and the 64K ring then drops 2-5.6K compiled blocks) |
+| Region members only with a quarter of the threshold counted (a heat test in `jc.candidate`), alone or at threshold 2^16; `region_max` 8 | Claude Code `--help`, 8 rounds (2026-11-19): 3.55, 3.68 and 3.57 s against 3.56. Alone: `shortened` 292 to 75 and members 2059 to 1556, but compiled share 54.5% to 49.8% (the cold members did run). At 2^16: 61.8% compiled, 898 compiles, compile time 148 to 264 ms |
 | V8 without Liftoff (`node --no-liftoff`) | Claude Code `--help` 4.7 against 3.3 s, about 3.5 ms more per extra compile (2026-11-19) |
 | A heat table keyed by host address (short countdown for code compiled before, also in an earlier process) | compiled share +2..+8 points on apk, but twice the compiles; time equal at best, worse with shorter countdowns; remembering counting blocks too thrashed the table |
 | Countdowns kept across arena resets with alternating-way replacement | npm 6.04 against 5.22 s: conflict evictions lost progress and evicted members failed checked entries; replacing the way with less progress fixed it |

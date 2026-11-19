@@ -388,8 +388,8 @@ interrupt or a failed checked entry); compiled code tells `run` which
 through the done codes. `next_by` crosses that with the class of the
 block run next (`jc.Nx`: same block, never compiled, not yet compiled,
 same region, a self-loop module, another region that could grow, or a
-full one); it stays zero for now, because nothing calls `countNext`.
-The A64 counters and bench scripts: a64/performance.md, Measuring.
+full one). The A64 counters and bench scripts: a64/performance.md,
+Measuring.
 
 ## Numbers
 

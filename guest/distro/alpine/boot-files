@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# What a boot of the alpine image to the console's prompt plus a first exec
+# reads, in that order: these files come first in alpine.erofs, and the SDK
+# fetches them ahead in one request (guest/lib/image.sh). Recorded by
+# KW_DISTRO_TRACE=1 guest/build.sh distro alpine; do not edit by hand.
+bin/busybox
+etc/group
+etc/hostname
+etc/inittab
+etc/kw-binfmt.sh
+etc/passwd
+etc/profile
+etc/profile.d/20locale.sh
+etc/profile.d/kw-apk.sh
+etc/profile.d/kw-home.sh
+etc/profile.d/kw-prompt.sh
+lib/ld-musl-aarch64.so.1
+usr/lib/kw-distro
+usr/lib/kw-image
+usr/lib/os-release

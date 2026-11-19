@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# The binfmt_misc interpreter (kw-binfmt.sh): $1 = the binary, $2 = its
+# argv[0], then its arguments. Picks qemu-ARCH from e_machine (the masks
+# admit only those four values, so e_ident[EI_CLASS] needs no check here)
+# and execs the binary under it. The first time, as root with a network, it
+# installs qemu-ARCH and a library root for dynamic binaries at qemu's
+# default prefix /usr/gnemul/qemu-ARCH: musl, libgcc and libstdc++, plus
+# gcompat for glibc binaries (/lib64/ld-linux-x86-64.so.2 etc. on top of
+# musl), checked with that architecture's keys from alpine-keys. qemu-ARCH
+# is in community, so it enables that repository first (kw-apk-enable). One
+# install at a time, because apk locks its database. Without root or a
+# network it runs with what is there, and fails only without qemu.
+
+case $(od -An -tx1 -j18 -N1 "$1" 2>/dev/null) in
+*3e) arch=x86_64 apkarch=x86_64 ;;
+*f3) arch=riscv64 apkarch=riscv64 ;;
+*03) arch=i386 apkarch=x86 ;;
+*28) arch=arm apkarch=armv7 ;;
+*) echo "$1: cannot tell the architecture" >&2; exit 126 ;;
+esac
+q=/usr/bin/qemu-$arch r=/usr/gnemul/qemu-$arch
+need() { [ ! -x $q ] || [ ! -e $r/.kw-ready ]; }
+if need && [ "$(id -u)" = 0 ] &&
+	awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null; then
+	exec 9>/run/kw-qemu.lock && flock 9
+	if need; then
+		gray= reset=
+		[ -t 2 ] && gray='\033[90m' reset='\033[0m'
+		trap 'printf "$reset" >&2; exit 130' INT TERM
+		if [ ! -x $q ]; then
+			printf "${gray}%s: %s binary, apk add qemu-%s\n" "$1" $arch $arch >&2
+			/etc/kw-apk-enable   # qemu-ARCH is in community
+			apk add qemu-$arch >&2
+		fi
+		if [ -x $q ] && [ ! -e $r/.kw-ready ]; then
+			printf "${gray}%s: %s libraries in %s\n" "$1" $arch $r >&2
+			init=
+			[ -d $r/lib/apk/db ] || init=--initdb
+			mkdir -p $r
+			apk add --root $r --arch $apkarch $init --no-scripts --no-cache \
+				--keys-dir /usr/share/apk/keys/$apkarch \
+				--repositories-file /etc/apk/repositories \
+				musl libgcc libstdc++ gcompat >&2 && : > $r/.kw-ready
+		fi
+		printf "$reset" >&2
+		trap - INT TERM
+	fi
+	exec 9>&-
+fi
+if [ ! -x $q ]; then
+	echo "$1: $arch binary, needs qemu-$arch (apk add qemu-$arch)" >&2
+	exit 126
+fi
+f=$1 a0=$2
+shift 2
+exec $q -0 "$a0" "$f" "$@"

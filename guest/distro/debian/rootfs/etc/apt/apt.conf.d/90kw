@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// apt and debconf for a slow CPU and no one at the prompt: no recommends
+// (the minimal set stays minimal), no index diffs (one download beats many
+// patches), no pty per dpkg run. The image's docker-* files already keep
+// indexes gzipped, skip translations and use force-unsafe-io.
+
+// unkernel
+APT::Install-Recommends "false";
+Acquire::PDiffs "false";
+Dpkg::Use-Pty "false";

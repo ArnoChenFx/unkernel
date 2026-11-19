@@ -1,0 +1,217 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /init of the base initramfs (guest/base/build.sh): find the distro image,
+# make the root an overlay of it, and exec its /sbin/init.
+#
+#   1. devtmpfs, proc, sysfs and a tmpfs on /run;
+#   2. /data: the data disk (ext4 labelled kwdata), if the host attached one;
+#   3. the distro: the block device labelled kwroot (erofs or ext4), mounted
+#      read-only at /kw/distro; /usr/lib/kw-distro names it. None, one that
+#      does not mount or boot, or kw.root=base: the base shell (busybox
+#      init with /etc/inittab, kw/lib/sysinit);
+#   4. the upper layer: /data/distros/NAME/{upper,work} with a data disk,
+#      else (no data disk, safe mode, kw.root=initramfs) a tmpfs at /kw/tmp;
+#   5. the root: overlay of /kw/layer (the kw tools and runtime, on top) and
+#      /kw/distro under that upper layer, checked (the merged /bin/sh runs,
+#      /sbin/init is executable), then pivot_root with this root at
+#      /run/kw-lower, /dev /proc /sys /run /data moved along and a tmpfs on
+#      /tmp.
+#
+# State of a distro on the data disk, in /data/distros/NAME/:
+#   upper, work          the overlay's upper and work directories
+#   lower                the image id the upper was last used with
+#   history              image changes under the upper
+#   discard              kw-overlay discard on the data upper: at this boot
+#   discarded-TIME/      set-aside changes
+# Safe mode: when the check in 5. fails on the data upper, this boot runs
+# the distro on a tmpfs upper with /data mounted, the data upper left
+# untouched; the next boot checks again. Everything that decides it runs
+# from here or from the read-only image, never from the upper. The page
+# watches the console for "kw-overlay: SAFE MODE:".
+#
+# /run/kw-base describes this boot for kw-overlay and data-stop (name=,
+# image=, upper=data|tmpfs|none, why=, state=, dev=, fstype=).
+# Messages go to /run/kw-overlay.msg, notices (an image update) to
+# /run/kw-overlay.note; /usr/lib/kw/welcome prints them.
+
+export PATH=/bin
+umask 022
+msg=/run/kw-overlay.msg
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+mount -t tmpfs -o nosuid,nodev,mode=755 tmpfs /run
+
+say() { echo "$*" >> $msg; }
+now() { date +%Y%m%d-%H%M%S; }
+syncdata() { sync -f "$st" 2>/dev/null || sync; }
+name= img= dev= fstype= st= why= ut= data= upper= work=
+
+state() {
+	printf '%s\n' "name=$name" "image=$img" "upper=$ut" "why=$why" "state=$st" "dev=$dev" "fstype=$fstype" > /run/kw-base
+}
+
+# base_shell REASON: a shell on the base itself (no distro root).
+base_shell() {
+	mountpoint -q /mnt && umount /mnt
+	mountpoint -q /kw/tmp && umount /kw/tmp
+	ut=none why=$1
+	state
+	# The kw layer's scripts find busybox at /run/kw-lower/bin.
+	ln -s / /run/kw-lower
+	exec /bin/busybox init
+}
+
+mode=
+for a in $(cat /proc/cmdline); do
+	case $a in kw.root=*) mode=${a#kw.root=} ;; esac
+done
+case $mode in
+'' | initramfs | base) ;;
+*) say "kw-overlay: ignoring kw.root=$mode (known: initramfs, base)"; mode= ;;
+esac
+
+# bylabel LABEL: the block device whose ext4 or erofs volume label is LABEL,
+# in $found, and which of the two in $ft. Not findfs or blkid: busybox tries
+# every format it knows, one of them (a RAID superblock) near the end of the
+# device, and on a distro image read over HTTP that is a request of its own.
+bylabel() {
+	local b
+	for b in /sys/class/block/*; do
+		b=/dev/${b##*/}
+		[ "$(dd if="$b" bs=8 skip=143 count=2 2>/dev/null | tr -d '\0')" = "$1" ] && { found=$b ft=ext4; return 0; }
+		[ "$(dd if="$b" bs=8 skip=136 count=2 2>/dev/null | tr -d '\0')" = "$1" ] && { found=$b ft=erofs; return 0; }
+	done
+	return 1
+}
+
+# The data disk: noatime, commit=1, discard if the device has it, 1 s dirty
+# expiry.
+if bylabel kwdata; then
+	d=$found
+	o=noatime,commit=1
+	[ "$(cat /sys/class/block/${d#/dev/}/queue/discard_max_bytes 2>/dev/null)" -gt 0 ] 2>/dev/null && o=$o,discard
+	if mount -t ext4 -o $o "$d" /data; then
+		data=1
+		[ "$(stat -c %u:%g /data)" = 0:0 ] || chown 0:0 /data
+		sysctl -q -w vm.dirty_expire_centisecs=100 vm.dirty_writeback_centisecs=100
+	else
+		say "kw-data: cannot mount $d (LABEL=kwdata) on /data"
+	fi
+fi
+
+[ "$mode" = base ] && base_shell "kw.root=base on the kernel command line"
+bylabel kwroot || base_shell "no distro image (no disk labelled kwroot)"
+dev=$found
+for t in $ft erofs ext4; do
+	mount -t "$t" -o ro "$dev" /kw/distro 2>/dev/null && { fstype=$t; break; }
+done
+[ -n "$fstype" ] || base_shell "the distro image $dev (LABEL=kwroot) does not mount as erofs or ext4"
+name=$(head -n1 /kw/distro/usr/lib/kw-distro 2>/dev/null)
+case $name in
+'' | *[!a-z0-9]*)
+	say "kw-overlay: the image has no valid /usr/lib/kw-distro ('$name'), so its changes cannot be kept"
+	name= ;;
+esac
+img=$(head -n1 /kw/distro/usr/lib/kw-image 2>/dev/null)
+
+# safe REASON: this boot on a tmpfs upper.
+safe() {
+	say "kw-overlay: SAFE MODE: $1"
+	say "  This boot runs the plain $name image (changes stay in memory). Your"
+	say "  changes to the root are kept, unmounted, in $st/upper; nothing was deleted."
+	say "  Fix them there and reboot: each boot checks again."
+	say "  kw-overlay status    what happened"
+	say "  kw-overlay discard   set them aside and start over from the image"
+	why="safe mode: $1" upper=
+}
+
+# The data upper of this distro (a pending discard first).
+data_upper() {
+	mkdir -p "$st" || { why="cannot create $st"; return; }
+	if [ -e "$st/discard" ]; then
+		old=$st/discarded-$(now) i=1
+		while [ -e "$old" ]; do i=$((i + 1)) old=$st/discarded-$(now)-$i; done
+		mkdir -p "$old"
+		mv "$st/upper" "$st/lower" "$old/" 2>/dev/null
+		rm -rf "$st/work" "$st/discard"
+		say "kw-overlay: starting over from the image; the previous changes are in $old"
+	fi
+	mkdir -p "$st/upper" "$st/work"
+	was=$(cat "$st/lower" 2>/dev/null)
+	if [ "$was" != "$img" ]; then
+		if [ -n "$was" ]; then
+			echo "$name image updated: $img" >> /run/kw-overlay.note
+			echo "$(date -Iseconds) $was -> $img" >> "$st/history"
+		fi
+		echo "$img" > "$st/lower"
+		syncdata
+	fi
+	upper=$st/upper work=$st/work
+}
+
+# root UPPER WORK: mount the overlay at /mnt.
+root() {
+	mount -t overlay overlay -o "lowerdir=/kw/layer:/kw/distro,upperdir=$1,workdir=$2,redirect_dir=off,index=off,xino=off,metacopy=off" /mnt
+}
+# Whether the merged root can boot: its /bin/sh runs (a broken shell or C
+# library shows up here) and /sbin/init is executable. Sets $bad.
+check() {
+	bad=
+	chroot /mnt /bin/sh -c '[ -x /sbin/init ]' 2>/dev/null && return 0
+	if chroot /mnt /bin/sh -c : 2>/dev/null; then
+		bad="/sbin/init is missing or not executable"
+	elif [ -e /mnt/bin/sh ] || [ -L /mnt/bin/sh ]; then
+		bad="/bin/sh does not run"
+	else
+		bad="/bin/sh is missing"
+	fi
+	return 1
+}
+
+if [ -z "$data" ]; then
+	why="no data disk"
+elif [ -z "$name" ]; then
+	why="the image names no distro"
+elif [ "$mode" = initramfs ]; then
+	st=/data/distros/$name why="kw.root=initramfs"
+	say "kw-overlay: kw.root=initramfs: the plain image this time; your root changes stay in $st/upper, unmounted"
+else
+	st=/data/distros/$name
+	data_upper
+fi
+if [ -n "$upper" ]; then
+	if ! root "$upper" "$work"; then
+		safe "the overlay could not be mounted (see dmesg)"
+	elif ! check; then
+		umount /mnt
+		safe "$bad with your changes (a broken shell, C library or init?)"
+	else
+		ut=data
+	fi
+fi
+if [ -z "$ut" ]; then
+	ut=tmpfs
+	mount -t tmpfs -o mode=755 tmpfs /kw/tmp && mkdir /kw/tmp/upper /kw/tmp/work &&
+		root /kw/tmp/upper /kw/tmp/work || base_shell "the overlay of the $name image could not be mounted (see dmesg)"
+	check || base_shell "the $name image cannot boot: $bad"
+fi
+state
+
+# The base root is a lower layer now (/kw/layer): it must not change.
+mount -o remount,ro / || say "kw-overlay: cannot make the base root read-only"
+for m in dev proc sys run; do mount --move /$m /mnt/$m; done
+[ -z "$data" ] || mount --move /data /mnt/data
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /mnt/tmp
+mkdir -p /mnt/run/kw-lower
+if ! cd /mnt || ! pivot_root . run/kw-lower; then
+	cd /
+	for m in dev proc sys run; do mount --move /mnt/$m /$m; done
+	[ -z "$data" ] || mount --move /mnt/data /data
+	umount /mnt/tmp
+	mount -o remount,rw /
+	base_shell "pivot_root into the overlay failed"
+fi
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+exec /sbin/init

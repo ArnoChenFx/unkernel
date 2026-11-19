@@ -1,0 +1,24 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/welcome (the kw layer): the welcome line (PRETTY_NAME from
+# /etc/os-release, none without one), then what the base has to say
+# (/run/kw-overlay.msg: safe mode, a discard) in yellow on a terminal, and
+# its notices (/run/kw-overlay.note: an image update) in gray. Nothing more
+# when all went well.
+
+PATH=/run/kw-lower/bin
+if [ -f /etc/os-release ]; then
+	echo "Welcome to $(. /etc/os-release; echo "${PRETTY_NAME:-$NAME}") on unkernel ($(uname -m))"
+fi
+if [ -s /run/kw-overlay.msg ]; then
+	y= reset=
+	[ -t 1 ] && y='\033[33m' reset='\033[0m'
+	printf "$y%s$reset\n" "$(cat /run/kw-overlay.msg)"
+fi
+if [ -s /run/kw-overlay.note ]; then
+	g= reset=
+	[ -t 1 ] && g='\033[90m' reset='\033[0m'
+	printf "$g%s$reset\n" "$(cat /run/kw-overlay.note)"
+fi
+exit 0

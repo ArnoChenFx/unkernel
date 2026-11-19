@@ -27,7 +27,7 @@
 // the kernel needs no rebuild. The host runtime (js/core/kernel.ts, see
 // bundledBoot) uses them when it is given no initrd / command line of its own:
 //
-//   node js/cli.ts vendor/build/bundle/unkernel-alpine.wasm
+//   node js/cli.ts vendor/build/bundle/unkernel.wasm
 //
 // The cpio is gzipped (CONFIG_RD_GZIP) unless it already is or --no-gzip is
 // given. Existing unkernel.* sections are replaced, so re-bundling works.
@@ -61,7 +61,7 @@ function customSection(name, payload) {
 }
 
 /** Split a wasm binary into its sections: [{id, name?, start, end}]. */
-function sections(wasm) {
+export function sections(wasm) {
 	if (wasm.length < 8 || wasm[0] !== 0 || wasm[1] !== 0x61 || wasm[2] !== 0x73 || wasm[3] !== 0x6d)
 		throw new Error("not a WebAssembly module");
 	let p = 8;

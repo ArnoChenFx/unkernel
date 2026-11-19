@@ -1,0 +1,219 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# curl shim over busybox wget, installed as /usr/local/bin/curl. It handles
+# only plain GET requests with -L whose result it can reproduce exactly, e.g.
+# `curl -fsSL URL | sh` or `curl -fLo FILE URL`. Anything else runs the real
+# curl, installed on first use (/etc/kw-apk-install curl, needs a network);
+# once /usr/bin/curl exists, this execs it right away.
+# - Before any request: an option not handled below, a request body or a
+#   method other than GET, no -L (wget always follows redirects, so it would
+#   contact hosts that curl does not), credentials (-u, user@host, an
+#   Authorization or Cookie header), a URL with a fragment, dot segments,
+#   glob characters (without -g) or unusual characters, a proxy or CA bundle
+#   variable, a curlrc file, or -o into a missing directory.
+# - After the GET, which the real curl then repeats: an HTTP error without -f
+#   (curl prints the error body, wget drops it), a status wget does not
+#   take, a TLS or other wget failure, or binary output to a terminal.
+# Output is written only after a complete, successful transfer, so a
+# fallback never leaves partial output behind.
+# Handled: -f -s -S -L -k -g -o -O -H -A -e -m -X GET --url --http1.1
+# --tlsv1 --tlsv1.[0-2] -# --progress-bar --no-progress-meter.
+
+real=/usr/bin/curl
+[ -x $real ] && exec $real "$@"
+set -f
+
+# The original arguments, quoted for eval (no command substitution, which
+# would drop trailing newlines).
+orig=
+for a; do
+	r=
+	while :; do
+		case $a in
+		*\'*) r="$r${a%%\'*}'\\''"; a=${a#*\'} ;;
+		*) break ;;
+		esac
+	done
+	orig="$orig '$r$a'"
+done
+# -s, for messages printed before the arguments are parsed: short option
+# clusters up to the first letter that takes a value.
+silent=
+for a; do
+	case $a in
+	--silent) silent=1 ;;
+	--*) ;;
+	-?*)
+		a=${a#-}
+		while [ -n "$a" ]; do
+			case $a in
+			s*) silent=1 ;;
+			[AbcCdDeEFHKmoPQrtTuUwxXyYz]*) break ;;
+			esac
+			a=${a#?}
+		done ;;
+	esac
+done
+tmp= err=
+cleanup() { rm -f "$tmp" "$err"; }
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; trap - TERM; kill -TERM $$' TERM
+# real_curl WHY: run the original command with the real curl.
+real_curl() {
+	cleanup
+	if [ ! -x $real ]; then
+		if [ -n "$silent" ]; then
+			/etc/kw-apk-install curl >/dev/null 2>&1
+		else
+			echo "curl: $1: installing the real curl" >&2
+			/etc/kw-apk-install curl >&2
+		fi
+		[ -x $real ] || { echo "curl: $1 needs the real curl, and apk add curl failed" >&2; exit 2; }
+	fi
+	eval "exec $real $orig"
+}
+for v in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY \
+	CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR; do
+	eval "[ -z \"\${$v:-}\" ]" || real_curl "\$$v"
+done
+[ -n "${HOME:-}" ] || real_curl "no \$HOME (curlrc)"
+for f in "${CURL_HOME:+$CURL_HOME/.curlrc}" "${XDG_CONFIG_HOME:-$HOME/.config}/curlrc" "$HOME/.curlrc"; do
+	[ -n "$f" ] && [ -e "$f" ] && real_curl "$f"
+done
+
+url= out= nout=0 remote= fail= showerr= follow= insecure= maxtime= globoff=
+ua=curl/8.23.0 hdrs= nl='
+'
+while [ $# -gt 0 ]; do
+	a=$1; shift
+	case $a in
+	-[!-]?*) # clusters: -fsSLo FILE -> -f -sSLo FILE; -oFILE -> -o FILE
+		rest=${a#-?}; a=${a%"$rest"}
+		case $a in -[oHAemX]) set -- "$rest" "$@" ;; *) set -- "-$rest" "$@" ;; esac ;;
+	esac
+	case $a in
+	-o|--output|-H|--header|-A|--user-agent|-e|--referer|-m|--max-time|-X|--request|--url)
+		[ $# -gt 0 ] || real_curl "$a"
+		v=$1; shift
+		case $v in *"$nl"*) real_curl "$a with a newline" ;; esac ;;
+	esac
+	case $a in
+	-f|--fail) fail=1 ;;
+	-s|--silent) silent=1 ;;
+	-S|--show-error) showerr=1 ;;
+	-L|--location) follow=1 ;;
+	-k|--insecure) insecure=1 ;;
+	-g|--globoff) globoff=1 ;;
+	-O|--remote-name) nout=$((nout + 1)); remote=1 ;;
+	-o|--output) nout=$((nout + 1)); out=$v ;;
+	-X|--request) [ "$v" = GET ] || real_curl "-X $v" ;;
+	-A|--user-agent) [ -n "$v" ] || real_curl "-A ''"; ua=$v ;;
+	-e|--referer)
+		case $v in *\;auto*|'') real_curl "-e '$v'" ;; esac
+		hdrs="$hdrs${nl}Referer: $v" ;;
+	-m|--max-time)
+		case $v in ''|*[!0-9.]*|*.*.*|.*|*.) real_curl "-m $v" ;; esac
+		case $v in *[1-9]*) maxtime=$v ;; esac ;; # -m 0: no limit
+	-H|--header)
+		case $v in @*) real_curl "-H $v" ;; esac
+		name=${v%%:*}
+		case $name in "$v"|*[!A-Za-z0-9_-]*|'') real_curl "-H $v" ;; esac
+		val=${v#*:}
+		case $val in *[!\ \	]*) ;; *) real_curl "-H $v" ;; esac
+		case $(printf %s "$name" | tr A-Z a-z) in
+		authorization|cookie|host|proxy-*|connection|content-*|transfer-encoding|\
+		accept-encoding|te|range|if-*|expect)
+			real_curl "-H $name" ;;
+		user-agent) ua=${val# }; continue ;;
+		esac
+		hdrs="$hdrs$nl$v" ;;
+	--url) [ -z "$url" ] || real_curl "a second URL"; url=$v ;;
+	--http1.1|--tlsv1|--tlsv1.[012]|-\#|--progress-bar|--no-progress-meter) ;;
+	-*) real_curl "$a" ;;
+	*) [ -z "$url" ] || real_curl "a second URL"; url=$a ;;
+	esac
+done
+[ -n "$url" ] || real_curl "no URL"
+[ -n "$follow" ] || real_curl "no -L"
+[ "$nout" -le 1 ] || real_curl "more than one output option"
+case $url in
+http://*|https://*) ;;
+*) real_curl "URL $url" ;;
+esac
+case $url in *[!A-Za-z0-9._~:/?@!\$\&\'\(\)*+,\;=%-]*) real_curl "URL $url" ;; esac
+[ -n "$globoff" ] || case $url in *[][{}]*) real_curl "URL glob" ;; esac
+rest=${url#*://}
+host=${rest%%[/?]*}
+path=${rest#"$host"}; path=${path%%\?*}
+case $host in *@*|'') real_curl "URL $url" ;; esac
+case $path/ in */./*|*/../*) real_curl "URL dot segments" ;; esac
+if [ -n "$remote" ]; then
+	out=${path##*/}
+	[ -n "$out" ] || real_curl "-O without a file name"
+fi
+[ -n "$out" ] || out=-
+if [ "$out" = - ]; then
+	tmp=$(mktemp) || exit 23
+else
+	dir=.
+	case $out in */*) dir=${out%/*}; [ -n "$dir" ] || dir=/ ;; esac
+	[ -d "$dir" ] || real_curl "-o into a missing directory"
+	if [ -e "$out" ] || [ -L "$out" ]; then
+		tmp=$(mktemp) || exit 23 # copied into it, like curl's fopen
+	else
+		tmp=$(mktemp "$dir/.curl-shim.XXXXXX") || exit 23
+	fi
+fi
+err=$(mktemp) || exit 23
+
+set -- -q -S -O "$tmp" --header "User-Agent: $ua"
+[ -n "$insecure" ] && set -- "$@" --no-check-certificate
+IFS=$nl
+for h in $hdrs; do set -- "$@" --header "$h"; done
+unset IFS
+if [ -n "$maxtime" ]; then timeout "$maxtime" wget "$@" "$url" 2>"$err"
+else wget "$@" "$url" 2>"$err"; fi
+rc=$?
+
+# The status line of each response; the last one is the final response.
+statuses=$(sed -n 's/^  HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$err")
+status=${statuses##*$nl}
+# say CODE MESSAGE: fail like curl (the message is shown unless -s without -S).
+say() {
+	c=$1; shift
+	[ -n "$silent" ] && [ -z "$showerr" ] || echo "curl: ($c) $*" >&2
+	exit "$c"
+}
+port=${host##*:}
+if [ "$port" = "$host" ]; then
+	case $url in https:*) port=443 ;; *) port=80 ;; esac
+fi
+case $rc:$status in
+0:2??) ;;
+143:*)
+	[ -n "$maxtime" ] || real_curl "wget killed"
+	say 28 "Operation timed out after $maxtime seconds" ;;
+*:[45]??)
+	[ -n "$fail" ] || real_curl "HTTP $status without -f"
+	say 22 "The requested URL returned error: $status" ;;
+*:) # no response from the first host; wget's own error lines only
+	case $(grep '^wget: ' "$err") in
+	*"bad address"*) say 6 "Could not resolve host: ${host%:*}" ;;
+	*"onnection refused"*) say 7 "Failed to connect to ${host%:*} port $port: Couldn't connect to server" ;;
+	*) real_curl "wget: $(grep -m 1 . "$err" | cut -c 1-60)" ;;
+	esac ;;
+*) real_curl "HTTP $status" ;;
+esac
+# curl refuses binary data on a terminal unless -o is given (-o - too).
+if [ "$nout" = 0 ]; then
+	if [ -t 1 ] && ! tr -d '\000' <"$tmp" | cmp -s - "$tmp"; then
+		real_curl "binary output to a terminal"
+	fi
+fi
+if [ "$out" = - ]; then cat "$tmp" || exit 23
+elif [ -e "$out" ] || [ -L "$out" ]; then cat "$tmp" >"$out" || exit 23
+else mv -f -- "$tmp" "$out" || exit 23
+fi
+exit 0

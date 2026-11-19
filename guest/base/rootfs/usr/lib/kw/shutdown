@@ -1,0 +1,18 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/shutdown (the kw layer): what a distro's init (and the base's
+# base shell) runs at poweroff and reboot, before reboot(2): with /data
+# mounted, stop every process but init and this script first, so that
+# nothing keeps /data busy (busybox init would only do that after this),
+# then leave /data clean (data-stop) and sync.
+
+PATH=/run/kw-lower/bin
+if mountpoint -q /data; then
+	kill -TERM -1 2>/dev/null
+	sleep 0.2
+	kill -KILL -1 2>/dev/null
+	/usr/lib/kw/data-stop
+fi
+sync
+exit 0

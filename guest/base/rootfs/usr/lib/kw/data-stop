@@ -1,0 +1,28 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/data-stop (the kw layer): leave /data clean at shutdown.
+# /usr/lib/kw/shutdown calls it after it has stopped every process and
+# before reboot(2). On a data upper (/run/kw-base: upper=data) /data is busy
+# under the root overlay, so / and /data are remounted read-only, which
+# commits the journal and marks the file system clean. Otherwise /data is
+# unmounted.
+
+PATH=/run/kw-lower/bin
+mountpoint -q /data || exit 0
+sync
+if [ "$(sed -n 's/^upper=//p' /run/kw-base 2>/dev/null)" = data ]; then
+	mount -o remount,ro / 2>/dev/null
+	if mount -o remount,ro /data; then
+		echo "kw-shutdown: /data is clean (read-only under the overlay root)"
+	else
+		echo "kw-shutdown: /data is busy"
+	fi
+elif umount /data; then
+	echo "kw-shutdown: /data is clean"
+elif mount -o remount,ro /data; then
+	echo "kw-shutdown: /data is busy, remounted read-only"
+else
+	echo "kw-shutdown: /data is busy"
+fi
+exit 0

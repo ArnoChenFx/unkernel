@@ -1,0 +1,28 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/udhcpc (the kw layer): udhcpc's script (/usr/lib/kw/net):
+# apply the lease (address, default route, DNS servers in
+# /etc/resolv.conf, which is rewritten only when it changes).
+
+PATH=/run/kw-lower/bin
+case $1 in
+deconfig)
+	ip addr flush dev "$interface"
+	ip link set "$interface" up
+	;;
+bound | renew)
+	ip addr flush dev "$interface"
+	ip addr add "$ip/${mask:-24}" ${broadcast:+broadcast $broadcast} dev "$interface"
+	for r in $router; do ip route add default via "$r" dev "$interface" && break; done
+	conf=
+	for d in $dns; do conf="${conf}nameserver $d
+"; done
+	if [ -n "$conf" ] && [ "$(cat /etc/resolv.conf 2>/dev/null)
+" != "$conf" ]; then
+		rm -f /etc/resolv.conf
+		printf '%s' "$conf" > /etc/resolv.conf
+	fi
+	;;
+esac
+exit 0

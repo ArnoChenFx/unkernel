@@ -1,0 +1,28 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/rc (the kw layer): the first thing a distro's init runs. The
+# base has mounted /dev, /proc, /sys, /run, /tmp and /data; this adds what
+# every distro needs on top: cgroup2, devpts, /dev/shm, /run/lock, the
+# hostname (/etc/hostname, unless it is empty or localhost: unkernel), and
+# binfmt_misc with WebAssembly modules (binary format version 1, which WASI
+# preview 1 programs are) run on the host's wasm engine through kwwasi,
+# which needs a host serving vsock port 1021 (the CLI's --wasi; prototype).
+# A distro registers its own formats after this (Alpine: qemu-user).
+
+PATH=/run/kw-lower/bin
+m() { mountpoint -q "$2" || mount -t "$1" ${3:+-o "$3"} "$1" "$2"; }
+m cgroup2 /sys/fs/cgroup nosuid,nodev,noexec
+mkdir -p /dev/pts /dev/shm
+m devpts /dev/pts gid=5,mode=620,ptmxmode=666
+m tmpfs /dev/shm nosuid,nodev,mode=1777
+mkdir -p -m 1777 /run/lock
+h=$(head -n1 /etc/hostname 2>/dev/null)
+case $h in '' | localhost | localhost.*) h=unkernel ;; esac
+hostname "$h"
+d=/proc/sys/fs/binfmt_misc
+if [ -d $d ] && { mountpoint -q $d || mount -t binfmt_misc binfmt_misc $d 2>/dev/null; } &&
+	[ -x /usr/bin/kwwasi ] && [ ! -e $d/wasi ]; then
+	printf '%s\n' ':wasi:M::\x00asm\x01\x00\x00\x00::/usr/bin/kwwasi:P' > $d/register
+fi
+exit 0

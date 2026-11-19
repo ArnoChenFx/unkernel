@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# kw-apk-enable [URL...]: add repositories from /etc/kw-apk-lazy (all of them
+# without arguments) to /etc/apk/repositories, unless they are there already.
+# It runs no `apk update`: that would fetch every index again, while the next
+# apk command fetches only the indexes that are missing or older than 4 h.
+
+f=/etc/apk/repositories
+[ $# -gt 0 ] || set -- $(grep -v '^[[:space:]]*#' /etc/kw-apk-lazy 2>/dev/null)
+for r; do
+	grep -qxF "$r" $f 2>/dev/null && continue
+	[ -z "$(tail -c1 $f 2>/dev/null)" ] || echo >> $f
+	echo "$r" >> $f || exit 1
+done

@@ -1,0 +1,94 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# kw-apk-install NAME: install the package providing command NAME. Exit 0 if
+# NAME is installed now, else print the shell's "not found". The lookup does
+# not ask apk, which parses all enabled indexes on every run (~0.65 s main,
+# ~2.7 s with community, under kwemu). A command in no enabled repository is
+# looked up in the ones in /etc/kw-apk-lazy (community); on a hit, that
+# repository is enabled for good, then installed from.
+#
+# Lookups go through a list of the command names an index provides (its
+# cmd: entries on p: lines), built from the index the first time it is
+# needed and kept in /var/cache/kw-apk/<index file name>.cmds. Its first
+# line records the index's mtime and size; when the index changes (apk
+# refreshed it, the page pushed a newer one) the list is built again.
+# Building takes ~1.2 s for main and ~3.1 s for community, a lookup in a list
+# ~0.1 s, where a grep of the index itself took ~2.9 s for community every
+# time. busybox is slow per line (~10 us), so the pipeline first cuts the
+# 323k lines of community's index down to the ~4.4k with "cmd:" (grep -F,
+# the cheapest filter), then takes the p: lines; a p: line starts with its
+# first provide ("p:cmd:htop=3.5.3-r0"), hence the sed rather than grep.
+#
+# A lazy repository's index is fetched with wget straight to the name apk
+# gives its cache file (APKINDEX.<first 8 hex digits of sha1(index URL)>
+# .tar.gz), so once the repository is enabled apk uses that file instead of
+# downloading it again (while its mtime is less than 4 h old). The page may
+# have pushed it there already (web/src/apk.ts). apk ignores the file while
+# the repository is not enabled, and checks its signature on every load,
+# so the grep here is the only thing that reads it unverified.
+
+cmd=$1
+notfound() { echo "sh: $cmd: not found" >&2; exit 127; }
+case $cmd in ''|*[!A-Za-z0-9._+-]*) notfound ;; esac
+[ "$(id -u)" = 0 ] || notfound
+awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null || notfound
+gray= reset=
+[ -t 2 ] && gray='\033[90m' reset='\033[0m'
+trap 'printf "$reset" >&2; exit 130' INT TERM
+# "NAME: not found, " starts the first status line only.
+pre="$cmd: not found, "
+say() { printf "${gray}%s%s${reset}\n" "$pre" "$1" >&2; pre=; }
+arch=$(cat /etc/apk/arch)
+# The plain repository URLs (optionally after an @tag) in the given files.
+repos() { sed -n 's/^@[^ ]*  *//; s/[[:space:]]*$//; /^https\{0,1\}:\/\/[^[:space:]]*$/p' "$@" 2>/dev/null; }
+# apk's cache file for a repository's index.
+index() { echo "/var/cache/apk/APKINDEX.$(printf %s "${1%/}/$arch/APKINDEX.tar.gz" | sha1sum | cut -c1-8).tar.gz"; }
+# has INDEX: whether the cached index provides cmd:NAME (see above).
+has() {
+	local l=/var/cache/kw-apk/${1##*/}.cmds stamp
+	stamp=$(stat -c '#%Y %s' "$1" 2>/dev/null) || return 1
+	if [ "$(head -n1 "$l" 2>/dev/null)" != "$stamp" ]; then
+		mkdir -p /var/cache/kw-apk
+		{ echo "$stamp"; zcat "$1" | grep -F cmd: | sed -n 's/^p://p' | tr ' =' '\n\n' | sed -n 's/^cmd://p'; } > "$l.$$" &&
+			mv -f "$l.$$" "$l" || { rm -f "$l.$$"; return 1; }
+	fi
+	grep -qxF "$cmd" "$l"
+}
+on=" $(echo $(repos /etc/apk/repositories /etc/apk/repositories.d/*.list)) "
+for r in $on; do
+	[ -e "$(index "$r")" ] && continue
+	say "fetching the apk index"
+	apk update -q >&2 || notfound
+	break
+done
+found=
+for r in $on; do has "$(index "$r")" && { found=1; break; }; done
+if [ -z "$found" ]; then
+	for r in $(repos /etc/kw-apk-lazy); do
+		case $on in *" $r "*) continue ;; esac
+		f=$(index "$r")
+		if [ ! -e "$f" ]; then
+			say "fetching the ${r##*/} index"
+			if ! wget -qO "$f.kw" "${r%/}/$arch/APKINDEX.tar.gz" 2>/dev/null; then
+				rm -f "$f.kw"
+				continue
+			fi
+			mv -f "$f.kw" "$f"
+		fi
+		has "$f" || continue
+		say "$cmd is in ${r##*/}, adding it to /etc/apk/repositories"
+		/etc/kw-apk-enable "$r" || notfound
+		found=1
+		break
+	done
+fi
+# Lists of indexes that are gone (a repository was removed).
+for l in /var/cache/kw-apk/*.cmds; do
+	[ ! -e "$l" ] || [ -e "/var/cache/apk/$(basename "$l" .cmds)" ] || rm -f "$l"
+done
+[ -n "$found" ] || notfound
+printf "${gray}%sapk add cmd:%s\n" "$pre" "$cmd" >&2
+apk add "cmd:$cmd" >&2
+printf "$reset" >&2
+command -v "$cmd" >/dev/null

@@ -3,7 +3,8 @@
 Linux 7.3 built as one wasm module (`arch/wasm`, grown from Joel Severin's
 linux-wasm port), with the kwemu aarch64 CPU (`src/`, contract in
 `include/kw_emu.h`) linked in to run unmodified aarch64 user space, and the
-guest images it boots. The overview is the top-level README.md; the
+bundle that carries it with the base initramfs (the guest side is in the
+top-level `guest/`, its README.md). The overview is the top-level README.md; the
 reference for changing anything here is in `.agents/` (start at
 [.agents/kernel.md](../.agents/kernel.md)).
 
@@ -12,8 +13,7 @@ reference for changing anything here is in `.agents/` (start at
 | `build.sh` | every kernel-side build step (below) |
 | `patches/linux/` | the kernel series on Linux v7.3.4 (`7595a62d45e`), applied as branch `kw-arm64-user` in `vendor/src/linux-wasm-kernel` (.agents/kernel.md, Tree and patch workflow) |
 | `patches/llvm/` | the wasm-ld patches (.agents/toolchain.md) |
-| `tools/` | `bundle.mjs` (the bundle), `kwdiff.mjs` (the UP-to-SMP patch), `kwsparse.mjs`, `mkcpio.py`, `ext4-owners.py`, `fake-llvm/` (Kbuild's toolchain wrapper), `env.sh` (pins and host tools) |
-| `guest/` | the images and the programs in them (.agents/kernel/guest.md): `alpine.sh`, `alpine-opt.sh` (.agents/guest-packages.md), `alpine-disk.sh`, `ubuntu-disk.sh`, `kw-data.sh` and `overlay/` (.agents/data-disk.md), the shims, `fbdoom`, and the C programs (`kwtest`, `abitest`, `kwbench`, `glimmer`, `kwtty`, `kwvsock`, `kw9p`, `kwshm`, `kwwasi`) |
+| `tools/` | `bundle.mjs` (the bundle), `kwdiff.mjs` (the UP-to-SMP patch), `kwsparse.mjs`, `fake-llvm/` (Kbuild's toolchain wrapper), `env.sh` (host tools and the build helpers) |
 
 ## Build
 
@@ -27,28 +27,27 @@ build` and `kernel/build.sh all`. Steps, each on its own:
 | `kernel` | the UP kernel `vendor/build/kernel/vmlinux` (wasm64) with kwemu from `zig-out/lib/libkwemu.a`, then `lower` and the bundle; the quick loop |
 | `smp` | the SMP kernel in `vendor/build/kernel-smp`, then the bundle with its patch |
 | `lower` | `vmlinux32.wasm`, the 32-bit-memory build every host runs |
-| `alpine` | `vendor/build/initramfs/alpine.cpio` and `alpine-test.cpio` |
-| `disk` | `vendor/build/disk/alpine.ext4` (needs e2fsprogs) |
 | `datadisk` | `vendor/build/disk/kwdata.kwsparse.gz`, the data disk template |
-| `bundle` | `vendor/build/bundle/unkernel-alpine.wasm` (kernel, initramfs, command line, template, SMP patch), also copied to `web/kernel/` |
+| `base` | the base initramfs `vendor/build/initramfs/base.cpio` and `base-test.cpio` (`guest/build.sh base`) and the bundle `vendor/build/bundle/unkernel.wasm` (kernel, base initramfs, command line, template, SMP patch), also copied to `web/kernel/`; `KW_BASE_OUT=dir` writes all three to dir and copies nothing |
+| `distro [NAME...]` | the distro images `vendor/build/distro/NAME.{erofs,ext4}`, their ids `NAME.id` and the index `distros.json` (`guest/build.sh distro`) |
 | `all` | all of the above |
-| `ubuntu` | `vendor/build/disk/ubuntu.ext4`, Ubuntu Base 26.10 (not in `all`) |
-| `stats` | `vendor/build/bundle/unkernel-alpine-stats.wasm`, kwemu with exit counters (`--stats`; not in `all`) |
+| `stats` | `vendor/build/bundle/unkernel-stats.wasm`, kwemu with exit counters (`--stats`; not in `all`) |
 
-`KSRC`, `KOUT`, `KOUT_SMP` and `KW_BUILD` build another tree or into
+`kernel`, `smp`, `lower` and `datadisk` refresh the bundle when
+`base.cpio` exists, and `distros.json` (its ABI and base id) when there are
+images. `KSRC`, `KOUT`, `KOUT_SMP` and `KW_BUILD` build another tree or into
 another output root; the header of `build.sh` lists every variable.
-Downloads are pinned (`build.sh`, `tools/env.sh`).
+Downloads are pinned (`build.sh`, `tools/env.sh`, `guest/**/pins.sh`).
 
 ## Run
 
 ```sh
-node js/cli.ts                                                    # Alpine from the bundle; Ctrl-] quits; --help lists options
-node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"     # kernel tests as /init
+node js/cli.ts                                                    # Alpine on the bundle; Ctrl-] quits; --help lists options
+node js/cli.ts --distro debian                                    # Debian; --distro none: the base shell
+node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"     # kernel tests as /init (no distro)
 node js/cli.ts --smp 2 --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the same on the SMP kernel
-node js/cli.ts --kernel vendor/build/kernel/vmlinux --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the wasm64 build
-node js/cli.ts --disk vendor/build/disk/alpine.ext4               # Alpine on ext4, persistent
-node js/cli.ts --disk vendor/build/disk/ubuntu.ext4 --snapshot    # Ubuntu, changes kept in memory
-node js/cli.ts --data /tmp/kwdata.img                             # with the data disk at /data
+node js/cli.ts --kernel vendor/build/kernel/vmlinux --append "console=hvc0 rdinit=/usr/bin/kwtest"   # the wasm64 build (with base.cpio)
+node js/cli.ts --data /tmp/kwdata.img                             # with the data disk at /data (changes persist)
 ```
 
 Which tests to run for a change: .agents/testing.md.

@@ -1,0 +1,9 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# poweroff under kw-init: SIGUSR1 to PID 1.
+
+# unkernel: poweroff under kw-init.
+trap 'exit 0' TERM   # kw-init stops everything: no "Terminated"
+kill -USR1 1
+sleep 10

@@ -3,8 +3,9 @@
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # Set up unkernel from a fresh clone: check prerequisites, then build
 # everything (kwemu, patched wasm-ld, the UP and SMP kernels + their
-# 32-bit-memory variants, Alpine initramfs and the bundle with the patch
-# to the SMP kernel, Alpine disk image). The browser page (web/)
+# 32-bit-memory variants, the data disk template, the base initramfs and
+# the bundle unkernel.wasm with the patch to the SMP kernel, the Alpine
+# and Debian images with distros.json). The browser page (web/)
 # needs its npm dependencies, which this script does not install: run
 # pnpm install, then pnpm dev.
 #
@@ -76,14 +77,14 @@ check() {
 	for t in clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-ranlib llvm-readelf llvm-strip; do
 		tool "$t" "part of LLVM (clang, lld, llvm packages)" && note "$t" ok
 	done
-	for t in cmake ninja gcc make flex bison bc m4 python3 git curl tar gzip bzip2 xz sha256sum sha512sum; do
+	for t in cmake ninja gcc make flex bison bc m4 python3 git curl tar gzip bzip2 xz zstd sha256sum sha512sum; do
 		tool "$t" && note "$t" ok
 	done
 	for t in mke2fs debugfs e2fsck; do
 		tool "$t" "e2fsprogs >= 1.43" && note "$t" ok
 	done
-	# kernel/guest/alpine-opt.sh, the guest packages rebuilt for kwemu (run by
-	# alpine.sh): meson for apk-tools (a Python program: only looked up),
+	# guest/distro/alpine/opt/build.sh, the guest packages rebuilt for kwemu (run by
+	# the Alpine image's build): meson for apk-tools (a Python program: only looked up),
 	# lua for apk's help text, perl modules for openssl's Configure.
 	for t in patch perl; do
 		tool "$t" && note "$t" ok
@@ -98,7 +99,7 @@ check() {
 	if [ -n "$(type -P meson)" ]; then
 		note meson ok
 	else
-		fail meson "install meson (alpine-opt.sh builds apk-tools with it)"
+		fail meson "install meson (guest/distro/alpine/opt/build.sh builds apk-tools with it)"
 	fi
 	if [ "$(uname -m)" != x86_64 ]; then
 		note alpine-opt "WARNING: its gcc toolchain is for x86_64 hosts; build with KW_ALPINE_OPT=0 (Alpine's builds)"
@@ -166,6 +167,7 @@ echo "== kernel/build.sh all"
 echo
 echo "Done in $(( (SECONDS - start) / 60 )) min $(( (SECONDS - start) % 60 )) s. Try:"
 echo "  node js/cli.ts                                                       # Alpine shell, Ctrl-] quits"
+echo "  node js/cli.ts --distro debian                                       # Debian (--distro none: the base shell)"
 echo '  node js/cli.ts --append "console=hvc0 rdinit=/usr/bin/kwtest"         # smoke test (kwtest as /init)'
-echo "  node js/cli.ts --disk vendor/build/disk/alpine.ext4                   # Alpine on ext4 (persistent)"
+echo "  node js/cli.ts --data /tmp/kwdata.img                                # changes persist on a data disk"
 echo "  pnpm install && pnpm dev                                             # browser: http://localhost:8080/"

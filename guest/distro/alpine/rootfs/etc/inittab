@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /etc/inittab of the Alpine image (busybox init, the minirootfs's
+# /sbin/init): the kw layer's rc, welcome and net (/usr/lib/kw/, from the
+# base), the qemu-user binfmt formats, a root shell on hvc0 and kwtty serve
+# (respawned), the layer's shutdown at poweroff and reboot.
+
+# unkernel: a root shell on the console, and kwtty for the host's
+# terminal sessions over vsock (it sleeps when there is no vsock device).
+::sysinit:/usr/lib/kw/rc
+::sysinit:/usr/lib/kw/welcome
+::sysinit:/usr/lib/kw/net
+::sysinit:/etc/kw-binfmt.sh
+hvc0::respawn:-/bin/sh
+::respawn:/usr/bin/kwtty serve
+::ctrlaltdel:/sbin/reboot
+::shutdown:/usr/lib/kw/shutdown

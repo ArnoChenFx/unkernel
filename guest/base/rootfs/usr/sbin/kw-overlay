@@ -1,0 +1,91 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# kw-overlay (the kw layer): the root overlay of a distro on the data disk
+# (/data/distros/NAME; the base's /init has the details).
+
+PATH=/run/kw-lower/bin
+usage() {
+	cat <<-'EOT'
+	usage: kw-overlay [status|discard] [NAME]
+	  status    the root, the image, safe mode and why, the size of the
+	            changes, image updates, directories set aside, other distros
+	  discard   set the changes aside (/data/distros/NAME/discarded-TIME) and
+	            start over from the image: at once when they are not mounted
+	            (safe mode, kw.root=initramfs, the base shell, another
+	            distro), at the next boot when this boot runs on them
+	NAME defaults to the distro this boot runs, or in the base shell to the
+	only one on /data.
+	EOT
+}
+get() { sed -n "s/^$1=//p" /run/kw-base 2>/dev/null; }
+size() { du -sh "$1" 2>/dev/null | cut -f1; }
+cmd=${1:-status}
+booted=$(get name) ut=$(get upper)
+name=${2:-$booted}
+case $cmd in
+status | discard) ;;
+-h | --help | help) usage; exit 0 ;;
+*) usage >&2; exit 2 ;;
+esac
+nodata() { echo "kw-overlay: no /data (kwdata disk), so the root changes are not kept" >&2; exit 1; }
+[ $cmd = status ] || mountpoint -q /data || nodata
+if [ -z "$name" ]; then
+	set -- /data/distros/*/
+	[ $# = 1 ] && [ -d "$1" ] && name=$(basename "$1")
+fi
+case $name in *[!a-z0-9]*) echo "kw-overlay: no distro '$name'" >&2; exit 2 ;; esac
+st=/data/distros/$name
+# Whether this boot runs on the changes of $name.
+mounted() { [ "$ut" = data ] && [ "$name" = "$booted" ]; }
+
+case $cmd in
+status)
+	if [ "$ut" = none ]; then
+		echo "root: the base shell ($(get why))"
+	elif [ "$ut" = data ]; then
+		echo "root: $booted, image $(get image); changes in $st/upper ($(size $st/upper))"
+	else
+		echo "root: ${booted:-?}, image $(get image); changes in memory this boot ($(get why))"
+	fi
+	if [ -n "$name" ] && ! mounted && [ -d $st/upper ]; then
+		echo "$name: changes in $st/upper ($(size $st/upper)), not mounted"
+	fi
+	[ -s /run/kw-overlay.msg ] && { echo "this boot:"; sed 's/^/  /' /run/kw-overlay.msg; }
+	mountpoint -q /data || nodata
+	if [ -z "$name" ]; then
+		for d in /data/distros/*/; do
+			[ -d "$d" ] && echo "distro on /data: $(basename "$d") ($(size "$d")): kw-overlay status $(basename "$d")"
+		done
+		exit 0
+	fi
+	[ -e $st/discard ] && echo "discard pending: the changes are set aside at the next boot"
+	[ -s $st/lower ] && echo "changes last used with image: $(cat $st/lower)"
+	[ -s $st/history ] && { echo "image updates under the changes:"; sed 's/^/  /' $st/history; }
+	for d in $st/discarded-*; do
+		[ -d "$d" ] && echo "set aside: $d ($(size "$d"))"
+	done
+	for d in /data/distros/*/; do
+		[ -d "$d" ] && [ "$d" != "$st/" ] && echo "other distro on /data: $(basename "$d") ($(size "$d"))"
+	done
+	exit 0
+	;;
+discard)
+	[ -n "$name" ] || { echo "usage: kw-overlay discard NAME" >&2; exit 2; }
+	if mounted; then
+		: > $st/discard
+		echo "kw-overlay: at the next boot, $st/upper moves to $st/discarded-TIME and the root starts over from the image"
+	else
+		rm -f $st/discard
+		if [ -d $st/upper ]; then
+			old=$st/discarded-$(date +%Y%m%d-%H%M%S) i=1
+			while [ -e $old ]; do i=$((i + 1)) old=$st/discarded-$(date +%Y%m%d-%H%M%S)-$i; done
+			mkdir -p $old && mv $st/upper $old/ || { echo "kw-overlay: cannot move $st/upper to $old" >&2; exit 1; }
+			mv $st/lower $old/ 2>/dev/null
+			echo "kw-overlay: your changes are now in $old; the next boot starts over from the image"
+		fi
+		rm -rf $st/work
+	fi
+	sync -f /data 2>/dev/null
+	;;
+esac

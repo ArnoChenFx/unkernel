@@ -1,0 +1,39 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# kw-apt-install NAME: install the package providing command NAME. Exit 0 if
+# NAME is installed now, else print bash's "command not found" and exit 127.
+# The lookup does not ask apt (no Contents index in the image, apt-file and
+# command-not-found would download ~50 MB of them): /usr/lib/kw-commands,
+# made at build time from the image's date's Contents files
+# (tools/commands.py), has one "NAME PACKAGE" line per command in /usr/bin,
+# /usr/sbin, /bin and /sbin of main. The image's package lists are baked in
+# and age: when the install fails (a version gone from the mirror), the
+# lists are fetched again and the install retried once.
+
+# unkernel: install the package that provides a command.
+cmd=$1
+notfound() { echo "bash: $cmd: command not found" >&2; exit 127; }
+case $cmd in ''|*[!A-Za-z0-9._+-]*) notfound ;; esac
+[ "$EUID" = 0 ] || notfound
+awk '$2 == "00000000" { f = 1 } END { exit !f }' /proc/net/route 2>/dev/null || notfound
+line=$(grep -m1 "^${cmd//./\\.} " /usr/lib/kw-commands 2>/dev/null) || notfound
+pkg=${line#* }
+gray= reset=
+[ -t 2 ] && gray=$'\033[90m' reset=$'\033[0m'
+trap 'printf %s "$reset" >&2; exit 130' INT TERM
+# "NAME: not found, " starts the first status line only.
+pre="$cmd: not found, "
+say() { printf '%s%s%s%s\n' "$gray" "$pre" "$1" "$reset" >&2; pre=; }
+# Not on the terminal's input: dpkg would eat what was typed ahead.
+install() { apt-get install -y -q --no-install-recommends "$pkg" </dev/null >&2; }
+say "apt-get install $pkg"
+printf %s "$gray" >&2
+if ! install; then
+	printf %s "$reset" >&2
+	say "fetching the package lists"
+	printf %s "$gray" >&2
+	apt-get update -q </dev/null >&2 && install
+fi
+printf %s "$reset" >&2
+command -v "$cmd" >/dev/null || notfound

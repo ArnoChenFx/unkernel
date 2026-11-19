@@ -4,32 +4,34 @@
 # Build the unkernel kernels (wasm64 vmlinux with emulated aarch64 user mode)
 # and their 32-bit-memory variants (the ones the page and the bundle use):
 # the UP kernel and the SMP kernel (CONFIG_SMP, one wasm instance per CPU on
-# a shared memory) from the same tree; the Alpine initramfs and disk
-# images, and the single-file bundle (the UP kernel, Alpine and a patch
-# from the UP to the SMP kernel); `ubuntu` builds the Ubuntu Base disk
-# image (not part of `all`).
+# a shared memory) from the same tree; the data disk template; the base
+# initramfs (guest/build.sh base) and the single-file bundle unkernel.wasm
+# (the UP kernel, the base initramfs, the data disk template and a patch
+# from the UP to the SMP kernel); and the distro images with their index
+# distros.json (guest/build.sh distro).
 # ./setup.sh at the repository root checks the prerequisites and runs `all`.
 #
-#   kernel/build.sh [toolchain|binaryen|kernel|smp|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]  (default: all)
+#   kernel/build.sh [toolchain|binaryen|kernel|smp|lower|datadisk|base|distro|stats|all]  (default: all)
 #
-# `all` is idempotent: finished steps are skipped or rebuilt incrementally, and
-# an existing vendor/build/disk/alpine.ext4 is kept (it may hold your changes;
-# `kernel/build.sh disk` rebuilds it). It builds both kernels (KW_SMP=0: the
-# UP kernel only).
+# `all` is idempotent: finished steps are skipped or rebuilt incrementally.
+# It builds both kernels (KW_SMP=0: the UP kernel only), the data disk
+# template, the base bundle and every distro image.
 #
 # `kernel` builds the UP kernel only (the quick loop for kernel work), `smp`
 # the SMP kernel only (vendor/build/kernel-smp, with kwemu built with atomics
-# in vendor/build/kwemu-smp); each refreshes the bundle. The bundle carries
-# the patch to the SMP kernel when that kernel was built from the same tree
-# as the UP one (the kernels' banners, kernel/tools/bundle.mjs --smp), and
-# otherwise leaves it out with a warning (run `smp` after `kernel`).
+# in vendor/build/kwemu-smp); each refreshes the bundle (when the base
+# initramfs exists) and distros.json. The bundle carries the patch to the
+# SMP kernel when that kernel was built from the same tree as the UP one
+# (the kernels' banners, kernel/tools/bundle.mjs --smp), and otherwise
+# leaves it out with a warning (run `smp` after `kernel`).
 #
 # `stats` builds a profiling variant next to the normal outputs, which it
 # leaves alone: kwemu with -Dkwemu-stats (exit counters, the kw_debug_stats
 # export) in vendor/build/kwemu-stats, the UP kernel in
 # vendor/build/kernel-stats (the first run is a full kernel build) and the
-# bundle vendor/build/bundle/unkernel-alpine-stats.wasm (no SMP patch). Boot
-# it with `node js/cli.ts --kernel vendor/build/bundle/unkernel-alpine-stats.wasm --stats`.
+# bundle vendor/build/bundle/unkernel-stats.wasm (the base initramfs, no SMP
+# patch; run `base` first). Boot it with
+# `node js/cli.ts --kernel vendor/build/bundle/unkernel-stats.wasm --stats`.
 #
 # Kernels are reproducible: two builds of the same tree with the same
 # toolchain are byte for byte the same (so is the bundle's SMP patch). The
@@ -54,24 +56,30 @@
 #                                   and up.kwpatch, the UP->SMP patch the last bundle used
 #   vendor/build/kwemu-smp          kwemu built with atomics, for the SMP kernel
 #   vendor/toolchain/binaryen       Binaryen release (wasm-opt), fetched by `binaryen`
-#   vendor/build/disk/alpine.ext4   Alpine root file system image for kwblk (`disk`)
 #   vendor/build/disk/kwdata.kwsparse.gz  empty ext4 "kwdata" data disk template (`datadisk`)
-#   vendor/build/disk/ubuntu.ext4  Ubuntu Base 26.10 root file system image (`ubuntu`)
-#   vendor/build/initramfs/         alpine.cpio (also holds /usr/bin/kwtest, abitest and kwbench;
-#                                   with KW_RELEASE=1 only alpine-test.cpio does)
-#   vendor/build/bundle/            unkernel-alpine.wasm (vmlinux32.wasm + alpine.cpio + cmdline
-#                                   + the data disk template + the SMP patch in custom sections);
-#                                   the default of the CLI (js/cli.ts) and the SDK, and copied to
-#                                   web/kernel/ for the page's dev server;
-#                                   unkernel-alpine-stats.wasm from `stats`
+#   vendor/build/initramfs/         base.cpio (also holds /usr/bin/kwtest, abitest and kwbench;
+#                                   with KW_RELEASE=1 only base-test.cpio does; `base`)
+#   vendor/build/distro/            the distro images <name>.erofs, <name>.ext4, their ids
+#                                   <name>.id and the index distros.json (`distro`; guest/README.md)
+#   vendor/build/bundle/            unkernel.wasm (vmlinux32.wasm + base.cpio + cmdline + the data
+#                                   disk template + the SMP patch in custom sections; `base`): the
+#                                   default of the CLI (js/cli.ts) and the SDK, and copied to
+#                                   web/kernel/ for the page's dev server; unkernel-stats.wasm
+#                                   from `stats`
 #
 # Environment:
 #   KW_BUILD=dir   build output root instead of vendor/build (every output above but
-#                  the toolchain's vendor/build/lld22; alpine-opt.sh's package rebuild
-#                  also stays in vendor/build/alpine-opt, a cache that its stamp keys),
+#                  the toolchain's vendor/build/lld22; the Alpine package rebuild
+#                  (guest/distro/alpine/opt/build.sh) also stays in vendor/build/alpine-opt,
+#                  a cache that its stamp keys, unless KW_ALPINE_OPT_DIR=dir),
 #                  e.g. with KSRC to build a branch without touching the main outputs.
 #                  The CLI, the SDK build and the tests read vendor/build: give them
-#                  paths (--kernel, --initrd, UNKERNEL_TEST_KERNEL, KW_KERNEL)
+#                  paths (--kernel, --distro, UNKERNEL_TEST_KERNEL, UNKERNEL_TEST_DISTRO_DIR)
+#   KW_BASE_OUT=dir  `base` (and the bundle refresh of `kernel`, `smp`, `lower`, `datadisk`)
+#                  reads and writes base.cpio, base-test.cpio and unkernel.wasm there
+#                  instead of vendor/build/initramfs and vendor/build/bundle, and does not
+#                  copy unkernel.wasm to web/kernel/ (a build beside the main outputs);
+#                  KW_DISTRO_OUT=dir does the same for `distro` (guest/README.md)
 #   KW_SMP=1|0     1: the bundle must carry the SMP patch (fail otherwise); 0: no SMP
 #                  kernel in `all` and no patch in the bundle. Default: `all` builds
 #                  both and requires it, every other step adds it when it matches
@@ -115,6 +123,9 @@ BINARYEN_SHA256_aarch64=89c07ea56faf38d0fbecf36ca8ec0721756716185f265b568e133d42
 
 ksrc="${KSRC:-$vendor/src/linux-wasm-kernel}"
 kout="${KOUT:-$build/kernel}"
+# The base initramfs and its bundle (guest/lib/env.sh), the distro images.
+base_out="$(realpath -m "${KW_BASE_OUT:-$build/initramfs}")"
+distro_out="$(realpath -m "${KW_DISTRO_OUT:-$build/distro}")"
 kout_smp="${KOUT_SMP:-$build/kernel-smp}"
 toolchain="$vendor/toolchain/bin"
 
@@ -425,33 +436,34 @@ smp_bundle_args() {
 	fi
 }
 
-# A single-file kernel (the 32-bit-memory build) with Alpine (gzipped), its
-# command line, the data disk template and the patch to the SMP kernel
-# bundled in custom sections; the runtime boots it when given no initrd of
-# its own.
-# $1: the bundle's file name (default unkernel-alpine.wasm; another name,
-# the stats bundle, gets no SMP patch).
-bundle_alpine() {
-	local out="$build/bundle" cpio="$build/initramfs/alpine.cpio" name="${1:-unkernel-alpine.wasm}"
-	[ -f "$cpio" ] || { echo "bundle: no $cpio (run '$0 alpine')" >&2; return 1; }
+# A single-file kernel (the 32-bit-memory build) with the base initramfs
+# (gzipped), its command line, the data disk template and the patch to the
+# SMP kernel bundled in custom sections; the runtime boots it when given no
+# initrd of its own.
+# $1: the bundle's file name (default unkernel.wasm; another name, the
+# stats bundle, gets no SMP patch and no web/kernel/ copy).
+bundle_base() {
+	local name="${1:-unkernel.wasm}" out="$build/bundle" cpio="$base_out/base.cpio" web=1
+	if [ -n "${KW_BASE_OUT:-}" ]; then
+		out="$base_out" web=
+	fi
+	[ -f "$cpio" ] || { echo "bundle: no $cpio (run '$0 base')" >&2; return 1; }
 	[ -f "$kout/vmlinux32.wasm" ] || { echo "bundle: no $kout/vmlinux32.wasm (run '$0 lower')" >&2; return 1; }
 	mkdir -p "$out"
-	rm -f "$out/unkernel-alpine32.wasm"   # earlier name of this bundle
 	local dd=() smp=() args tpl="$build/disk/kwdata.kwsparse.gz"
 	if [ -f "$tpl" ]; then
 		dd=(--datadisk "$tpl")
 	else
 		echo "warning: no $tpl ('$0 datadisk' needs mke2fs); the bundle has no data disk template" >&2
 	fi
-	if [ "$name" = unkernel-alpine.wasm ]; then
+	if [ "$name" = unkernel.wasm ]; then
 		args="$(smp_bundle_args)" || return 1
 		[ -z "$args" ] || mapfile -t smp <<< "$args"
 	fi
 	node "$root/kernel/tools/bundle.mjs" "$kout/vmlinux32.wasm" "$cpio" -o "$out/$name" \
 		--cmdline "console=hvc0 rdinit=/init" "${dd[@]}" "${smp[@]}"
-	# The page's dev server runs web/kernel/'s copy (web/scripts/kernel.ts);
-	# a page build replaces it with the newest release's.
-	if [ "$name" = unkernel-alpine.wasm ]; then
+	# The page's dev server runs web/kernel/'s copy (web/scripts/kernel.ts).
+	if [ -n "$web" ] && [ "$name" = unkernel.wasm ]; then
 		mkdir -p "$root/web/kernel"
 		cp "$out/$name" "$root/web/kernel/$name"
 	fi
@@ -463,8 +475,8 @@ bundle_alpine() {
 # image file from it, and the guest mounts it at /data; a saved disk is never
 # replaced by a newer template.
 # The output is reproducible: fixed UUID, hash seed and timestamps, a pinned
-# mke2fs.conf (the ext4 features of the host defaults that alpine-disk.sh
-# uses, which kw_defconfig supports), inode tables and journal zeroed now.
+# mke2fs.conf (common ext4 host defaults, which kw_defconfig supports),
+# inode tables and journal zeroed now.
 # The orphan file is 32 KiB (8 blocks, ~8000 slots; the default for 4 GiB is
 # 1 MiB): the kernel reads it one block at a time at every mount, and on the
 # page each read was an IndexedDB round trip.
@@ -503,23 +515,24 @@ build_datadisk() {
 	node "$root/kernel/tools/kwsparse.mjs" encode "$img" -o "$out/kwdata.kwsparse.gz"
 	rm -f "$img" "$conf"
 }
-# After a kernel or Alpine rebuild: keep the bundle (the default of the CLI,
-# the SDK and the page) in step, when both inputs exist.
+# After a kernel rebuild: keep the bundle (the default of the CLI, the SDK
+# and the page) in step when the base initramfs exists, and with it the
+# ABI and base id in distros.json when there are distro images.
 refresh_bundle() {
-	[ -f "$build/initramfs/alpine.cpio" ] && [ -f "$kout/vmlinux32.wasm" ] || return 0
-	bundle_alpine
+	[ -f "$base_out/base.cpio" ] && [ -f "$kout/vmlinux32.wasm" ] || return 0
+	bundle_base
+	refresh_index
 }
 
-# The disk image is kept if it is newer than everything it is built from.
-disk_is_current() {
-	local img="$build/disk/alpine.ext4" f
-	[ -f "$img" ] || return 1
-	for f in "$root/kernel/guest/alpine-disk.sh" "$root/kernel/guest/alpine.sh" \
-		"$root/kernel/guest/alpine-opt.sh" "$root/kernel/guest/curl-shim.sh" "$root/kernel/guest/bwrap-shim.sh" \
-		"$root/kernel/guest/kw-data.sh" "$root/kernel/guest/kw-path.sh" "$root/kernel/tools/ext4-owners.py" \
-		"$root/kernel/tools/env.sh"; do
-		[ "$img" -nt "$f" ] || return 1
-	done
+# distros.json (guest/build.sh index), when there are distro images and the
+# bundle and the images are both the main outputs or both elsewhere
+# (KW_BASE_OUT and KW_DISTRO_OUT), so a build beside the main outputs does
+# not rewrite the main index.
+refresh_index() {
+	[ -z "${KW_BASE_OUT:-}" ] && [ -z "${KW_DISTRO_OUT:-}" ] ||
+		{ [ -n "${KW_BASE_OUT:-}" ] && [ -n "${KW_DISTRO_OUT:-}" ]; } || return 0
+	compgen -G "$distro_out/*.id" >/dev/null || return 0
+	"$root/guest/build.sh" index || echo "warning: distros.json in $distro_out not updated" >&2
 }
 
 case "$what" in
@@ -532,16 +545,14 @@ lower)
 	if [ -f "$kout_smp/vmlinux" ]; then lower_kernel "$kout_smp"; fi
 	refresh_bundle
 	;;
-alpine) "$root/kernel/guest/alpine.sh"; refresh_bundle ;;
-disk) "$root/kernel/guest/alpine-disk.sh" ;;
 datadisk) build_datadisk; refresh_bundle ;;
-bundle) bundle_alpine ;;
-ubuntu) "$root/kernel/guest/ubuntu-disk.sh" ;;
+base) "$root/guest/build.sh" base; bundle_base; refresh_index ;;
+distro) shift; "$root/guest/build.sh" distro "$@" ;;   # <name>.{erofs,ext4,id}, distros.json
 stats)
 	KWEMU_STATS=1
 	kout="${KOUT:-$build/kernel-stats}"
 	build_kernel up
-	bundle_alpine unkernel-alpine-stats.wasm
+	bundle_base unkernel-stats.wasm
 	;;
 all)
 	build_kernel up
@@ -549,16 +560,10 @@ all)
 		build_kernel smp
 		KW_SMP=1   # so the bundle must carry the patch
 	fi
-	"$root/kernel/guest/alpine.sh"
 	build_datadisk || true   # without mke2fs: a bundle without the data disk
-	bundle_alpine
-	if disk_is_current; then
-		echo "disk: keeping $build/disk/alpine.ext4 (kernel/build.sh disk rebuilds it)"
-	elif PATH="$PATH:/usr/sbin:/sbin" command -v mke2fs >/dev/null; then
-		"$root/kernel/guest/alpine-disk.sh"
-	else
-		echo "warning: no mke2fs (e2fsprogs); skipping the disk image" >&2
-	fi
+	"$root/guest/build.sh" base
+	bundle_base
+	"$root/guest/build.sh" distro   # every distro, then distros.json
 	;;
-*) echo "usage: $0 [toolchain|binaryen|kernel|smp|lower|alpine|disk|datadisk|bundle|ubuntu|stats|all]" >&2; exit 2 ;;
+*) echo "usage: $0 [toolchain|binaryen|kernel|smp|lower|datadisk|base|distro|stats|all]" >&2; exit 2 ;;
 esac

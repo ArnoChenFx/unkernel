@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# What a boot of the debian image to the console's prompt plus a first exec
+# reads, in that order: these files come first in debian.erofs, and the SDK
+# fetches them ahead in one request (guest/lib/image.sh). Recorded by
+# KW_DISTRO_TRACE=1 guest/build.sh distro debian; do not edit by hand.
+etc/bash.bashrc
+etc/bindresvport.blacklist
+etc/ca-certificates.conf
+etc/debconf.conf
+etc/debian_version
+etc/fstab
+etc/gai.conf
+etc/group
+etc/group-
+etc/gshadow
+etc/host.conf
+etc/hostname
+etc/hosts
+etc/ld.so.cache
+etc/nsswitch.conf
+etc/passwd
+etc/profile
+etc/profile.d/kw-apt.sh
+etc/profile.d/kw-prompt.sh
+etc/resolv.conf
+root/.bashrc
+root/.profile
+usr/bin/bash
+usr/bin/cat
+usr/bin/dash
+usr/bin/id
+usr/bin/ls
+usr/bin/run-parts
+usr/bin/setsid
+usr/lib/aarch64-linux-gnu/gconv/gconv-modules.cache
+usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+usr/lib/aarch64-linux-gnu/libc.so.6
+usr/lib/aarch64-linux-gnu/libcap.so.2.75
+usr/lib/aarch64-linux-gnu/libpcre2-8.so.0.14.0
+usr/lib/aarch64-linux-gnu/libselinux.so.1
+usr/lib/aarch64-linux-gnu/libtinfo.so.6.5
+usr/lib/kw-distro
+usr/lib/kw-image
+usr/lib/locale/C.utf8/LC_ADDRESS
+usr/lib/locale/C.utf8/LC_COLLATE
+usr/lib/locale/C.utf8/LC_CTYPE
+usr/lib/locale/C.utf8/LC_IDENTIFICATION
+usr/lib/locale/C.utf8/LC_MEASUREMENT
+usr/lib/locale/C.utf8/LC_MESSAGES/SYS_LC_MESSAGES
+usr/lib/locale/C.utf8/LC_MONETARY
+usr/lib/locale/C.utf8/LC_NAME
+usr/lib/locale/C.utf8/LC_NUMERIC
+usr/lib/locale/C.utf8/LC_PAPER
+usr/lib/locale/C.utf8/LC_TELEPHONE
+usr/lib/locale/C.utf8/LC_TIME
+usr/lib/os-release
+usr/local/sbin/kw-init
+usr/share/terminfo/l/linux
+usr/share/terminfo/x/xterm-256color
+usr/share/zoneinfo/Etc/UTC

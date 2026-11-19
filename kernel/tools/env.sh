@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-# Sourced by setup.sh and the kernel/ build scripts (bash). Sets:
+# Sourced by setup.sh and the kernel/ and guest/ build scripts (bash). Sets:
 #   root, vendor        repository root and its vendor/ directory
 #   build               where the build outputs go: $KW_BUILD (an absolute
 #                       path), default vendor/build; sources, downloads and
@@ -8,26 +8,13 @@
 #   zig                 the zig binary ($ZIG, else zig on PATH)
 # and provides real_bin, use_real_host_tools and fetch_verified.
 #
-# Pinned external inputs (the only things downloaded besides the git clones
-# in kernel/build.sh) also live here, so they are in one place.
+# The guest's pins are next to their builders (guest/*/pins.sh,
+# guest/tools/pins.sh), the kernel's and the toolchain's in kernel/build.sh.
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 vendor="$root/vendor"
 build="$(realpath -m "${KW_BUILD:-$vendor/build}")"
 zig="${ZIG:-$(command -v zig || true)}"
-
-ALPINE_VERSION=3.24.4
-ALPINE_TARBALL_NAME="alpine-minirootfs-$ALPINE_VERSION-aarch64.tar.gz"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION%.*}/releases/aarch64/$ALPINE_TARBALL_NAME"
-ALPINE_SHA256=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
-
-# Ubuntu Base (the minimal root file system), for kernel/guest/ubuntu-disk.sh
-# and the page's Ubuntu demo (web/src/demos/ubuntu.ts pins the same file).
-# The versioned release directory, which does not move on.
-UBUNTU_VERSION=26.10
-UBUNTU_TARBALL_NAME="ubuntu-base-$UBUNTU_VERSION-base-arm64.tar.gz"
-UBUNTU_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/$UBUNTU_VERSION/release/$UBUNTU_TARBALL_NAME"
-UBUNTU_SHA256=8b7ea4ed71a92873f7f4e260a3defe0d9ed85cb69c0155b12414208f79fa0f2d
 
 # real_bin NAME: the first NAME on PATH that is an ELF executable, else the
 # first NAME on PATH at all (empty if none). Some hosts put wrapper scripts

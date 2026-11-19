@@ -1,0 +1,3 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+The license notice that the kw layer installs as /usr/share/licenses/unkernel.

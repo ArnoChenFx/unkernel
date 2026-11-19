@@ -127,8 +127,7 @@ otherwise it goes on without a reschedule. A sleeper woken behind a busy
 task thus leaves once and then wakes on its new CPU. Sleepers are not
 interrupted to move them the way parking does: calls that do not restart
 would return EINTR at the scheduler's whim. Tasks preempted in the kernel
-(`cond_resched()`) stay where they are (status.md, SMP, Placement, has
-what that costs).
+(`cond_resched()`) stay where they are (status.md, SMP, open items).
 
 ### `/proc/kwmove`
 
@@ -297,7 +296,12 @@ when 0: one flag read per lock). `arch_spin_is_contended()` counts only
 tickets (its users, `spin_needbreak()` and `rwlock_needbreak()`, return 0
 without preemption anyway). qrwlock's `wait_lock` is an `arch_spinlock_t`,
 so it is unfair too; a waiting writer holds it, so readers still cannot
-starve a writer. Measurements: status.md, SMP, step 7.
+starve a writer. Measured 2026-11-17 (riscv64 guest, lowered kernels,
+JIT): beside 24 spinning host processes at 8 CPUs, 8 threads on one
+kernel spinlock took 0.097 s against 14.7 s with ticket locks; on an idle
+host the same case took 1.4x as long (0.102 against 0.073 s); realistic
+workloads (gcc, configure, node, Python, apk; 2-8 CPUs) measured the same
+either way (`vendor/smp-deferred/load/README.md`).
 
 ## Devices
 

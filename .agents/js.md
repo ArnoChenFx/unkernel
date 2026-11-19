@@ -432,7 +432,7 @@ parts that are easy to get wrong.
     may be on their way; then the writer waits up to 50 ms for CPU 0's
     host to take one, and if it took none, drops (logged) without waiting
     until it takes one again.
-  - Measured (2026-11-17, Node, 2 CPUs; status.md, SMP, console speed):
+  - Measured (2026-11-17, Node, 2 CPUs, riscv64 guest):
     `seq 1 200000` on CPU 1 as fast as on CPU 0 in every mode; output of
     a task on CPU 1 reaches the host about 0.1-0.3 ms after it was
     written also while CPU 0 runs user code (before: at CPU 0's next

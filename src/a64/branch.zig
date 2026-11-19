@@ -270,14 +270,11 @@ pub fn dcZva(s: c.St, va: u64) c.Error!void {
 }
 
 /// IC IVAU: the guest made new code at va visible (after DC CVAU and DSB;
-/// CTR_EL0.DIC = 0 requires it). THE hook where decoded or compiled code
-/// must be dropped: a decoded-code cache or JIT tier invalidates here (by
-/// page or all of it) and ends the block it is running, so that the next
-/// instruction is decoded again. Today Cpu.fenceI (the riscv FENCE.I
-/// point) revalidates every block and sets the smc flag the run loop
-/// checks after the instruction. No permission check (an IC IVAU of an
-/// unmapped address does nothing).
+/// CTR_EL0.DIC = 0 requires it). The decoded-op tier drops what this CPU
+/// decoded from va's physical page, ends the running block, and makes every
+/// other CPU drop its decoded code at its next block boundary (tier.icIvau,
+/// the code epoch). No permission check (an IC IVAU of an unmapped address
+/// does nothing here).
 pub fn icIvau(s: c.St, va: u64) void {
-    _ = va; // a later tier may invalidate only va's page
-    s.m.fenceI();
+    @import("tier.zig").icIvau(s.m, va);
 }

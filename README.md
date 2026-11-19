@@ -48,9 +48,9 @@ path runs at wasm speed.
   and https downloads in the guest reach 30 MB/s.
 
 These numbers were measured with the riscv64 guest. The aarch64 guest has
-no JIT yet, and CPU-bound work in it runs several times slower than
-riscv64 with its JIT (`apk search` over the main index: 5.9 s against
-0.75 s, 2026-11-17). CPU-heavy programs are well behind native.
+a decoded-op interpreter and no JIT yet, so CPU-bound work in it runs
+slower than riscv64 with its JIT (`apk search` over the main index: 1.1 s
+against 0.75 s, 2026-11-17). CPU-heavy programs are well behind native.
 [Benchmarks](#-benchmarks) has the full numbers.
 
 ## 🐧 A real kernel
@@ -210,7 +210,9 @@ gets real stacks that it can suspend and resume.
 
 For the riscv64 guest, hot user code goes through a second tier: a JIT that
 compiles riscv64 to wasm modules at run time, with output that matches the
-interpreter bit for bit. The aarch64 CPU has the interpreter only so far.
+interpreter bit for bit. The aarch64 CPU has the interpreter only so far:
+blocks of guest code are decoded once into compact ops, and what has no op
+runs through a reference interpreter.
 [Benchmarks](#-benchmarks) shows what each tier costs.
 
 Devices are small paravirtual drivers that talk to the JavaScript host:
@@ -241,8 +243,8 @@ faster than without it, which is still well behind native.
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
 - No ptrace register sets, so `strace` and `gdb` don't work. No seccomp.
-- No JIT for the aarch64 CPU yet, and no AdvSIMD (vector) floating point:
-  a program that uses it gets SIGILL (Alpine's busybox `sleep` does).
+- No JIT for the aarch64 CPU yet (its decoded-op interpreter runs integer
+  code at about 250-300 MIPS under Node).
 - A wasm trap in the kernel ends the session.
 
 ## 🧩 Use it from JavaScript

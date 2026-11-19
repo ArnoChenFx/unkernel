@@ -3,7 +3,9 @@
 // Differential tests of the A64 CPU: every guest in zig-out/guest/a64 runs
 // under qemu-aarch64 (the reference) and under kwemu through the test
 // harness (src/emu/harness.zig, C ABI only), native and wasm64; stdout and
-// the exit status must be identical. Without qemu-aarch64 on PATH (or
+// the exit status must be identical. A third run ("lockstep") runs kw_run's
+// decoded-op tier and the reference interpreter side by side in the native
+// harness and stops at the first event, register or memory difference. Without qemu-aarch64 on PATH (or
 // $QEMU_AARCH64) the comparison is skipped with a note, and the kwemu runs
 // must still exit with the status the guest expects.
 // Also checks that the wasm64 object imports nothing the kernel does not
@@ -28,6 +30,8 @@ const cases = [
   { guest: "simdtest", args: [], status: 0 },
   { guest: "fptest", args: [], status: 0 },
   { guest: "simdfptest", args: [], status: 0 },
+  { guest: "bench", args: ["200000", "2", "20"], status: 0 },
+  { guest: "kbench", args: ["interp", "2"], status: 0 },
 ];
 
 let failed = 0;
@@ -53,6 +57,11 @@ function runQemu(elf, args) {
 
 function runNative(elf, args) {
   const p = spawnSync(join(prefix, "bin", "kwemu-harness"), ["--stats", elf, ...args], { encoding: "utf8" });
+  return { status: p.status, out: p.stdout, err: p.stderr };
+}
+
+function runLockstep(elf, args) {
+  const p = spawnSync(join(prefix, "bin", "kwemu-harness"), ["--stats", "--lockstep", "1", elf, ...args], { encoding: "utf8" });
   return { status: p.status, out: p.stdout, err: p.stderr };
 }
 
@@ -106,7 +115,7 @@ for (const c of cases) {
     console.log(`FAIL a64 qemu ${c.guest}: status ${ref.status}, want ${c.status}\n${ref.err}`);
     continue;
   }
-  for (const [mode, run] of [["native", runNative], ["wasm64", runWasm]]) {
+  for (const [mode, run] of [["native", runNative], ["wasm64", runWasm], ["lockstep", runLockstep]]) {
     const r = await run(elf, c.args);
     let why = "";
     if (r.status !== c.status) why = `status ${r.status}, want ${c.status}`;
@@ -114,7 +123,7 @@ for (const c of cases) {
     if (why) {
       failed++;
       console.log(`FAIL a64 ${mode} ${c.guest}: ${why}\n--- stdout ---\n${r.out}--- stderr ---\n${r.err}`);
-    } else console.log(`ok   a64 ${mode.padEnd(6)} ${c.guest.padEnd(8)} ${ref ? "= qemu" : ""} (${stats(r)})`);
+    } else console.log(`ok   a64 ${mode.padEnd(8)} ${c.guest.padEnd(12)} ${ref ? "= qemu" : ""} (${stats(r)})`);
   }
 }
 

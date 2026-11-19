@@ -8,8 +8,8 @@ overview, and kernel/README.md covers the kernel side, the devices and the
 guest image.
 
 This branch (`aarch64`) switches the guest CPU to AArch64: `include/kw_emu.h`
-(ABI 9) and the kwemu library are A64 only (src/a64, .agents/a64.md, a
-reference interpreter, no JIT yet; AdvSIMD floating point is not done).
+(ABI 10) and the kwemu library are A64 only (src/a64, .agents/a64.md: a
+decoded-op tier over a reference interpreter, no JIT yet).
 The kernel presents the arm64 user ABI (kernel.md, arm64 user ABI), and
 the guest image is Alpine's aarch64 minirootfs (kernel/README.md, alpine).
 The riscv CPU is kept in src/cpu and src/emu for reference
@@ -20,7 +20,7 @@ The riscv CPU is kept in src/cpu and src/emu for reference
 | File | Covers |
 | --- | --- |
 | [.agents/kernel.md](.agents/kernel.md) | kernel tree and patch workflow, `kw_emu.h` contract, memory model, JSPI, host imports, IRQs, arm64 user ABI, config |
-| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, tests, coverage tool, state |
+| [.agents/a64.md](.agents/a64.md) | the AArch64 CPU (src/a64): layout, adding instructions, shared helpers, the decoded-op tier and its op set, coherence on SMP, tests, coverage tool, numbers, the JIT plan |
 | [.agents/kwemu.md](.agents/kwemu.md) | emulator and JIT design, invariants, tests, measured numbers, rejected designs (riscv; MMU and TLBs still shared) |
 | [.agents/js.md](.agents/js.md) | the SDK (`js/`): rules, build checks, disks, network stack and Wisp |
 | [.agents/web.md](.agents/web.md) | the browser page, releasing its kernel, engine quirks |
@@ -110,7 +110,8 @@ Details are in the area files.
   until they match (guest-packages.md).
 - Guest C programs in the image (`kernel/guest/*.c`) are built for the
   generic ARMv8.0 CPU. Check new code with the coverage classifier
-  (a64.md, Coverage tool): kwemu rejects AdvSIMD floating point for now.
+  (a64.md, Coverage tool): it lists what kwemu rejects (later architecture
+  features: LSE, SVE, SHA512, ...).
 - Overlay root and data disk rules are in data-disk.md. Never use
   `switch_root`, and never clear the IndexedDB store `kwdisk:kwdata-v1`.
 

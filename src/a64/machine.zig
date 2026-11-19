@@ -119,4 +119,29 @@ pub const Machine = struct {
         m.cpu.budget = budget;
         return run_mod.run(m.cpu, &m.regs);
     }
+    /// The reference loop (run.runRef) instead of kw_run's tier.
+    pub fn runRef(m: *Machine, budget: u64) u32 {
+        m.cpu.budget = budget;
+        return run_mod.runRef(m.cpu, &m.regs);
+    }
+    /// Another CPU on the same memory and page table (free with freeCpu).
+    pub fn newCpu(m: *Machine) !*Cpu {
+        const cpu_mem = try m.gpa.alignedAlloc(u8, .fromByteUnits(8), kwemu.cpu_size);
+        const cpu: *Cpu = @ptrCast(cpu_mem.ptr);
+        run_mod.cpuInit(cpu);
+        cpu.phys_base = m.cpu.phys_base;
+        kwemu.setPgd(cpu, m.root);
+        return cpu;
+    }
+    pub fn freeCpu(m: *Machine, cpu: *Cpu) void {
+        const p: [*]align(8) u8 = @ptrCast(cpu);
+        const sl: []align(8) u8 = p[0..kwemu.cpu_size];
+        m.gpa.free(sl);
+    }
+    /// The physical address mapped at `va` (0 if none).
+    pub fn paOf(m: *Machine, va: u64) u64 {
+        const e = m.slot(va).*;
+        if (e & V == 0) return 0;
+        return ((e >> 10) & ((1 << 44) - 1)) << 12;
+    }
 };

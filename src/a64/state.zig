@@ -42,7 +42,11 @@ pub const Priv = extern struct {
     /// Bytes the open exclusive access covers (LDXR: 1..8, LDXP: 8 or 16);
     /// meaningful only while Hart.resv is set.
     excl_size: u32 = 0,
-    _pad: u32 = 0,
+    /// Set by the tier's load slow path on a fault (opexec.zig, `ld`).
+    fault: u32 = 0,
     /// Second value of an LDXP (the word at resv + excl_size / 2).
     excl_val2: u64 = 0,
+    /// The cross-CPU code epoch this CPU has caught up with (tier.zig, code
+    /// coherence).
+    seen_epoch: u64 = 0,
 };

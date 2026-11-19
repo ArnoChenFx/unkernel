@@ -21,6 +21,11 @@ const a64_guests = [_][]const u8{
     "simdtest",
     "fptest",
     "simdfptest",
+    "bench",
+};
+/// A64 builds of portable C guests outside guest/a64 (name, source).
+const a64_ports = [_][2][]const u8{
+    .{ "kbench", "guest/kbench.c" },
 };
 /// Optional extensions (core.Ext) a gc guest is built with on top of rv64gc.
 fn guestExts(name: []const u8) std.Target.Cpu.Feature.Set {
@@ -86,8 +91,15 @@ pub fn build(b: *std.Build) void {
     // read-modify-writes, SC a compare-and-swap against the value LR read,
     // and FENCE a full barrier, for an SMP kernel's harts on one memory.
     const atomics = b.option(bool, "kwemu-atomics", "kwemu: build the wasm64 objects with the atomics and bulk-memory features, for a shared-memory kernel (default: false)") orelse false;
-    const kw_opts_mod = kwOptions(b, tail_call, stats, jit, jit_threshold, jit_grow, fp_fuzz);
-    const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, tail_call, stats, true, jit_threshold, jit_grow, fp_fuzz);
+    // kw_run = the A64 reference loop (src/a64/run.zig runRef) instead of
+    // the decoded-op tier: the oracle, for comparisons in the kernel.
+    const a64_ref = b.option(bool, "kwemu-a64-ref", "kwemu: kw_run runs the A64 reference interpreter instead of the decoded-op tier (default: false)") orelse false;
+    // Programs of the A64 tier's randomized block fuzz (src/a64/tier_tests.zig)
+    // in `zig build test`, and the first seed.
+    const a64_fuzz = b.option(u32, "kwemu-a64-fuzz", "kwemu: programs in the A64 tier-vs-reference block fuzz of zig build test (default: 0 = 300)") orelse 0;
+    const a64_fuzz_seed = b.option(u64, "kwemu-a64-fuzz-seed", "kwemu: first seed of the A64 block fuzz (default: 1)") orelse 1;
+    const kw_opts_mod = kwOptions(b, tail_call, stats, jit, jit_threshold, jit_grow, fp_fuzz, a64_ref, a64_fuzz, a64_fuzz_seed);
+    const kw_opts_jit_mod = if (jit) kw_opts_mod else kwOptions(b, tail_call, stats, true, jit_threshold, jit_grow, fp_fuzz, a64_ref, a64_fuzz, a64_fuzz_seed);
     const wasm64 = b.resolveTargetQuery(.{
         .cpu_arch = .wasm64,
         .os_tag = .freestanding,
@@ -155,12 +167,8 @@ pub fn build(b: *std.Build) void {
         .abi = .musl,
         .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.generic },
     });
-    for (a64_guests) |name| {
-        const mod = b.createModule(.{ .target = a64_target, .optimize = .ReleaseFast, .link_libc = true });
-        mod.addCSourceFile(.{ .file = b.path(b.fmt("guest/a64/{s}.c", .{name})), .flags = &.{ "-std=gnu11", "-Wall", "-fno-vectorize", "-fno-slp-vectorize" } });
-        const exe = b.addExecutable(.{ .name = b.fmt("a64-{s}", .{name}), .root_module = mod, .linkage = .static });
-        installGuest(b, exe, b.fmt("a64/{s}", .{name}));
-    }
+    for (a64_guests) |name| addA64Guest(b, a64_target, name, b.fmt("guest/a64/{s}.c", .{name}));
+    for (a64_ports) |p| addA64Guest(b, a64_target, p[0], p[1]);
 
     // A64 coverage classifier (test/a64-coverage.mjs): which raw words the
     // interpreter rejects as ILLEGAL, and the group each one is routed to.
@@ -218,7 +226,9 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests_a64.zig"),
             .target = native,
-            .optimize = .Debug,
+            // ReleaseSafe: the tier's block fuzz runs millions of
+            // instructions on two machines; safety checks stay on.
+            .optimize = .ReleaseSafe,
             .imports = &.{ .{ .name = "kw_h", .module = kw_h_native }, .{ .name = "kwemu_options", .module = kw_opts_mod } },
         }),
     });
@@ -245,8 +255,11 @@ pub fn build(b: *std.Build) void {
     b.step("fuzz", "Run the wasm64 unit tests with a long randomized interpreter-vs-JIT run (zig build fuzz -- N [SEED])").dependOn(&fuzz_run.step);
 }
 
-fn kwOptions(b: *std.Build, tail_call: bool, stats: bool, jit: bool, jit_threshold: u32, jit_grow: u32, fp_fuzz: u32) *std.Build.Module {
+fn kwOptions(b: *std.Build, tail_call: bool, stats: bool, jit: bool, jit_threshold: u32, jit_grow: u32, fp_fuzz: u32, a64_ref: bool, a64_fuzz: u32, a64_fuzz_seed: u64) *std.Build.Module {
     const o = b.addOptions();
+    o.addOption(bool, "a64_ref", a64_ref);
+    o.addOption(u32, "a64_fuzz", a64_fuzz);
+    o.addOption(u64, "a64_fuzz_seed", a64_fuzz_seed);
     o.addOption(bool, "tail_call", tail_call);
     o.addOption(bool, "stats", stats);
     o.addOption(bool, "jit", jit);
@@ -276,6 +289,14 @@ fn kwemuModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .strip = optimize != .Debug,
         .imports = &.{ .{ .name = "kw_h", .module = kw_h }, .{ .name = "kwemu_options", .module = opts } },
     });
+}
+
+fn addA64Guest(b: *std.Build, target: std.Build.ResolvedTarget, name: []const u8, src: []const u8) void {
+    const mod = b.createModule(.{ .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    mod.addCSourceFile(.{ .file = b.path(src), .flags = &.{ "-std=gnu11", "-Wall", "-fno-vectorize", "-fno-slp-vectorize" } });
+    mod.linkSystemLibrary("m", .{});
+    const exe = b.addExecutable(.{ .name = b.fmt("a64-{s}", .{name}), .root_module = mod, .linkage = .static });
+    installGuest(b, exe, b.fmt("a64/{s}", .{name}));
 }
 
 fn installGuest(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8) void {

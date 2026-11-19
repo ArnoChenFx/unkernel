@@ -558,15 +558,25 @@ qemu's TCG keeps writing new code, which kwemu interprets or recompiles.
 
 ## Open issues
 
-- **aarch64 image: AdvSIMD floating point.** kwemu rejects it (a64.md),
-  and Alpine's own builds use a little of it: `fcvtzs`, `scvtf`,
-  `ucvtf`, `fcvtzu` on D registers (busybox, musl, libcrypto) and `fneg
-  .2d` (musl's libm). busybox `sleep` (any argument) dies with SIGILL at
-  `fcvtzs d31, d0` (0x5ee1b81f), which fails 4 kwtty tests of `pnpm
-  test:api` and makes `kw-shutdown`'s `sleep 0.2` print "Illegal
-  instruction" (harmless: the next commands still run). kwbench has
-  `scvtf d0, d0` and `scvtf d1, d1`. Everything else in the image is clean
-  (2026-11-17, a64.md, The image).
+- **aarch64: no JIT yet.** kw_run runs a decoded-op tier (a64.md): on
+  the Alpine image about 3.3-4.9x the reference interpreter (`apk search`
+  over the main index 1.1 s, riscv64 with its JIT 0.75 s; 2026-11-17), the
+  wasm64 harness 245-295 MIPS on integer code. The JIT is planned in
+  a64.md (JIT plan): factor jit.zig's ISA-neutral core behind hooks, then
+  parallel streams for ALU and lazy flags, memory, and branches and
+  regions, with `src/a64/jit/` as their skeleton. AdvSIMD and FP stay
+  generic ops (the reference interpreter) in the tier.
+- **Two timing-sensitive cases in `pnpm test:api`** fail now and then,
+  more often since the aarch64 CPU got faster (2026-11-17, decoded-op tier
+  bundle: 7 runs, 1 clean, 4 with the first, 2 with the second; a bundle
+  with the reference-loop kernel: 2 runs, one with the first):
+  `snapshot() with network and vsock` takes the snapshot right after
+  accepting a vsock connection, and the host refuses it while vsock
+  packets are in flight ("snapshot: vsock packets in flight"; the test
+  does not retry); the inline `display, evdev and sound` case sums the
+  PCM chunks 300 ms after glimmer's "test sound done" and then misses the
+  last one (65966 or 65919 of 66150 frames), while
+  `test/glimmer-check.mjs --run` gets all 66150, sample exact (3 of 3).
 - **aarch64 image: not yet rerun.** The Ubuntu arm64 disk, x86_64, i386
   and arm binaries through qemu-user (riscv64 works: a static riscv64
   program installed qemu-riscv64 and its library root on first run, 60 s,

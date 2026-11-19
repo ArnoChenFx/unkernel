@@ -1,24 +1,29 @@
 # kwemu and its JIT tier
 
 On this branch the library exports the AArch64 CPU (a64.md): `kw_run` is
-the A64 interpreter and `struct kw_regs` the A64 register file (ABI 9).
-This file describes the RV64GC CPU that kwemu was until ABI 8 (plus
-optional extensions, below), kept for reference. What A64 still shares
-with it: `kwemu.Cpu` in `src/emu/kwemu.zig` (struct kw_cpu, the Sv39
-walker, the TLBs and flushes, `Hart.resv` as the exclusive monitor) and
-`src/cpu/fpu.zig`. The riscv guests and unit tests build only with
-`-Driscv-legacy` (`zig build test-riscv`: the native and the wasm64+JIT unit
-tests); the harness is A64-only, so `test/kwemu-test.mjs`,
-`kwemu-bench.mjs` and the riscv guests' harness runs do not work. The rest
-of this file has the design, the invariants that tests guarded, the numbers
-that drove decisions, and the designs that were tried and rejected.
+the A64 decoded-op tier over the A64 reference interpreter, and `struct
+kw_regs` the A64 register file (ABI 10). This file describes the RV64GC
+CPU that kwemu was until ABI 8 (plus optional extensions, below), kept for
+reference. What A64 shares with it: `kwemu.Cpu` in `src/emu/kwemu.zig`
+(struct kw_cpu, the Sv39 walker, the TLBs and flushes, `Hart.resv` as the
+exclusive monitor, and the block cache: `lookupIn` takes the ISA's block
+hooks, riscv's `Rv` or A64's `tier.Blocks`, so the Interpreter section's
+lookup, generations, revalidation, code tracking and arena resets hold
+for both) and `src/cpu/fpu.zig`. The riscv guests and unit tests build only
+with `-Driscv-legacy` (`zig build test-riscv`: the native and the
+wasm64+JIT unit tests); the harness is A64-only, so `test/kwemu-test.mjs`
+and the riscv guests' harness runs do not work, and `kwemu-bench.mjs` runs
+the A64 benchmark guests (a64.md, Numbers). The rest of this file has the
+design, the invariants that tests guarded, the numbers that drove
+decisions, and the designs that were tried and rejected; a64.md has the
+A64 tier's own and the plan for its JIT.
 
 ## Sources and outputs
 
 | Path | What |
 | --- | --- |
 | `src/libkwemu.zig` | library root: exports the A64 C ABI (`src/a64/run.zig`) |
-| `src/emu/kwemu.zig` | Sv39 walker and TLBs (shared with A64), riscv block cache (lookup, validation, SMC tracking), the riscv `run` |
+| `src/emu/kwemu.zig` | Sv39 walker and TLBs, the block cache (lookup, validation, SMC tracking; generic over the ISA's block hooks, shared with A64), the riscv block hooks (`Rv`) and `run` |
 | `src/emu/exec.zig` | decoder (RV64GC to ops), op semantics, dispatch |
 | `src/emu/jit.zig` | JIT tier: block and region emitter, slot pool, compile policy, host imports |
 | `src/cpu/core.zig` | reference interpreter; kwemu runs its `generic` ops through it |
@@ -28,7 +33,7 @@ that drove decisions, and the designs that were tried and rejected.
 | `guest/` | test guests: `isatest`, `fptest`, `atomics`, `kbench`, `aestest` (+zkne,+zknd), `bktest` (+zbc,+zbkb,+zbkc,+zbkx), `zbtest` (+zba,+zbb,+zbs,+zicond), `rvatest` (+zcb,+zimop,+zcmop,+zicbom,+zicboz,+zawrs), `zfatest` (+zfa), `zfhtest` (+zfhmin), `jalrtest` (C, static musl); `hello`, `bench` (Zig, `rt.zig`) |
 | `test/kwemu-test.mjs`, `kwemu-unit-wasm.mjs` | run by `zig build test` |
 | `test/kwemu-jit-host.mjs` | JS host of the JIT imports, for tests and benchmarks |
-| `test/kwemu-bench.mjs` | benchmark table (`--jit`, `--median --reps N`, `--wasm-only`) |
+| `test/kwemu-bench.mjs` | A64 benchmark table (`--ref`, `--median --reps N`, `--wasm-only`; a64.md, Numbers) |
 | `test/jit-proto.mjs` | the standalone feasibility prototype of the JIT |
 
 `zig build` writes `zig-out/lib/{kwemu.o,libkwemu.a}` (wasm64, cpu `mvp` +
@@ -43,7 +48,9 @@ exits per KiB of module, 0 = never; see Regions), `-Dkwemu-stats`
 `kernel/build.sh stats` builds a kernel and bundle with it),
 `-Dkwemu-fp-fuzz=N`, `-Dkwemu-tail-call` (off, see Rejected designs),
 `-Dlib-optimize` (ReleaseFast) and `-Doptimize` (native library and
-harness).
+harness). A64 only (a64.md, Decoded-op tier): `-Dkwemu-a64-ref` (kw_run
+is the reference loop), `-Dkwemu-a64-fuzz=N` and `-Dkwemu-a64-fuzz-seed`
+(the block fuzz in `zig build test`).
 
 ## Interpreter
 

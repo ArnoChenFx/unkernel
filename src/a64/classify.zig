@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! kwemu-a64-classify: for each raw A64 instruction word, the group file
-//! decode.zig routes it to and whether the interpreter implements it
+//! decode.zig routes it to, whether the reference interpreter implements it
 //! (anything but KW_EV_ILLEGAL when executed once on a scratch machine:
-//! a fault, syscall or breakpoint counts as implemented).
+//! a fault, syscall or breakpoint counts as implemented), and the op kind
+//! the decoded-op tier gives it (ops.zig; `generic` = the reference
+//! interpreter runs it).
 //!
 //! usage: kwemu-a64-classify words.txt
 //!   input: one word per line, 8 hex digits first, anything after ignored
-//!   output: "<word> <group> ok|ILLEGAL" per input line, same order
+//!   output: "<word> <group> ok|ILLEGAL <op>" per input line, same order
 //! test/a64-coverage.mjs builds the corpora and the report on top of it.
 
 const std = @import("std");
 const decode = @import("decode.zig");
+const ops = @import("ops.zig");
 const mach = @import("machine.zig");
 
 pub fn main(init: std.process.Init) !u8 {
@@ -46,9 +49,11 @@ pub fn main(init: std.process.Init) !u8 {
         for (&m.regs.x) |*x| x.* = data_va + 0x800;
         m.regs.sp = data_va + 0x1000;
         m.regs.pc = code_va;
-        const ev = m.run(1);
+        // The reference loop: it fetches the word every time (the tier
+        // would keep the block it decoded from the previous word).
+        const ev = m.runRef(1);
         const ok = ev != mach.EV_ILLEGAL;
-        try out.print(gpa, "{x:0>8} {s} {s}\n", .{ w, @tagName(decode.route(w)), if (ok) "ok" else "ILLEGAL" });
+        try out.print(gpa, "{x:0>8} {s} {s} {s}\n", .{ w, @tagName(decode.route(w)), if (ok) "ok" else "ILLEGAL", @tagName(ops.decode(w, code_va).op.h) });
     }
     try std.Io.File.stdout().writeStreamingAll(io, out.items);
     return 0;

@@ -5,7 +5,7 @@
 //! Imports (module "env"): host_write(fd: i32, ptr, len), host_now_ns() -> f64.
 //! Exports: kwh_buf(len) -> ptr (scratch for ELF image + NUL-separated argv),
 //!          kwh_run(elf_len, args_len, flags) -> exit status
-//!          (flags: 1 = stats, 2 = verbose).
+//!          (flags: 1 = stats, 2 = verbose, 4 = reference interpreter).
 
 const std = @import("std");
 const kw = @import("kw_h");
@@ -49,17 +49,19 @@ export fn kwh_run(elf_len: usize, args_len: usize, flags: u32) i32 {
         const start = std.mem.alignForward(usize, @as(usize, @intCast(old)) * 65536, 4096);
         phys = @as([*]align(4096) u8, @ptrFromInt(start))[0..phys_size];
     }
-    var argv: [32][]const u8 = undefined;
+    var argv: [harness.max_args - 3][]const u8 = undefined;
     var argc: usize = 0;
     var it = std.mem.splitScalar(u8, scratch[elf_len..][0..args_len], 0);
     while (it.next()) |s| {
-        if (s.len == 0 or argc == argv.len) continue;
+        if (s.len == 0) continue;
+        if (argc == argv.len) return -3;
         argv[argc] = s;
         argc += 1;
     }
     var m = harness.Machine.init(.{ .write = hostWrite, .now_ns = nowNs }, .{
         .stats = flags & 1 != 0,
         .verbose = flags & 2 != 0,
+        .ref = flags & 4 != 0,
     }, phys.?, &cpu_block);
     m.load(scratch[0..elf_len], argv[0..argc], &.{ "HOME=/", "PATH=/bin", "TERM=dumb" }) catch |e| {
         hostWrite(2, @errorName(e));

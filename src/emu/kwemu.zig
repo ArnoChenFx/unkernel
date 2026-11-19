@@ -23,7 +23,7 @@ const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
 pub const Regs = core.Regs;
-pub const abi_version: u32 = 9;
+pub const abi_version: u32 = 10;
 pub const cpu_size: usize = 8 << 20;
 
 pub const Event = extern struct {
@@ -296,10 +296,85 @@ pub const Cpu = extern struct {
 
     /// FENCE.I: every block must be revalidated before it runs again.
     pub fn fenceI(self: *Cpu) void {
+        self.retireAll();
+        self.priv.smc = 1;
+    }
+
+    /// Retire every exec-TLB generation: each block is revalidated (same
+    /// pc, host address and raw bits) before it runs again. Decoded code
+    /// stays in the arena, so blocks that did not change cost one compare
+    /// of their raw words.
+    pub fn retireAll(self: *Cpu) void {
         for (&self.priv.tlb_x) |*e| {
             if (e.gen != 0) e.gen = self.newGen();
         }
+    }
+
+    /// A64 IC IVAU (by VA, to the point of unification; the I-cache is PIPT
+    /// as CTR_EL0 says): retire the generations of every exec mapping of
+    /// the physical page that holds `va`, and end the running block
+    /// (`smc`). Cheap when that page holds no decoded code (the code-page
+    /// filter says so): new code written for the first time costs only the
+    /// two exec-TLB ways of va's own page. No permission check and no fault
+    /// (an unmapped va has no decoded code that could still be trusted: its
+    /// unmap was flushed).
+    pub fn icInvalidate(self: *Cpu, va: u64) void {
+        const vpn = va >> page_shift;
+        for (self.priv.tlb_x[2 * @as(usize, @intCast(vpn & (tlb_n - 1))) ..][0..2]) |*e| {
+            if (e.tag == vpn and e.gen != 0) e.gen = self.newGen();
+        }
+        if (self.hostPageOf(va)) |page| {
+            if (self.isMarked(page)) {
+                for (&self.priv.tlb_x) |*e| {
+                    if (e.gen != 0 and e.tag != invalid_tag and (e.tag << page_shift) +% e.add == page) e.gen = self.newGen();
+                }
+            }
+        }
         self.priv.smc = 1;
+    }
+
+    /// Host address of the page mapped at `va` (any permission), without a
+    /// fault or a TLB fill; null if it is not mapped.
+    fn hostPageOf(self: *Cpu, va: u64) ?u64 {
+        const vpn = va >> page_shift;
+        const x = self.priv.tlb_x[2 * @as(usize, @intCast(vpn & (tlb_n - 1))) ..][0..2];
+        for (x) |e| if (e.tag == vpn) return (vpn << page_shift) +% e.add;
+        const r = self.priv.tlb_r[@intCast(vpn & (dtlb_n - 1))];
+        if (r.tag == vpn) return (vpn << page_shift) +% r.add;
+        const top = va >> 38;
+        if (top != 0 and top != (1 << 26) - 1) return null;
+        var table = self.pgd;
+        var level: u6 = 2;
+        while (true) : (level -= 1) {
+            const e = hostLoad(u64, self.phys_base +% table +% ((va >> (page_shift + 9 * @as(u6, level))) & 511) * 8);
+            if (e & pte_v == 0) return null;
+            if (e & (pte_r | pte_w | pte_x) != 0) {
+                if (level != 0) return null;
+                return self.phys_base +% (((e >> 10) & ppn_mask) << page_shift);
+            }
+            if (level == 0) return null;
+            table = ((e >> 10) & ppn_mask) << page_shift;
+        }
+    }
+
+    /// Host address of `va` if the read TLB maps all `len` bytes from it
+    /// within one page (else null: take the per-access path).
+    pub inline fn readFast(self: *Cpu, va: u64, comptime len: u64) ?u64 {
+        const e = &self.priv.tlb_r[@intCast((va >> page_shift) & (dtlb_n - 1))];
+        return if (e.tag == (va +% (len - 1)) >> page_shift) va +% e.add else null;
+    }
+    /// Host address of `va` if the write TLB maps all `len` bytes from it
+    /// within one page and the page holds no decoded code (else null: take
+    /// the per-access path, which tracks stores into code).
+    pub inline fn writeFast(self: *Cpu, va: u64, comptime len: u64) ?u64 {
+        const e = &self.priv.tlb_w[@intCast((va >> page_shift) & (dtlb_n - 1))];
+        return if (e.tag == (va +% (len - 1)) >> page_shift) va +% e.add else null;
+    }
+    pub inline fn hostRead(comptime T: type, addr: u64) T {
+        return hostLoad(T, addr);
+    }
+    pub inline fn hostWrite(comptime T: type, addr: u64, v: T) void {
+        hostStore(T, addr, v);
     }
 
     inline fn newGen(self: *Cpu) u64 {
@@ -490,7 +565,7 @@ pub const Cpu = extern struct {
         const b0 = try self.readHost(va);
         const second = (va | page_mask) +% 1;
         const b1 = try self.readHost(second);
-        const n0: usize = @intCast(second - va);
+        const n0: usize = @intCast(second -% va); // wraps for an access that crosses 2^64
         var buf: [@sizeOf(T)]u8 = undefined;
         for (0..@sizeOf(T)) |k| buf[k] = if (k < n0) hostLoad(u8, b0 + k) else hostLoad(u8, b1 + (k - n0));
         return std.mem.readInt(T, &buf, .little);
@@ -516,7 +591,7 @@ pub const Cpu = extern struct {
         if (off + @sizeOf(T) <= page_size) return hostStore(T, try self.writeHost(va, @sizeOf(T)), v);
         // Translate both pages first so a fault leaves memory untouched.
         const second = (va | page_mask) +% 1;
-        const n0 = second - va;
+        const n0 = second -% va; // wraps for an access that crosses 2^64
         const b0 = try self.writeHost(va, n0);
         const b1 = try self.writeHost(second, @sizeOf(T) - n0);
         var buf: [@sizeOf(T)]u8 = undefined;
@@ -566,8 +641,25 @@ pub const Cpu = extern struct {
     }
 
     // ---- block lookup / decode --------------------------------------------------
+    //
+    // The cache machinery (block table, generations, revalidation, code-page
+    // marks, arena resets) is ISA-neutral; what a block's ops are, how they
+    // are decoded and how a block is checked against memory comes from a
+    // comptime hook type `D` (riscv: `Rv` below; A64: src/a64/tier.zig):
+    //   D.max_slots: u32                 op-arena slots one block may use
+    //   D.LookupError: error set         core.Error plus anything D.check returns
+    //   D.check(pc) D.LookupError!void   before the exec fetch of a new block
+    //   D.validate(cpu, b) bool          same raw instruction bits as decoded
+    //   D.decode(cpu, b, pc, host)       fill b.{pc, host, end_pc, op, n,
+    //                                    ninsn, mask} and its arena slots,
+    //                                    starting at ops_used (advance it)
 
     inline fn lookup(self: *Cpu, pc: u64) core.Error!*Block {
+        return self.lookupIn(Rv, pc);
+    }
+
+    /// The block at `pc`, decoded by `D` if no trusted copy is cached.
+    pub inline fn lookupIn(self: *Cpu, comptime D: type, pc: u64) D.LookupError!*Block {
         const set = blockSet(pc);
         // A generation is unique to one fill, so a block whose tgen equals
         // either entry of pc's exec-TLB set was validated under that live
@@ -579,15 +671,16 @@ pub const Cpu = extern struct {
         if (b0.pc == pc and (b0.tgen == g0 or b0.tgen == g1)) return b0;
         const b1 = &self.priv.blocks[set + 1];
         if (b1.pc == pc and (b1.tgen == g0 or b1.tgen == g1)) return b1;
-        return self.lookupSlow(set, pc);
+        return self.lookupSlow(D, set, pc);
     }
 
-    noinline fn lookupSlow(self: *Cpu, set: usize, pc: u64) core.Error!*Block {
+    noinline fn lookupSlow(self: *Cpu, comptime D: type, set: usize, pc: u64) D.LookupError!*Block {
         count(self, "lookups_slow", 1);
+        try D.check(pc);
         const host = try self.execHost(pc);
         const gen = self.execGen(pc);
         for (self.priv.blocks[set..][0..2]) |*b| {
-            if (b.pc == pc and b.host == host and self.validate(b)) {
+            if (b.pc == pc and b.host == host and D.validate(self, b)) {
                 b.tgen = gen;
                 self.markCode(host & ~page_mask, b.mask);
                 count(self, "revalidated", 1);
@@ -602,8 +695,36 @@ pub const Cpu = extern struct {
             v.* ^= 1;
             break :blk w;
         };
-        return self.decodeBlock(&self.priv.blocks[set + way], pc, host, gen);
+        const b = &self.priv.blocks[set + way];
+        if (self.priv.ops_used + D.max_slots > nops) self.resetCache();
+        if (jit.enabled) jit.drop(self, b); // its code belongs to the old contents
+        D.decode(self, b, pc, host);
+        b.tgen = gen;
+        b.jx = if (jit.enabled) jit.newBlock(self) else .{};
+        self.markCode(host & ~page_mask, b.mask);
+        return b;
     }
+
+    /// The op arena as `T` (a 16-byte op type of some ISA).
+    pub inline fn opArena(self: *Cpu, comptime T: type) [*]T {
+        comptime std.debug.assert(@sizeOf(T) == @sizeOf(Op) and @alignOf(T) <= @alignOf(Op));
+        return @ptrCast(&self.priv.ops);
+    }
+
+    /// riscv block hooks (kept for reference; see `lookupIn`).
+    const Rv = struct {
+        const max_slots = max_block + 1;
+        const LookupError = core.Error;
+        inline fn check(pc: u64) core.Error!void {
+            _ = pc;
+        }
+        fn validate(self: *Cpu, b: *const Block) bool {
+            return self.validate(b);
+        }
+        fn decode(self: *Cpu, b: *Block, pc: u64, host: u64) void {
+            self.decodeBlock(b, pc, host);
+        }
+    };
 
     /// Same pc, same host address, same raw instruction bits.
     fn validate(self: *Cpu, b: *const Block) bool {
@@ -622,9 +743,7 @@ pub const Cpu = extern struct {
         return true;
     }
 
-    fn decodeBlock(self: *Cpu, b: *Block, pc: u64, host: u64, gen: u64) *Block {
-        if (self.priv.ops_used + max_block + 1 > nops) self.resetCache();
-        if (jit.enabled) jit.drop(self, b); // its code belongs to the old contents
+    fn decodeBlock(self: *Cpu, b: *Block, pc: u64, host: u64) void {
         const start: u32 = @intCast(self.priv.ops_used);
         const ops = self.priv.ops[start..][0 .. max_block + 1];
         const page = host & ~page_mask;
@@ -686,20 +805,17 @@ pub const Cpu = extern struct {
         self.priv.ops_used += n;
         b.* = .{
             .pc = pc,
-            .tgen = gen,
+            .tgen = no_tgen,
             .host = host,
             .end_pc = cur,
             .op = start,
             .n = @intCast(n),
             .ninsn = @intCast(ninsn),
             .mask = mask,
-            .jx = if (jit.enabled) jit.newBlock(self) else .{},
         };
-        self.markCode(page, b.mask);
-        return b;
     }
 
-    /// pc of the op `k` instructions into block `b`.
+    /// pc of the op `k` instructions into block `b` (riscv).
     fn pcAt(self: *Cpu, b: *const Block, k: usize) u64 {
         var pc = b.pc;
         for (self.priv.ops[b.op..][0..k]) |op| pc = nextPc(op, pc);

@@ -15,6 +15,13 @@
 //!   * runs in budget slices, clears the exclusive monitor on every trap
 //!     return, and services ~40 Linux syscalls (enough for static musl).
 //!
+//! `--ref` runs the reference interpreter (kw_debug_run_ref) instead of
+//! kw_run's decoded-op tier. `lockstep` runs the guest on two machines, kw_run
+//! and the reference, in slices of random length, and compares the event,
+//! icount, every register and (every 64 events and at the end) all memory
+//! after each slice; time is then a function of icount, so both see the
+//! same.
+//!
 //! Platform-independent: native and wasm front ends supply a `Host`.
 
 const std = @import("std");
@@ -30,7 +37,21 @@ pub const Options = struct {
     slice: u64 = 2_000_000,
     stats: bool = false,
     verbose: bool = false,
+    /// Run the reference interpreter instead of kw_run.
+    ref: bool = false,
+    /// clock_gettime from icount (lockstep: both machines see the same time).
+    fake_time: bool = false,
 };
+
+/// Not in the ABI: the A64 reference loop (src/a64/run.zig).
+extern fn kw_debug_run_ref(cpu: *kw.struct_kw_cpu, regs: *kw.struct_kw_regs) u32;
+const kw_options = @import("kwemu_options");
+/// -Dkwemu-stats only: kwemu.Stats (11 counters, then executed ops per
+/// kind; more after them that the harness does not read).
+extern fn kw_debug_stats(cpu: *kw.struct_kw_cpu, out: *[11 + 192 + 2 + 192 + 40 + 64]u64) void;
+
+/// Most argv + envp strings `load` takes.
+pub const max_args = 1024;
 
 const page: u64 = 4096;
 const pa_base: u64 = 0x8000_0000;
@@ -277,7 +298,8 @@ pub const Machine = struct {
         // file name and a null word there): libc may read a few bytes past
         // a string's end (aarch64 memchr loads 16 bytes at a time).
         var sp = stack_top - 16;
-        var ptrs: [64]u64 = undefined;
+        if (argv.len + envp.len > max_args) return error.TooManyArgs;
+        var ptrs: [max_args]u64 = undefined;
         var n: usize = 0;
         for (argv) |a| {
             sp -= a.len + 1;
@@ -345,31 +367,43 @@ pub const Machine = struct {
 
     // ---- run loop ------------------------------------------------------------------
 
+    /// One kw_run (or reference) call with `budget`; returns the event kind.
+    fn step(m: *Machine, budget: u64) u32 {
+        m.cpu.budget = budget;
+        return if (m.opt.ref) kw_debug_run_ref(m.cpu, &m.regs) else kw.kw_run(m.cpu, &m.regs);
+    }
+
+    /// Act on an event as the kernel would.
+    fn service(m: *Machine, kind: u32) void {
+        const ev = m.cpu.ev;
+        switch (kind) {
+            kw.KW_EV_BUDGET => m.stats.slices += 1,
+            kw.KW_EV_INTERRUPT => {},
+            kw.KW_EV_SYSCALL => {
+                m.syscall();
+                kw.kw_clear_reservation(m.cpu);
+            },
+            kw.KW_EV_FAULT => {
+                m.fault(ev.addr, ev.access);
+                kw.kw_clear_reservation(m.cpu);
+            },
+            kw.KW_EV_ILLEGAL => m.die(4, "illegal instruction 0x{x} at pc=0x{x}", .{ ev.insn, m.pc() }),
+            kw.KW_EV_BREAKPOINT => m.die(5, "breakpoint at pc=0x{x}", .{m.pc()}),
+            kw.KW_EV_MISALIGNED => m.die(7, "misaligned access at 0x{x} pc=0x{x}", .{ ev.addr, m.pc() }),
+            else => m.die(6, "unknown event {d}", .{kind}),
+        }
+    }
+
+    fn now(m: *Machine) u64 {
+        return if (m.opt.fake_time) m.cpu.icount * 10 else m.host.now_ns();
+    }
+
     /// Run until the guest exits; returns its exit status (128+sig on a fatal trap).
     pub fn run(m: *Machine) u8 {
         const t0 = m.host.now_ns();
-        while (m.exit_code == null) {
-            m.cpu.budget = m.opt.slice;
-            const kind = kw.kw_run(m.cpu, &m.regs);
-            const ev = m.cpu.ev;
-            switch (kind) {
-                kw.KW_EV_BUDGET => m.stats.slices += 1,
-                kw.KW_EV_INTERRUPT => {},
-                kw.KW_EV_SYSCALL => {
-                    m.syscall();
-                    kw.kw_clear_reservation(m.cpu);
-                },
-                kw.KW_EV_FAULT => {
-                    m.fault(ev.addr, ev.access);
-                    kw.kw_clear_reservation(m.cpu);
-                },
-                kw.KW_EV_ILLEGAL => m.die(4, "illegal instruction 0x{x} at pc=0x{x}", .{ ev.insn, m.pc() }),
-                kw.KW_EV_BREAKPOINT => m.die(5, "breakpoint at pc=0x{x}", .{m.pc()}),
-                kw.KW_EV_MISALIGNED => m.die(7, "misaligned access at 0x{x} pc=0x{x}", .{ ev.addr, m.pc() }),
-                else => m.die(6, "unknown event {d}", .{kind}),
-            }
-        }
+        while (m.exit_code == null) m.service(m.step(m.opt.slice));
         const dt = @max(m.host.now_ns() - t0, 1);
+        if (m.opt.stats and kw_options.stats) m.printKwStats();
         if (m.opt.stats) {
             const n = m.cpu.icount;
             const mips = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(dt)) * 1000.0;
@@ -379,6 +413,33 @@ pub const Machine = struct {
             });
         }
         return m.exit_code.?;
+    }
+
+    /// -Dkwemu-stats: kwemu's counters and the 40 most executed op kinds
+    /// (indexes of src/a64/ops.zig's H).
+    fn printKwStats(m: *Machine) void {
+        var st: [11 + 192 + 2 + 192 + 40 + 64]u64 = undefined;
+        kw_debug_stats(m.cpu, &st);
+        m.print("[kwemu-stats] lookups_slow={d} revalidated={d} decoded={d} resets={d} blocks={d} block_insns={d} single_steps={d} walks r/w/x={d}/{d}/{d} generic={d}\n", .{
+            st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10],
+        });
+        const hist = st[11..][0..192];
+        var total: u64 = 0;
+        for (hist) |v| total += v;
+        var done: [192]bool = @splat(false);
+        m.print("[kwemu-ops]", .{});
+        for (0..40) |_| {
+            var best: usize = 0;
+            var bv: u64 = 0;
+            for (hist, 0..) |v, i| if (!done[i] and v > bv) {
+                bv = v;
+                best = i;
+            };
+            if (bv == 0) break;
+            done[best] = true;
+            m.print(" {d}:{d}.{d}", .{ best, bv * 100 / @max(total, 1), (bv * 1000 / @max(total, 1)) % 10 });
+        }
+        m.print("\n", .{});
     }
 
     fn die(m: *Machine, sig: u8, comptime fmt: []const u8, args: anytype) void {
@@ -451,7 +512,7 @@ pub const Machine = struct {
             99 => 0, // set_robust_list
             101, 124 => 0, // nanosleep, sched_yield
             113 => blk: { // clock_gettime
-                const ns = m.host.now_ns();
+                const ns = m.now();
                 m.put64(a[1], ns / 1_000_000_000);
                 m.put64(a[1] + 8, ns % 1_000_000_000);
                 break :blk 0;
@@ -540,3 +601,58 @@ pub const Machine = struct {
         return va;
     }
 };
+
+/// Run the guest on `t` (kw_run) and `r` (the reference) in lockstep: random
+/// slices on `t`, then `r` exactly to the same icount, and both must agree
+/// on the event, every register and memory. Returns the exit status, or 99
+/// on the first difference (after printing it).
+pub fn lockstep(t: *Machine, r: *Machine, seed: u64) u8 {
+    var rng: u64 = seed *% 2 +% 1;
+    var events: u64 = 0;
+    r.opt.ref = true;
+    t.opt.fake_time = true;
+    r.opt.fake_time = true;
+    while (t.exit_code == null) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        const slice: u64 = switch (rng & 7) {
+            0, 1 => 1 + (rng >> 8) % 8,
+            2, 3 => 1 + (rng >> 8) % 200,
+            4, 5, 6 => 1 + (rng >> 8) % 20000,
+            else => 1 + (rng >> 8) % 200_000,
+        };
+        const kt = t.step(slice);
+        const delta = t.cpu.icount - r.cpu.icount;
+        const kr = r.step(switch (kt) {
+            kw.KW_EV_BUDGET, kw.KW_EV_INTERRUPT, kw.KW_EV_SYSCALL => delta,
+            else => delta + 1, // the event's instruction did not retire
+        });
+        events += 1;
+        const want: u32 = if (kt == kw.KW_EV_INTERRUPT) kw.KW_EV_BUDGET else kt;
+        var bad = kr != want or t.cpu.icount != r.cpu.icount or !std.mem.eql(u8, std.mem.asBytes(&t.regs), std.mem.asBytes(&r.regs));
+        if (kt != kw.KW_EV_BUDGET and kt != kw.KW_EV_INTERRUPT and !std.mem.eql(u8, std.mem.asBytes(&t.cpu.ev), std.mem.asBytes(&r.cpu.ev))) bad = true;
+        if (!bad and (events % 64 == 0 or kt == kw.KW_EV_SYSCALL and t.regs.x[8] >= 93 and t.regs.x[8] <= 94))
+            bad = t.next_frame != r.next_frame or !std.mem.eql(u8, t.mem[0..@intCast(t.next_frame)], r.mem[0..@intCast(r.next_frame)]);
+        if (bad) {
+            t.print("[lockstep] difference after event {d} (slice {d}): kw_run {d} at icount {d} pc=0x{x}, reference {d} at icount {d} pc=0x{x}\n", .{
+                events, slice, kt, t.cpu.icount, t.regs.pc, kr, r.cpu.icount, r.regs.pc,
+            });
+            t.print("[lockstep] ev kw_run {d}/{d} addr=0x{x} insn=0x{x}, reference {d}/{d} addr=0x{x} insn=0x{x}\n", .{
+                t.cpu.ev.kind, t.cpu.ev.access, t.cpu.ev.addr, t.cpu.ev.insn, r.cpu.ev.kind, r.cpu.ev.access, r.cpu.ev.addr, r.cpu.ev.insn,
+            });
+            for (0..31) |i| if (t.regs.x[i] != r.regs.x[i]) t.print("[lockstep] x{d}: 0x{x} vs 0x{x}\n", .{ i, t.regs.x[i], r.regs.x[i] });
+            if (t.regs.sp != r.regs.sp) t.print("[lockstep] sp: 0x{x} vs 0x{x}\n", .{ t.regs.sp, r.regs.sp });
+            if (t.regs.nzcv != r.regs.nzcv) t.print("[lockstep] nzcv: 0x{x} vs 0x{x}\n", .{ t.regs.nzcv, r.regs.nzcv });
+            if (t.regs.fpsr != r.regs.fpsr or t.regs.fpcr != r.regs.fpcr) t.print("[lockstep] fpsr/fpcr differ\n", .{});
+            for (0..32) |i| if (!std.mem.eql(u64, &t.regs.v[i], &r.regs.v[i])) t.print("[lockstep] v{d} differs\n", .{i});
+            if (!std.mem.eql(u8, t.mem[0..@intCast(t.next_frame)], r.mem[0..@intCast(@min(t.next_frame, r.next_frame))])) t.print("[lockstep] memory differs\n", .{});
+            return 99;
+        }
+        r.opt.verbose = false;
+        t.service(kt);
+        r.service(kt);
+    }
+    if (t.opt.stats) t.print("[lockstep] {d} events, {d} instructions, identical\n", .{ events, t.cpu.icount });
+    return t.exit_code.?;
+}

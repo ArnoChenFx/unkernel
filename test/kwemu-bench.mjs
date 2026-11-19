@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// kwemu benchmarks: runs each guest benchmark on the native and wasm64
-// harness and prints a MIPS table.
-// usage: node test/kwemu-bench.mjs <zig-out prefix> [--reps N] [--median] [--only name,name] [--wasm-only|--native-only]
-//        [--jit]  (adds a wasm64+jit column: kwemu-harness-jit.wasm with the
-//                  JS host of test/kwemu-jit-host.mjs, default compile threshold,
-//                  plus the compiled-block count and compile time of the last rep)
-// (sieve+fib = guest/bench.zig; mem/fib/fp/sha/interp = guest/kbench.c)
+// kwemu benchmarks (A64): runs each benchmark guest on the native and wasm64
+// harness and prints a guest-MIPS table. Each mode runs kw_run (the
+// decoded-op tier); --ref adds the same harness with the reference
+// interpreter (kw_debug_run_ref) as a column, the "before" of the tier.
+// usage: node test/kwemu-bench.mjs [zig-out prefix] [--reps N] [--median] [--only name,name]
+//        [--wasm-only|--native-only] [--ref]
+// (sieve+fib = guest/a64/bench.c; mem/fib/fp/sha/interp = guest/kbench.c)
 import { readFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import { createJitHost } from "./kwemu-jit-host.mjs";
 
 const argv = process.argv.slice(2);
 const prefix = resolve(argv.find((a, i) => !a.startsWith("--") && !(argv[i - 1] ?? "").match(/^--(reps|only)$/)) ?? "zig-out");
@@ -22,15 +21,14 @@ const reps = Number(opt("--reps", "3"));
 // --median: report the median of the reps instead of the best
 const median = argv.includes("--median");
 const only = opt("--only", "")?.split(",").filter(Boolean);
-const guestDir = join(prefix, "guest");
+const withRef = argv.includes("--ref");
+const guestDir = join(prefix, "guest", "a64");
 const dec = new TextDecoder();
 const wasmModule = await WebAssembly.compile(await readFile(join(prefix, "bin", "kwemu-harness.wasm")));
-const withJit = argv.includes("--jit");
-const jitModule = withJit ? await WebAssembly.compile(await readFile(join(prefix, "bin", "kwemu-harness-jit.wasm"))) : null;
-let lastJit = "";
 
-async function runWasm(elf, args, module = wasmModule, jit = null) {
+async function runWasm(elf, args, ref) {
   let out = "", err = "", mem;
+  const stub = () => 0; // a library built with -Dkwemu-jit imports the JIT host; A64 never calls it
   const imports = {
     env: {
       host_write: (fd, ptr, len) => {
@@ -39,31 +37,23 @@ async function runWasm(elf, args, module = wasmModule, jit = null) {
       },
       host_now_ns: () => Number(process.hrtime.bigint()),
     },
+    unkernel: { kw_host_jit_caps: stub, kw_host_jit_compile: () => -1, kw_host_jit_free: () => {} },
   };
-  // a library built with -Dkwemu-jit=true: its plain harness imports them too
-  if (!jit && WebAssembly.Module.imports(module).some((i) => i.module === "unkernel")) jit = createJitHost({ available: false });
-  if (jit) imports.unkernel = jit.imports;
-  const inst = await WebAssembly.instantiate(module, imports);
+  const inst = await WebAssembly.instantiate(wasmModule, imports);
   const ex = inst.exports;
   mem = ex.memory;
-  jit?.attach(ex);
   const image = await readFile(elf);
   const argBytes = new TextEncoder().encode(args.join("\0") + "\0");
   const total = image.length + argBytes.length;
   const ptr = Number(ex.kwh_buf(BigInt(total)));
   new Uint8Array(mem.buffer, ptr, total).set(image);
   new Uint8Array(mem.buffer, ptr + image.length, argBytes.length).set(argBytes);
-  const status = ex.kwh_run(BigInt(image.length), BigInt(argBytes.length), 1);
-  if (jit) {
-    const s = jit.stats;
-    lastJit = `${s.compiles} / ${(Number(s.compileNs) / 1e6).toFixed(1)} ms`;
-    if (s.errors.length) return { status: -1, out, err: err + s.errors.join("\n") };
-  }
+  const status = ex.kwh_run(BigInt(image.length), BigInt(argBytes.length), ref ? 5 : 1);
   return { status, out, err };
 }
 
-function runNative(elf, args) {
-  const p = spawnSync(join(prefix, "bin", "kwemu-harness"), ["--stats", elf, ...args.slice(1)], { encoding: "utf8" });
+function runNative(elf, args, ref) {
+  const p = spawnSync(join(prefix, "bin", "kwemu-harness"), ["--stats", ...(ref ? ["--ref"] : []), elf, ...args.slice(1)], { encoding: "utf8" });
   return { status: p.status, out: p.stdout, err: p.stderr };
 }
 
@@ -76,13 +66,15 @@ const cases = [
   { name: "interp", guest: "kbench", args: ["interp"] },
 ].filter((c) => !only?.length || only.includes(c.name));
 
-const modes = [["native", runNative], ["wasm64", runWasm]].filter(
-  ([m]) => !(argv.includes("--wasm-only") && m === "native") && !(argv.includes("--native-only") && m === "wasm64"));
-if (withJit) modes.push(["wasm64+jit", (elf, args) => runWasm(elf, args, jitModule, createJitHost())]);
+const modes = [];
+for (const [m, run] of [["native", runNative], ["wasm64", runWasm]]) {
+  if ((argv.includes("--wasm-only") && m === "native") || (argv.includes("--native-only") && m === "wasm64")) continue;
+  if (withRef) modes.push([`${m} ref`, (elf, args) => run(elf, args, true)]);
+  modes.push([m, (elf, args) => run(elf, args, false)]);
+}
 
-const jitCol = withJit ? " jit blocks / compile |" : "";
-console.log(`| benchmark | Minsns | ${modes.map(([m]) => `${m} MIPS`).join(" | ")} |${jitCol} checksum |`);
-console.log(`| --- | ---: | ${modes.map(() => "---:").join(" | ")} |${withJit ? " ---: |" : ""} --- |`);
+console.log(`| benchmark | Minsns | ${modes.map(([m]) => `${m} MIPS`).join(" | ")} | checksum |`);
+console.log(`| --- | ---: | ${modes.map(() => "---:").join(" | ")} | --- |`);
 let failed = 0;
 for (const c of cases) {
   const elf = join(guestDir, `${c.guest}.elf`);
@@ -109,6 +101,6 @@ for (const c of cases) {
     all.sort((a, b) => a - b);
     cols.push((median && all.length ? all[(all.length - 1) >> 1] : best).toFixed(1));
   }
-  console.log(`| ${c.name} | ${insns} | ${cols.join(" | ")} |${withJit ? ` ${lastJit} |` : ""} ${sum} |`);
+  console.log(`| ${c.name} | ${insns} | ${cols.join(" | ")} | ${sum} |`);
 }
 if (failed) process.exit(1);

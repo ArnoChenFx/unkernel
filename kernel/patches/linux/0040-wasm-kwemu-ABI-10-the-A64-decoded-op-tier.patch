@@ -1,0 +1,97 @@
+From 331681f8caf42e7d17138f1d3dccfed2f80160b9 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Tue, 17 Nov 2026 21:24:40 +0000
+Subject: [PATCH] wasm: kwemu ABI 10: the A64 decoded-op tier
+
+kwemu now runs arm64 user code from decoded blocks of up to 64
+instructions. The kernel's side of the contract stays: code it rewrites
+in place is seen after a flush of a page that maps it. kw_run polls
+*irq_pending at every block end (at least every 64 instructions), not
+after branches the decoder follows inside a page, and IC IVAU on one
+CPU reaches the others through kwemu's own code epoch.
+---
+ arch/wasm/include/asm/kw_emu.h | 43 ++++++++++++++++++++++++----------
+ 1 file changed, 30 insertions(+), 13 deletions(-)
+
+diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
+index 8f7b0ebb667..dba5424701c 100644
+--- a/arch/wasm/include/asm/kw_emu.h
++++ b/arch/wasm/include/asm/kw_emu.h
+@@ -7,7 +7,7 @@
+  * guest registers in a kernel-owned struct kw_regs (normally inside the
+  * task's pt_regs).
+  *
+- * Guest ISA (ABI 9): AArch64, A64 instruction set, ARMv8.0-A user mode
++ * Guest ISA (ABI 9 and later): AArch64, A64 instruction set, ARMv8.0-A user mode
+  * (EL0), little-endian, with FP and AdvSIMD. No LSE, SVE, pointer
+  * authentication or MTE; the PAC and BTI encodings in the hint space run as
+  * NOPs. Optional features (KW_ISA_*, below) are enabled only when this
+@@ -30,19 +30,34 @@
+  * The emulator never writes PTEs: an access with A=0, or a store with
+  * D=0, raises KW_EV_FAULT so the kernel can set the bits.
+  *
+- * Code coherence: the A64 interpreter decodes every instruction from
+- * memory as it runs it, so code rewritten by the guest or the kernel is
+- * seen at once. Code the kernel rewrites must still be followed by the
+- * flushes it does anyway (kw_flush_tlb_range() of a page that maps it,
+- * kw_flush_tlb_all(), kw_set_pgd()), and guests make new code visible with
+- * IC IVAU (+ ISB), as on hardware with CTR_EL0.DIC = IDC = 0: a later
+- * decoded-code cache relies on exactly these points.
++ * Decoded-code cache (ABI 10): kw_run decodes guest code into blocks of up
++ * to 64 instructions inside one page (src/a64/tier.zig) and keeps them in
++ * struct kw_cpu, keyed by virtual pc and trusted only under the exec-TLB
++ * fill they were checked against. Every flush below (kw_flush_tlb_range()
++ * of a page that maps the code, kw_flush_tlb_all(), kw_set_pgd()) makes
++ * each block be checked again (same physical page, same instruction
++ * words) before it runs; kw_set_isa() and kw_host_reset() drop them all.
++ * So:
++ *  - Stores by this CPU's guest code into decoded code are tracked exactly
++ *    and take effect at the next instruction (self-modifying code needs no
++ *    flush), including stores through another virtual alias of the page.
++ *  - Code the kernel writes (or another CPU's guest writes) is seen after
++ *    a flush of a page that maps it on this CPU, or after IC IVAU of the
++ *    line by any guest on any CPU (+ ISB), as on hardware with
++ *    CTR_EL0.DIC = IDC = 0. A kernel that rewrites code in place must
++ *    therefore flush the page (it already must when it changes a mapping).
++ *  - Several CPUs: IC IVAU on one CPU is seen by every other CPU at its
++ *    next decoded-block boundary (at most 64 instructions later) or kw_run
++ *    entry, through a code epoch in kwemu's static data; no kernel action
++ *    is needed.
++ * Decoded blocks hold no state the kernel must save: a task's registers
++ * are in struct kw_regs whenever kw_run returns.
+  *
+  * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
+  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
+  * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
+- * DSB) full barriers and is meant to make exclusives atomic; without
+- * atomics everything assumes one CPU.
++ * DSB) full barriers, exclusives atomic, and IC IVAU visible to every CPU
++ * (above); without atomics everything assumes one CPU.
+  *
+  * jit_busy / flush_all (ABI 8): the window in which a CPU compiles JIT code
+  * and another CPU may skip waiting for its TLB flush. The A64 build has no
+@@ -61,7 +76,7 @@
+ extern "C" {
+ #endif
+ 
+-#define KW_ABI_VERSION 9
++#define KW_ABI_VERSION 10
+ 
+ /*
+  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
+@@ -149,8 +164,10 @@ void kw_cpu_init(struct kw_cpu *cpu);
+  * cpu->budget is decremented per retired instruction (SVC retires;
+  * faulting/illegal instructions do not) and cpu->icount advanced by the
+  * same amount; KW_EV_BUDGET when it reaches exactly 0 (returns at once if
+- * 0 on entry). *irq_pending is checked on entry, after every taken branch
+- * and at least every 64 instructions. Every event leaves regs (incl. pc)
++ * 0 on entry). *irq_pending is checked on entry and at the end of every
++ * decoded block, which is at least every 64 instructions and at every
++ * taken branch out of a block (ABI 10; a branch the decoder followed
++ * inside a page is not a check point). Every event leaves regs (incl. pc)
+  * exactly at an instruction boundary. Data accesses may be unaligned
+  * (SCTLR_EL1.A = 0); SP alignment is not checked.
+  */
+-- 
+2.56.0
+

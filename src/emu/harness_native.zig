@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 //! Native front end of the kwemu test harness (links the native libkwemu.a).
-//! usage: kwemu-harness [--stats] [--verbose] [--slice N] [--mem MiB] guest.elf [args...]
+//! usage: kwemu-harness [--stats] [--verbose] [--slice N] [--mem MiB] [--ref] [--lockstep SEED] guest.elf [args...]
 
 const std = @import("std");
 const kw = @import("kw_h");
@@ -12,6 +12,11 @@ var io: std.Io = undefined;
 fn hostWrite(fd: i32, bytes: []const u8) void {
     const f = if (fd == 2) std.Io.File.stderr() else std.Io.File.stdout();
     f.writeStreamingAll(io, bytes) catch {};
+}
+
+fn discard(fd: i32, bytes: []const u8) void {
+    _ = fd;
+    _ = bytes;
 }
 
 fn nowNs() u64 {
@@ -26,10 +31,16 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var opt: harness.Options = .{};
     var mem_mib: usize = 512;
+    var lock_seed: ?u64 = null;
     var i: usize = 1;
     while (i < args.len and std.mem.startsWith(u8, args[i], "--")) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--stats")) opt.stats = true;
         if (std.mem.eql(u8, args[i], "--verbose")) opt.verbose = true;
+        if (std.mem.eql(u8, args[i], "--ref")) opt.ref = true;
+        if (std.mem.eql(u8, args[i], "--lockstep") and i + 1 < args.len) {
+            i += 1;
+            lock_seed = try std.fmt.parseInt(u64, args[i], 0);
+        }
         if (std.mem.eql(u8, args[i], "--slice") and i + 1 < args.len) {
             i += 1;
             opt.slice = try std.fmt.parseInt(u64, args[i], 10);
@@ -40,7 +51,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (i >= args.len) {
-        hostWrite(2, "usage: kwemu-harness [--stats] [--verbose] [--slice N] [--mem MiB] guest.elf [args...]\n");
+        hostWrite(2, "usage: kwemu-harness [--stats] [--verbose] [--slice N] [--mem MiB] [--ref] [--lockstep SEED] guest.elf [args...]\n");
         return 2;
     }
     const image = try std.Io.Dir.cwd().readFileAlloc(io, args[i], gpa, .limited(256 << 20));
@@ -51,10 +62,19 @@ pub fn main(init: std.process.Init) !u8 {
     defer std.heap.page_allocator.free(mem);
 
     var m = harness.Machine.init(.{ .write = hostWrite, .now_ns = nowNs }, opt, mem, &cpu_block);
-    m.load(image, args[i..], &.{ "HOME=/", "PATH=/bin", "TERM=dumb" }) catch |e| {
+    const env: []const []const u8 = &.{ "HOME=/", "PATH=/bin", "TERM=dumb" };
+    m.load(image, args[i..], env) catch |e| {
         hostWrite(2, @errorName(e));
         hostWrite(2, ": cannot load guest\n");
         return 2;
     };
-    return m.run();
+    const seed = lock_seed orelse return m.run();
+    // Lockstep: a second machine (the reference) on its own memory.
+    const mem2 = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), mem_mib << 20);
+    defer std.heap.page_allocator.free(mem2);
+    const cpu2 = try gpa.alignedAlloc(u8, .fromByteUnits(8), kw.KW_CPU_SIZE);
+    defer gpa.free(cpu2);
+    var r = harness.Machine.init(.{ .write = discard, .now_ns = nowNs }, opt, mem2, cpu2[0..kw.KW_CPU_SIZE]);
+    try r.load(image, args[i..], env);
+    return harness.lockstep(&m, &r, seed);
 }

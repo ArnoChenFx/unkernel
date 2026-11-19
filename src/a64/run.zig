@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-//! The C ABI of include/kw_emu.h (ABI 9, A64) and the run loop behind
-//! kw_run: a reference interpreter, one instruction at a time through
-//! decode.zig; no decoded-code cache and no JIT yet. struct kw_cpu, the
+//! The C ABI of include/kw_emu.h (A64) and the reference run loop
+//! (`runRef`): one instruction at a time through decode.zig, the semantic
+//! oracle of the decoded-op tier (tier.zig), which is what kw_run runs
+//! unless the library is built with -Dkwemu-a64-ref. struct kw_cpu, the
 //! Sv39-format page-table walker, the TLBs and flushes are kwemu.Cpu
 //! (src/emu/kwemu.zig, shared with the riscv code kept there); the
 //! exclusive monitor's address is Hart.resv, so kw_clear_reservation and
@@ -14,7 +15,12 @@ const kwemu = @import("../emu/kwemu.zig");
 const c = @import("common.zig");
 const decode = @import("decode.zig");
 const branch = @import("branch.zig");
+const tier = @import("tier.zig");
 const kw_h = @import("kw_h");
+const options = @import("kwemu_options");
+
+/// kw_run is the reference loop (`runRef`) instead of the decoded-op tier.
+pub const use_ref = options.a64_ref;
 
 pub const Regs = c.Regs;
 const Cpu = kwemu.Cpu;
@@ -45,7 +51,14 @@ fn event(cpu: *Cpu, kind: core.Kind, access: u32, addr: u64, insn: u64) u32 {
     return @intFromEnum(kind);
 }
 
+/// kw_run: the decoded-op tier (tier.run), or the reference loop.
 pub fn run(cpu: *Cpu, regs: *Regs) u32 {
+    return if (use_ref) runRef(cpu, regs) else tier.run(cpu, regs);
+}
+
+/// The reference loop: decode and execute one instruction at a time. It
+/// polls *irq_pending after every taken branch and every 64 instructions.
+pub fn runRef(cpu: *Cpu, regs: *Regs) u32 {
     const start = cpu.budget;
     var left = start;
     defer {
@@ -64,7 +77,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
             cpu.priv.smc = 0;
             return event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0);
         };
-        // Set by stores into pages the (riscv) block cache tracks and by
+        // Set by stores into pages the tier's block cache tracks and by
         // IC IVAU; nothing here is decoded ahead, so just clear it.
         cpu.priv.smc = 0;
         switch (e) {
@@ -99,10 +112,14 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
 pub fn cpuInit(cpu: *Cpu) void {
     kwemu.cpuInit(cpu);
     cpu.priv.a64.isa = c.implemented;
+    tier.epochInit(cpu);
 }
 
 pub fn setIsa(cpu: *Cpu, isa: u64) u64 {
     cpu.priv.a64.isa = isa & c.implemented;
+    // Decoded blocks need not depend on it (feature instructions are
+    // generic ops, which check it when they run), but drop them anyway.
+    cpu.resetCache();
     return cpu.priv.a64.isa;
 }
 
@@ -119,6 +136,22 @@ pub fn exportAbi() void {
     @export(&kw_isa_supported, .{ .name = "kw_isa_supported" });
     @export(&kw_set_isa, .{ .name = "kw_set_isa" });
     @export(&kw_host_reset, .{ .name = "kw_host_reset" });
+    // Not part of the ABI: the reference loop for differential tests (the
+    // harness's --lockstep and --ref), and the counters of a -Dkwemu-stats
+    // build.
+    @export(&kw_debug_run_ref, .{ .name = "kw_debug_run_ref" });
+    if (kwemu.stats_on) @export(&kw_debug_stats, .{ .name = "kw_debug_stats" });
+}
+
+fn kw_debug_run_ref(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {
+    return runRef(cpu, regs);
+}
+/// Word by word through volatile pointers (a struct copy would call memmove).
+fn kw_debug_stats(cpu: *Cpu, out: *kwemu.Stats) callconv(.c) void {
+    const n = @sizeOf(kwemu.Stats) / 8;
+    const src: *volatile [n]u64 = @ptrCast(&cpu.priv.stats);
+    const dst: *volatile [n]u64 = @ptrCast(out);
+    for (0..n) |i| dst[i] = src[i];
 }
 
 fn kw_cpu_init(cpu: *Cpu) callconv(.c) void {

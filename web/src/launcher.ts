@@ -40,11 +40,6 @@
 // A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
 // but disabled, with why; so is one whose `packages` leave out this boot's
 // distro (?distro=).
-// Launching a demo sets ?demo=<id> in the page's URL (history.replaceState),
-// so a reload launches it again once the guest is up (launchFromUrl, from
-// boot.ts); the last demo launched wins. Closing that demo's window (or its
-// shell exiting) removes ?demo= again (forgetDemo); the kernel stopping does not.
-import { DEMOS } from "./demos/index.ts";
 import { fmtMiB, getFile, pushFile, type FileSpec } from "./download.ts";
 import { KW } from "./kw.ts";
 import { selectWindow } from "./shortcuts.ts";
@@ -265,35 +260,11 @@ async function waitPort(vm: KernelHandle, port: number, timeout: number, signal?
 	}
 }
 
-/** Sets ?demo=<id> in the page's URL, or removes it (null), replacing its history entry. */
-function setDemoParam(id: string | null): void {
-	try {
-		const u = new URL(location.href);
-		if (u.searchParams.get("demo") === id) return;
-		if (id === null) u.searchParams.delete("demo");
-		else u.searchParams.set("demo", id);
-		history.replaceState(history.state, "", u);
-	} catch {}
-}
-
-/** A window named `name` closed (windows.ts onClose): if it is ?demo='s, a reload no longer launches it. */
-export function forgetDemo(name: string): void {
-	if (new URLSearchParams(location.search).get("demo") === name) setDemoParam(null);
-}
-
-/** Launches the demo ?demo= names (hidden ones too), if any. Called once the guest is up (boot.ts). */
-export function launchFromUrl(): void {
-	const params = new URLSearchParams(location.search);
-	const id = params.get("demo");
-	// ?showcase or ?demo=-: the scripted tour of the demos, for a recording (showcase.ts).
-	if (id === "-" || (params.has("showcase") && params.get("showcase") !== "0")) {
-		void import("./showcase.ts").then((m) => m.runShowcase(params.get("showcase") ?? ""), (e) => KW.ui?.toast(`showcase: ${(e as Error)?.message ?? e}`));
-		return;
-	}
-	if (!id) return;
-	const d = DEMOS.find((x) => x.id === id);
-	if (d) void launch(d);
-	else KW.ui?.toast(`?demo=${id}: no such demo`);
+/** ?showcase: the scripted tour of the demos, for a recording (showcase.ts). Called once the guest is up (boot.ts). */
+export function showcaseFromUrl(): void {
+	const v = new URLSearchParams(location.search).get("showcase");
+	if (v === null || v === "0") return;
+	void import("./showcase.ts").then((m) => m.runShowcase(v), (e) => KW.ui?.toast(`showcase: ${(e as Error)?.message ?? e}`));
 }
 
 /** Demos between the click and their window appearing (the files are being written). */
@@ -305,9 +276,9 @@ export const demoWindow = (d: Demo) => KW.windows?.list().find((w) => w.n !== 0 
 /**
  * Run a demo in a new terminal window (see the top of this file), or show
  * its window if it already has one: a demo runs once at a time. Failures
- * are toasts. keepUrl leaves ?demo= alone (the showcase).
+ * are toasts.
  */
-export async function launch(d: Demo, opts: { keepUrl?: boolean } = {}): Promise<void> {
+export async function launch(d: Demo): Promise<void> {
 	const ui = KW.ui!;
 	const why = unavailable(d);
 	if (why) return ui.toast(`${d.title}: ${why}`);
@@ -317,7 +288,6 @@ export async function launch(d: Demo, opts: { keepUrl?: boolean } = {}): Promise
 	if (open) return selectWindow(open.n);
 	if (starting.has(d.id)) return;
 	starting.add(d.id);
-	if (!opts.keepUrl) setDemoParam(d.id); // a reload launches it again
 	try {
 		const dir = d.dir ?? `~/demos/${d.id}`;
 		try {

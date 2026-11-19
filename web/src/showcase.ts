@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The showcase: a fast scripted tour of the demos, hands off. It
-// starts once the guest is up (launchFromUrl in launcher.ts) when the URL has
-// ?showcase or ?demo=-, and needs nothing clicked: each step puts a caption
+// starts once the guest is up (showcaseFromUrl in launcher.ts) when the URL has
+// ?showcase, and needs nothing clicked: each step puts a caption
 // near the bottom of the page, clear of the typing at the top (the title
 // cards sit in the middle), launches a demo through launcher.ts (or types
 // into a shell window), waits until it shows what it is about, plays it (keys typed into
@@ -18,7 +18,6 @@
 //                               packages, npm installs and in-guest builds (Doom)
 //                               persist on the data disk, so a later tour does not
 //                               wait on them. Combine as warm,doom,nitro.
-//   ?demo=-                     the same as ?showcase
 //
 // While it runs, KW.showcase has skip() (the current step), pause() and
 // resume() (between steps), for the devtools console. The tour does not
@@ -288,7 +287,7 @@ async function demo(s: DemoStep, chapter: string): Promise<void> {
 	try {
 		// With ports this resolves once the preview is open (or failed); else once the window runs.
 		const timeout = warmOnly ? 900_000 : s.timeout ?? 30_000;
-		await Promise.race([launched = launch(d, { keepUrl: true }), wait(timeout)]);
+		await Promise.race([launched = launch(d), wait(timeout)]);
 		const win = demoWindow(d);
 		if (!win) return log(`${s.demo}: no window, skipped`);
 		const ok = await until(async () =>

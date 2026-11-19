@@ -6,7 +6,7 @@
 // React components (components/) render. Also the actions those components
 // run: Copy diagnostics, the data disk buttons, the key bar, paste, font size.
 import { flushSync } from "react-dom";
-import { DEFAULT_CMDLINE, DEFAULT_DISTRO, type Config } from "./config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, SETTING_NAMES, saveSettings, type Config } from "./config.ts";
 import { KW, type KWError } from "./kw.ts";
 import { initStore, type Ask, type PadLayout, type CheckResult, type Options, type State, type Tab, type UiState } from "./store.ts";
 
@@ -334,7 +334,7 @@ export function createUi(cfg: Config) {
 
 		diagText,
 		/** The page URL that Reboot loads (the Options as chosen; config.ts reads them back); defaults are left out. */
-		rebootUrl,
+		nextSettings, optionsChanged,
 		/** Reload the page with the Options as chosen, like the Reboot button. */
 		reboot,
 		setOption<K extends keyof Options>(k: K, v: Options[K]) { $.set((s) => ({ options: { ...s.options, [k]: v } })); },
@@ -440,17 +440,18 @@ export function createUi(cfg: Config) {
 		else fallback();
 	}
 
-	function rebootUrl(): string {
+	/**
+	 * The settings Reboot saves (config.ts SETTINGS_KEY): the options as
+	 * chosen, by their parameter names, only where they differ from the
+	 * defaults; a setting without a control (?shared=) is kept as it is.
+	 */
+	function nextSettings(): Record<string, string> {
 		const o = $.get().options;
-		const p = new URLSearchParams(location.search);
+		const p = new URLSearchParams(cfg.settings);
 		const set = (k: string, v: string | null) => (v === null ? p.delete(k) : p.set(k, v));
 		set("mem", o.mem === "auto" ? null : o.mem);
 		const wisp = o.wisp.split(",").map((s) => s.trim()).filter(Boolean).join(",");
-		if (o.net === "off") set("wisp", p.get("net") === "0" ? null : "0"); // an existing ?net=0 stays
-		else {
-			p.delete("net");
-			set("wisp", o.net === "custom" && wisp ? wisp : null);
-		}
+		set("wisp", o.net === "off" ? "0" : o.net === "custom" && wisp ? wisp : null);
 		set("jit", o.jit === "off" ? "0" : null);
 		set("verbose", o.verbose === "keep" ? "1" : null);
 		set("display", o.display === "off" ? "0" : null);
@@ -459,28 +460,38 @@ export function createUi(cfg: Config) {
 		set("append", append && append !== DEFAULT_CMDLINE ? append : null);
 		set("data", o.data === "off" ? "0" : null);
 		set("root", o.root === "safe" ? "initramfs" : null);
-		// Worker thread and CPUs: in the URL only where they differ from this device's defaults (config.ts).
+		// Worker thread and CPUs: saved only where they differ from this device's defaults (config.ts).
 		set("worker", (o.worker === "on") === cfg.workerDefault ? null : o.worker === "on" ? "1" : "0");
 		// The next load's default count: the suggestion in worker mode (config.ts cpuDefault).
 		const cpuNext = o.worker === "on" && !cfg.smpBlocked && cfg.cpuSuggested ? cfg.cpuSuggested : 1;
 		set("cpus", o.cpus === String(cpuNext) ? null : o.cpus);
 		set("distro", o.distro === DEFAULT_DISTRO ? null : o.distro);
-		const q = p.toString();
-		return location.pathname + (q ? `?${q}` : "");
+		return Object.fromEntries([...p].sort(([a], [b]) => a.localeCompare(b)));
+	}
+	/** The options differ from the settings this load booted with (the Reboot button says so). */
+	function optionsChanged(): boolean {
+		const sorted = (s: Record<string, string>) => JSON.stringify(Object.entries(s).sort(([a], [b]) => a.localeCompare(b)));
+		return sorted(nextSettings()) !== sorted(cfg.settings);
 	}
 	let rebooting = false;
 	/** A data disk reset or import is running (dataAction); it ends in a reload. */
 	let dataBusy = false;
 	function reboot() {
-		const url = rebootUrl();
-		const go = () => {
-			if (url === location.pathname + location.search) location.reload();
-			else location.assign(url);
-		};
 		if (rebooting) return;
 		// A reset or import in progress reloads the page itself; a reload now would cut it off.
 		if (dataBusy) { ui.toast("The data disk is being replaced; the page reloads when it is done"); return; }
 		rebooting = true;
+		// Save the options and load the URL without settings (the URL's applied to
+		// one load, and are saved with the rest now). Where localStorage refuses,
+		// the URL carries them instead.
+		const next = nextSettings();
+		const u = new URL(location.href);
+		for (const k of SETTING_NAMES) u.searchParams.delete(k);
+		if (!saveSettings(next)) for (const [k, v] of Object.entries(next)) u.searchParams.set(k, v);
+		const go = () => {
+			if (u.href === location.href) location.reload();
+			else location.assign(u);
+		};
 		// Let the guest write its file systems back to the saved disks first
 		// (boot.ts: KW.sync, at most 3 s).
 		if (KW.beforeReboot && $.get().state === "running") {

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// Options in the System tab: one control per URL parameter (config.ts)
-// except ?simulate. Reboot loads the page with them (ui.rebootUrl()).
+// Options in the System tab: one control per setting (config.ts) except
+// ?simulate and ?showcase. Reboot saves them in localStorage and reloads
+// (ui.nextSettings()).
 // Terminal style: on/off options are [x] check boxes, Network and Distro are
 // (•) radio choices, CPUs and Memory are sliders over their counts and sizes.
 // FontSize, in the Guest tab, is the same kind of slider; it applies at once
@@ -13,7 +14,7 @@
 // on the form (capture phase, so non-bubbling events count too) read every
 // change: React drops an event whose value was set from script (autofill,
 // the browser tests), and the store would miss it. A check box stores its
-// data-on or data-off value, so the options keep the values rebootUrl() reads.
+// data-on or data-off value, so the options keep the values nextSettings() reads.
 import { useEffect, useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
 import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED, webkitEngine } from "../config.ts";
 import { KW } from "../kw.ts";

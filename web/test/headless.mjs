@@ -172,7 +172,7 @@ const scenarios = {
 		const tl = await page.evaluate("['preflight', 'kernel', 'compile', 'memory', 'boot', 'userspace'].map(id => id + ' ' + KW.ui.stageState(id))");
 		if (tl.some((l) => !/ (done|skip)$/.test(l))) throw new Error(`boot stages incomplete: ${tl.join(", ")}`);
 		await page.shot("desktop-panel.png");
-		// Every option has a control, and Reboot's URL follows them (defaults leave the URL bare).
+		// Every option has a control, and the settings Reboot saves follow them (defaults save nothing).
 		// Check boxes and radios are set as a script would; the page renders on the next task.
 		const opts = await page.evaluate(`(async () => {
 			const $ = (id) => document.getElementById(id);
@@ -182,7 +182,7 @@ const scenarios = {
 			const net = (v) => check("opt-net-" + v, true);
 			const range = (id, v) => set(id, String($(id).dataset.values.split(",").indexOf(v)), "input");
 			const mem = (v) => range("opt-mem", v);
-			const before = KW.ui.rebootUrl();
+			const before = KW.ui.nextSettings();
 			mem("64"); net("custom"); set("opt-wisp", "wss://a.example/, wss://b.example/", "input");
 			check("opt-jit", false); check("opt-verbose", true); set("opt-append", "console=hvc0 rdinit=/bin/sh", "input");
 			check("opt-data", false); check("opt-root", true); check("opt-worker", true);
@@ -193,24 +193,24 @@ const scenarios = {
 			const distroDefault = document.querySelector("#opt-distro input:checked")?.id;
 			check("opt-distro-none", true);
 			await tick();
-			const all = KW.ui.rebootUrl(), wispShown = !$("opt-wisp-row").hidden, label = $("reboot").textContent;
+			const all = KW.ui.nextSettings(), wispShown = !$("opt-wisp-row").hidden, label = $("reboot").textContent;
 			net("off");
-			const off = KW.ui.rebootUrl();
+			const off = KW.ui.nextSettings();
 			mem("auto"); net("default"); check("opt-jit", true); check("opt-verbose", false); set("opt-append", "", "input");
 			check("opt-data", true); check("opt-root", false); check("opt-worker", false);
 			if (cpus) range("opt-cpus", "1");
 			if (distroDefault) check(distroDefault, true);
 			await tick();
-			return { before, all, wispShown, label, off, reset: KW.ui.rebootUrl(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault, workerDefault: KW.config.workerDefault, cpuNext: !KW.config.smpBlocked && KW.config.cpuSuggested || 1 };
+			return { before, all, wispShown, label, off, reset: KW.ui.nextSettings(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault, workerDefault: KW.config.workerDefault, cpuNext: !KW.config.smpBlocked && KW.config.cpuSuggested || 1 };
 		})()`);
-		const q = new URLSearchParams(opts.all.split("?")[1]);
+		const q = new URLSearchParams(opts.all);
 		// The page runs at ?worker=0&cpus=1 (lib.mjs goto()): only those, where they differ from the defaults.
-		const home = new URLSearchParams(opts.before.split("?")[1] ?? "");
-		if (opts.before !== opts.reset || [...home.keys()].some((k) => k !== "worker" && k !== "cpus") || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
+		const home = new URLSearchParams(opts.before);
+		if (JSON.stringify(opts.before) !== JSON.stringify(opts.reset) || [...home.keys()].some((k) => k !== "worker" && k !== "cpus") || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
 			|| q.get("mem") !== "64" || q.get("wisp") !== "wss://a.example/,wss://b.example/" || q.get("jit") !== "0" || q.get("verbose") !== "1"
-			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== (opts.workerDefault ? null : "1") || q.get("cpus") !== (opts.cpus && opts.cpuNext !== 2 ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || new URLSearchParams(opts.off.split("?")[1]).get("wisp") !== "0")
-			throw new Error(`options do not map to the URL: ${JSON.stringify(opts)}`);
-		console.log(`  options -> ${decodeURIComponent(opts.all)}`);
+			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== (opts.workerDefault ? null : "1") || q.get("cpus") !== (opts.cpus && opts.cpuNext !== 2 ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || opts.off.wisp !== "0")
+			throw new Error(`options do not map to the settings: ${JSON.stringify(opts)}`);
+		console.log(`  options -> ${q}`);
 		await page.click('.tabs [data-tab="log"]');
 		const log = await page.evaluate("document.getElementById('log').textContent");
 		if (!/Run \/init as init process/.test(log)) throw new Error("kernel log tab lacks the dmesg lines");

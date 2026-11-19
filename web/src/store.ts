@@ -101,7 +101,7 @@ export interface UiState {
 	preview: { port: number; shown: boolean; fill: boolean } | null;
 	/** The demo launcher (components/Launcher.tsx) covers the page. */
 	launcher: boolean;
-	/** The Options as chosen (components/Options.tsx), read by rebootUrl(). */
+	/** The Options as chosen (components/Options.tsx), read by nextSettings(). */
 	options: Options;
 }
 

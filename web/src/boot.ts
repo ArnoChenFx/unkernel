@@ -25,7 +25,7 @@ import { INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, fmtSize, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
-import { forgetDemo, launchFromUrl } from "./launcher.ts";
+import { showcaseFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { attachPreview, closePreview, openPreview, previewUrl } from "./preview.ts";
 import { writeReadme } from "./readme.ts";
@@ -354,12 +354,12 @@ export function start(): void {
 	};
 	const windows = createWindows({
 		term0: term, send0: send, ready: () => guestReady, alive: () => !stopped && !ended() && ui.state() !== "error" && ui.state() !== "halted",
-		autoFocus: !cfg.coarse, onClose: forgetDemo,
+		autoFocus: !cfg.coarse,
 	});
 	KW.windows = windows;
 	KW.ready = () => guestReady;
-	// ?demo=<id>: launch that demo again (launcher.ts sets it when one launches).
-	void guestReady.then(launchFromUrl, () => {});
+	// ?showcase: the scripted tour of the demos (launcher.ts).
+	void guestReady.then(showcaseFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
 	if (cfg.net && alpine) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
 	// Intro notes in /root/README, once per data disk (readme.ts); written for Alpine.

@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The page's configuration, from its URL. The kernel is the page's own
-// (sdk.ts): the base bundle unkernel.wasm, with the distro image ?distro=
-// picks (virtual:unkernel-kernel's list) attached read-only. Each parameter
-// except ?simulate, ?demo and ?showcase has a control under Options in the status panel
-// (ui.ts), which rebuilds the URL on Reboot (keeping the others).
+// The page's configuration. The kernel is the page's own (sdk.ts): the base
+// bundle unkernel.wasm, with the distro image ?distro= picks
+// (virtual:unkernel-kernel's list) attached read-only.
+//
+// The settings below are kept in localStorage (SETTINGS_KEY: {name: value},
+// only those that differ from the defaults). Each one except ?simulate and
+// ?showcase has a control under Options in the status panel; Reboot saves
+// them there (ui.ts nextSettings()) and loads the page's bare URL. A URL
+// parameter of the same name overrides the saved one for that load (links,
+// the browser tests); the page never writes the URL. ?simulate and
+// ?showcase are read from the URL only.
 //
 //   ?mem=MiB                           kernel memory (default: auto, from the SDK's autoMemoryMiB():
 //                                      256 on phones, 512 otherwise, less on low-memory devices)
@@ -71,14 +77,10 @@
 //                                      Firefox; one on phones, on fewer than 4 threads and in
 //                                      WebKit, where several CPUs ran slower), else one.
 //                                      ?cpus=1: one CPU, the UP kernel.
-//   ?demo=<id>                         launch that demo once the guest is up (launcher.ts). The
-//                                      launcher sets it on each launch, so a reload reopens the
-//                                      last demo, and closing its window removes it; read
-//                                      there, not here. ?demo=- runs the showcase.
-//   ?showcase[=warm,<step>,...]        a fast scripted tour of the demos with captions; warm
-//                                      pre-installs them, step ids pick a subset (showcase.ts);
-//                                      read in launcher.ts
-//   ?simulate=nojspi,oom,lowmem        fake a failure (for tests)
+//   ?showcase[=warm,<step>,...]        URL only: a fast scripted tour of the demos with captions;
+//                                      warm pre-installs them, step ids pick a subset
+//                                      (showcase.ts); read in launcher.ts
+//   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
 
@@ -103,7 +105,35 @@ export const REPO = "https://github.com/pithings/unkernel";
 /** The command line without ?append=. */
 export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 
+/** localStorage: the saved settings (the header above), a JSON object of strings. */
+export const SETTINGS_KEY = "kw.settings";
+/** The settings' names. ?net=0 is read as ?wisp=0 and never saved. */
+export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus"];
+
+/** The saved settings ({} where there are none or localStorage refuses). */
+export function loadSettings(): Record<string, string> {
+	try {
+		const v: unknown = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}");
+		if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).filter(([k, x]) => SETTING_NAMES.includes(k) && typeof x === "string"));
+	} catch {}
+	return {};
+}
+
+/** Saves the settings for the next load (none: removes the key); false where localStorage refuses. */
+export function saveSettings(s: Record<string, string>): boolean {
+	const keep = Object.entries(s).filter(([k]) => SETTING_NAMES.includes(k) && k !== "net");
+	try {
+		if (keep.length) localStorage.setItem(SETTINGS_KEY, JSON.stringify(Object.fromEntries(keep)));
+		else localStorage.removeItem(SETTINGS_KEY);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export interface Config {
+	/** The settings this load read: the saved ones with the URL's on top (?net=0 as wisp=0). */
+	settings: Record<string, string>;
 	/** The kernel this page boots on one CPU: the base bundle unkernel.wasm (its UP kernel). */
 	kernelUrl: string;
 	/** The image this load boots, or null (?distro=none). */
@@ -227,8 +257,12 @@ function takeOnce(key: string): string | null {
 	}
 }
 
-export function readConfig(search: string = location.search): Config {
-	const params = new URLSearchParams(search);
+export function readConfig(search: string = location.search, saved: Record<string, string> = loadSettings()): Config {
+	const url = new URLSearchParams(search);
+	const params = new URLSearchParams(saved);
+	for (const k of SETTING_NAMES) if (url.has(k)) params.set(k, url.get(k)!);
+	if (params.get("net") === "0") params.set("wisp", "0");
+	params.delete("net");
 	const coarse = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 	const mobileUA = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
 	const mobile = coarse || mobileUA;
@@ -268,9 +302,10 @@ export function readConfig(search: string = location.search): Config {
 	const names = DISTROS_OFFERED.map((d) => d.name);
 	if (distroAsked === "none") distroParam = "none";
 	else if (distroAsked && names.includes(distroAsked)) distroParam = distroAsked;
-	else if (distroAsked) distroWhy = `?distro=${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
+	else if (distroAsked) distroWhy = `distro ${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
 	const distro = DISTROS_OFFERED.find((d) => d.name === distroParam) ?? null;
 	return {
+		settings: Object.fromEntries(params),
 		kernelUrl: kernelUrl.pathname,
 		distro,
 		distroParam,
@@ -278,14 +313,14 @@ export function readConfig(search: string = location.search): Config {
 		guest: distro?.name ?? "none",
 		append: append || null,
 		memMiB: fixed ? Number(memParam) : auto.mib,
-		memWhy: fixed ? `?mem=${memParam}` : auto.why,
+		memWhy: fixed ? `set to ${memParam} MiB` : auto.why,
 		memAutoMiB: auto.mib,
 		memParam: fixed ? memParam : null,
 		memFallbackMiB: [...DEFAULT_MEMORY_FALLBACK_MIB],
 		cmdline: root ? `${append || DEFAULT_CMDLINE} kw.root=${root}` : append || DEFAULT_CMDLINE,
 		baseCmdline: append || DEFAULT_CMDLINE,
 		cmdlineGiven: !!append || !!root,
-		net: params.get("net") !== "0" && wispParam !== "0",
+		net: wispParam !== "0",
 		wisp: wisp?.length ? wisp : null,
 		jit: params.get("jit") !== "0",
 		display: params.get("display") !== "0",
@@ -306,7 +341,7 @@ export function readConfig(search: string = location.search): Config {
 		cpuSuggested,
 		shared: params.get("shared") !== "0",
 		verbose: params.get("verbose") === "1",
-		simulate: (params.get("simulate") || "").split(",").filter(Boolean),
+		simulate: (url.get("simulate") || "").split(",").filter(Boolean),
 		mobile,
 		coarse,
 		mobileUA,

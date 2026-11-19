@@ -34,7 +34,7 @@ export function Panel() {
 	}, [tab]);
 	const pane = (id: Tab) => ({ id: `pane-${id}`, role: "tabpanel", "aria-labelledby": `tab-${id}`, hidden: tab !== id });
 
-	const changed = open && ui.rebootUrl() !== location.pathname + location.search;
+	const changed = open && ui.optionsChanged();
 	void options; // re-render (the Reboot label) when an option changes
 
 	return (

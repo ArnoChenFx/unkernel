@@ -11,10 +11,10 @@ users.
 
 `web/index.html` (the inline error bootstrap, and fallback markup that
 React replaces), and in `web/src/`: `main.tsx` (entry: config, renders the
-app, preflight with the SDK's `checkSupport()`), `config.ts` (URL
-parameters, documented at its top), `store.ts` (the UI state, read with
+app, preflight with the SDK's `checkSupport()`), `config.ts` (the
+settings, kept in localStorage, documented at its top), `store.ts` (the UI state, read with
 `useStore()`), `ui.ts` (`KW.ui`: the imperative API boot.ts and main.tsx
-drive, plus `rebootUrl()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
+drive, plus `nextSettings()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
 it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `readme.ts` (`/root/README`), `download.ts` (files the page fetches for the guest), `sdk.ts`, `kw.ts` (`window.KW`),
@@ -221,9 +221,16 @@ deploying the page needs no kernel toolchain.
 
 ## Rules
 
-- Every URL parameter except `?simulate` has a control under Options in
-  the System tab (`Options.tsx`, the store's `options`, `rebootUrl()`). A
-  new parameter needs one too. The desktop test checks the mapping. The
+- Settings live in localStorage `kw.settings` (config.ts `SETTINGS_KEY`:
+  the parameter names and values, only those that differ from the
+  defaults). Reboot saves the options there and loads the bare URL; a URL
+  parameter of the same name overrides the saved one for that load (the
+  browser tests use that), and the page never writes the URL (where
+  localStorage refuses, Reboot puts them in the URL instead). Every
+  setting except `?shared` has a control under Options in the System tab
+  (`Options.tsx`, the store's `options`, `nextSettings()`); `?simulate`
+  and `?showcase` are URL only. A new setting needs a control too. The
+  desktop test checks the mapping. The
   fields are controlled, and also read by native listeners on the form,
   because React drops change events for a value set from script (the test
   does that).
@@ -393,7 +400,7 @@ config.ts) boots the SMP kernel on N CPUs (kernel/smp.md; js.md, CPU
 threads). Default in worker mode where the page can boot the SMP
 kernel: the suggested count (`cfg.cpuDefault`); else 1, the UP kernel.
 `?cpus=1` is the UP kernel (the same files and code paths as before
-the option). The Worker thread and CPUs options go into the URL only
+the option). The Worker thread and CPUs options are saved only
 where they differ from these defaults. It applies on Reboot, like the
 other options.
 
@@ -434,8 +441,8 @@ other options.
   `bootUpOnce()`: it stores the reason in sessionStorage `kw-up-once` and
   reloads; that load boots on one CPU the usual way (in worker mode
   where that is the default) and shows the reason (`cfg.smpWhy`: the Guest CPUs row,
-  the CPUs note, diagnostics). `?cpus=` stays in the URL, so the next
-  Reboot tries again. If sessionStorage refuses, the failure is reported
+  the CPUs note, diagnostics). The saved CPUs setting stays, so the next
+  load tries again. If sessionStorage refuses, the failure is reported
   instead (no reload loop). A kernel worker that cannot start CPU threads
   (`webCpuBlocker()` there) runs the SMP kernel on one CPU: the Guest
   CPUs row warns, from `stats().cpus`. A failure after the kernel started
@@ -704,11 +711,6 @@ to push (Node SDK, 2026-11-18). A demo with `hidden` set is left out of the laun
 is open (a dot under its tile) shows that window. A demo whose `needs`
 (display, net, sound) the page's options rule out is dimmed, with why; so
 is one whose `packages` leave out this boot's distro.
-Launching a demo sets `?demo=<id>` in the URL (`history.replaceState`), and
-a page with `?demo=` launches that demo once the guest is up, so a reload
-reopens the last demo launched; Reboot keeps it. Closing that demo's
-window (or its shell exiting) removes `?demo=`; the kernel stopping does
-not.
 Failures are toasts. Checked by hand only.
 
 Every demo's run.sh, as the launcher writes it, was run on the aarch64
@@ -733,9 +735,9 @@ asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
 (extracting the pushed tarball; 0.2 later, `apt-get update` 28 s in the
 chroot), Doom 22 (tcc install, downloads and a 6 s build; 0.2 later).
 
-`?showcase` (or `?demo=-`) runs `src/showcase.ts` once the guest is up: a
+`?showcase` runs `src/showcase.ts` once the guest is up: a
 fast, hands-off tour of the demos, leaving out the web servers (described at its top).
-Each step shows a caption and launches its demo without touching `?demo=`.
+Each step shows a caption and launches its demo.
 It waits for a process (`pgrep -f`), a pattern on the screen, the display or
 the preview, then plays it: keys typed into the terminal, or the evdev
 keyboard for glimmer and Doom. Then it closes the demo. A bar along the top

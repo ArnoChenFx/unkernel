@@ -134,8 +134,6 @@ export interface WindowsOptions {
 	alive: () => boolean;
 	/** Give the current window the focus after a switch (not on touch devices, where it raises the keyboard). */
 	autoFocus: boolean;
-	/** A window went away while the kernel runs (closed, or its shell exited); not when the kernel stopping closes them all. */
-	onClose?: (name: string) => void;
 }
 
 export interface Windows extends WindowsApi {
@@ -276,7 +274,6 @@ export function createWindows(opts: WindowsOptions): Windows {
 		w.bottom.dispose();
 		w.el.remove();
 		publish();
-		if (opts.alive()) opts.onClose?.(w.name);
 	}
 
 	function input(w: Win, d: string | Uint8Array) {

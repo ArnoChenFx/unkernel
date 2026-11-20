@@ -67,6 +67,9 @@ const A = struct {
     fn icivau(rt: u32) u32 {
         return 0xd50b_7520 | rt;
     }
+    fn br(rn: u32) u32 {
+        return 0xd61f_0000 | (rn << 5);
+    }
     const ret: u32 = 0xd65f_03c0;
     const isb: u32 = 0xd503_3fdf;
     const nop: u32 = 0xd503_201f;
@@ -401,6 +404,50 @@ test "a64 tier: budgets that end inside a block, and the interrupt poll at block
     try t.expectEqual(ic2, m.cpu.icount);
     try t.expectEqual(@intFromEnum(tier.StopTier.entry), m.cpu.priv.a64.stop_tier);
     try t.expectEqual(@as(u64, 0), m.cpu.priv.a64.stop_block);
+    bell.* = 0;
+    m.cpu.irq_pending = null;
+}
+
+test "a64 tier: an interrupt stop inside a compiled region names the member that ran last" {
+    var m = try Machine.init(t.allocator);
+    defer m.deinit();
+    m.mapData(0x40000, 1);
+    const bell: *volatile u32 = @ptrCast(@alignCast(m.at(0x40000).ptr));
+    // A chain of four blocks on one page, A -> B -> C -> D -> A, no self
+    // loop; C stores x5 into the doorbell. Indirect branches end each block
+    // (direct ones in the page are followed into one superblock).
+    var page = [_]u32{0} ** (0x400 / 4);
+    page[0x000 / 4 ..][0..3].* = .{ A.addi(0, 0, 1), A.addi(1, 1, 1), A.br(7) }; // A
+    page[0x100 / 4 ..][0..2].* = .{ A.addi(0, 0, 1), A.br(8) }; // B
+    page[0x200 / 4 ..][0..3].* = .{ A.strw(5, 6, 0), A.addi(0, 0, 1), A.br(9) }; // C
+    page[0x300 / 4 ..][0..2].* = .{ A.addi(0, 0, 1), A.br(10) }; // D
+    m.code(0x10000, &page);
+    m.regs.x[6] = 0x40000;
+    m.regs.x[7] = 0x10100;
+    m.regs.x[8] = 0x10200;
+    m.regs.x[9] = 0x10300;
+    m.regs.x[10] = 0x10000;
+    m.regs.pc = 0x10000;
+    // Warm up with a silent doorbell: everything compiled, into one region
+    // (one module per page), and the doorbell's page in the data TLB.
+    m.cpu.irq_pending = bell;
+    try expectEv(&m, mach.EV_BUDGET, m.run(100000));
+    // Ring it: C's store raises the interrupt, D's checked entry sees it.
+    m.regs.x[5] = 1;
+    m.regs.pc = 0x10000;
+    const entries = if (jc.enabled) m.cpu.priv.jit.entries else 0;
+    try expectEv(&m, mach.EV_INTERRUPT, m.run(100000));
+    try t.expectEqual(@as(u64, 0x10300), m.regs.pc);
+    if (@import("run.zig").use_ref) {
+        try t.expectEqual(@as(u64, 0), m.cpu.priv.a64.stop_block);
+    } else {
+        try t.expectEqual(@as(u64, 0x10200), m.cpu.priv.a64.stop_block);
+        if (jc.enabled) {
+            // One entry into the region at A, which ran on to C.
+            try t.expectEqual(entries + 1, m.cpu.priv.jit.entries);
+            try t.expectEqual(@intFromEnum(tier.StopTier.compiled), m.cpu.priv.a64.stop_tier);
+        } else try t.expectEqual(@intFromEnum(tier.StopTier.decoded), m.cpu.priv.a64.stop_tier);
+    }
     bell.* = 0;
     m.cpu.irq_pending = null;
 }

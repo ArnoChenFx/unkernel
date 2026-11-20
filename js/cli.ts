@@ -19,7 +19,7 @@ import { bundledBoot, moduleIsMemory64, type ExitResult } from "./core/kernel.ts
 import { smpKernelFromBundle } from "./core/kpatch.ts";
 import type { MountsOption } from "./core/mounts.ts";
 import { NetStack } from "./core/net.ts";
-import { formatProfile, type ProfileOptions } from "./core/profile.ts";
+import { formatProfile, symbolizeProfile, type ProfileOptions } from "./core/profile.ts";
 import type { JitStats, KwemuStats } from "./core/jit.ts";
 import { createImageFromKwsparse, openDisk } from "./node/disk.ts";
 import { distroFetcher, isCheckout, type FetchDistroProgress } from "./node/distro-fetch.ts";
@@ -38,7 +38,7 @@ const fetchDistro = distroFetcher(new URL("..", import.meta.url));
 const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--distro alpine|debian|none|FILE|URL]
        [--initrd none|NAME|file.cpio[.gz]] [--append "cmdline"] [--user NAME]
        [--mem MiB] [--timeout seconds] [--input "text"] [--input-delay seconds]
-       [--size COLSxROWS] [--stats] [--profile FILE [--profile-hz N] [--profile-insns N]]
+       [--size COLSxROWS] [--stats] [--profile FILE [--profile-hz N] [--profile-insns N] [--profile-root DIR]]
        [--disk image.ext4[:ro]|URL[:ro]]... [--snapshot]
        [--data FILE [--data-template FILE.kwsparse.gz]]
        [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
@@ -111,13 +111,16 @@ asks, and --stats then says "not in this kernel"). --stats prints the JIT counte
 kernel built by kernel/build.sh stats.
 
 --profile FILE samples where guest user time goes and writes a JSON histogram
-to FILE at exit (by command, process and user pc: time samples, instruction
-samples, the block that ran before a time sample and the kwemu tier that saw
-it; per 4 KiB page, time against instructions), with a short table on stderr.
-Time samples (--profile-hz N per CPU, default 1000) need the SMP kernel's
-shared memory, so --cpus 2 or more; without it there are instruction samples
-only (one every --profile-insns N user instructions of a CPU, default
-1000000; 0 turns either off).
+to FILE at exit (time samples, instruction samples, the block that ran before
+a time sample and the kwemu tier that saw it; by file and file offset over
+all processes, per 4 KiB page of a file time against instructions, and per
+command, process and user pc), with a short table on stderr. Time samples
+(--profile-hz N per CPU, default 1000) need the SMP kernel's shared memory,
+so --cpus 2 or more; without it there are instruction samples only (one
+every --profile-insns N user instructions of a CPU, default 1000000; 0 turns
+either off). --profile-root DIR names the code with ELF symbols, reading
+the guest's files from a host copy of its root (for example
+vendor/build/distro/debian-root).
 
 --worker runs the kernel in a worker thread (createKernel({ worker: true })),
 with the disks and the network built there from specs; the display, the input
@@ -267,12 +270,13 @@ const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;
 const workerArg = args.find((a) => a === "--worker" || a.startsWith("--worker="));
 const profileFile = opt("profile");
+const profileRoot = opt("profile-root");
 const profile: ProfileOptions | undefined = profileFile === undefined ? undefined : {
 	hz: Number(opt("profile-hz", "1000")),
 	insns: Number(opt("profile-insns", "1000000")),
 };
-if (profile && (!profileFile || profileFile.startsWith("--") || !(profile.hz! >= 0) || !(profile.insns! >= 0))) {
-	process.stderr.write("[host] --profile FILE [--profile-hz N] [--profile-insns N]\n");
+if (profile && (!profileFile || profileFile.startsWith("--") || !(profile.hz! >= 0) || !(profile.insns! >= 0) || profileRoot?.startsWith("--") || (args.includes("--profile-root") && !profileRoot))) {
+	process.stderr.write("[host] --profile FILE [--profile-hz N] [--profile-insns N] [--profile-root DIR]\n");
 	process.exit(1);
 }
 // A restore defaults to the snapshot's CPUs (another count is refused).
@@ -715,7 +719,14 @@ function finish(res: ExitResult): void {
 	if (!profileFile) return finishNow(res);
 	if (finishing) return;
 	finishing = true;
-	void Promise.race([vm.profile(), new Promise<undefined>((r) => setTimeout(r, 5000))]).then((report) => {
+	void Promise.race([vm.profile(), new Promise<undefined>((r) => setTimeout(r, 5000))]).then(async (report) => {
+		if (report && profileRoot) {
+			const top = path.resolve(profileRoot);
+			await symbolizeProfile(report, (p) => {
+				const f = path.resolve(top, `.${p}`);
+				return f.startsWith(top + path.sep) && existsSync(f) && statSync(f).isFile() ? readFileSync(f) : undefined;
+			});
+		}
 		if (!report) process.stderr.write("[host] profile: no report\n");
 		else {
 			writeFileSync(profileFile, `${JSON.stringify(report, null, 1)}\n`);

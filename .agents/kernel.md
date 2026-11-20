@@ -86,7 +86,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 | arm64 uapi | `arch/wasm/include/uapi/asm/`, `include/asm/elf.h` |
 | features: the table, `kw.isa=`, AT_HWCAP, cpuinfo | `arch/wasm/kernel/cpu.c`, `kw_isa_init()` from `tlb.c` |
 | IRQ numbers, IPI bits | `arch/wasm/include/asm/irq.h` |
-| guest pc sampling (`kw_prof`, its rings) | `arch/wasm/kernel/prof.c`, `asm/kwprof.h` |
+| guest pc sampling (`kw_prof`, its rings and file names) | `arch/wasm/kernel/prof.c`, `asm/kwprof.h` |
 | devices | `drivers/tty/hvc/hvc_wasm.c`, `drivers/block/kwblk.c`, `drivers/net/kwnet.c`, `drivers/video/fbdev/kwfb.c`, `drivers/input/kwinput.c`, `sound/drivers/kwsnd.c`, `net/vmw_vsock/kwvsock.c`, `drivers/misc/kwshm.c` |
 
 ## The kwemu contract (`include/kw_emu.h`)

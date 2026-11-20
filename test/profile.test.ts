@@ -4,6 +4,8 @@
 // kernel's arch/wasm/kernel/prof.c) on the bundled kernel's base shell: a
 // busy awk is the dominant command in instruction samples (the UP kernel,
 // inline) and in time samples (the SMP kernel on 2 CPUs, in a worker);
+// samples name the file and offset of their code, the same in two processes
+// of one binary, and code in anonymous memory keeps its raw address;
 // without the option the kernel's rings stay untouched; a snapshot taken
 // while sampling restores without it, sampling off.
 //
@@ -14,7 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createKernel, bundledKernelUrl, type KernelHandle, type KernelInstance } from "../js/node.ts";
+import { PROFILE_ANON, PROFILE_UNKNOWN, createKernel, bundledKernelUrl, type KernelHandle, type KernelInstance } from "../js/node.ts";
 
 const testKernel = process.env.UNKERNEL_TEST_KERNEL ? path.resolve(process.env.UNKERNEL_TEST_KERNEL) : undefined;
 const kernelModule = await WebAssembly.compile(readFileSync(testKernel ?? fileURLToPath(bundledKernelUrl)));
@@ -74,6 +76,96 @@ test("profile on the UP kernel: instruction samples only, awk dominant", async (
 	assert.equal(rings(vm).flags, 2);
 });
 
+/**
+ * A static aarch64 program (ELF built here) that copies a two-instruction
+ * loop into an anonymous RWX page and calls it with x0 = 0x2fa0000: about
+ * 100 M instructions in memory no file backs (a guest JIT's code).
+ */
+function anonLoopElf(): Uint8Array {
+	const base = 0x400000, code = 120;
+	const words = [
+		0xd2800000, 0xd2820001, 0xd28000e2, 0xd2800443, // x0 = 0, x1 = 4096, x2 = RWX, x3 = MAP_PRIVATE | MAP_ANONYMOUS
+		0x92800004, 0xd2800005, 0xd2801bc8, 0xd4000001, // x4 = -1, x5 = 0, x8 = mmap; svc
+		0xaa0003f3, 0, // x19 = the page; adr x1, body (below)
+		0xf9400022, 0xf9000262, 0xb9400822, 0xb9000a62, // copy body's 3 words
+		0xd5033fdf, 0xd2a05f40, 0xd63f0260, // isb; x0 = 0x2fa0000; blr x19
+		0xd2800000, 0xd2800ba8, 0xd4000001, // exit(0)
+		0xf1000400, 0x54ffffe1, 0xd65f03c0, // body: subs x0, x0, #1; b.ne body; ret
+	];
+	const adr = 9, body = 20;
+	const imm = (body - adr) * 4;
+	words[adr] = 0x10000000 | ((imm & 3) << 29) | ((imm >> 2) << 5) | 1;
+	const size = code + words.length * 4;
+	const b = new Uint8Array(size);
+	const dv = new DataView(b.buffer);
+	b.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+	dv.setUint16(16, 2, true); // ET_EXEC
+	dv.setUint16(18, 183, true); // EM_AARCH64
+	dv.setUint32(20, 1, true);
+	dv.setBigUint64(24, BigInt(base + code), true); // e_entry
+	dv.setBigUint64(32, 64n, true); // e_phoff
+	dv.setUint16(52, 64, true);
+	dv.setUint16(54, 56, true);
+	dv.setUint16(56, 1, true);
+	dv.setUint16(58, 64, true);
+	dv.setUint32(64, 1, true); // PT_LOAD
+	dv.setUint32(68, 5, true); // R | X
+	dv.setBigUint64(80, BigInt(base), true);
+	dv.setBigUint64(88, BigInt(base), true);
+	dv.setBigUint64(96, BigInt(size), true);
+	dv.setBigUint64(104, BigInt(size), true);
+	dv.setBigUint64(112, 0x1000n, true);
+	words.forEach((w, i) => dv.setUint32(code + 4 * i, w, true));
+	return b;
+}
+
+/** File offset ranges of an ELF file's executable PT_LOAD segments. */
+function execRanges(b: Uint8Array): [number, number][] {
+	const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+	const phoff = Number(dv.getBigUint64(32, true)), n = dv.getUint16(56, true), sz = dv.getUint16(54, true);
+	const out: [number, number][] = [];
+	for (let i = 0; i < n; i++) {
+		const p = phoff + i * sz;
+		if (dv.getUint32(p, true) === 1 && dv.getUint32(p + 4, true) & 1) {
+			const off = Number(dv.getBigUint64(p + 8, true));
+			out.push([off, off + Number(dv.getBigUint64(p + 32, true))]);
+		}
+	}
+	return out;
+}
+
+test("profile: samples name the file and offset, roll up across processes; anonymous code stays per process", async (t) => {
+	const { vm } = await boot(t, { profile: { insns: 100000 } });
+	const busybox = (await vm.exec("cat", ["/bin/busybox"], { encoding: "buffer" })).stdout;
+	assert.equal((await vm.exec("awk", BUSY)).stdout, BUSY_OUT);
+	assert.equal((await vm.exec("awk", BUSY)).stdout, BUSY_OUT);
+	const put = await vm.exec("sh", ["-c", "cat > /tmp/anonloop && chmod +x /tmp/anonloop && /tmp/anonloop"], { input: anonLoopElf() });
+	assert.equal(put.exitCode, 0, put.stderr);
+	const p = (await vm.profile())!;
+	assert.equal(p.version, 2);
+	assert.ok(p.where.file > 5000 && p.where.named >= 1, JSON.stringify(p.where));
+	assert.equal(p.where.noName, 0);
+	// awk's code: /bin/busybox, at offsets in its executable segments.
+	const ranges = execRanges(busybox);
+	const awk = p.sites.filter((x) => x.comm === "awk" && x.path === "/bin/busybox");
+	assert.ok(awk.length > 10, JSON.stringify(p.sites.slice(0, 4)));
+	for (const x of awk) {
+		const off = Number(x.off);
+		assert.ok(ranges.some(([a, b]) => off >= a && off < b), `${x.off} outside ${JSON.stringify(ranges)}`);
+	}
+	// Both awk processes ran the same loop: one site, two processes.
+	const top = [...awk].sort((a, b) => b.insnSamples - a.insnSamples)[0]!;
+	assert.ok(top.processes >= 2 && top.pid === undefined, JSON.stringify(top));
+	const awkPids = new Set(p.procPages.filter((x) => x.comm === "awk").map((x) => x.pid));
+	assert.ok(awkPids.size >= 2, `awk pids ${[...awkPids]}`);
+	assert.ok(p.files.some((f) => f.path === "/bin/busybox" && f.processes >= 3));
+	// The loop in an anonymous page: no file (id 0), its own process, the raw address.
+	const anon = p.sites.filter((x) => x.path === PROFILE_ANON && x.comm === "anonloop");
+	assert.ok(p.where.anon > 500 && anon.reduce((a, x) => a + x.insnSamples, 0) > 500, JSON.stringify(p.where));
+	assert.ok(anon.every((x) => x.pid !== undefined && x.processes === 1 && BigInt(x.off) >= 0x1000n));
+	assert.ok(!p.sites.some((x) => x.comm === "anonloop" && x.path === PROFILE_UNKNOWN && x.insnSamples > 10));
+});
+
 test("profile on 2 CPUs (SMP kernel, worker): time and instruction samples, awk dominant, tiers named", { skip: !hasSmp && "the bundle has no SMP kernel (kernel/build.sh smp)" }, async (t) => {
 	const { vm } = await boot(t, { worker: true, cpus: 2, profile: { hz: 1000, insns: 1000000 } });
 	assert.equal((await vm.exec("awk", BUSY)).stdout, BUSY_OUT);
@@ -89,6 +181,9 @@ test("profile on 2 CPUs (SMP kernel, worker): time and instruction samples, awk 
 	const awkRows = p.rows.filter((r) => r.comm === "awk" && r.timeSamples);
 	assert.ok(awkRows.some((r) => r.tier === "compiled" || r.tier === "decoded"), JSON.stringify(awkRows.slice(0, 4)));
 	assert.ok(awkRows.some((r) => r.prevBlockPc), "time samples name the block that ran before");
+	// Time samples name their file too (recorded after the interrupt, in task context).
+	const awkTime = p.sites.filter((x) => x.comm === "awk" && x.path === "/bin/busybox").reduce((a, x) => a + x.timeSamples, 0);
+	assert.ok(awkTime > top.user * 0.9, `${awkTime} of ${top.user} awk time samples in /bin/busybox; ${JSON.stringify(p.where)}`);
 	const res = await vm.stop();
 	assert.equal(res.kind, "stopped");
 	const last = (await vm.profile())!;

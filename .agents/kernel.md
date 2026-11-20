@@ -6,7 +6,7 @@ break. Longer topics are in `.agents/kernel/`:
 | File | Covers |
 | --- | --- |
 | [kernel/smp.md](kernel/smp.md) | the SMP build: model, moving tasks, IPIs, MM, waiting for another CPU, devices, costs |
-| [kernel/parking.md](kernel/parking.md) | parking every task, snapshots and restore, what SMP parking would need |
+| [kernel/parking.md](kernel/parking.md) | parking every task, snapshots and restore, on UP and on SMP |
 | [kernel/devices.md](kernel/devices.md) | console, kwblk, kwnet, kwfb, kwinput, kwsnd, kwvsock, kwshm, 9p |
 | [kernel/config.md](kernel/config.md) | `kw_defconfig` rules, what is on and off, measured options |
 | [kernel/tests.md](kernel/tests.md) | kwtest and abitest coverage, other checks, debugging |
@@ -71,7 +71,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 
 | What | Where |
 | --- | --- |
-| entry, task switch, `kw_resume`, `kw_secondary_entry` | `arch/wasm/kernel/entry.S`, `process.c` |
+| entry, task switch, `kw_resume`, `kw_secondary_entry`, `kw_secondary_resume` | `arch/wasm/kernel/entry.S`, `process.c` |
 | user-mode loop (`kw_run` slices, IRQ and timer checks, yield) | `arch/wasm/kernel/traps.c` (`KW_SLICE` 200000, `KW_ENTRY_COST` 1000, `KW_YIELD_NS` 20 ms) |
 | parking, `/proc/kwpark` | `arch/wasm/kernel/park.c`, `asm/park.h`, `include/linux/kw_park.h` |
 | SMP: CPU bring-up, `kw_host_call()`; IPIs; waits | `arch/wasm/kernel/smp.c`, `irq.c`, `wait.c` |
@@ -108,7 +108,8 @@ a patch re-export.
   then calls `kw_isa_init()` (cpu.c), which calls `kw_set_isa()` once with
   what `kw.isa=` leaves on and advertises exactly the set it returns.
   `kw_set_isa()` drops all decoded code, so it is for boot only.
-- `kw_host_reset()` is for a restored snapshot (`__kw_resume`): the memory
+- `kw_host_reset()` is for a restored snapshot (`__kw_resume`, and each
+  other CPU's `kw_secondary_restart()` on SMP): the memory
   belongs to a new module instance, so kwemu forgets its JIT slots without
   `kw_host_jit_free`, asks `kw_host_jit_caps` again and drops all decoded
   code.
@@ -120,8 +121,9 @@ a patch re-export.
   and `struct kw_regs`, which the kernel owns. The atomics build (SMP
   kernels) has two static words in kwemu's data section, shared by every
   CPU as they must be: `pair_lock` (128-bit STXP and CASP) and
-  `code_epoch` (IC IVAU on any CPU; a64/tier.md, Coherence). Parking, UP only,
-  never sees them.
+  `code_epoch` (IC IVAU on any CPU; a64/tier.md, Coherence). A snapshot
+  is taken with every CPU out of `kw_run()`, so `pair_lock` is free in it,
+  and `code_epoch` only counts up (kernel/parking.md, SMP).
 - User page tables are read at `phys_base + pa` (Memory model), and kwemu
   never writes a PTE: if A is 0, or D is 0 on a store, it raises
   `KW_EV_FAULT`, and the kernel sets the bits directly (a fast path, like
@@ -219,7 +221,8 @@ A task suspended in JSPI cannot be saved, so parking brings every task to a
 point where its state is all in memory, and resumes each on a fresh stack;
 snapshots are built on it. **Every kernel thread needs a
 `kw_park_point()` in its loop**, or every cycle fails with EBUSY naming it.
-UP only. Details: [kernel/parking.md](kernel/parking.md).
+Parking and snapshots work on both kernels. Details:
+[kernel/parking.md](kernel/parking.md).
 
 ## Host interface
 
@@ -248,9 +251,10 @@ instantiation fails; a standalone WASI runtime cannot run the kernel.
   the kernel image or the bounce buffer.
 
 **`unkernel`**: `wasm_switch_to`, `wasm_snapshot_point` (parking.md),
-`wasm_init_flag`, `wasm_cpu_count`, `wasm_cpu_start` and `wasm_stack_drop`
-(SMP kernels only), `wasm_driver_console_size`, `wasm_dump_stacktrace`, the
-device imports (`wasm_driver_block_*`, `_net_*`, `_fb_*`, `_input_*`,
+`wasm_init_flag`, `wasm_cpu_count`, `wasm_cpu_start` (also from a
+restored snapshot's `__kw_resume()`, which the host answers with
+`kw_secondary_resume`) and `wasm_stack_drop` (SMP kernels only),
+`wasm_driver_console_size`, `wasm_dump_stacktrace`, the device imports (`wasm_driver_block_*`, `_net_*`, `_fb_*`, `_input_*`,
 `_sound_*`, `_vsock_*`, `_shm_*`; devices.md) and kwemu's
 `kw_host_jit_caps`/`compile`/`free` (host `js/core/jit.ts`). **`env`**
 holds only `memory`, fixed size, chosen by the host.

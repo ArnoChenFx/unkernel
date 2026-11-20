@@ -24,7 +24,7 @@ import { NetStack, type NetBackend, type NetStats } from "./net.ts";
 import { buildDisks, buildNet, isNetSpec, type DeviceRegistry, type DiskSpec, type NetSpec, type SkippedDisk } from "./devices.ts";
 import { openDistro, type DistroInfo, type DistroSource } from "./distro.ts";
 import { ConsoleOutput } from "./output.ts";
-import type { KernelSnapshot } from "./snapshot.ts";
+import { snapshotCpuMismatch, type KernelSnapshot } from "./snapshot.ts";
 import { checkWorkerOptions, createKernelInWorker, type WorkerKernel } from "./worker-host.ts";
 import type { WorkerEndpoint } from "./worker-protocol.ts";
 import type { KernelTransport } from "./worker-shared.ts";
@@ -62,7 +62,8 @@ export interface CreateKernelOptions {
 	 * in the snapshot, read-only as it was, and the guest's open files on
 	 * it are opened again by path (a file gone meanwhile answers ESTALE);
 	 * nothing of their files is in the snapshot. Other `mounts` are
-	 * mounted as at boot.
+	 * mounted as at boot. `cpus` defaults to the snapshot's CPU count, and
+	 * another count rejects (every task resumes on the CPU it ran on).
 	 */
 	restore?: KernelSnapshot;
 	/**
@@ -137,9 +138,10 @@ export interface CreateKernelOptions {
 	 * SMP): each runs in its own thread on a shared memory, so it needs a
 	 * platform that starts CPU threads (Platform.spawnCpu: Node, and browsers
 	 * where the kernel runs in a worker of a cross-origin isolated page, as
-	 * `worker: true` does). Default 1. A UP kernel ignores it, and so does a
-	 * thread that cannot start CPUs (both with a log line); stats().cpus
-	 * says how many it got.
+	 * `worker: true` does). Default 1, or with `restore` the snapshot's. A UP
+	 * kernel ignores it, and so does a thread that cannot start CPUs (both
+	 * with a log line; a restore then rejects); stats().cpus says how many
+	 * it got.
 	 */
 	cpus?: number;
 	/**
@@ -784,6 +786,13 @@ export function createKernelOn(platform: Platform, opts?: CreateKernelOptions & 
 export async function createKernelOn(platform: Platform, opts: CreateKernelOptions & WorkerOption = {}): Promise<KernelHandle> {
 	if (typeof WebAssembly !== "object" || typeof WebAssembly.Suspending !== "function" || typeof WebAssembly.promising !== "function")
 		throw new BootError("support", "This engine has no JSPI (WebAssembly.Suspending / WebAssembly.promising), which the kernel needs");
+	const restoring = opts.restore;
+	if (restoring) {
+		// A snapshot of an SMP machine boots the SMP kernel with its CPUs, unless told otherwise.
+		if (opts.cpus === undefined) opts = { ...opts, cpus: restoring.cpus ?? 1 };
+		const why = snapshotCpuMismatch(restoring, Math.max(1, Math.floor(opts.cpus ?? 1)));
+		if (why) throw new BootError("boot", `snapshot: ${why}`);
+	}
 	const { signal, onProgress } = opts;
 	const progress = (p: BootProgress) => { try { onProgress?.(p); } catch {} };
 	const vopt = opts.vsock ?? true;

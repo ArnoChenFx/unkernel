@@ -37,7 +37,9 @@
 //            other side's word (sequentially consistent), so no commit is
 //            missed.
 //   SPACE    writers waiting for space ("wait"): the reader notifies TAIL
-//   CLOSED   1: the session ended, writes are dropped
+//   CLOSED   1: the session ended (CPU 0's host closes it at exit, also
+//            when another thread reads it), writes are dropped; what was
+//            committed before can still be taken
 //   LOCK     held by the one taking records out (any thread, "post")
 //   BATCH    the next batch number
 //   BATCHES  batches posted by other CPUs and not yet taken by CPU 0's host
@@ -172,6 +174,8 @@ export class ConsoleRing {
 	 * taken out ("post", "take"). Returns the bytes dropped.
 	 */
 	write(src: Uint8Array, p: number, len: number, full: ConsoleFull, sink?: (b: ConsoleBatch) => void): number {
+		// The session ended: nothing written from now on comes out (not counted as dropped).
+		if (Atomics.load(this.ctl, CLOSED)) return len;
 		for (let off = 0; off < len;) {
 			const n = Math.min(len - off, this.#maxRecord);
 			if (!this.tryWrite(src, p + off, n) && !(full === "wait" ? this.#waitWrite(src, p + off, n) : this.#takeWrite(src, p + off, n, sink!, full === "post"))) {

@@ -255,7 +255,6 @@ export function createUi(cfg: Config) {
 		},
 		/** Suspend from a shortcut or the dialog: asks first (boot.ts does it: KW.suspend). */
 		async confirmSuspend() {
-			if (cfg.cpus > 1) { ui.toast("Suspend needs one CPU: the SMP kernel cannot be saved (Options, CPUs)"); return; }
 			if (!KW.suspend || $.get().state !== "running") { ui.toast("Suspend works once the system runs"); return; }
 			if (!await ui.ask({ title: "suspend", msg: "Save the running system in this browser and stop it? The next load offers to resume it. Terminal windows 1-9 and network connections do not survive.", ok: "Suspend" })) return;
 			ui.closePanel();
@@ -405,7 +404,7 @@ export function createUi(cfg: Config) {
 		L.push(`unkernel diagnostics, ${new Date().toISOString()}`);
 		L.push(`url: ${location.href}`);
 		L.push(`state: ${s.state} (${s.label}) after ${fmtT(now())}`);
-		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.cpus > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl} distro=${cfg.guest}${s.distro ? ` image=${s.distro.image || "?"} (${s.distro.url})` : ""} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}${cfg.smpParam > 1 ? ` cpus=${cfg.cpus}${cfg.smpWhy ? ` (asked ${cfg.smpParam}: ${cfg.smpWhy})` : ""}` : ""}`);
+		L.push(`config: mem=${cfg.memMiB} MiB (${cfg.memWhy})${KW.memActualMiB ? ` allocated=${KW.memActualMiB} MiB` : ""} kernel=${cfg.cpus > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl} distro=${cfg.guest}${s.distro ? ` image=${s.distro.image || "?"} (${s.distro.url})` : ""} cmdline="${cfg.cmdline}"${cfg.worker ? " worker=1" : ""}${cfg.smpParam > 1 || cfg.cpus > 1 || cfg.smpWhy ? ` cpus=${cfg.cpus}${cfg.smpWhy ? ` (asked ${cfg.smpParam}: ${cfg.smpWhy})` : cfg.resumeCpus ? " (the suspended session's)" : ""}` : ""}`);
 		L.push("", "== stages");
 		for (const [id] of STAGES) {
 			const st = stages[id]!;

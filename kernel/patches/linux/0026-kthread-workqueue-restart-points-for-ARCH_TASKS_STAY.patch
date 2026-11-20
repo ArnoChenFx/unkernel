@@ -1,4 +1,4 @@
-From e52d7c1acab2b42aa690091b8a155ab2f988116e Mon Sep 17 00:00:00 2001
+From 17e7967b624988b2ae836ac939db69bf8ab31ad9 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:06:57 +0000
 Subject: [PATCH] kthread, workqueue: restart points for ARCH_TASKS_STAY_ON_CPU

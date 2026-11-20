@@ -39,7 +39,7 @@ import { InputHost, type InputState } from "./input.ts";
 import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
-import { copySnapshotMemory, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot } from "./snapshot.ts";
+import { copySnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot } from "./snapshot.ts";
 import { VsockDevice } from "./vsock.ts";
 import { WasiHost, never } from "./wasi.ts";
 
@@ -174,9 +174,10 @@ export interface KernelConfig {
 	jit?: boolean;
 	/**
 	 * Resume this snapshot (snapshot()) instead of booting: same kernel
-	 * build, memory size and type. initrd and cmdline are ignored. `disks`
-	 * must be the snapshot's, unchanged (snapshotDiskMismatch); boot()
-	 * rejects otherwise.
+	 * build, memory size and type, and as many CPUs (`cpus`, which an SMP
+	 * snapshot needs the platform to start). initrd and cmdline are ignored.
+	 * `disks` must be the snapshot's, unchanged (snapshotDiskMismatch);
+	 * boot() rejects otherwise.
 	 */
 	restore?: KernelSnapshot;
 	/**
@@ -359,6 +360,10 @@ export class Kernel {
 		this.exited = new Promise((r) => (this.exit = (res) => {
 			if (this.result) return; // first exit wins
 			this.consoleFlush(true);
+			// Another thread reads the ring: what a CPU writes from now on is
+			// dropped (after a snapshot with stop, the other CPUs run on until
+			// their threads end; nothing they write may come out).
+			this.conRing?.close();
 			this.result = res;
 			try { this.onStage("exit", res); } catch {}
 			r(res);
@@ -473,6 +478,8 @@ export class Kernel {
 				initFlag: flag instanceof WebAssembly.Global ? Number(flag.value) : 0,
 				irqWord0: this.irqAddr ?? 0,
 				epochMs: performance.timeOrigin - this.wasi.monoOffset,
+				// A restored kernel starts its CPUs only to resume them (__kw_resume).
+				resume: !!this.opts.restore,
 				jit: this.jit.stats.enabled, memory64: this.memory64, jitMirror,
 				console: this.conRing!.buffer, consoleFull: this.conReader ? "post" : "wait",
 			});
@@ -722,7 +729,9 @@ export class Kernel {
 	 * network's TCP connections do not survive a restore (the guest's get
 	 * reset), except the 9p sessions of host file systems, which the vsock
 	 * device saves (VsockDevice.onSave; a request in flight on one makes
-	 * the snapshot point busy, VsockDevice.blocker()).
+	 * the snapshot point busy, VsockDevice.blocker()). An SMP kernel's
+	 * snapshot records its CPU count (KernelSnapshot.cpus); a restore needs
+	 * as many, each task resuming on the CPU it ran on.
 	 */
 	snapshot({ stop = false }: { stop?: boolean } = {}): Promise<KernelSnapshot> {
 		if (this.irqAddr === undefined || this.result) return Promise.reject(new Error("snapshot: the kernel is not running"));
@@ -821,7 +830,7 @@ export class Kernel {
 		const input = new Uint8Array(pending.reduce((n, c) => n + c.length, 0));
 		pending.reduce((off, c) => (input.set(c, off), off + c.length), 0);
 		const snap: KernelSnapshot = {
-			version: 1, fingerprint: this.fingerprint, memory64: this.memory64,
+			version: 1, fingerprint: this.fingerprint, cpus: this.cpus, memory64: this.memory64,
 			...copySnapshotMemory(this.u8(), freeBits ? this.u8().subarray(Number(freeMap), Number(freeMap) + Math.ceil(Number(freeBits) / 8)) : null, Number(freeBits ?? 0)),
 			monotonicMs: this.wasi.monotonicMs(),
 			consoleSize: this.consoleSize, input, disks: sealed.map((s) => s.state),
@@ -971,7 +980,8 @@ export class Kernel {
 		const { module, restore } = this.opts;
 		if (restore) {
 			// A disk that changed since the snapshot would not match the restored caches.
-			const why = snapshotDiskMismatch(restore.disks ?? [], this.block.disks)
+			const why = snapshotCpuMismatch(restore, this.cpus)
+				?? snapshotDiskMismatch(restore.disks ?? [], this.block.disks)
 				?? snapshotDeviceMismatch(restore.devices ?? {}, this.devicesPresent(), this.opts.net?.mac);
 			if (why) throw new Error(`snapshot: ${why}`);
 		}

@@ -1,4 +1,4 @@
-From c2beeed8b46f064329b567f35cebabf5cb0645af Mon Sep 17 00:00:00 2001
+From d7f45bf8f39ccea86cdce0d76f8381b7f19e9812 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:10 +0000
 Subject: [PATCH] wasm: kwsnd, ALSA playback to the JavaScript host

@@ -121,7 +121,7 @@ shared memory. PCM and everything else are messages either way.
 N CPUs, each another instance of the kernel in its own thread on a shared
 memory, each with its own JIT; it implies --worker, and --stats prints the
 JIT counters per CPU. A UP kernel runs on one CPU (a log line says so). An SMP kernel has every device
-(their host side and their I/O stay with CPU 0), but no snapshots.
+(their host side and their I/O stay with CPU 0) and snapshots.
 
 --display gives the guest a display: /dev/fb0 (kwfb, 32 bpp XRGB8888), whose
 memory exists while a program has it open; 640x480, or --display=WxH (the
@@ -191,7 +191,8 @@ it run on, {suspend=FILE} saves it and stops it (exit 0, no clean shutdown),
 and --restore FILE resumes one instead of booting, with the same kernel (the
 snapshot carries the memory size; --mem, --initrd and --append do not apply)
 and the same devices (--no-net, --no-vsock, --display, --sound and --shm as
-when it was saved), with or without --worker. --mount directories survive
+when it was saved), with or without --worker, and on as many CPUs (--cpus
+defaults to the snapshot's; another count is refused). --mount directories survive
 (without --worker), with the guest's open files on them: pass the same
 --mount options again (a file deleted meanwhile gives "Stale file handle").
 Other vsock sessions (--forward connections) and the guest's TCP connections
@@ -255,7 +256,8 @@ const timeout = Number(opt("timeout", "0"));
 const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;
 const workerArg = args.find((a) => a === "--worker" || a.startsWith("--worker="));
-const smpCpus = Number(opt("cpus", "1"));
+// A restore defaults to the snapshot's CPUs (another count is refused).
+const smpCpus = Number(opt("cpus", String(restore?.cpus ?? 1)));
 if (!Number.isInteger(smpCpus) || smpCpus < 1 || smpCpus > 32) {
 	process.stderr.write("[host] --cpus N: 1 to 32 CPUs\n");
 	process.exit(1);
@@ -414,7 +416,7 @@ const net = !useNet || worker ? undefined : new NetStack({
 	hostLoopback: !wisp, mtu: mtu ? Number(mtu) : undefined, log,
 });
 
-if (restorePath && restore) process.stderr.write(`[host] restoring ${rel(restorePath)} (${restore.memory.byteLength / 1048576} MiB)\n`);
+if (restorePath && restore) process.stderr.write(`[host] restoring ${rel(restorePath)} (${restore.memory.byteLength / 1048576} MiB${(restore.cpus ?? 1) > 1 ? `, ${restore.cpus} CPUs` : ""})\n`);
 
 const sizeOpt = opt("size")?.match(/^(\d+)x(\d+)$/);
 const consoleSize = sizeOpt ? { cols: Number(sizeOpt[1]), rows: Number(sizeOpt[2]) }

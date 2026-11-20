@@ -94,28 +94,45 @@ parts that are easy to get wrong.
   says how much was left out) and seals every disk. It resolves with a
   `KernelSnapshot` (the whole memory, the kernel's `linux_banner` as its
   fingerprint, the guest's monotonic time, the console size, unread
-  console input, each disk's `DiskSnapshotState` and the other devices'
-  `DeviceSnapshots`) once the disks are durable. Without `stop` the guest
-  keeps running; `stop: true` calls `Kernel.stop()` inside the import, so
-  no task runs after the copy. It rejects when a disk cannot be in a
+  console input, the CPU count (`cpus`), each disk's `DiskSnapshotState`
+  and the other devices' `DeviceSnapshots`) once the disks are durable.
+  Without `stop` the guest keeps running; `stop: true` calls
+  `Kernel.stop()` inside the import, so no task runs after the copy on
+  CPU 0; with several CPUs the others run on until their threads end, but
+  the exit has closed the console ring, so nothing they write comes out,
+  and every device is CPU 0's. The copy of an SMP kernel's shared memory
+  is an ordinary ArrayBuffer (transferable in worker mode). It rejects when a disk cannot be in a
   snapshot, when a task does not park (the error names it), when block,
   net, vsock or shm queues are not empty at that point, or a 9p request
   is in flight (`VsockDevice.blocker()`), and while a mount or unmount
   runs (`MountTable.snapshotBlocker()`; in worker mode while anything is
   mounted, Host file systems below).
-  `createKernel({ restore })` checks the disks (`snapshotDiskMismatch()`)
-  and the devices (`snapshotDeviceMismatch()`: display, sound, vsock, shm
-  and network each configured as when saved, the network with the same
-  MAC, since the restored kernel has exactly the drivers it had); a
-  mismatch rejects naming it, with no fallback. It then instantiates the
-  same build, copies the memory in and enters `kw_resume`;
+  `createKernel({ restore })` checks the CPU count
+  (`snapshotCpuMismatch()`: every task resumes on the CPU it ran on, so a
+  snapshot needs exactly its own count; `cpus` defaults to the
+  snapshot's, which also picks the bundle's SMP kernel, and a platform
+  that gives fewer CPUs rejects in `Kernel.boot()`), the disks
+  (`snapshotDiskMismatch()`) and the devices (`snapshotDeviceMismatch()`:
+  display, sound, vsock, shm and network each configured as when saved,
+  the network with the same MAC, since the restored kernel has exactly the
+  drivers it had); a mismatch rejects naming it, with no fallback. A UP
+  snapshot on the SMP kernel or the reverse fails the fingerprint check.
+  It then instantiates the same build (CPU 0 only), copies the memory in
+  and enters `kw_resume`; the kernel starts the other CPUs again
+  (`wasm_cpu_start`), and each CPU thread of a restored kernel enters
+  `kw_secondary_resume` (`CpuInit.resume`; CPU threads, below).
   `WasiHost.monoOffset` keeps the guest's monotonic clock going from the
-  saved value. `encodeSnapshot()`
+  saved value, on every CPU (`CpuInit.epochMs` is taken from it).
+  `encodeSnapshot()`
   leaves out zero 64 KiB chunks (4 KiB pages would save another 6%,
-  2026-11-15, so the format stays). `snapshot()` is on `KernelHandle`.
+  2026-11-15, so the format stays). Its JSON header has `cpus`; a file
+  without it (from before SMP snapshots) decodes as one CPU. `snapshot()` is on `KernelHandle`.
   The CLI's `{save=FILE}`, `{suspend=FILE}` (`--input` tokens) and
-  `--restore FILE` are the test hooks; `test/api.test.ts` round-trips a
-  shell through one, and one with a data disk.
+  `--restore FILE` (whose `--cpus` defaults to the snapshot's, so an SMP
+  snapshot runs in worker mode) are the test hooks; `test/api.test.ts`
+  round-trips a shell through one, one with a data disk, and a machine
+  busy on 4 CPUs (several snapshots while it runs, a restore, a snapshot
+  of the restored one restored again).
 - Disks in snapshots (core/block.ts, data-disk.md): disks are not copied.
   `BlockDevice.snapshotState()` gives a disk's identity, write generation
   and (files) a stamp; `snapshotSeal()`, called at the consistent point,
@@ -399,9 +416,9 @@ parts that are easy to get wrong.
   threads: a worker's value never ran ahead of the main thread's,
   2026-11-16). In worker mode the kernel worker starts the CPU threads
   itself (`ServeKernelOptions.spawnCpu`). Exit terminates them.
-- Defaults: the SDK and the CLI boot one CPU on the calling thread
-  (snapshots, `--suspend` and the kwtest and abitest runs of testing.md
-  expect the UP kernel). For a host that serves other work, `worker:
+- Defaults: the SDK and the CLI boot one CPU on the calling thread (the
+  kwtest and abitest runs of testing.md expect the UP kernel), except a
+  restore, which takes the snapshot's CPU count. For a host that serves other work, `worker:
   true` costs nothing (same speed, the event loop free) and `cpus: 4` is
   where parallel work stops gaining: `node test/profile.ts` (testing.md,
   Profiling CPUs and worker mode; i7-10700K, 2026-11-19: 4 CPUs 2.9-3.3x,
@@ -409,7 +426,9 @@ parts that are easy to get wrong.
 - `runCpu()` checks that the flag reads 2, instantiates the module with
   its own `wasm_switch_to` (its own resumers: JSPI stacks stay in their
   thread), clocks, `random_get`, `sched_yield`, kwemu's JIT imports and
-  `fd_write`, and enters `kw_secondary_entry(idle)`. Panic text (fd 2,
+  `fd_write`, and enters `kw_secondary_entry(idle)`, or in a restored
+  kernel (`CpuInit.resume`, from `KernelConfig.restore`: such a kernel
+  starts CPUs only to resume them) `kw_secondary_resume(idle)`. Panic text (fd 2,
   one CPU's) goes to CPU 0's host as a message; `log` lines are host
   messages, not console output. Its
   imports share one `Uint8Array` and one `DataView` made at start (the
@@ -439,7 +458,10 @@ parts that are easy to get wrong.
     where a thread has no `Atomics.waitAsync`). It needs nothing from CPU
     0, so a full ring makes a writer wait (`Atomics.wait`, "wait"): the
     owner never waits for the kernel, so that cannot deadlock. At exit
-    the owner takes what is left before it closes the output.
+    the owner takes what is left before it closes the output. CPU 0's
+    host closes the ring at its exit too (later writes are dropped, what
+    was committed can still be taken), so that after a snapshot with
+    `stop` nothing the other CPUs write meanwhile comes out.
   - Inline and `--worker=messages`: CPU 0's host reads it (`Kernel`):
     the same loop while its thread is free, a take in its clock import
     (`Kernel.poller`, at most every 1 ms unless 16 KiB wait; the messages

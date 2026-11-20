@@ -1,4 +1,4 @@
-From 5cc346df367c28aee8b92da1d027cab81a572eb1 Mon Sep 17 00:00:00 2001
+From 020120e8e6cd93ac6ca0960fe2c919ff3a5c5103 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:09 +0000
 Subject: [PATCH] wasm: kwnet, an Ethernet device backed by the JavaScript host

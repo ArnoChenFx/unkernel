@@ -34,8 +34,8 @@ layer has kwwasi and its rc registers it; `node test/wasi-binfmt.ts
 [--worker] [--messages]` (on Alpine) installs a fresh build through a
 mount and registers it by hand if needed. It passes inline, in
 a worker and with `UNKERNEL_TEST_CPUS=2`, on the shared path and with
-`--messages` (2026-11-19, aarch64; the snapshot part with one CPU only, since an
-SMP kernel has no KW_PARK), and the built CLI (`pnpm build`,
+`--messages` (2026-11-19, aarch64; the snapshot part with one CPU only, from
+before SMP kernels had snapshots), and the built CLI (`pnpm build`,
 `dist/cli.mjs --wasi`, inline and `--cpus 2`) ran programs on the shared
 path (a Ctrl-C through it was tried on the message path only). Preview 0
 modules (`wasi_unstable`) run adapted (js.md): wasienv's Lua 5.4 shell
@@ -191,7 +191,7 @@ Open:
    bundles carry the patch to it. JSPI-suspended stacks cannot move
    between threads, so a task moves only where its stack can be dropped
    and it can start on a fresh one (kernel/smp.md, Moving tasks); parking
-   assumes UP in the places listed in kernel/parking.md. Measured on the
+   and snapshots work (kernel/parking.md, SMP). Measured on the
    riscv64 guest (2026-11-16 and 17, Node, i7-10700K): on one CPU against
    the UP build, user code, syscalls and copies are unchanged, while
    anonymous faults cost +40% and fork+exit+wait +46% (atomics, spinlocks,
@@ -213,9 +213,10 @@ Open:
      4 KiB O_DIRECT read took 80-90 µs from CPU 1 against 30-40 µs from
      CPU 0, riscv64 guest, 2026-11-16); adaptive idle polling
      (below) or completing on the submitting CPU would cut that.
-   - Parking and snapshots: deferred (decided 2026-11-17). They stay
-     UP only (`KW_PARK` depends on `!SMP`; kernel/parking.md lists what
-     they would need), and the page hides Suspend with several CPUs.
+   - Snapshots work on SMP with the CPU count they were saved with (a
+     park cycle costs 13-15 ms under load, mostly a grace period in
+     flight finishing; kernel/parking.md, SMP), also the page's Suspend
+     (item 10).
    - Console ring (js.md, CPU threads), paths that never ran: the
      reader's 4 ms polling where the main thread has no
      `Atomics.waitAsync`, the drop path in a real guest (stress test
@@ -334,10 +335,11 @@ Open:
     - **Size**: dropping clean page cache before the seal pays off only
       with a root on a disk (the default root is tmpfs: no gain measured,
       2026-11-15).
-    - **SMP**: parking assumes UP in the places listed in
-      kernel/parking.md, SMP (the idle check, unpark while the old stack may still run
-      on another CPU, the idle restart under TINY_RCU, the per-CPU page
-      lists drained before the free-page walk).
+    - **SMP**: snapshots work in the SDK, the CLI and the page
+      (kernel/parking.md, SMP; js.md, Snapshots; web.md, Suspend and
+      resume), restorable only with the CPU count they were saved with
+      (each task is held on its CPU). Not yet run in a browser: the
+      page's Suspend and resume with several CPUs.
     Known costs: parking makes epoll_wait and socket-timeout waits return
     EINTR once per snapshot; every new kernel thread needs a park point
     (kernel/parking.md).

@@ -1,4 +1,4 @@
-From 701dd272f9938efcf9021f25a6630420f6b792ef Mon Sep 17 00:00:00 2001
+From 008239f880be96a0ab3531c5786b88887e59cabf Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Sun, 15 Nov 2026 14:41:37 +0000
 Subject: [PATCH] wasm: kwvsock: reset connections after a snapshot restore
@@ -69,7 +69,7 @@ index f899d66488e..c5986eabefd 100644
  	kw_unpark_all();
  	kw_park_finish(0);
 diff --git a/include/linux/kw_park.h b/include/linux/kw_park.h
-index d5e71f70002..78a88cfddf3 100644
+index f041a02ba52..066fefea371 100644
 --- a/include/linux/kw_park.h
 +++ b/include/linux/kw_park.h
 @@ -21,11 +21,22 @@
@@ -95,7 +95,7 @@ index d5e71f70002..78a88cfddf3 100644
  /*
   * True while kernel threads are asked to park. Wait conditions that a
   * plain wake_up_process() does not end (wait_event*()) add it, so that the
-@@ -55,6 +66,11 @@ static inline bool kw_park_pending(void)
+@@ -59,6 +70,11 @@ static inline bool kw_park_pending(void)
  static inline void kw_park_point(int (*fn)(void *), void *arg)
  {
  }

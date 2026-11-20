@@ -1,4 +1,4 @@
-From db103f3fc30ead9996fc8894b2b6987525a5bd18 Mon Sep 17 00:00:00 2001
+From 2579750793811d84c78b3aa23f975fe9a03ef4ba Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -101,7 +101,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  delete mode 100644 arch/wasm/kernel/sys_riscv.c
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
-index e8846e18f69..b0ba1f1be7a 100644
+index 27dd1dde5cd..38d7504a761 100644
 --- a/arch/wasm/Kconfig
 +++ b/arch/wasm/Kconfig
 @@ -5,16 +5,19 @@ menu "Wasm-specific options"
@@ -2904,10 +2904,10 @@ index f81622e213d..ef54fc24620 100644
  	return 0;
  }
 diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
-index 05622e66df2..8612997cb26 100644
+index 2a860cf0e7e..98b3ef59d17 100644
 --- a/arch/wasm/kernel/process.c
 +++ b/arch/wasm/kernel/process.c
-@@ -185,9 +185,6 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
+@@ -206,9 +206,6 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
  	}
  #endif
  
@@ -2917,7 +2917,7 @@ index 05622e66df2..8612997cb26 100644
  	return wasm_arch_switch(prev, next, is_new,
  				READ_ONCE(prev->__state) == TASK_DEAD);
  }
-@@ -288,7 +285,7 @@ void arch_stay_move_to(struct task_struct *p, int cpu)
+@@ -309,7 +306,7 @@ void arch_stay_move_to(struct task_struct *p, int cpu)
   * notify-resume work, another reschedule) is in the TIF flags, which only
   * the task itself clears; its system call's exit work (tracing, a ptrace
   * stop, audit) came before the reschedule and is not repeated; pt_regs
@@ -2926,7 +2926,7 @@ index 05622e66df2..8612997cb26 100644
   */
  static void __noreturn kw_user_resume(struct task_struct *prev)
  {
-@@ -404,11 +401,12 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -429,11 +426,12 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  		p->thread.fn_arg = args->fn_arg;
  	} else {
  		*childregs = *current_pt_regs();
@@ -2942,7 +2942,7 @@ index 05622e66df2..8612997cb26 100644
  		p->thread.fn = NULL;
  		p->thread.fn_arg = NULL;
  	}
-@@ -434,11 +432,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+@@ -459,11 +457,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
  	return 0;
  }
  
@@ -2959,7 +2959,7 @@ index 05622e66df2..8612997cb26 100644
  	regs->kernel = 0;
  }
  
-@@ -447,13 +449,13 @@ void show_regs(struct pt_regs *regs)
+@@ -472,13 +474,13 @@ void show_regs(struct pt_regs *regs)
  	int i;
  
  	show_regs_print_info(KERN_DEFAULT);

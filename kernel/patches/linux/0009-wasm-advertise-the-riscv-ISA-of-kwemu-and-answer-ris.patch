@@ -1,4 +1,4 @@
-From 355735b3fa085f31116088b053f3e7966a85e352 Mon Sep 17 00:00:00 2001
+From e31d200dfc449776a61740b8bb2ef01f6a344fcd Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 10:16:09 +0000
 Subject: [PATCH] wasm: advertise the riscv ISA of kwemu and answer

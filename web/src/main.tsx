@@ -62,8 +62,8 @@ async function preflight(): Promise<boolean> {
 	ui.check("mem", "Kernel memory", "info", `${cfg.memMiB} MiB requested`, cfg.memWhy);
 	ui.check("cpu", "CPU threads", "info", String(navigator.hardwareConcurrency || "unknown"));
 	// Several guest CPUs (?cpus=N, config.ts): what this load boots with, and why not more.
-	ui.check("smp", "Guest CPUs", cfg.smpParam < 2 ? "info" : cfg.cpus > 1 ? "pass" : "warn",
-		cfg.cpus > 1 ? `${cfg.cpus} (?cpus=${cfg.smpParam})` : cfg.smpParam > 1 ? `1 (asked for ${cfg.smpParam})` : "1",
+	ui.check("smp", "Guest CPUs", cfg.cpus > 1 ? "pass" : cfg.smpParam < 2 ? "info" : "warn",
+		cfg.cpus > 1 ? `${cfg.cpus} (${cfg.resumeCpus ? "the suspended session's" : `?cpus=${cfg.smpParam}`})` : cfg.smpParam > 1 ? `1 (asked for ${cfg.smpParam})` : "1",
 		cfg.smpWhy ?? (cfg.cpus > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory"
 			: cfg.smpBlocked ? `several CPUs are unavailable: ${cfg.smpBlocked}` : "Options, CPUs, boots the SMP kernel on several"));
 	ui.check("input", "Input", "info", (cfg.coarse ? "touch" : "mouse/keyboard") + (navigator.maxTouchPoints ? `, ${navigator.maxTouchPoints} touch points` : ""));

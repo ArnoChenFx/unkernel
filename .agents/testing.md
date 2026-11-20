@@ -76,7 +76,9 @@ bundle) runs the same checks:
   --shm` for its kwfb and kwshm checks), and once on one CPU (`--kernel
   vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test`);
 - abitest with `--cpus 2`;
-- `UNKERNEL_TEST_CPUS=2 pnpm test:api` (the snapshot tests skip);
+- `UNKERNEL_TEST_CPUS=2 pnpm test:api` (the snapshot tests too: they then
+  save and restore 2-CPU machines; the "SMP: snapshot()" test uses 4 CPUs
+  without the variable);
 - `node test/glimmer-check.mjs --run --kernel <it> --cpus 2` (on Alpine;
   `--distro none` for the base shell).
 

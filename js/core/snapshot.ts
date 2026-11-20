@@ -45,6 +45,11 @@ export interface KernelSnapshot {
 	version: 1;
 	/** The kernel build it came from (Kernel.fingerprint); restore refuses another. */
 	fingerprint: string;
+	/**
+	 * CPUs the machine had (absent: 1, as in snapshots from before SMP
+	 * ones). A restore needs the same number: each task is held on its CPU.
+	 */
+	cpus?: number;
 	memory64: boolean;
 	/** All of the kernel's memory; the pages it reported free are zero. */
 	memory: Uint8Array;
@@ -78,6 +83,18 @@ export function snapshotDeviceMismatch(saved: DeviceSnapshots, present: Record<D
 	if (m && mac && (m.length !== mac.length || m.some((b, i) => b !== mac[i])))
 		return "the network device has another MAC than in the snapshot";
 	return null;
+}
+
+/**
+ * Why a machine with `cpus` CPUs cannot resume `saved`, or null if it can:
+ * a task stays on the CPU it ran on (kernel/smp.md), so a restore needs
+ * every CPU the snapshot had, and no more (an SMP kernel never starts CPUs
+ * after its boot).
+ */
+export function snapshotCpuMismatch(saved: KernelSnapshot, cpus: number): string | null {
+	const had = saved.cpus ?? 1;
+	if (had === cpus) return null;
+	return `the snapshot has ${had} CPU${had === 1 ? "" : "s"}, this machine has ${cpus}`;
 }
 
 const diskName = (i: number) => `wd${String.fromCharCode(97 + i)}`;
@@ -158,7 +175,8 @@ function isZero(u8: Uint8Array, off: number): boolean {
 /**
  * Encode a snapshot: MAGIC, a u32 header length, the JSON header (everything
  * but the memory and the input), the input, then each non-zero 64 KiB chunk
- * of the memory as a u32 chunk index and its bytes. Little-endian.
+ * of the memory as a u32 chunk index and its bytes. Little-endian. A header
+ * without `cpus` (files from before SMP snapshots) decodes as one CPU.
  */
 export function encodeSnapshot(s: KernelSnapshot): Uint8Array {
 	const mem = s.memory;
@@ -166,7 +184,7 @@ export function encodeSnapshot(s: KernelSnapshot): Uint8Array {
 	const chunks: number[] = [];
 	for (let off = 0; off < mem.byteLength; off += CHUNK) if (!isZero(mem, off)) chunks.push(off / CHUNK);
 	const header = encoder.encode(JSON.stringify({
-		version: s.version, fingerprint: s.fingerprint, memory64: s.memory64, memoryBytes: mem.byteLength,
+		version: s.version, fingerprint: s.fingerprint, cpus: s.cpus ?? 1, memory64: s.memory64, memoryBytes: mem.byteLength,
 		freeBytes: s.freeBytes ?? 0, monotonicMs: s.monotonicMs, consoleSize: s.consoleSize, inputBytes: s.input.length, chunks: chunks.length,
 		disks: s.disks, devices: s.devices,
 	}));
@@ -206,6 +224,6 @@ export function decodeSnapshot(bytes: Uint8Array): KernelSnapshot {
 		memory.set(bytes.subarray(p + 4, p + 4 + CHUNK), c * CHUNK);
 		p += 4 + CHUNK;
 	}
-	return { version: 1, fingerprint: h.fingerprint, memory64: h.memory64, memory, freeBytes: h.freeBytes ?? 0, monotonicMs: h.monotonicMs, consoleSize: h.consoleSize, input,
+	return { version: 1, fingerprint: h.fingerprint, cpus: Number.isInteger(h.cpus) && h.cpus > 1 ? h.cpus : 1, memory64: h.memory64, memory, freeBytes: h.freeBytes ?? 0, monotonicMs: h.monotonicMs, consoleSize: h.consoleSize, input,
 		disks: Array.isArray(h.disks) ? h.disks : [], devices: h.devices && typeof h.devices === "object" ? h.devices : {} };
 }

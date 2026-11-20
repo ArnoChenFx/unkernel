@@ -71,7 +71,9 @@
 //                                      kernelSmpUrl: a base bundle with an SMP patch) and
 //                                      cross-origin isolation (https or localhost); otherwise, or
 //                                      when the SMP kernel fails to load or start, the page boots
-//                                      on one CPU as usual (smpBlocker(), boot.ts). No Suspend.
+//                                      on one CPU as usual (smpBlocker(), boot.ts). A session
+//                                      suspended on N CPUs resumes on N (a load that boots
+//                                      another count offers to reload on N: CPUS_ONCE_KEY).
 //                                      Default in worker mode: the suggested count (half the
 //                                      threads, at most SUGGESTED_CPUS: 4 on desktops, 2 in
 //                                      Firefox; one on phones, on fewer than 4 threads and in
@@ -186,11 +188,13 @@ export interface Config {
 	smpParam: number;
 	/** The CPUs this device boots with by default: cpuSuggested where the page can boot the SMP kernel, else 1. */
 	cpuDefault: number;
-	/** CPUs this load boots with: smpParam where possible (capped at cpuMax), else 1. */
+	/** CPUs this load boots with: resumeCpus, else smpParam where possible (capped at cpuMax), else 1. */
 	cpus: number;
+	/** This load boots on the suspended session's CPU count to resume it (CPUS_ONCE_KEY, boot.ts), else 0. */
+	resumeCpus: number;
 	/** Why this page cannot boot more than one CPU (smpBlocker()), or null. */
 	smpBlocked: string | null;
-	/** Why this load boots on one CPU although ?cpus= asks for more, or null. */
+	/** Why this load boots on one CPU although ?cpus= asks for more, or after a fallback to one (boot.ts bootUpOnce()), or null. */
 	smpWhy: string | null;
 	/** The most CPUs offered: navigator.hardwareConcurrency, at most 16 (the kernel's limit). */
 	cpuMax: number;
@@ -247,6 +251,8 @@ export function webkitEngine(ua = navigator.userAgent): boolean {
 export const UP_ONCE_KEY = "kw-up-once";
 /** sessionStorage: boot this tab's next load on the page's thread, one CPU (boot.ts bootUpOnce(..., inline)), with why. */
 export const INLINE_ONCE_KEY = "kw-inline-once";
+/** sessionStorage: boot this tab's next load on this many CPUs, to resume the session suspended on them (boot.ts offerResumeCpus()). */
+export const CPUS_ONCE_KEY = "kw-cpus-once";
 function takeOnce(key: string): string | null {
 	try {
 		const v = sessionStorage.getItem(key);
@@ -293,9 +299,13 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const smpBlocked = smpBlocker();
 	const cpuDefault = !smpBlocked && workerParam && cpuSuggested ? cpuSuggested : 1;
 	const smpParam = params.has("cpus") ? Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1)) : cpuDefault;
-	const upOnce = smpParam > 1 ? takeOnce(UP_ONCE_KEY) ?? inlineOnce : null;
-	const smpWhy = smpParam < 2 ? null : smpBlocked ?? upOnce;
-	const cpus = smpWhy ? 1 : Math.min(smpParam, cpuMax);
+	// Once, to resume a session suspended on that many CPUs (it needs exactly its count), where the page can.
+	const cpusOnce = Math.floor(Number(takeOnce(CPUS_ONCE_KEY))) || 0;
+	const resumeCpus = cpusOnce > 1 && !smpBlocked && cpusOnce <= cpuMax ? cpusOnce : 0;
+	// A fallback to one CPU (boot.ts bootUpOnce()), also after a failed resume on several with ?cpus=1.
+	const upOnce = resumeCpus ? null : takeOnce(UP_ONCE_KEY) ?? (smpParam > 1 ? inlineOnce : null);
+	const smpWhy = resumeCpus || (smpParam < 2 && !upOnce) ? null : smpBlocked ?? upOnce;
+	const cpus = resumeCpus || (smpWhy ? 1 : Math.min(smpParam, cpuMax));
 	// The distro: one of the images ("none": the base shell).
 	const distroAsked = params.get("distro");
 	let distroParam = DEFAULT_DISTRO, distroWhy: string | null = null;
@@ -335,6 +345,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		smpParam,
 		cpuDefault,
 		cpus,
+		resumeCpus,
 		smpBlocked,
 		smpWhy,
 		cpuMax,

@@ -28,6 +28,13 @@ export interface CpuInit {
 	cpu: number;
 	/** The idle task (kw_secondary_entry's argument). */
 	idle: bigint;
+	/**
+	 * The kernel is a restored snapshot: enter kw_secondary_resume, which
+	 * runs the CPU's saved idle task on, instead of kw_secondary_entry
+	 * (bring-up). CPU 0's host knows (KernelConfig.restore); the kernel
+	 * starts CPUs after a restore only to resume them.
+	 */
+	resume?: boolean;
 	module: WebAssembly.Module;
 	/** The kernel's shared memory. */
 	memory: WebAssembly.Memory;
@@ -311,13 +318,14 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		return;
 	}
 	const ex = instance.exports;
-	if (typeof ex.kw_secondary_entry !== "function") {
-		fatal("this kernel has no kw_secondary_entry export");
+	const entryName = init.resume ? "kw_secondary_resume" : "kw_secondary_entry";
+	if (typeof ex[entryName] !== "function") {
+		fatal(`this kernel has no ${entryName} export`);
 		return;
 	}
 	jit.attach(ex);
 	retFromFork = WebAssembly.promising(ex.ret_from_fork as (...args: unknown[]) => unknown) as typeof retFromFork;
-	const entry = WebAssembly.promising(ex.kw_secondary_entry as (idle: bigint) => unknown);
+	const entry = WebAssembly.promising(ex[entryName] as (idle: bigint) => unknown);
 	port.post({ t: "running" });
-	entry(init.idle).then(() => trap(new Error("kw_secondary_entry returned")), trap);
+	entry(init.idle).then(() => trap(new Error(`${entryName} returned`)), trap);
 }

@@ -4,7 +4,7 @@
 
 export { IRQ_SYNC, Kernel, bundledBoot, moduleIsMemory64 } from "./kernel.ts";
 export type { BootStage, ExitKind, ExitResult, KernelConfig, KernelStats, MemoryStage, NetDevice } from "./kernel.ts";
-export { decodeSnapshot, encodeSnapshot, snapshotDeviceMismatch, snapshotDiskMismatch } from "./snapshot.ts";
+export { decodeSnapshot, encodeSnapshot, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch } from "./snapshot.ts";
 export type { DeviceKind, DeviceSnapshots, KernelSnapshot } from "./snapshot.ts";
 export { BaseDisk, CowDisk, F_DISCARD, F_FLUSH, F_RO, F_WRITE_ZEROES, FlushTracker, HttpBase, readDistroHeader, SparseBase, ZERO_BLOCK, ZeroBase } from "./block.ts";
 export type { BlockDevice, BlockStats, CowDiskOptions, CowDiskStats, DiskBase, DiskSnapshotState, DistroHeader, HttpBaseOptions, HttpBaseStats, MaybePromise, OverlayStore, StoreIndex } from "./block.ts";

@@ -12,7 +12,8 @@
 // (preview.ts: guest web servers in an iframe). With several CPUs (?cpus=N,
 // config.ts) it loads the SMP kernel instead and boots it in worker mode,
 // whose worker starts the other CPUs; whatever stops that before the
-// kernel runs reloads once on one CPU (bootUpOnce()). The kernel is the
+// kernel runs reloads once on one CPU (bootUpOnce()). A suspended session
+// resumes on the CPU count it was saved on (offerResumeCpus()). The kernel is the
 // base bundle, with the distro image ?distro= picks (config.ts) attached
 // read-only by URL (createKernel({ distro }); inline it is opened here
 // first, for the resume check), and the Alpine-only part (the apk index
@@ -21,7 +22,7 @@ import "@wterm/dom/src/terminal.css";
 import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
 import { createAudioOut } from "./audio.ts";
-import { INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
+import { CPUS_ONCE_KEY, INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, fmtSize, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
@@ -29,7 +30,7 @@ import { showcaseFromUrl } from "./launcher.ts";
 import { browserNet, browserNetSpec } from "./net.ts";
 import { openCommand } from "./open.ts";
 import { attachPreview, closePreview, openPreview, previewSupported, previewUrl } from "./preview.ts";
-import { ScreenTail, clearSession, loadSession, saveSession, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
+import { ScreenTail, clearSession, loadSession, saveSession, sessionCpus, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
 import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
 import { takeResumeRequest } from "./ui.ts";
@@ -115,7 +116,7 @@ export function start(): void {
 	/** The kernel has exited (inline: the moment it does; a worker: once its exit message arrived). */
 	const ended = () => { const l = local(); return l ? !!l.kernel.result : vmExited; };
 	const send = (s: string | Uint8Array) => vm?.write(s);
-	/** This load boots the SMP kernel on several CPUs (config.ts; never resumed, never suspended). */
+	/** This load boots the SMP kernel on several CPUs (config.ts). */
 	const smp = cfg.cpus > 1;
 	/** The kernel this load runs: the base's UP bundle, or its SMP one (sdk.ts kernelSmpUrl). */
 	const kernelUrl = smp ? cfg.kernelSmpUrl! : cfg.kernelUrl;
@@ -587,10 +588,11 @@ export function start(): void {
 		return m < 1 ? "just now" : m < 120 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
 	};
 	/**
-	 * Offer to resume the saved session, if this page can: the same kernel,
-	 * the same devices and (inline, where the data disk is open here) the
-	 * data disk unchanged since; in worker mode the worker checks the disk,
-	 * and a refusal falls back to a fresh boot. null: boot fresh.
+	 * Offer to resume the saved session, if this page can: the same kernel
+	 * and CPU count (another count: offerResumeCpus(), before), the same
+	 * devices and (inline, where the data disk is open here) the data disk
+	 * unchanged since; in worker mode the worker checks the disk, and a
+	 * refusal falls back to a fresh boot. null: boot fresh.
 	 */
 	async function offerResume(info: Promise<SessionMeta | null>, disks: BlockDevice[] | DiskSpec[]): Promise<{ snap: KernelSnapshot; meta: SessionMeta } | null> {
 		let meta: SessionMeta | null;
@@ -600,14 +602,14 @@ export function start(): void {
 			ui.hostLog(`[host] suspended session: cannot read it: ${(e as Error)?.message ?? e}`);
 			return null;
 		}
-		if (!meta) return null;
+		if (!meta || sessionCpus(meta) !== cfg.cpus) return null;
 		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}`;
 		// Inline: the disks as the snapshot lists them, the distro image first.
 		const inlineDisks = !cfg.worker ? [...(distroDisk ? [distroDisk] : []), ...disks as BlockDevice[]] : null;
 		// A data disk that changed since can never resume it: forget it then.
 		const stale = inlineDisks ? snapshotDiskMismatch(meta.disks, inlineDisks)
 			: cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null;
-		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices(), distroRef) ?? stale;
+		const why = sessionMismatch(meta, kernelUrl, sessionDevices(), distroRef) ?? stale;
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
 			ui.hostLog(`[host] suspended session (${label}) not offered: ${why}`);
@@ -616,7 +618,8 @@ export function start(): void {
 		}
 		const dataNote = meta.devices.data ? " Boot fresh discards it: a fresh boot changes the data disk." : " Boot fresh keeps it for later.";
 		// The Resume button (after Suspend) reloaded the page: resume without asking again.
-		if (!resumeRequested && !await ui.ask({ title: "resume", msg: `Resume the session suspended ${ago(meta.saved)} (${fmtMiB(meta.bytes)}, ${meta.memoryMiB} MiB of memory)?${dataNote}`, ok: "Resume", cancel: "Boot fresh" })) {
+		const on = smp ? `, ${cpusText(cfg.cpus)}` : "";
+		if (!resumeRequested && !await ui.ask({ title: "resume", msg: `Resume the session suspended ${ago(meta.saved)} (${fmtMiB(meta.bytes)}, ${meta.memoryMiB} MiB of memory${on})?${dataNote}`, ok: "Resume", cancel: "Boot fresh" })) {
 			ui.hostLog(`[host] suspended session (${label}): booting fresh instead`);
 			if (meta.devices.data) await clearSession().catch(() => {});
 			return null;
@@ -633,14 +636,14 @@ export function start(): void {
 	let suspending: Promise<string | null> | null = null;
 	/**
 	 * Suspend: save the running machine in this browser and stop it
-	 * (session.ts); the next load offers to resume it. Not with several CPUs:
-	 * the SMP kernel cannot park, so it has no snapshots (ui.confirmSuspend()
-	 * says so, and KW.suspend stays unset).
+	 * (session.ts); the next load offers to resume it, on as many CPUs.
 	 */
-	if (!smp) KW.suspend = async () => {
+	KW.suspend = async () => {
 		if (!vm || ended() || !running) throw new Error("the system is not running");
 		if (suspending) throw new Error("a suspend is in progress");
 		if (typeof indexedDB === "undefined") throw new Error("this browser has no IndexedDB to keep the session in");
+		// The SMP kernel on one CPU (the worker could not start their threads): no load would boot that again.
+		if (smp && vm.stats().cpus !== cfg.cpus) throw new Error(`the SMP kernel runs on ${vm.stats().cpus} of ${cfg.cpus} CPUs here (their threads did not start); set CPUs to 1 under Options to suspend`);
 		const t0 = performance.now();
 		const target = vm;
 		ui.setState("running", "Suspending");
@@ -648,7 +651,7 @@ export function start(): void {
 		const run = async () => {
 			const snap = await target.snapshot({ stop: true });
 			tSnap = performance.now() - t0;
-			return saveSession(snap, { saved: Date.now(), kernelUrl: cfg.kernelUrl, devices: sessionDevices(), screen: screenTail.text(), worker: cfg.worker, distro: distroRef });
+			return saveSession(snap, { saved: Date.now(), kernelUrl, devices: sessionDevices(), screen: screenTail.text(), worker: cfg.worker, distro: distroRef });
 		};
 		const p = run();
 		suspending = p.then(() => null, (e: unknown) => (e as Error)?.message ?? String(e));
@@ -685,13 +688,44 @@ export function start(): void {
 		else location.reload();
 		return true;
 	}
+	const cpusText = (n: number) => `${n} CPU${n === 1 ? "" : "s"}`;
+	/** The page's kernel for `n` CPUs (the SMP one is null without the bundle's patch). */
+	const kernelFor = (n: number) => (n > 1 ? cfg.kernelSmpUrl : cfg.kernelUrl);
+	/** Why this page cannot start `n` CPUs now, or null (config.ts: smpBlocker(), this tab's fallback to one CPU, the host's threads). */
+	const cpusBlocker = (n: number): string | null => n < 2 ? null
+		: cfg.smpBlocked ?? cfg.smpWhy ?? (n > cfg.cpuMax ? `this device reports ${cfg.cpuMax} CPU threads` : null);
+	/** Reload this tab once on `n` CPUs (config.ts reads CPUS_ONCE_KEY) and resume the suspended session. False if sessionStorage refuses. */
+	function resumeOnCpus(n: number, reason: string): boolean {
+		try {
+			sessionStorage.setItem(CPUS_ONCE_KEY, String(n));
+		} catch {
+			return false;
+		}
+		ui.hostLog(`[host] booting on ${n} CPUs instead: ${reason}`);
+		KW.term?.notice(`[host] booting on ${n} CPUs instead: ${reason}`);
+		ui.resume(); // sets kw-resume and reloads
+		return true;
+	}
+	/** Do not boot: the suspended session stays, with its data disk as it was. Always true (the page stops here). */
+	function keepSession(why: string): boolean {
+		ui.hostLog(`[host] not booting: ${why}`);
+		ui.check("session", "Suspended session", "warn", "kept; not booted", why);
+		ui.setState("halted", "Not started");
+		setLive(null);
+		void termReady.then(() => KW.term?.notice(`[host] not booted: ${why} — reload the page to be asked again`), () => {});
+		return true;
+	}
 	/**
-	 * Several CPUs and a suspended session (always saved on one CPU, the UP
-	 * kernel): offer to resume it on one CPU this time. True: the page
-	 * reloads to do that. Asked before the kernel downloads, since the answer
-	 * picks which one.
+	 * A suspended session saved on another CPU count than this load's (a
+	 * task resumes on the CPU it ran on, so it needs exactly its count;
+	 * sessions from before SMP ones ran on one): offer to reload on that
+	 * count, where this page can start it now. Where it cannot, this load
+	 * boots its own count, and asks first if the session has a data disk:
+	 * that boot changes the disk, which makes the session useless. True:
+	 * the page reloads or stops here. Asked before the kernel is needed,
+	 * since the answer picks it.
 	 */
-	async function offerResumeUp(info: Promise<SessionMeta | null>): Promise<boolean> {
+	async function offerResumeCpus(info: Promise<SessionMeta | null>): Promise<boolean> {
 		let meta: SessionMeta | null;
 		try {
 			meta = await info;
@@ -699,24 +733,43 @@ export function start(): void {
 			ui.hostLog(`[host] suspended session: cannot read it: ${(e as Error)?.message ?? e}`);
 			return false;
 		}
-		if (!meta) return false;
-		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}`;
-		const why = sessionMismatch(meta, cfg.kernelUrl, sessionDevices(), distroRef) ??
+		const n = meta ? sessionCpus(meta) : cfg.cpus;
+		if (!meta || n === cfg.cpus) return false;
+		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}, ${cpusText(n)}`;
+		const why = sessionMismatch(meta, kernelFor(n), sessionDevices(), distroRef) ??
 			(cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null);
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
 			ui.hostLog(`[host] suspended session (${label}) not offered: ${why}`);
 			return false;
 		}
-		const n = cfg.cpus;
-		const dataNote = meta.devices.data ? ` Booting on ${n} CPUs discards it: that boot changes the data disk.` : ` Booting on ${n} CPUs keeps it for later.`;
-		if (!resumeRequested && !await ui.ask({ title: "resume", msg: `Resume the session suspended ${ago(meta.saved)} (${fmtMiB(meta.bytes)}, ${meta.memoryMiB} MiB of memory)? It resumes on one CPU, as it was saved.${dataNote}`, ok: "Resume on 1 CPU", cancel: `Boot on ${n} CPUs` })) {
-			ui.hostLog(`[host] suspended session (${label}): booting on ${n} CPUs instead`);
-			ui.check("session", "Suspended session", "info", `${label}; not resumed`, `booted on ${n} CPUs instead${meta.devices.data ? " (discarded: the data disk changes)" : ""}`);
+		const m = cfg.cpus;
+		const blocked = cpusBlocker(n);
+		if (blocked) {
+			const msg = `the session suspended ${ago(meta.saved)} runs on ${cpusText(n)}, which this page cannot start now (${blocked})`;
+			ui.check("session", "Suspended session", "warn", `${label}; not resumed`, msg);
+			ui.hostLog(`[host] suspended session (${label}) not offered: ${msg}`);
+			if (meta.devices.data) {
+				if (!await ui.ask({ title: "resume", msg: `The session suspended ${ago(meta.saved)} runs on ${cpusText(n)}, which this page cannot start now (${blocked}). Booting on ${cpusText(m)} discards it: that boot changes the data disk.`, ok: `Boot on ${cpusText(m)}`, cancel: "Keep it" }))
+					return keepSession(`the session suspended ${ago(meta.saved)} needs ${cpusText(n)} (${blocked})`);
+				ui.hostLog(`[host] suspended session (${label}): booting on ${cpusText(m)} instead, discarded`);
+				await clearSession().catch(() => {});
+				return false;
+			}
+			warn(`Not resuming the session suspended ${ago(meta.saved)}: it runs on ${cpusText(n)}, which this page cannot start now (${blocked}); it is kept`);
+			ui.toast(`Not resumed: the session needs ${cpusText(n)}`);
+			return false;
+		}
+		const dataNote = meta.devices.data ? ` Booting on ${cpusText(m)} discards it: that boot changes the data disk.` : ` Booting on ${cpusText(m)} keeps it for later.`;
+		if (!resumeRequested && !await ui.ask({ title: "resume", msg: `Resume the session suspended ${ago(meta.saved)} (${fmtMiB(meta.bytes)}, ${meta.memoryMiB} MiB of memory)? It resumes on ${cpusText(n)}, as it was saved.${dataNote}`, ok: `Resume on ${cpusText(n)}`, cancel: `Boot on ${cpusText(m)}` })) {
+			ui.hostLog(`[host] suspended session (${label}): booting on ${cpusText(m)} instead`);
+			ui.check("session", "Suspended session", "info", `${label}; not resumed`, `booted on ${cpusText(m)} instead${meta.devices.data ? " (discarded: the data disk changes)" : ""}`);
 			if (meta.devices.data) await clearSession().catch(() => {});
 			return false;
 		}
-		return bootUpOnce(`resuming the session suspended ${ago(meta.saved)}, which runs on one CPU`, true);
+		const reason = `resuming the session suspended ${ago(meta.saved)}, which runs on ${cpusText(n)}`;
+		return (n === 1 ? bootUpOnce(reason, true) : resumeOnCpus(n, reason)) ||
+			keepSession(`this browser refuses sessionStorage, which the reload on ${cpusText(n)} needs (set CPUs to ${n} under Options and Reboot to resume)`);
 	}
 
 	// --- the distro image and what the base made of it ---------------------------------
@@ -789,15 +842,13 @@ export function start(): void {
 		let dataDisks: BlockDevice[] | DiskSpec[] = [];
 		if (cfg.worker) {
 			// The worker builds the data disk and the network from specs.
-			ui.check("worker", "Worker mode", "pass", cfg.workerParam ? (cfg.workerAsked ? "on (?worker=1)" : "on (default)") : `for ${cfg.cpus} CPUs (?cpus=${cfg.smpParam})`,
+			ui.check("worker", "Worker mode", "pass", cfg.workerParam ? (cfg.workerAsked ? "on (?worker=1)" : "on (default)") : `for ${cfg.cpus} CPUs (${cfg.resumeCpus ? "the suspended session's" : `?cpus=${cfg.smpParam}`})`,
 				"the kernel, the data disk, the network, the display, input and sound devices run in a Web Worker" + (smp ? ", which starts the other CPUs as workers of its own" : ""));
 			ui.hostLog(`[host] worker mode: the kernel runs in a Web Worker, with the data disk, the network, the display, input and sound${smp ? `; ${cfg.cpus} CPUs` : ""}`);
 			dataDisks = await dataSpec();
 		}
-		if (smp) {
-			if (await offerResumeUp(session)) return; // reloading to resume on one CPU
-			loading = load(kernelUrl);
-		}
+		if (await offerResumeCpus(session)) return; // reloading to resume on the session's CPU count, or kept
+		if (smp) loading = load(kernelUrl);
 		let module: WebAssembly.Module;
 		try {
 			module = await loading!;
@@ -896,8 +947,8 @@ export function start(): void {
 			sound: cfg.sound ? createAudioOut({ log }) : false, // Web Audio, ?sound=0 (audio.ts)
 			vsock: true, // the terminal windows (windows.ts: kwtty sessions)
 		};
-		// Several CPUs: offered above (offerResumeUp), on one CPU only.
-		const resume = smp ? null : await offerResume(session, dataDisks);
+		// A session on this load's CPU count (another: offerResumeCpus(), above).
+		const resume = await offerResume(session, dataDisks);
 		kernelStarting = true;
 		try {
 			const create = (restore?: KernelSnapshot) => {
@@ -932,15 +983,26 @@ export function start(): void {
 					if (resume.meta.screen) screenTail.push(resume.meta.screen);
 					ui.check("session", "Suspended session", "pass", `resumed (saved ${ago(resume.meta.saved)})`, `${fmtMiB(resume.meta.bytes)}; saved ${cfg.worker === resume.meta.worker ? "in this mode" : resume.meta.worker ? "in worker mode" : "inline"}`);
 				} catch (e) {
-					// Refused (a disk or device that differs, another kernel build) or failed: boot fresh.
 					const why = (e as Error)?.message ?? String(e);
+					// Several CPUs that did not start (the worker, its CPU threads; not a refusal of a disk or
+					// device): the session stays, and the page reloads on one CPU, which asks before a boot
+					// changes the session's data disk (offerResumeCpus()).
+					const n = sessionCpus(resume.meta);
+					if (n > 1 && (!/^snapshot: /.test(why) || /^snapshot: the snapshot has \d+ CPUs?, this machine has/.test(why)) &&
+						bootUpOnce(`resuming on ${n} CPUs failed (${why})`)) return;
+					// Refused (a disk or device that differs, another kernel build) or failed: boot fresh.
 					warn(`Could not resume the suspended session (${why}); booting fresh`);
 					ui.toast(`Could not resume: ${why}`);
 					ui.check("session", "Suspended session", "warn", "not resumed", why);
 					vm = await create();
 				}
-				// Resumed or refused, it is used up: the running machine changes the disk.
-				await clearSession().catch(() => {});
+				// Resumed or refused, it is used up: the running machine changes the disk. Resumed on several
+				// CPUs, once user space answers: its tasks resume only after every CPU came back, so a CPU
+				// that fails to start meanwhile leaves the disk, and so the session, as saved.
+				if (resumed && sessionCpus(resume.meta) > 1) {
+					const saved = resume.meta.saved;
+					void vm.exec("/bin/sh", ["-c", ":"]).then(() => clearSession(saved)).catch(() => {});
+				} else await clearSession().catch(() => {});
 			} else vm = await create();
 		} catch (e) {
 			kernelStarting = false;
@@ -998,7 +1060,7 @@ export function start(): void {
 		if (smp) {
 			// The worker gives the SMP kernel one CPU where it cannot start their threads (it logs why).
 			const got = vm.stats().cpus;
-			ui.check("smp", "Guest CPUs", got > 1 ? "pass" : "warn", got > 1 ? `${got} (?cpus=${cfg.smpParam})` : `1 (asked for ${cfg.cpus})`,
+			ui.check("smp", "Guest CPUs", got > 1 ? "pass" : "warn", got > 1 ? `${got} (${cfg.resumeCpus ? "the suspended session's" : `?cpus=${cfg.smpParam}`})` : `1 (asked for ${cfg.cpus})`,
 				got > 1 ? "the SMP kernel, each CPU in a Web Worker on one shared memory"
 					: "the kernel worker could not start CPU threads (the Kernel log says why): the SMP kernel runs on one CPU");
 			ui.hostLog(`[host] SMP kernel on ${got} CPU${got > 1 ? "s" : ""} (${cfg.cpus} asked)`);

@@ -7,7 +7,10 @@
 // here); the next load offers to resume
 // it (boot.ts). One session at a time: "meta" (small, read to decide
 // whether to offer) and "bytes" (the encoded snapshot, a Blob) are written
-// in one transaction and deleted together.
+// in one transaction and deleted together. A session saved on several CPUs
+// resumes only on as many (every task resumes on the CPU it ran on), with
+// the SMP kernel; its snapshot is bigger (each CPU adds its emulator's 8
+// MiB: about 35 MiB on 2 CPUs, 54 on 4, 90 on 8).
 //
 // Saving when the tab closes is not done: the save needs the kernel to
 // park, the memory copied and encoded (about 150 ms with the CLI,
@@ -40,8 +43,10 @@ function dropOldDbs(): void {
 export interface SessionMeta {
 	/** Date.now() when it was saved. */
 	saved: number;
-	/** The page's kernel (a hashed asset URL in builds: another release cannot resume it). */
+	/** The page's kernel that ran it, UP or SMP (a hashed asset URL in builds: another release cannot resume it). */
 	kernelUrl: string;
+	/** CPUs it ran on, which a resume needs (KernelSnapshot.cpus); absent in sessions from before SMP ones: 1. */
+	cpus?: number;
 	/** Linux's banner of the kernel that saved it. */
 	fingerprint: string;
 	memoryMiB: number;
@@ -116,10 +121,10 @@ export async function loadSession(): Promise<KernelSnapshot> {
 }
 
 /** Encode and keep `snap` (replacing any saved session). Returns the encoded size. */
-export async function saveSession(snap: KernelSnapshot, meta: Omit<SessionMeta, "fingerprint" | "memoryMiB" | "disks" | "bytes">): Promise<number> {
+export async function saveSession(snap: KernelSnapshot, meta: Omit<SessionMeta, "fingerprint" | "memoryMiB" | "cpus" | "disks" | "bytes">): Promise<number> {
 	const bytes = encodeSnapshot(snap);
 	const blob = new Blob([bytes as Uint8Array<ArrayBuffer>]);
-	const full: SessionMeta = { ...meta, fingerprint: snap.fingerprint, memoryMiB: snap.memory.byteLength / 1048576, disks: snap.disks, bytes: bytes.length };
+	const full: SessionMeta = { ...meta, fingerprint: snap.fingerprint, memoryMiB: snap.memory.byteLength / 1048576, cpus: snap.cpus ?? 1, disks: snap.disks, bytes: bytes.length };
 	await run("readwrite", (s) => {
 		s.put(blob, "bytes");
 		s.put(full, "meta");
@@ -127,14 +132,24 @@ export async function saveSession(snap: KernelSnapshot, meta: Omit<SessionMeta, 
 	return bytes.length;
 }
 
-/** Forget the saved session. */
-export async function clearSession(): Promise<void> {
+/** Forget the saved session; with `saved`, only if it is still the one saved then (SessionMeta.saved). */
+export async function clearSession(saved?: number): Promise<void> {
 	if (typeof indexedDB === "undefined") return;
-	await run("readwrite", (s) => { s.clear(); });
+	await run("readwrite", async (s) => {
+		if (saved !== undefined && (await reqP(s.get("meta")) as SessionMeta | undefined)?.saved !== saved) return;
+		s.clear();
+	});
 }
 
-/** Why `m` cannot be resumed with these options, this kernel and this distro image, or null if it can. */
-export function sessionMismatch(m: SessionMeta, kernelUrl: string, devices: SessionDevices, distro: { name: string; url: string } | null): string | null {
+/** The CPUs a session needs (sessions from before SMP ones have none: 1). */
+export const sessionCpus = (m: SessionMeta): number => (Number.isInteger(m.cpus) && m.cpus! > 1 ? m.cpus! : 1);
+
+/**
+ * Why `m` cannot be resumed with these options, this kernel (the page's UP
+ * or SMP one, whichever runs the session's CPU count) and this distro
+ * image, or null if it can.
+ */
+export function sessionMismatch(m: SessionMeta, kernelUrl: string | null, devices: SessionDevices, distro: { name: string; url: string } | null): string | null {
 	if (m.kernelUrl !== kernelUrl) return "it was saved by another kernel release";
 	const was = m.distro ?? null;
 	if ((was?.url ?? null) !== (distro?.url ?? null)) {

@@ -35,7 +35,9 @@ The host side: js.md, CPU threads.
   are asm-generic's ticket locks with the wait out of line, taken out of
   turn by default (Waiting for another CPU); rwlocks are queued
   (`ARCH_USE_QUEUED_RWLOCKS`); RCU is TREE_RCU.
-- No parking and no snapshots (parking.md, SMP).
+- Parking and snapshots work (a rendezvous of every CPU in the idle loop,
+  led by CPU 0; a restore starts every CPU's idle task again and needs the
+  snapshot's CPU count: parking.md, SMP).
 
 ## Moving tasks
 

@@ -159,12 +159,13 @@ export function Options() {
 		});
 	const cpuWarn = webkitEngine()
 		? "To try: in Safari and on iOS, several CPUs ran slower than one (/profile.html)."
-		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 8 MiB of guest memory. No Suspend.`;
+		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 8 MiB of guest memory, and as much in a suspended session.`;
 	// More than one CPU runs each in a Web Worker (config.ts: worker), so Worker thread is ticked and locked.
 	const smp = o.cpus !== "1" && !cfg.smpBlocked;
 	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`
 		: cfg.smpWhy ? `This boot runs on one CPU: ${cfg.smpWhy}.`
-		: "More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); no Suspend.";
+		: cfg.resumeCpus ? `This boot runs on ${cfg.resumeCpus} CPUs, those of the suspended session it resumes.`
+		: "More than one boots the SMP kernel, each CPU in a Web Worker (as with Worker thread); a suspended session resumes on as many.";
 
 	// Distro: the images (debian first) and none, the base shell.
 	const mib1 = (n: number) => `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MiB`;

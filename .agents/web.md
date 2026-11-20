@@ -464,13 +464,26 @@ other options.
   37.7-38.4 s and 2.8 s (CPU 0: 2.3-2.5 s); echo of a shell on CPU 1
   while CPU 0 spins, median 9.4 and 0.57 ms; lines printed in turn on
   CPUs 0 and 1 in order either way; the default load unchanged.
-- No Suspend: the SMP kernel cannot park. `KW.suspend` stays unset (so
-  the status line has no pause icon), the dialog footer has no
-  `#suspend`, and Ctrl-A z says why. A suspended session (always a UP
-  one) is offered before the download: "Resume on 1 CPU" reloads once on
-  one CPU (`bootUpOnce()` with `kw-resume`) and resumes it; "Boot on N
-  CPUs" boots SMP and, when the session has a data disk, deletes it (that
-  boot changes the disk), else keeps it.
+- Suspend works with several CPUs (Suspend and resume, below). The
+  session records its CPU count (none in sessions saved before: one), and
+  resumes only on as many, with the kernel for that count. A load whose
+  count differs offers it before the download (`offerResumeCpus()`):
+  "Resume on N CPUs" reloads once on N (sessionStorage `kw-cpus-once`,
+  config.ts `resumeCpus`; for one CPU `bootUpOnce()`, both with
+  `kw-resume`) and resumes it; "Boot on M CPUs" boots this load's count
+  and, when the session has a data disk, deletes it (that boot changes the
+  disk), else keeps it. Where the page cannot start N CPUs now
+  (`smpBlocker()`, this tab's fallback to one CPU, fewer host threads) it
+  is not offered: with a data disk the page asks first ("Boot on M CPUs",
+  which deletes it, or "Keep it", which stops without booting,
+  `keepSession()`), without one it boots M with a warning and keeps it. A
+  resume whose CPUs do not start (`createKernel()` rejects, other than for
+  a disk or device) keeps the session and reloads on one CPU
+  (`bootUpOnce()`), which then asks as above; a resumed SMP session is
+  deleted only once user space answers an `exec()` (its tasks resume only
+  after every CPU is back, so until then a CPU that fails leaves the disk
+  as saved). The SMP kernel on fewer CPUs than asked (the worker could
+  not start their threads) refuses Suspend: no load boots that again.
 - The boot summary says "on N CPUs"; diagnostics' config
   line has `cpus=`.
 - Checked in headless Chromium (Playwright's build, the built page from
@@ -491,7 +504,7 @@ other options.
 
 ## Suspend and resume
 
-Not with several CPUs (above). Suspend (Ctrl-A z, `z` in the dialog, the dialog footer's `#suspend`, the
+Suspend (Ctrl-A z, `z` in the dialog, the dialog footer's `#suspend`, the
 status line's pause icon `#bar-suspend` while the system runs, or
 `KW.suspend()` without asking) saves the running machine with the SDK's
 `snapshot({ stop: true })` (js.md, Snapshots), inline or in worker mode, and
@@ -504,11 +517,13 @@ with Resume and Boot fresh) before the kernel starts.
 
 - `session.ts` keeps one session in IndexedDB `kwsnap:session-v2`, its own
   database (the first open on a page deletes `kwsnap:session-v1` and any
-  other older version, unawaited): `meta` (time, the page's kernel URL, the banner, the device
+  other older version, unawaited): `meta` (time, the page's kernel URL, UP
+  or SMP, the CPU count, the banner, the device
   options, the disks' snapshot state, the console's last 64 KiB) and
   `bytes` (the `encodeSnapshot()` Blob), written in one transaction. It
   never opens `kwdisk:kwdata-v1`.
-- Offered only when the kernel URL (a hashed asset: another release cannot
+- Offered only when the CPU count (another: Several CPUs, above), the
+  kernel URL (a hashed asset: another release cannot
   resume), the distro image's URL (`meta.distro`; a build's names its
   content, so another build of the same distro cannot resume) and the device
   options (Display, Sound, Network, Data disk) are
@@ -526,7 +541,8 @@ with Resume and Boot fresh) before the kernel starts.
 - No save when the tab goes away: a save needs the kernel to park, the
   memory copied and encoded (about 150 ms with the CLI, 2026-11-15) and
   about 30 MiB committed to IndexedDB, and a closing page has no
-  guarantee that a transaction it starts commits. A snapshot without `stop`
+  guarantee that a transaction it starts commits (with several CPUs
+  more: 35 MiB on 2, 54 on 4, 90 on 8; kernel/parking.md, SMP). A snapshot without `stop`
   when the tab is hidden would not help: the guest writes `/data` within
   seconds, which makes it unrestorable.
 - Checked by hand only (no browser test).

@@ -251,7 +251,8 @@ well behind native.
 ### 🚧 Known limits
 
 - The SDK and CLI boot one CPU by default; the page boots several where
-  it can (`?cpus=`). Several CPUs (SMP) cannot be suspended.
+  it can (`?cpus=`). A snapshot of several CPUs (SMP), and so a session
+  suspended on the page, resumes only on as many.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).

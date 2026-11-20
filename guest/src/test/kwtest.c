@@ -2542,13 +2542,7 @@ static void park_checks(void)
 	char wake[PK_N] = { 'r', 'p', 0, 0, 'e', 0 };
 
 	if (park_read(&first)) {
-		struct utsname u;
-
-		/* An SMP kernel has no parking (kernel.md, Parking). */
-		if (!uname(&u) && strstr(u.version, " SMP "))
-			CHECK(1, "park: skipped (SMP kernel: no parking)");
-		else
-			CHECK(0, "park: no /proc/kwpark");
+		CHECK(0, "park: no /proc/kwpark");
 		return;
 	}
 	shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
@@ -3465,19 +3459,21 @@ static void mv_wake_check(void)
 	close(mv_w.p2[0]);
 	close(mv_w.p2[1]);
 	CHECK(!err && !mv_w.bad && left <= MV_WAKES - 20,
-	      "move: a thread woken in read() on a CPU a busy thread keeps: away from it from wakeup %d of %d on (%d away, %d bad), %lu better CPUs named, %lu taken",
-	      left + 1, MV_WAKES, away, mv_w.bad, b.hinted - a.hinted, b.followed - a.followed);
+	      "move: a thread woken in read() on a CPU a busy thread keeps: away from it from wakeup %d of %d on (%d away, %d bad, err %d), %lu better CPUs named, %lu taken",
+	      left + 1, MV_WAKES, away, mv_w.bad, err, b.hinted - a.hinted, b.followed - a.followed);
 }
 
 /*
  * A child execs beside a busy thread pinned to CPU 0 while other CPUs idle:
  * the new image must start elsewhere (the move happens on execve()'s way
- * to user mode; the exec'd kwtest exits with its CPU).
+ * to user mode; the exec'd kwtest exits with its CPU). Each child's result
+ * is its CPU's digit, or 'x' for an exit that is no CPU (the exec failed:
+ * 99) and 's' for one killed by a signal; those count as abnormal.
  */
 static void mv_exec_check(void)
 {
 	pthread_t hog;
-	int i, err = 0, away = 0, n = 5;
+	int i, err = 0, away = 0, abnormal = 0, n = 5;
 	char cpus[16] = "";
 
 	mv_w.stop = 0;
@@ -3494,20 +3490,25 @@ static void mv_exec_check(void)
 			execl("/proc/self/exe", "kwtest", "cpu", (char *)NULL);
 			_exit(99);
 		}
-		if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) {
+		if (pid < 0 || waitpid(pid, &status, 0) != pid) {
 			err++;
 			break;
 		}
-		cpus[i] = '0' + (WEXITSTATUS(status) < 10 ? WEXITSTATUS(status) : 0);
-		away += WEXITSTATUS(status) > 0 && WEXITSTATUS(status) < 64;
+		if (!WIFEXITED(status) || WEXITSTATUS(status) >= 64) {
+			cpus[i] = WIFEXITED(status) ? 'x' : 's';
+			abnormal++;
+			continue;
+		}
+		cpus[i] = WEXITSTATUS(status) < 10 ? '0' + WEXITSTATUS(status) : '+';
+		away += WEXITSTATUS(status) > 0;
 	}
 	mv_w.stop = 1;
 	if (!err || i)
 		pthread_join(hog, NULL);
 	mv_setaff(0, mv.all);
-	CHECK(!err && !mv_w.bad && away >= n - 1,
-	      "move: exec beside a busy thread on CPU 0: %d of %d new images started on another CPU (%s)",
-	      away, n, cpus);
+	CHECK(!err && !abnormal && !mv_w.bad && away >= n - 1,
+	      "move: exec beside a busy thread on CPU 0: %d of %d new images started on another CPU (%s; err %d, abnormal %d, bad %d)",
+	      away, n, cpus, err, abnormal, mv_w.bad);
 }
 
 static void move_checks(void)

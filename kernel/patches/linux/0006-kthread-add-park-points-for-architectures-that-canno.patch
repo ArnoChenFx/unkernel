@@ -1,4 +1,4 @@
-From b01543025ebe6ed61690ad5be6bae93926b17bc9 Mon Sep 17 00:00:00 2001
+From cf733ab7e3c321fe2828183c95c0735ef1f29a71 Mon Sep 17 00:00:00 2001
 From: Pooya Parsa <pooya@pi0.io>
 Date: Sun, 15 Nov 2026 13:43:35 +0000
 Subject: [PATCH] kthread: add park points for architectures that cannot keep a
@@ -27,15 +27,16 @@ Without CONFIG_KW_PARK both helpers are empty inlines.
  drivers/base/devtmpfs.c       | 10 ++++++
  drivers/tty/hvc/hvc_console.c |  2 ++
  fs/ext4/super.c               |  4 +++
- fs/jbd2/journal.c             | 25 ++++++++++++---
- include/linux/kw_park.h       | 60 +++++++++++++++++++++++++++++++++++
- kernel/kthread.c              | 11 +++++++
+ fs/jbd2/journal.c             | 25 +++++++++++---
+ include/linux/kw_park.h       | 64 +++++++++++++++++++++++++++++++++++
+ kernel/kthread.c              | 11 ++++++
+ kernel/rcu/tree.c             | 25 +++++++++++---
  kernel/smpboot.c              |  2 ++
  kernel/workqueue.c            |  4 +++
- mm/compaction.c               | 23 ++++++++++++--
+ mm/compaction.c               | 23 +++++++++++--
  mm/oom_kill.c                 |  5 ++-
  mm/vmscan.c                   | 19 +++++++++--
- 11 files changed, 155 insertions(+), 10 deletions(-)
+ 12 files changed, 179 insertions(+), 15 deletions(-)
  create mode 100644 include/linux/kw_park.h
 
 diff --git a/drivers/base/devtmpfs.c b/drivers/base/devtmpfs.c
@@ -179,10 +180,10 @@ index 55b4ce01022..0fabc9a953a 100644
  
 diff --git a/include/linux/kw_park.h b/include/linux/kw_park.h
 new file mode 100644
-index 00000000000..d5e71f70002
+index 00000000000..f041a02ba52
 --- /dev/null
 +++ b/include/linux/kw_park.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,64 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Park points (CONFIG_KW_PARK).
@@ -222,9 +223,13 @@ index 00000000000..d5e71f70002
 +}
 +
 +/*
-+ * Park here if asked to. The thread then never returns from this call: it
-+ * resumes on a fresh stack in fn(arg), whose return value is its exit code
-+ * as for a kthread function.
++ * Park here if asked to. A parked thread resumes on a fresh stack in
++ * fn(arg), whose return value is its exit code as for a kthread function,
++ * and never returns from this call. On SMP the park may be called off
++ * while the thread is still on this stack (the cycle ended, or it was
++ * resumed before it switched out): then this returns and the caller goes
++ * on as if nothing had been pending, so the point must be one where that
++ * is right.
 + */
 +static inline void kw_park_point(int (*fn)(void *), void *arg)
 +{
@@ -287,6 +292,66 @@ index a3f95c90456..b7e17bab503 100644
  	set_current_state(TASK_INTERRUPTIBLE);	/* mb paired w/ kthread_stop */
  
  	if (kthread_should_stop()) {
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 96848fc1f02..f0e2d8b6627 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -64,6 +64,7 @@
+ #include <linux/mm.h>
+ #include <linux/kasan.h>
+ #include <linux/context_tracking.h>
++#include <linux/kw_park.h>
+ #include "../time/tick-internal.h"
+ 
+ #include "tree.h"
+@@ -2299,21 +2300,26 @@ static noinline void rcu_gp_cleanup(void)
+ }
+ 
+ /*
+- * Body of kthread that handles grace periods.
++ * The grace-period loop; it also resumes here after parking (kw_park.h),
++ * past rcu_bind_gp_kthread().
+  */
+-static int __noreturn rcu_gp_kthread(void *unused)
++static int __noreturn rcu_gp_kthread_loop(void *unused)
+ {
+-	rcu_bind_gp_kthread();
+ 	for (;;) {
+ 
+ 		/* Handle grace-period start. */
+ 		for (;;) {
++			/* No grace period in progress: park here (kw_park.h). */
++			kw_park_point(rcu_gp_kthread_loop, NULL);
+ 			trace_rcu_grace_period(rcu_state.name, rcu_state.gp_seq,
+ 					       TPS("reqwait"));
+ 			WRITE_ONCE(rcu_state.gp_state, RCU_GP_WAIT_GPS);
+ 			swait_event_idle_exclusive(rcu_state.gp_wq,
+-					 READ_ONCE(rcu_state.gp_flags) &
+-					 RCU_GP_FLAG_INIT);
++					 (READ_ONCE(rcu_state.gp_flags) &
++					  RCU_GP_FLAG_INIT) || kw_park_pending());
++			/* A grace period requested meanwhile starts after the resume. */
++			if (kw_park_pending())
++				continue;
+ 			rcu_gp_torture_wait();
+ 			WRITE_ONCE(rcu_state.gp_state, RCU_GP_DONE_GPS);
+ 			/* Locking provides needed memory barrier. */
+@@ -2336,6 +2342,15 @@ static int __noreturn rcu_gp_kthread(void *unused)
+ 	}
+ }
+ 
++/*
++ * Body of kthread that handles grace periods.
++ */
++static int __noreturn rcu_gp_kthread(void *unused)
++{
++	rcu_bind_gp_kthread();
++	rcu_gp_kthread_loop(NULL);
++}
++
+ /*
+  * Report a full set of quiescent states to the rcu_state data structure.
+  * Invoke rcu_gp_kthread_wake() to awaken the grace-period kthread if
 diff --git a/kernel/smpboot.c b/kernel/smpboot.c
 index 4503b60ce9b..7ec98f80a8b 100644
 --- a/kernel/smpboot.c

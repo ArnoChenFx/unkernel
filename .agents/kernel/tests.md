@@ -57,7 +57,7 @@ What it covers beyond syscalls:
 - `hot loops (JIT)` and `FP hot loop (JIT)` run long enough to compile
   (self-looping blocks with page faults, a thread, a COW child, SIGALRM);
   the FP hash comes from a native build (`fphot()`).
-- `park:` a park cycle through `/proc/kwpark` (UP; parking.md).
+- `park:` park cycles through `/proc/kwpark` (UP and SMP; parking.md).
 - AF_VSOCK: with the host device (the CLI's default) the guest CID is 3 and
   a connect to host port 9 is refused (ECONNRESET); with `--no-vsock`
   `connect()` fails with ENODEV.

@@ -12,7 +12,7 @@
 //   UNKERNEL_TEST_WISP=1 ...                           # also the default Wisp server (internet)
 //   UNKERNEL_TEST_KERNEL=path ...                      # another bundle instead of the bundled kernel
 //   UNKERNEL_TEST_DISTRO_DIR=dir ...                   # where alpine.erofs is (default vendor/build/distro)
-//   UNKERNEL_TEST_CPUS=n ...                           # CPUs for an SMP kernel under test (snapshot tests skipped)
+//   UNKERNEL_TEST_CPUS=n ...                           # CPUs for an SMP kernel under test (the bundle's SMP kernel for n > 1)
 //   UNKERNEL_TEST_CONCURRENCY=n ...                    # tests at once (default: the number of cores; 1 = in order)
 //
 // The tests run concurrently, each kernel stopped by its own test's cleanup. A
@@ -34,9 +34,12 @@ type Instance = Awaited<ReturnType<typeof createKernel>>;
 /** The kernel under test: UNKERNEL_TEST_KERNEL (a bundle, e.g. from a build of your own), else the bundled one. */
 const testKernel = process.env.UNKERNEL_TEST_KERNEL ? path.resolve(process.env.UNKERNEL_TEST_KERNEL) : undefined;
 const kernelFile = testKernel ?? fileURLToPath(bundledKernelUrl);
-/** UNKERNEL_TEST_CPUS: CPUs to offer an SMP kernel under test; it has no snapshots. */
+/** UNKERNEL_TEST_CPUS: CPUs to offer an SMP kernel under test. */
 const testCpus = Number(process.env.UNKERNEL_TEST_CPUS) || undefined;
-const noSnapshots = (testCpus ?? 1) > 1 && "SMP: no snapshots";
+/** Kernel messages a restored machine must not show (a WARN, an RCU stall, an idle state out of balance, a hung task). */
+const KERNEL_TROUBLE = "WARNING|BUG|INFO: rcu| stall|not watching|blocked for more|Oops|Call trace|NOHZ";
+/** The kernel under test compiled once by the test (a Module skips the SMP patch, so this applies it for UNKERNEL_TEST_CPUS > 1). */
+const compileTestKernel = () => sdk.loadKernelModule(readFileSync(kernelFile), { smp: (testCpus ?? 1) > 1 });
 
 /** The shell prompts: the base shell's (guest/base/initramfs/etc/profile), Alpine's (guest/distro/alpine/rootfs). */
 const PROMPT = /base\x1b\[0m \S* # |⇒/;
@@ -49,13 +52,16 @@ const distroDir = path.resolve(process.env.UNKERNEL_TEST_DISTRO_DIR ?? fileURLTo
 const alpine = (kernelBytes.includes("cannot find valid erofs superblock") ? ["erofs", "ext4"] : ["ext4", "erofs"])
 	.map((f) => path.join(distroDir, `alpine.${f}`)).find((f) => existsSync(f));
 const noAlpine = !alpine && `no ${path.join(distroDir, "alpine.erofs")} (kernel/build.sh distro alpine)`;
-const kernelImports = WebAssembly.Module.imports(await WebAssembly.compile(kernelBytes));
+const kernelModule = await WebAssembly.compile(kernelBytes);
+const kernelImports = WebAssembly.Module.imports(kernelModule);
 /** 9p adds no import; its client's version string is in the kernel only with NET_9P (kw_defconfig). */
 const kernelHas9p = kernelBytes.includes("9P2000.L");
 const kernelHasVsock = kernelImports.some((i) => i.name === "wasm_driver_vsock_init");
 const kernelHasShm = kernelImports.some((i) => i.name === "wasm_driver_shm_init");
 /** Was kwemu built with its JIT tier (kw_host_jit_*)? kernel/build.sh builds it unless KWEMU_JIT=0 (.agents/a64/jit.md). */
 const kernelHasJit = kernelImports.some((i) => i.name === "kw_host_jit_caps");
+/** Does the bundle carry the SMP kernel (its patch; kernel.md, Two kernels)? */
+const hasSmpPatch = WebAssembly.Module.customSections(kernelModule, "unkernel.kernel.smp.kwpatch").length > 0;
 
 type BootOptions = NonNullable<Parameters<typeof createKernel>[0]>;
 // A failed assertion must not leave a kernel running (it would keep the test process alive).
@@ -1595,7 +1601,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm.exited;
 	});
 
-	test("snapshot() of a running machine, resumed by createKernel({ restore }) in a new instance (console only)", { skip: noSnapshots }, async (t) => {
+	test("snapshot() of a running machine, resumed by createKernel({ restore }) in a new instance (console only)", async (t) => {
 		const vm = await boot(t, { vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.KernelInstance);
 		const a = screen(vm);
@@ -1617,7 +1623,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await assert.rejects(boot(t, { restore: snap, log: () => {} }), /snapshot: the snapshot has no vsock device, but this machine is given one/);
 	});
 
-	test("snapshot() leaves out the free pages: after a memory-heavy workload the file stays small, and tmpfs and a running process survive", { skip: noSnapshots }, async (t) => {
+	test("snapshot() leaves out the free pages: after a memory-heavy workload the file stays small, and tmpfs and a running process survive", async (t) => {
 		const vm = await boot(t, { vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.KernelInstance);
 		const a = screen(vm);
@@ -1638,7 +1644,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await b.waitFor(new RegExp(`got-${sum}-1`));
 	});
 
-	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key (Alpine)", { skip: noSnapshots || noAlpine }, async (t) => {
+	test("snapshot() with display, evdev and sound: the restored glimmer keeps its picture, its open devices and its stream, and reads a key (Alpine)", { skip: noAlpine }, async (t) => {
 		const opts = (events: string[], chunks: number[], modes: Array<string | null>, inputs: string[]) => ({
 			log: () => {}, vsock: false, distro: alpine!, display: { width: 320, height: 240 },
 			onDisplay: (m: { width: number; height: number } | null) => modes.push(m && `${m.width}x${m.height}`),
@@ -1681,7 +1687,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 	});
 
 	test("snapshot() with network and vsock: the guest's old sessions end, new connections, exec() and fetch() work",
-		{ skip: noSnapshots || (!kernelHasVsock && "the kernel under test has no kwvsock") }, async (t) => {
+		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
 		const http = createServer((_req, res) => res.end("hello after restore\n"));
 		await new Promise<void>((r) => http.listen(0, "127.0.0.1", r));
 		t.after(() => http.close());
@@ -1746,7 +1752,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 	});
 
 	test("snapshot() with host file systems: the mounts and a process's open files on them survive; a file deleted on the host meanwhile answers ESTALE; refused without the mounts and in worker mode",
-		{ skip: noSnapshots || (!kernelHasVsock && "the kernel under test has no kwvsock") }, async (t) => {
+		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
 		writeFileSync(path.join(dir, "held.txt"), "");
@@ -1799,10 +1805,10 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm2.exited).code, 0);
 	});
 
-	test("snapshot() with a data disk: resumes with the saved and the unsaved writes; refused once the disk changed", { skip: noSnapshots }, async (t) => {
+	test("snapshot() with a data disk: resumes with the saved and the unsaved writes; refused once the disk changed", async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
-		const module = await WebAssembly.compile(readFileSync(kernelFile));
+		const module = await compileTestKernel();
 		const file = path.join(dir, "data.img");
 		await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
 		const open: Array<InstanceType<typeof FileDisk>> = [];
@@ -1839,7 +1845,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await assert.rejects(boot(t, { kernel: module, vsock: false, restore: snap, disks: [disk()], log: () => {} }), /was written after the snapshot/);
 	});
 
-	test("worker mode: snapshot() in the worker, resumed inline and in a worker (transferRestore detaches the memory)", { skip: noSnapshots }, async (t) => {
+	test("worker mode: snapshot() in the worker, resumed inline and in a worker (transferRestore detaches the memory)", async (t) => {
 		const vm = await boot(t, { worker: true, vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.WorkerKernel);
 		const a = screen(vm);
@@ -1866,10 +1872,10 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm3.exited).code, 0);
 	});
 
-	test("worker mode: snapshot() with a data disk, resumed in a worker and saved again, then inline; refused once the disk changed", { skip: noSnapshots }, async (t) => {
+	test("worker mode: snapshot() with a data disk, resumed in a worker and saved again, then inline; refused once the disk changed", async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
 		t.after(() => rmSync(dir, { recursive: true, force: true }));
-		const module = await WebAssembly.compile(readFileSync(kernelFile));
+		const module = await compileTestKernel();
 		const file = path.join(dir, "data.img");
 		await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
 		const spec = { kind: "file", path: file } as const;
@@ -1899,6 +1905,162 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm3.stop({ reason: "test" });
 		await assert.rejects(boot(t, { worker: true, kernel: module, vsock: false, disks: [spec], restore: snapA, log: () => {} }),
 			/snapshot: disk wda \(.*data\.img\) was written after the snapshot/);
+	});
+
+	/** A shell command's output on the console, between markers of its own. */
+	const shell = (vm: Instance, a: ReturnType<typeof screen>) => {
+		let n = 0;
+		return async (cmd: string, ms?: number): Promise<string> => {
+			const tag = `Q${++n}x${Math.floor(Math.random() * 1e6)}`;
+			const from = a.s.text.length;
+			vm.write(`echo ${tag}-B; ${cmd}; echo ${tag}-E\n`);
+			const re = new RegExp(`\\n${tag}-B\\r?\\n([\\s\\S]*?)${tag}-E\\r?\\n`);
+			await a.waitFor(re, from, ms);
+			return re.exec(a.s.text.slice(from))![1]!.replace(/\r/g, "");
+		};
+	};
+
+	test("SMP: snapshot() of a machine busy on every CPU (saved while running, repeatedly), restored with as many CPUs; every task continues, kwtest's SMP checks pass in it and across its own snapshot, restored again; another CPU count is refused",
+		{ skip: !hasSmpPatch && "the kernel under test carries no SMP kernel" }, async (t) => {
+		const cpus = testCpus && testCpus > 1 ? testCpus : 4;
+		const vm = await boot(t, { cpus, vsock: false, log: () => {} });
+		assert.equal(vm.stats().cpus, cpus);
+		const a = screen(vm);
+		await a.waitFor(PROMPT);
+		const sh = shell(vm, a);
+		// A counter per CPU and one more (busy in user mode), a pipe pair, and a reader blocked opening a fifo.
+		// Each value replaces the file by a rename: a shell's read takes a byte at a time and could mix two values.
+		await sh(`for i in $(seq 0 ${cpus}); do sh -c "n=0; while :; do n=\\$((n+1)); [ \\$((n % 50)) = 0 ] && echo \\$n > /tmp/c.$i.t && mv /tmp/c.$i.t /tmp/c.$i; done" & done; ` +
+			"yes | sh -c 'n=0; while read l; do n=$((n+1)); [ $((n % 200)) = 0 ] && echo $n > /tmp/pipe.t && mv /tmp/pipe.t /tmp/pipe; done' & " +
+			"mkfifo /tmp/ff; (read x < /tmp/ff; echo \"fifo-$x\" > /tmp/ffout) & sleep 0.5");
+		// Wait until the counters' tasks have run on every CPU (field 39 of /proc/PID/stat).
+		const onCpus = (s: (cmd: string) => Promise<string>) => s("for p in $(pgrep -f 'n % 50'); do cut -d' ' -f39 /proc/$p/stat; done | sort -un | tr '\\n' ' '")
+			.then((o) => o.trim().split(/\s+/).filter(Boolean));
+		const everyCpu = async (s: (cmd: string) => Promise<string>, label: string) => {
+			for (let i = 0; ; i++) {
+				const seen = await onCpus(s);
+				if (seen.length >= cpus) return;
+				if (i > 100) assert.fail(`${label}: the counters ran on CPUs ${seen.join(",")} only, of ${cpus}`);
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		};
+		await everyCpu(sh, "before");
+		const counters = async (s: (cmd: string) => Promise<string>) => (await s(`for f in $(for i in $(seq 0 ${cpus}); do echo /tmp/c.$i; done) /tmp/pipe; do v=; while [ -z "$v" ]; do read v < $f; done; echo $v; done`)).trim().split(/\s+/).map(Number);
+		const advanced = async (s: (cmd: string) => Promise<string>, label: string) => {
+			const c0 = await counters(s);
+			assert.equal(c0.length, cpus + 2, `${label}: ${c0}`);
+			await new Promise((r) => setTimeout(r, 500));
+			const c1 = await counters(s);
+			assert.ok(c1.every((v, i) => v > c0[i]!), `${label}: every counter advances (${c0} -> ${c1})`);
+		};
+		await advanced(sh, "before");
+
+		// Saved while running, three times: the machine goes on each time.
+		for (let i = 0; i < 3; i++) {
+			const s = await vm.snapshot();
+			assert.equal(s.cpus, cpus);
+			await advanced(sh, `after snapshot ${i + 1} without stop`);
+		}
+		// Across the last one also a sleeper (nanosleep).
+		await sh("(u0=$(cut -d' ' -f1 /proc/uptime); sleep 3; echo \"$u0 $(cut -d' ' -f1 /proc/uptime)\" > /tmp/slept) & sleep 0.5");
+		const snap = sdk.decodeSnapshot(sdk.encodeSnapshot(await vm.snapshot({ stop: true })));
+		assert.equal(snap.cpus, cpus, "the encoding keeps the CPU count");
+		assert.equal((await vm.exited).kind, "stopped");
+
+		await assert.rejects(boot(t, { cpus: cpus - 1, vsock: false, restore: snap, log: () => {} }), new RegExp(`snapshot: the snapshot has ${cpus} CPUs, this machine has ${cpus - 1}`));
+		// Without cpus a restore takes the snapshot's.
+		const vm2 = await createKernel({ kernel: testKernel, vsock: false, restore: snap, log: () => {} });
+		t.after(() => vm2.stop({ reason: "test cleanup" }));
+		assert.equal(vm2.stats().cpus, cpus);
+		const b = screen(vm2);
+		const sh2 = shell(vm2, b);
+		assert.equal((await sh2("nproc")).trim(), String(cpus));
+		await advanced(sh2, "restored");
+		await everyCpu(sh2, "restored");
+		await sh2("echo hi > /tmp/ff");
+		const done = async (s: (cmd: string, ms?: number) => Promise<string>, files: string, ok: (out: string) => boolean) => {
+			for (let i = 0; ; i++) {
+				const out = await s(`cat ${files} 2>/dev/null; true`, 30000);
+				if (ok(out)) return out;
+				if (i > 480) assert.fail(`not done after the restore: ${out}`);
+				await new Promise((r) => setTimeout(r, 250));
+			}
+		};
+		const slept = await done(sh2, "/tmp/ffout /tmp/slept", (o) => /fifo-hi/.test(o) && /^\d+\.\d+ \d+\.\d+$/m.test(o));
+		const [u0, u1] = /^(\d+\.\d+) (\d+\.\d+)$/m.exec(slept)!.slice(1).map(Number) as [number, number];
+		assert.ok(u1 - u0 >= 3 && u1 - u0 < 30, `the sleep across the snapshot took ${u1 - u0} s of guest uptime`);
+		assert.equal((await sh2(`dmesg | grep -cE '${KERNEL_TROUBLE}'; true`)).trim(), "0", await sh2("dmesg | tail -30"));
+
+		// kwtest's SMP checks in the restored machine (they need idle CPUs: the counters end), then across a
+		// snapshot of it (threads on several CPUs: exclusives, futexes, moves; 5 s on 4 CPUs), restored again.
+		// Where the threads ran and whether a woken or exec'd task moved race with the host's load (testing.md),
+		// so those checks may fail under a busy test run, but only as placement misses: no failed call (err 0),
+		// every exec'd child exited with its CPU (abnormal 0), nothing read wrong (bad 0). Every count and every
+		// other check must hold.
+		const smpOk = (out: string) => out.split("\n").filter((l) => l.startsWith("FAIL")).every((l) =>
+			/^FAIL move: a thread woken in read\(\) on a CPU a busy thread keeps: .*\(\d+ away, 0 bad, err 0\)/.test(l) ||
+			/^FAIL move: exec beside a busy thread on CPU 0: \d+ of \d+ new images started on another CPU \([0-9+]+; err 0, abnormal 0, bad 0\)$/.test(l) ||
+			/^FAIL smp: .* atomic add (\d+), cas (\d+), mutex (\d+) \(want \1, \2, \3\)$/.test(l));
+		await sh2("pkill -f 'n % 50'; pkill yes; sleep 0.5");
+		const smpRun = await sh2("kwtest smp 2>&1 | grep -v '^ok'", 240000);
+		assert.ok(/kwtest: \d+ failure\(s\)/.test(smpRun) && smpOk(smpRun), smpRun);
+		await sh2("(kwtest smp > /tmp/smp.log 2>&1; echo $? > /tmp/smp.rc) & sleep 1");
+		const snap2 = await vm2.snapshot({ stop: true });
+		assert.equal(snap2.cpus, cpus);
+		const vm3 = await boot(t, { cpus, vsock: false, restore: snap2, log: () => {} });
+		const c = screen(vm3);
+		const sh3 = shell(vm3, c);
+		const rc = await done(sh3, "/tmp/smp.rc", (o) => /^\d+$/m.test(o));
+		const smpLog = await sh3("grep -v '^ok' /tmp/smp.log");
+		assert.ok(/kwtest: \d+ failure\(s\)/.test(smpLog) && (rc.trim() === "0" || smpOk(smpLog)), `kwtest smp across the snapshot (exit ${rc.trim()}): ${smpLog}`);
+		// A park cycle after the restore (fields: requests R done D result X ...).
+		assert.equal((await sh3("set -- $(cat /proc/kwpark); w=$(($2 + 1)); echo 1 > /proc/kwpark; " +
+			"while set -- $(cat /proc/kwpark); [ $(($4 - w)) -lt 0 ]; do usleep 10000; done; echo $6", 30000)).trim(), "0", "a park cycle after the restore");
+		assert.equal((await sh3(`dmesg | grep -cE '${KERNEL_TROUBLE}'; true`)).trim(), "0", await sh3("dmesg | tail -30"));
+		vm3.write("poweroff -f\n");
+		assert.equal((await vm3.exited).code, 0);
+	});
+
+	test("snapshots and the CPU count: a UP snapshot is refused with more CPUs and by the SMP kernel (another build), and an SMP one by the UP kernel",
+		{ skip: !hasSmpPatch && "the kernel under test carries no SMP kernel" }, async (t) => {
+		const up = await WebAssembly.compile(readFileSync(kernelFile));
+		const smp = await sdk.loadKernelModule(readFileSync(kernelFile), { smp: true });
+		// Saved once init is done starting the shell: a vfork child parked before its exec would keep init from parking.
+		const settled = async (v: Instance) => {
+			const a = screen(v);
+			await a.waitFor(PROMPT);
+			v.write("echo up-$((6*7))\n");
+			await a.waitFor(/up-42/);
+		};
+		const vm = await boot(t, { kernel: up, cpus: 1, vsock: false, log: () => {} });
+		await settled(vm);
+		const snap = await vm.snapshot({ stop: true });
+		assert.equal(snap.cpus, 1);
+		await assert.rejects(boot(t, { kernel: up, cpus: 2, vsock: false, restore: snap, log: () => {} }), /the snapshot has 1 CPU, this machine has 2/);
+		await assert.rejects(boot(t, { kernel: smp, cpus: 1, vsock: false, restore: snap, log: () => {} }), /saved by another kernel build/);
+		// A header without a CPU count (a file from before SMP snapshots) is one CPU.
+		const bytes = sdk.encodeSnapshot(snap), dv = new DataView(bytes.buffer, bytes.byteOffset);
+		const hlen = dv.getUint32(8, true), header = JSON.parse(new TextDecoder().decode(bytes.subarray(12, 12 + hlen)));
+		assert.equal(header.cpus, 1);
+		delete header.cpus;
+		const h2 = new TextEncoder().encode(JSON.stringify(header)), old = new Uint8Array(12 + h2.length + bytes.length - 12 - hlen);
+		old.set(bytes.subarray(0, 8));
+		new DataView(old.buffer).setUint32(8, h2.length, true);
+		old.set(h2, 12);
+		old.set(bytes.subarray(12 + hlen), 12 + h2.length);
+		const oldSnap = sdk.decodeSnapshot(old);
+		assert.equal(oldSnap.cpus, 1);
+		const vmOld = await boot(t, { kernel: up, cpus: 1, vsock: false, restore: oldSnap, log: () => {} });
+		const o = screen(vmOld);
+		vmOld.write("echo old-file-$((6*7))\n");
+		await o.waitFor(/old-file-42/);
+		await vmOld.stop({ reason: "test" });
+		const vmSmp = await boot(t, { kernel: smp, cpus: 2, vsock: false, log: () => {} });
+		await settled(vmSmp);
+		const snapSmp = await vmSmp.snapshot({ stop: true });
+		assert.equal(snapSmp.cpus, 2);
+		// The UP kernel runs on one CPU whatever it is offered, so it cannot resume two.
+		await assert.rejects(boot(t, { kernel: up, cpus: 2, vsock: false, restore: snapSmp, log: () => {} }), /the snapshot has 2 CPUs, this machine has 1/);
 	});
 
 });

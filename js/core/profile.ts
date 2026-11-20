@@ -664,7 +664,9 @@ function readElfSymbols(b: Uint8Array): ElfSyms | undefined {
 	for (let i = 0; i < phnum; i++) {
 		const p = phoff + i * phentsize;
 		if (p + 56 > b.length) break;
-		if (dv.getUint32(p, true) === 1) loads.push({ off: n64(p + 8), size: n64(p + 32), vaddr: n64(p + 16) });
+		// An executable segment by p_memsz: a separate debug file keeps the
+		// segments but truncates their p_filesz (its code is NOBITS).
+		if (dv.getUint32(p, true) === 1) loads.push({ off: n64(p + 8), size: n64(p + (dv.getUint32(p + 4, true) & 1 ? 40 : 32)), vaddr: n64(p + 16) });
 	}
 	const secs: { type: number; off: number; size: number; link: number; entsize: number }[] = [];
 	for (let i = 0; i < shnum; i++) {

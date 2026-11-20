@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROFILE_ANON, PROFILE_UNKNOWN, createKernel, bundledKernelUrl, type KernelHandle, type KernelInstance } from "../js/node.ts";
+import { PROFILE_ANON, PROFILE_UNKNOWN, createKernel, bundledKernelUrl, symbolizeProfile, type KernelHandle, type KernelInstance, type ProfileReport } from "../js/node.ts";
 
 const testKernel = process.env.UNKERNEL_TEST_KERNEL ? path.resolve(process.env.UNKERNEL_TEST_KERNEL) : undefined;
 const kernelModule = await WebAssembly.compile(readFileSync(testKernel ?? fileURLToPath(bundledKernelUrl)));
@@ -210,4 +210,50 @@ test("profile and snapshots: a snapshot taken while sampling restores without th
 	const p = (await vm3.profile())!;
 	assert.equal(p.comms[0]!.comm, "awk"); // by instructions, without time samples
 	assert.ok(p.totals.insns > 5000 && p.totals.insns < 40000, `${p.totals.insns} instruction samples (only this boot's)`);
+});
+
+test("symbolizeProfile: a separate debug file (code segment with a truncated p_filesz) names the code by p_memsz", async () => {
+	// ELF header, one PT_LOAD (R | X, offset 0 at 0x10000, p_filesz 0x100 as
+	// objcopy --only-keep-debug leaves it, p_memsz 0x20000), .strtab, .symtab
+	// with fn at 0x18000 (size 0x100), and the section headers.
+	const b = new Uint8Array(376);
+	const dv = new DataView(b.buffer);
+	b.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+	dv.setUint16(16, 3, true); // ET_DYN
+	dv.setUint16(18, 183, true);
+	dv.setBigUint64(32, 64n, true); // e_phoff
+	dv.setBigUint64(40, 184n, true); // e_shoff
+	dv.setUint16(54, 56, true);
+	dv.setUint16(56, 1, true);
+	dv.setUint16(58, 64, true);
+	dv.setUint16(60, 3, true);
+	dv.setUint32(64, 1, true); // PT_LOAD
+	dv.setUint32(68, 5, true); // R | X
+	dv.setBigUint64(80, 0x10000n, true);
+	dv.setBigUint64(88, 0x10000n, true);
+	dv.setBigUint64(96, 0x100n, true); // p_filesz
+	dv.setBigUint64(104, 0x20000n, true); // p_memsz
+	b.set(new TextEncoder().encode("\0fn\0"), 128);
+	dv.setUint32(160, 1, true); // symbol 1: "fn", STT_FUNC, section 1
+	b[164] = 0x12;
+	dv.setUint16(166, 1, true);
+	dv.setBigUint64(168, 0x18000n, true);
+	dv.setBigUint64(176, 0x100n, true);
+	const sh = (i: number, type: number, off: number, size: number, link: number, entsize: number) => {
+		const h = 184 + 64 * i;
+		dv.setUint32(h + 4, type, true);
+		dv.setBigUint64(h + 24, BigInt(off), true);
+		dv.setBigUint64(h + 32, BigInt(size), true);
+		dv.setUint32(h + 40, link, true);
+		dv.setBigUint64(h + 56, BigInt(entsize), true);
+	};
+	sh(1, 2, 136, 48, 2, 24); // .symtab
+	sh(2, 3, 128, 4, 0, 0); // .strtab
+	const site = { path: "/lib/x.so", off: "0x8010", processes: 1, comm: "x", timeSamples: 0, insnSamples: 3 };
+	const page = { path: "/lib/x.so", page: "0x8000", processes: 1, comm: "x", timeSamples: 0, insnSamples: 3 };
+	const r = { sites: [site], pages: [page] } as unknown as ProfileReport;
+	await symbolizeProfile(r, (p) => (p === "/lib/x.so" ? b : undefined));
+	assert.equal(r.sites[0]!.symbol, "fn+0x10");
+	assert.equal(r.pages[0]!.symbol, "fn");
+	assert.deepEqual(r.symbols!.map((y) => [y.symbol, y.insnSamples]), [["fn", 3]]);
 });

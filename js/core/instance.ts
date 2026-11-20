@@ -14,7 +14,7 @@ import type { JitStats, KwemuStats } from "./jit.ts";
 import type { SoundHost, SoundOption, SoundState, SoundStats } from "./sound.ts";
 import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
 import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
-import { connectOn, execOn, spawnOn, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess } from "./tty.ts";
+import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess, type TtySessionSnapshot } from "./tty.ts";
 import { fetchOver } from "./http.ts";
 import { CommandTable, parseCommands, type CommandsOption, type HostCommand } from "./commands.ts";
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
@@ -24,7 +24,7 @@ import { NetStack, type NetBackend, type NetStats } from "./net.ts";
 import { buildDisks, buildNet, isNetSpec, type DeviceRegistry, type DiskSpec, type NetSpec, type SkippedDisk } from "./devices.ts";
 import { openDistro, type DistroInfo, type DistroSource } from "./distro.ts";
 import { ConsoleOutput } from "./output.ts";
-import { snapshotCpuMismatch, type KernelSnapshot } from "./snapshot.ts";
+import { snapshotCpuMismatch, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import { checkWorkerOptions, createKernelInWorker, type WorkerKernel } from "./worker-host.ts";
 import type { WorkerEndpoint } from "./worker-protocol.ts";
 import type { KernelTransport } from "./worker-shared.ts";
@@ -57,7 +57,9 @@ export interface CreateKernelOptions {
 	 * and network each given, or not, as when it was taken (a network with
 	 * the same MAC), or createKernel rejects. vsock sessions (spawn(),
 	 * exec(), connect(), fetch(), listeners' connections) and the guest's
-	 * TCP connections do not survive: the guest's ends are reset. Host file
+	 * TCP connections do not survive: the guest's ends are reset, except
+	 * detachable terminal sessions (spawn() with `detachable`), which the
+	 * guest keeps detached for attach() (the snapshot's `ttys`). Host file
 	 * systems do (inline only): `mounts` must give one for each mount path
 	 * in the snapshot, read-only as it was, and the guest's open files on
 	 * it are opened again by path (a file gone meanwhile answers ESTALE);
@@ -352,7 +354,7 @@ export interface KernelHandle {
 	/** Stop the kernel now (no clean shutdown). Resolves with the exit. */
 	stop(res?: { code?: number; reason?: string }): Promise<ExitResult>;
 	/** Save the machine; resume it with createKernel({ restore }) (see KernelInstance.snapshot()). */
-	snapshot(opts?: { stop?: boolean }): Promise<KernelSnapshot>;
+	snapshot(opts?: SnapshotOptions): Promise<KernelSnapshot>;
 	/** Counters (in a worker: the latest snapshot, at most about 500 ms old while running). */
 	stats(): InstanceStats;
 	/** Memory actually allocated, in MiB. */
@@ -386,6 +388,17 @@ export interface KernelHandle {
 	 */
 	spawn(file: string | undefined, args: readonly string[] | undefined, opts: PipeOptions): Promise<Subprocess>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
+	/**
+	 * Take over a detachable session (spawn() with `detachable`) by its
+	 * `sessionId` or as the snapshot listed it (KernelSnapshot.ttys),
+	 * typically after createKernel({ restore }): a live Pty on the same
+	 * program and pty, whose output starts with the session's recent output
+	 * unless `replay: false` (tty.ts attachPty()). Rejects with a PtyError
+	 * ENOENT when the guest has no such session (or cannot reattach: an
+	 * image from before the feature), ENODEV without vsock. Does not wait
+	 * for createKernel's `mounts` or `commands`.
+	 */
+	attach(session: string | TtySessionSnapshot, opts?: AttachOptions): Promise<Pty>;
 	/**
 	 * Run `file` with `args` on pipes, feed it `input`, and resolve with
 	 * its stdout and stderr (strings, or bytes with `encoding: "buffer"`)
@@ -500,6 +513,11 @@ export class KernelInstance implements KernelHandle {
 		// saved at the snapshot point, with the vsock device.
 		this.kernel.vsock.onSave = () => mounts.save();
 		this.kernel.vsock.hostBusy = () => mounts.snapshotBusy();
+		// The detachable sessions open at the snapshot point (their Ptys end with a stopped kernel).
+		this.kernel.onSnapshot = (snap) => {
+			const ttys = ttySessions(host);
+			if (ttys.length) snap.ttys = ttys;
+		};
 	}
 
 	/**
@@ -545,6 +563,11 @@ export class KernelInstance implements KernelHandle {
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions): Promise<Pty>;
 	spawn(file?: string, args?: readonly string[], opts?: PtyOptions | PipeOptions): Promise<Pty | Subprocess> {
 		return this.#gate(() => spawnOn(this.#vsock, file, args, opts));
+	}
+
+	/** Take over a detachable session (see KernelHandle.attach()). */
+	attach(session: string | TtySessionSnapshot, opts?: AttachOptions): Promise<Pty> {
+		return attachOn(this.#vsock, session, opts);
 	}
 
 	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
@@ -672,13 +695,17 @@ export class KernelInstance implements KernelHandle {
 	 * after the copy (no clean shutdown), the usual way to suspend a machine
 	 * with disks. The devices' host state is saved (display, input, sound,
 	 * shm exports, the network's MAC); vsock sessions and TCP connections
-	 * are not (a restored guest's ends are reset). Host file systems are:
+	 * are not (a restored guest's ends are reset), but detachable terminal
+	 * sessions survive in the guest and are listed in `ttys` for attach(). Host file systems are:
 	 * each mount's 9p session and the guest's open files on it (not the
 	 * files themselves; restore with the same `mounts`). Rejects while a
 	 * mount or unmount runs, or when a 9p request is in flight at the
-	 * snapshot point.
+	 * snapshot point. `commit` stores the snapshot while the kernel waits
+	 * at that point, and the kernel stops only once it succeeded (with
+	 * `hold`, or waits on there until told to stop or go on); if it fails
+	 * the guest goes on (SnapshotOptions, SnapshotCommitError).
 	 */
-	snapshot(opts: { stop?: boolean } = {}): Promise<KernelSnapshot> {
+	snapshot(opts: SnapshotOptions = {}): Promise<KernelSnapshot> {
 		const why = this.#mounts.snapshotBlocker(true);
 		if (why) return Promise.reject(new Error(`snapshot: ${why}`));
 		return this.kernel.snapshot(opts);

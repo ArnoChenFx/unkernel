@@ -35,6 +35,7 @@ import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundChunk, SoundSink } from "./sound.ts";
 import { sharedNow } from "./worker-devices.ts";
 import { SharedServer, applyEvdev } from "./worker-shared.ts";
+import { SnapshotCommitError, awakeTimeout, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
 import { type FromWorker, type ToWorker, type WorkerBootSpec, type WorkerExit, type WorkerPort } from "./worker-protocol.ts";
 
 export interface ServeKernelOptions {
@@ -48,8 +49,16 @@ export interface ServeKernelOptions {
 	whyNoCpus?: Platform["whyNoCpus"];
 }
 
-/** How long the exit waits for saves in flight before it is reported anyway. */
+/** How long the exit waits for saves in flight before it is reported anyway (awake time: awakeTimeout()). */
 const EXIT_SAVE_WAIT_MS = 10000;
+/**
+ * How long the exit waits for snapshots in progress (awake time), whose
+ * results go out first: a snapshot with stop ends the kernel before its
+ * disks are durable, a commit before its owner has answered. One still
+ * open then is answered as failed, still before "exit".
+ */
+const EXIT_SNAPSHOT_WAIT_MS = 60000;
+const awakeDelay = (ms: number) => new Promise<void>((r) => { awakeTimeout(r, ms); });
 /** While frame credits wait for a change, how often to look (a timer; it runs at the kernel's next yield). */
 const FRAME_POLL_MS = 16;
 
@@ -149,8 +158,21 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 		}
 	};
 
-	/** Snapshots in progress: their results go out before "exit". */
-	const snapshots = new Set<Promise<unknown>>();
+	/** Snapshots in progress, by id: each is answered ("snapshot-result") before "exit". */
+	const snapshots = new Map<number, Promise<void>>();
+	/** snapshot({ commit }) held at the consistent point: the owner's verdict awaited, by id. */
+	const commits = new Map<number, { resolve: () => void; reject: (e: Error) => void }>();
+	/** snapshot({ commit, hold }) committed: the owner's "snapshot-release" awaited, or one that came first, by id. */
+	const holds = new Map<number, { decide?: (d: SnapshotHoldDecision) => void; early?: SnapshotHoldDecision }>();
+	/** Answer snapshot `msg.id` once (a result that cannot be posted, such as a failed transfer, is answered as an error). */
+	const answer = (msg: Extract<FromWorker, { t: "snapshot-result" }>, transfer?: ArrayBuffer[]) => {
+		if (!snapshots.delete(msg.id)) return;
+		try {
+			post(msg, transfer);
+		} catch (e) {
+			post({ t: "snapshot-result", id: msg.id, ok: false, error: `snapshot: the result could not be posted: ${(e as Error)?.message ?? e}` });
+		}
+	};
 	/** Sync requests not answered yet: answered false at exit (no flush confirmed them). */
 	const pendingSyncs = new Set<number>();
 	/** spec index -> the built disk, and the specs' kinds. */
@@ -287,9 +309,14 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 			shared?.detach();
 			flush();
 			flushVsock();
-			// The owner ends the worker when it gets "exit": let saves in flight commit
-			// first, and a snapshot's result (one with stop ends the kernel) go out.
-			await Promise.race([Promise.all([vm.settled(), ...snapshots]), new Promise((r) => setTimeout(r, EXIT_SAVE_WAIT_MS))]);
+			// The owner ends the worker when it gets "exit": let every snapshot's result go out
+			// first (one with stop or a commit ends the kernel), then saves in flight commit.
+			// Both waits count awake time, so the timers of a worker frozen in a background
+			// tab, firing late on its return, do not beat the IndexedDB results it waits for.
+			if (snapshots.size) await Promise.race([Promise.all(snapshots.values()), awakeDelay(EXIT_SNAPSHOT_WAIT_MS)]);
+			for (const id of [...snapshots.keys()])
+				answer({ t: "snapshot-result", id, ok: false, error: "snapshot: the kernel ended before its disks became durable" });
+			await Promise.race([vm.settled(), awakeDelay(EXIT_SAVE_WAIT_MS)]);
 			for (const id of pendingSyncs) post({ t: "synced", id, ok: false });
 			pendingSyncs.clear();
 			const result = cloneableExit(res);
@@ -347,11 +374,57 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				post({ t: "snapshot-result", id, ok: false, error: "snapshot: the kernel is not running" });
 				break;
 			}
-			const p = instance.snapshot({ stop: msg.stop }).then(
-				(snapshot) => post({ t: "snapshot-result", id, ok: true, snapshot }, [snapshot.memory.buffer as ArrayBuffer]),
-				(e) => post({ t: "snapshot-result", id, ok: false, error: (e as Error)?.message ?? String(e) }));
-			snapshots.add(p);
-			void p.finally(() => snapshots.delete(p));
+			if (snapshots.has(id)) break;
+			// With commit: the snapshot goes to the owner (memory transferred) while the
+			// kernel waits at its consistent point, and the owner's verdict ends the wait.
+			const commit = msg.commit ? (snap: KernelSnapshot, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+				commits.set(id, { resolve, reject });
+				signal.addEventListener("abort", () => {
+					commits.delete(id);
+					reject(signal.reason as Error);
+				}, { once: true });
+				try {
+					post({ t: "snapshot-held", id, snapshot: snap }, [snap.memory.buffer as ArrayBuffer]);
+				} catch (e) {
+					commits.delete(id);
+					reject(new Error(`the snapshot could not be posted: ${(e as Error)?.message ?? e}`));
+				}
+			}) : undefined;
+			// With hold: after the commit the kernel waits for the owner's "snapshot-release" (no timeout).
+			const hold = commit && msg.hold ? (_snap: KernelSnapshot, signal: AbortSignal) => new Promise<SnapshotHoldDecision>((resolve) => {
+				const h = holds.get(id);
+				if (h?.early) {
+					holds.delete(id);
+					resolve(h.early);
+					return;
+				}
+				holds.set(id, { decide: resolve });
+				signal.addEventListener("abort", () => holds.delete(id), { once: true });
+			}) : undefined;
+			const opts: SnapshotOptions = commit ? { commit, commitTimeoutMs: msg.commitTimeoutMs, ...(hold ? { hold } : {}) } : { stop: msg.stop };
+			snapshots.set(id, instance.snapshot(opts).then(
+				(snapshot) => commit ? answer({ t: "snapshot-result", id, ok: true }) : answer({ t: "snapshot-result", id, ok: true, snapshot }, [snapshot.memory.buffer as ArrayBuffer]),
+				(e) => answer({
+					t: "snapshot-result", id, ok: false, error: (e as Error)?.message ?? String(e),
+					...(e instanceof SnapshotCommitError ? { commitFailed: true, timedOut: e.timedOut } : {}),
+				})));
+			break;
+		}
+		case "snapshot-commit": {
+			const c = commits.get(msg.id);
+			commits.delete(msg.id);
+			if (msg.ok) c?.resolve();
+			else c?.reject(new Error(msg.error ?? "the commit failed"));
+			break;
+		}
+		case "snapshot-release": {
+			if (!snapshots.has(msg.id)) break; // answered already (the kernel ended)
+			const how: SnapshotHoldDecision = msg.stop ? "stop" : "continue";
+			const h = holds.get(msg.id);
+			if (h?.decide) {
+				holds.delete(msg.id);
+				h.decide(how);
+			} else holds.set(msg.id, { early: how }); // before the kernel asked (its microtasks after the commit)
 			break;
 		}
 		case "stop":

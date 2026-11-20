@@ -54,6 +54,12 @@ export interface CpuInit {
 	 * performance.now() - epochMs` (ms) on every thread: CPU 0's clock.
 	 */
 	epochMs: number;
+	/**
+	 * epochMs on a SharedArrayBuffer ([0]), read instead of it where given:
+	 * Kernel.advanceClock() moves it while the kernel waits at a snapshot
+	 * point (every CPU held, none reading it).
+	 */
+	clock?: Float64Array;
 	/** Offer kwemu's JIT tier on this CPU (KernelConfig.jit). */
 	jit: boolean;
 	/** The memory is a memory64 one (the JIT's modules import it as such). */
@@ -154,7 +160,7 @@ const IPI_STOP = 1 << 26;
 
 /** Run CPU `init.cpu` on this thread until the session ends (the owner terminates the thread). */
 export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
-	const { cpu, memory, module } = init;
+	const { cpu, memory, module, clock } = init;
 	const i32 = new Int32Array(memory.buffer);
 	// The session ends here: stop CPU 0 (the stop IPI, which the kernel
 	// takes even while spinning with interrupts off), which may wait for
@@ -205,7 +211,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 				return ERRNO.SUCCESS;
 			}
 			if (id > CLOCK_THREAD_CPUTIME) return ERRNO.INVAL;
-			const ns = Math.round((performance.timeOrigin + performance.now() - init.epochMs) * 1e6);
+			const ns = Math.round((performance.timeOrigin + performance.now() - (clock ? clock[0]! : init.epochMs)) * 1e6);
 			const v = dv();
 			v.setUint32(time, ns >>> 0, true);
 			v.setUint32(time + 4, Math.floor(ns / 4294967296), true);

@@ -12,13 +12,16 @@
 // once (an attachment, an open mask, a stream state), which a restored
 // kernel does not tell again. Connections do not survive: the kernel
 // resets its vsock connections after a restore (kwvsock), and the network
-// stack answers TCP segments of flows it does not know with RST.
+// stack answers TCP segments of flows it does not know with RST. Detachable
+// terminal sessions (tty.ts) do: the guest keeps them through that reset,
+// and the snapshot lists them (`ttys`) for attach().
 
 import type { BlockDevice, DiskSnapshotState } from "./block.ts";
 import type { DisplaySnapshot } from "./display.ts";
 import type { InputSnapshot } from "./input.ts";
 import type { ShmSnapshot } from "./shm.ts";
 import type { SoundSnapshot } from "./sound.ts";
+import type { TtySessionSnapshot } from "./tty.ts";
 import type { VsockSnapshot } from "./vsock.ts";
 
 /**
@@ -65,6 +68,112 @@ export interface KernelSnapshot {
 	disks: DiskSnapshotState[];
 	/** The other devices (empty in snapshots from before devices were saved). */
 	devices: DeviceSnapshots;
+	/**
+	 * The detachable terminal sessions (PtyOptions.detachable) the host had
+	 * open at the snapshot point; attach() each in the restored machine
+	 * within its detachTimeout. Absent when there were none (and in
+	 * snapshots from before them).
+	 */
+	ttys?: TtySessionSnapshot[];
+}
+
+/**
+ * Options of snapshot() (Kernel, KernelInstance, WorkerKernel).
+ *
+ * `commit` saves a machine without the risk of `stop: true`, whose stop
+ * comes before the caller has stored the snapshot (a failed store then loses
+ * the machine). The kernel waits at its consistent point (every task parked,
+ * on SMP every other CPU held) while the host makes the disks durable and
+ * then runs `commit(snapshot, signal)`, which stores the snapshot. Resolved:
+ * the kernel stops there (exit kind "stopped", as with `stop`), and
+ * snapshot() resolves. Rejected, or still pending after `commitTimeoutMs` of
+ * awake time (awakeTimeout(): a frozen page does not count), or a disk that
+ * did not become durable: the kernel goes on as after a snapshot without
+ * `stop`, and snapshot() rejects with a SnapshotCommitError. `signal` aborts
+ * when the snapshot is given up (the timeout, or the kernel ended); a commit
+ * that stored something should then remove it, since the machine runs on
+ * past it. Implies `stop`. In worker mode `commit` and `hold` run on the
+ * owner's thread with the memory transferred there.
+ *
+ * `hold` (with `commit`) decides after a successful commit instead of the
+ * stop: the kernel stays at its consistent point, the snapshot stored,
+ * until the value `hold(snapshot, signal)` returns settles. "continue": the
+ * kernel goes on as after a snapshot without `stop` (the stored snapshot is
+ * then stale: remove it, since the guest writes its disks again); "stop" (or
+ * anything else, a rejection too: the stored snapshot is safe to resume):
+ * it stops there, as without `hold`. No timeout applies: the caller bounds
+ * the hold. snapshot() resolves with the snapshot once it ends, also when
+ * the kernel ended meanwhile (stop(), a worker that died: `signal` aborts
+ * then; the snapshot was stored and the kernel never ran past it).
+ *
+ * Time: nothing runs in the guest while it waits, and when it goes on (a
+ * failed commit, or a hold's "continue") its clocks have advanced by the
+ * wait, as for a virtual machine paused by its hypervisor: its monotonic
+ * clock (the host's) jumps by it, timers that expired meanwhile fire, and
+ * its wall clock stays the host's. Should the host's monotonic clock have
+ * fallen behind its wall clock over the wait (it may stop while a device
+ * sleeps), the guest's monotonic clock is advanced by the difference, so
+ * its wall clock stays right. A restore instead continues the monotonic
+ * clock from the saved value and steps the wall clock (kernel/parking.md).
+ */
+export interface SnapshotOptions {
+	/** Stop the kernel right after the copy (no task runs after it). */
+	stop?: boolean;
+	/** Store the snapshot before the kernel is given up (above). */
+	commit?: (snapshot: KernelSnapshot, signal: AbortSignal) => unknown;
+	/** How long `commit` may take, in ms of awake time (default SNAPSHOT_COMMIT_TIMEOUT_MS). */
+	commitTimeoutMs?: number;
+	/** After a successful commit: keep the kernel at its consistent point until this decides (above). */
+	hold?: (snapshot: KernelSnapshot, signal: AbortSignal) => SnapshotHoldDecision | PromiseLike<SnapshotHoldDecision>;
+}
+
+/** How a snapshot({ commit, hold }) hold ends: the kernel goes on, or stops at the snapshot. */
+export type SnapshotHoldDecision = "stop" | "continue";
+
+/**
+ * The host's wall clock ran ahead of its monotonic clock by this much over
+ * a hold (ms) before the guest's monotonic clock is advanced to match (a
+ * device that slept; smaller differences are clock noise and NTP slewing).
+ */
+export const HOLD_CLOCK_LAG_MS = 1000;
+
+/** snapshot({ commit })'s default commitTimeoutMs. */
+export const SNAPSHOT_COMMIT_TIMEOUT_MS = 30000;
+
+/**
+ * snapshot({ commit }) gave the snapshot up after the copy (the commit
+ * rejected or timed out, or a disk did not become durable): the kernel runs
+ * on, unless it ended meanwhile for another reason.
+ */
+export class SnapshotCommitError extends Error {
+	/** The commit took longer than commitTimeoutMs. */
+	readonly timedOut: boolean;
+	constructor(message: string, opts: { timedOut?: boolean; cause?: unknown } = {}) {
+		super(message, opts.cause === undefined ? undefined : { cause: opts.cause });
+		this.name = "SnapshotCommitError";
+		this.timedOut = !!opts.timedOut;
+	}
+}
+
+/**
+ * Call `fn` once `ms` of awake time has passed: counted in steps of `step`
+ * ms, each adding at most two steps however late its timer fired, so a page
+ * or worker frozen in the background (iOS, a discarded tab) does not use the
+ * time up while it sleeps, and the timers that fire late and all at once
+ * when it wakes do not beat the I/O it was waiting for. Returns a cancel
+ * function.
+ */
+export function awakeTimeout(fn: () => void, ms: number, step = 1000): () => void {
+	let left = ms, last = performance.now(), timer: ReturnType<typeof setTimeout> | undefined;
+	const tick = () => {
+		const now = performance.now();
+		left -= Math.min(now - last, 2 * step);
+		last = now;
+		if (left <= 0) fn();
+		else timer = setTimeout(tick, Math.min(step, left));
+	};
+	timer = setTimeout(tick, Math.min(step, ms));
+	return () => clearTimeout(timer);
 }
 
 /**
@@ -186,7 +295,7 @@ export function encodeSnapshot(s: KernelSnapshot): Uint8Array {
 	const header = encoder.encode(JSON.stringify({
 		version: s.version, fingerprint: s.fingerprint, cpus: s.cpus ?? 1, memory64: s.memory64, memoryBytes: mem.byteLength,
 		freeBytes: s.freeBytes ?? 0, monotonicMs: s.monotonicMs, consoleSize: s.consoleSize, inputBytes: s.input.length, chunks: chunks.length,
-		disks: s.disks, devices: s.devices,
+		disks: s.disks, devices: s.devices, ...(s.ttys?.length ? { ttys: s.ttys } : {}),
 	}));
 	const out = new Uint8Array(MAGIC.length + 4 + header.length + s.input.length + chunks.length * (4 + CHUNK));
 	const dv = new DataView(out.buffer);
@@ -224,6 +333,7 @@ export function decodeSnapshot(bytes: Uint8Array): KernelSnapshot {
 		memory.set(bytes.subarray(p + 4, p + 4 + CHUNK), c * CHUNK);
 		p += 4 + CHUNK;
 	}
+	const ttys = Array.isArray(h.ttys) ? (h.ttys as TtySessionSnapshot[]).filter((t) => t && typeof t.id === "string") : [];
 	return { version: 1, fingerprint: h.fingerprint, cpus: Number.isInteger(h.cpus) && h.cpus > 1 ? h.cpus : 1, memory64: h.memory64, memory, freeBytes: h.freeBytes ?? 0, monotonicMs: h.monotonicMs, consoleSize: h.consoleSize, input,
-		disks: Array.isArray(h.disks) ? h.disks : [], devices: h.devices && typeof h.devices === "object" ? h.devices : {} };
+		disks: Array.isArray(h.disks) ? h.disks : [], devices: h.devices && typeof h.devices === "object" ? h.devices : {}, ...(ttys.length ? { ttys } : {}) };
 }

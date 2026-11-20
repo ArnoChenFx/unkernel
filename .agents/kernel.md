@@ -204,7 +204,9 @@ a patch re-export.
   wasm globals, saved in locals across the switch (entry.S).
 - The UP kernel has one CPU and `ARCH_NO_PREEMPT`; the SMP kernel has one
   such thread per CPU (smp.md).
-- **Suspending imports**: `unkernel.wasm_switch_to` and the WASI
+- **Suspending imports**: `unkernel.wasm_switch_to`,
+  `unkernel.wasm_snapshot_point` (only for `snapshot({ commit })`, which
+  holds the kernel at its consistent point; parking.md) and the WASI
   `poll_oneoff`, `sched_yield` and `proc_exit`, and only when the host
   returns a promise. Every other import must return synchronously; in
   particular `wasm_driver_block_submit` is called by blk-mq in atomic

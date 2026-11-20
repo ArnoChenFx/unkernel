@@ -39,7 +39,7 @@ import { InputHost, type InputState } from "./input.ts";
 import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
-import { copySnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot } from "./snapshot.ts";
+import { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, awakeTimeout, copySnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import { VsockDevice } from "./vsock.ts";
 import { WasiHost, never } from "./wasi.ts";
 
@@ -63,6 +63,16 @@ const EBUSY = 16;
 const ENOSYS = 38;
 
 const textDecoder = new TextDecoder();
+
+/** A snapshot() waiting for the kernel's consistent point. */
+interface SnapshotWaiter {
+	resolve: (s: KernelSnapshot) => void;
+	reject: (e: Error) => void;
+	stop: boolean;
+	commit?: SnapshotOptions["commit"];
+	commitTimeoutMs: number;
+	hold?: SnapshotOptions["hold"];
+}
 
 /**
  * How a kernel run ended: "halt" (orderly power-off/reboot: code 0 power
@@ -329,8 +339,22 @@ export class Kernel {
 	fingerprint = "";
 	/** The MAC kwnet got (wasm_driver_net_init), once the guest's driver started; null before or without a network. */
 	netMac: Uint8Array | null = null;
-	/** The snapshot() in progress. */
-	snapshotWaiter: { resolve: (s: KernelSnapshot) => void; reject: (e: Error) => void; stop: boolean } | null = null;
+	/** The snapshot() in progress, until its consistent point. */
+	snapshotWaiter: SnapshotWaiter | null = null;
+	/** snapshot({ commit }): the kernel waits at its consistent point for the commit (and a hold). */
+	snapshotHeld = false;
+	/** While snapshotHeld: settles once the sealed disks are durable (true) or failed (false); sync() answers with it. */
+	heldDurable: Promise<boolean> | null = null;
+	/**
+	 * The guest's monotonic clock for the other CPUs' threads: [0] is
+	 * CpuInit.epochMs (performance.timeOrigin - WasiHost.monoOffset), on a
+	 * SharedArrayBuffer, so advanceClock() reaches them. Made with the first CPU thread.
+	 */
+	clockEpoch: Float64Array | null = null;
+	/** The host's wall clock as holdForCommit() reads it (ms; a test may stand in a clock of its own). */
+	wallClock: () => number = () => Date.now();
+	/** Called with each snapshot at its consistent point, before commit or resolve: adds the host's own state (KernelInstance: `ttys`). */
+	onSnapshot: ((snap: KernelSnapshot) => void) | undefined;
 	/** CPUs offered to the kernel (1 unless an SMP kernel and KernelConfig.cpus > 1). */
 	cpus = 1;
 	/** The other CPUs' threads, once started. */
@@ -365,6 +389,10 @@ export class Kernel {
 			// their threads end; nothing they write may come out).
 			this.conRing?.close();
 			this.result = res;
+			// A snapshot asked for that never reached its consistent point.
+			const w = this.snapshotWaiter;
+			this.snapshotWaiter = null;
+			w?.reject(new Error(`snapshot: the kernel ended before its consistent point (${res.reason})`));
 			try { this.onStage("exit", res); } catch {}
 			r(res);
 		}));
@@ -465,6 +493,27 @@ export class Kernel {
 		return [this.jit.kwemuStats(), ...this.jitMirrors.map((m) => this.jit.kwemuStats(jitBufFromMirror(m)))];
 	}
 
+	/** clockEpoch, made on first use (a CPU thread). */
+	sharedClock(): Float64Array {
+		if (!this.clockEpoch) {
+			this.clockEpoch = new Float64Array(new SharedArrayBuffer(8));
+			this.clockEpoch[0] = performance.timeOrigin - this.wasi.monoOffset;
+		}
+		return this.clockEpoch;
+	}
+
+	/**
+	 * Move the guest's monotonic clock forward by `ms` on every CPU (never
+	 * back: the guest's clocks must not run backwards). Only while the guest
+	 * cannot read it mid-change: at a snapshot point, where every task is
+	 * parked and every other CPU held (holdForCommit()).
+	 */
+	advanceClock(ms: number): void {
+		if (!(ms > 0)) return;
+		this.wasi.monoOffset += ms;
+		if (this.clockEpoch) this.clockEpoch[0] = performance.timeOrigin - this.wasi.monoOffset;
+	}
+
 	/** wasm_cpu_start(cpu, idle): start a secondary CPU's thread. */
 	startCpu(cpu: number, idle: bigint): number {
 		const spawn = this.opts.spawnCpu;
@@ -477,7 +526,7 @@ export class Kernel {
 				cpu, idle, module: this.opts.module, memory: this.memory, cpus: this.cpus,
 				initFlag: flag instanceof WebAssembly.Global ? Number(flag.value) : 0,
 				irqWord0: this.irqAddr ?? 0,
-				epochMs: performance.timeOrigin - this.wasi.monoOffset,
+				epochMs: performance.timeOrigin - this.wasi.monoOffset, clock: this.sharedClock(),
 				// A restored kernel starts its CPUs only to resume them (__kw_resume).
 				resume: !!this.opts.restore,
 				jit: this.jit.stats.enabled, memory64: this.memory64, jitMirror,
@@ -696,6 +745,8 @@ export class Kernel {
 			// Not running: nothing can become dirty; wait for saves in flight.
 			return Promise.all(disks.map((d) => d.saving?.catch(() => {}))).then(() => true);
 		}
+		// Held at a snapshot point: the disks were sealed there and nothing has run since.
+		if (this.snapshotHeld && this.heldDurable) return this.heldDurable;
 		const marks = disks.map((d) => d.flushSeq ?? 0);
 		this.setIrqBits(1 << IRQ_SYNC);
 		this.wake();
@@ -731,11 +782,17 @@ export class Kernel {
 	 * device saves (VsockDevice.onSave; a request in flight on one makes
 	 * the snapshot point busy, VsockDevice.blocker()). An SMP kernel's
 	 * snapshot records its CPU count (KernelSnapshot.cpus); a restore needs
-	 * as many, each task resuming on the CPU it ran on.
+	 * as many, each task resuming on the CPU it ran on. With `commit`
+	 * (SnapshotOptions) the kernel waits at the consistent point until the
+	 * caller has stored the snapshot, and stops only then (with `hold`, or
+	 * waits on for the caller's decision); a failed commit lets it go on
+	 * (SnapshotCommitError).
 	 */
-	snapshot({ stop = false }: { stop?: boolean } = {}): Promise<KernelSnapshot> {
+	snapshot({ stop = false, commit, commitTimeoutMs = SNAPSHOT_COMMIT_TIMEOUT_MS, hold }: SnapshotOptions = {}): Promise<KernelSnapshot> {
 		if (this.irqAddr === undefined || this.result) return Promise.reject(new Error("snapshot: the kernel is not running"));
-		if (this.snapshotWaiter) return Promise.reject(new Error("snapshot: one is in progress"));
+		if (this.snapshotWaiter || this.snapshotHeld) return Promise.reject(new Error("snapshot: one is in progress"));
+		if (commit !== undefined && typeof commit !== "function") return Promise.reject(new TypeError("snapshot: commit must be a function"));
+		if (hold !== undefined && (typeof hold !== "function" || !commit)) return Promise.reject(new TypeError("snapshot: hold must be a function, and needs commit"));
 		if (!this.exports?.kw_resume) return Promise.reject(new Error("snapshot: this kernel cannot resume one (no kw_resume)"));
 		for (const [i, d] of this.block.disks.entries()) {
 			const why = typeof d.snapshotSeal !== "function" ? "it does not support snapshots" : (() => {
@@ -743,7 +800,9 @@ export class Kernel {
 			})();
 			if (why) return Promise.reject(new Error(`snapshot: disk wd${String.fromCharCode(97 + i)}: ${why}`));
 		}
-		const p = new Promise<KernelSnapshot>((resolve, reject) => (this.snapshotWaiter = { resolve, reject, stop }));
+		const p = new Promise<KernelSnapshot>((resolve, reject) => (this.snapshotWaiter = {
+			resolve, reject, stop: stop || !!commit, commit, commitTimeoutMs: Math.max(0, Number(commitTimeoutMs) || 0), hold,
+		}));
 		this.raiseIrq(IRQ_SNAPSHOT);
 		return p;
 	}
@@ -800,8 +859,12 @@ export class Kernel {
 		}
 	}
 
-	/** wasm_snapshot_point: the end of a snapshot cycle (see snapshot()). */
-	snapshotPoint(result: number, blocker: bigint, freeMap?: bigint, freeBits?: bigint): number {
+	/**
+	 * wasm_snapshot_point: the end of a snapshot cycle (see snapshot()). A
+	 * JSPI suspending import: a promise (snapshot({ commit })) keeps the
+	 * kernel at its consistent point until it settles.
+	 */
+	snapshotPoint(result: number, blocker: bigint, freeMap?: bigint, freeBits?: bigint): number | Promise<number> {
 		const w = this.snapshotWaiter;
 		this.snapshotWaiter = null;
 		if (!w) return -EBUSY;
@@ -836,11 +899,95 @@ export class Kernel {
 			consoleSize: this.consoleSize, input, disks: sealed.map((s) => s.state),
 			devices: this.saveDevices(),
 		};
+		try {
+			this.onSnapshot?.(snap);
+		} catch {}
+		if (w.commit) return this.holdForCommit(w, snap, sealed.map((s) => s.done));
 		// The kernel parks for good at its next suspension point, before any task runs.
 		if (w.stop) this.stop({ reason: "stopped after a snapshot" });
 		Promise.all(sealed.map((s) => s.done)).then(() => w.resolve(snap),
 			(e) => w.reject(new Error(`snapshot: saving a disk failed: ${(e as Error)?.message ?? e}`)));
 		return 0;
+	}
+
+	/**
+	 * snapshot({ commit }) at the consistent point: wait (the import's
+	 * promise) for the disks to become durable and then for the commit.
+	 * Committed: stop here for good (the promise never settles, so nothing
+	 * runs after the copy, and on SMP the held CPUs stay held until their
+	 * threads end), or with `hold` wait on for its decision and stop or go
+	 * on then. Not committed (it rejected, timed out, or a disk failed):
+	 * answer 0, and the kernel resumes every task as after a snapshot without
+	 * stop. Host events meanwhile (frames, input, vsock packets, sync
+	 * requests) only queue or set IRQ bits, as while the kernel is busy.
+	 */
+	async holdForCommit(w: SnapshotWaiter, snap: KernelSnapshot, durable: Promise<void>[]): Promise<number> {
+		this.snapshotHeld = true;
+		const heldAt = { wall: this.wallClock(), mono: performance.now() };
+		const sealed = Promise.all(durable);
+		this.heldDurable = sealed.then(() => true, () => false);
+		const ac = new AbortController();
+		let timedOut = false;
+		const cancel = awakeTimeout(() => {
+			timedOut = true;
+			ac.abort(new Error(`the commit did not finish within ${w.commitTimeoutMs} ms`));
+		}, w.commitTimeoutMs);
+		const given = new Promise<never>((_, reject) => ac.signal.addEventListener("abort", () => reject(ac.signal.reason as Error), { once: true }));
+		given.catch(() => {});
+		try {
+			await Promise.race([sealed.catch((e: unknown) => {
+				throw new Error(`saving a disk failed: ${(e as Error)?.message ?? e}`);
+			}), given]);
+			await Promise.race([Promise.resolve().then(() => w.commit!(snap, ac.signal)), given]);
+		} catch (e) {
+			cancel();
+			if (!ac.signal.aborted) ac.abort(e);
+			this.#leaveHold(heldAt);
+			const why = (e as Error)?.message ?? String(e);
+			w.reject(new SnapshotCommitError(`snapshot: not committed (${why}); ${this.result ? `the kernel has ended (${this.result.reason})` : "the kernel runs on"}`, { timedOut, cause: e }));
+			return 0;
+		}
+		cancel();
+		if (w.hold && !this.result) {
+			// Stored: no timeout from here on; the hold's own decision, or the kernel's end.
+			const ended = new AbortController();
+			void this.exited.then((r) => ended.abort(new Error(`the kernel has ended (${r.reason})`)));
+			const exited = this.exited.then(() => "ended" as const);
+			let how: string;
+			try {
+				how = String(await Promise.race([Promise.resolve().then(() => w.hold!(snap, ended.signal)), exited]));
+			} catch (e) {
+				this.log(`[host] snapshot: the hold failed (${(e as Error)?.message ?? e}); stopping at the snapshot`);
+				how = "stop";
+			}
+			if (how === "continue" && !this.result) {
+				this.#leaveHold(heldAt);
+				w.resolve(snap);
+				return 0;
+			}
+		}
+		this.snapshotHeld = false;
+		this.heldDurable = null;
+		this.stop({ reason: "stopped after a snapshot" });
+		w.resolve(snap);
+		return never();
+	}
+
+	/**
+	 * The kernel goes on from a snapshot point where it waited (a failed
+	 * commit, a hold's "continue"): its clocks have advanced by the wait
+	 * (SnapshotOptions, Time), and by however much more the host's wall
+	 * clock moved than its monotonic one, so the guest's wall clock, which
+	 * its monotonic clock carries on from the boot or restore, stays right.
+	 */
+	#leaveHold(heldAt: { wall: number; mono: number }): void {
+		this.snapshotHeld = false;
+		this.heldDurable = null;
+		const lag = (this.wallClock() - heldAt.wall) - (performance.now() - heldAt.mono);
+		if (lag > HOLD_CLOCK_LAG_MS && !this.result) {
+			this.advanceClock(lag);
+			this.log(`[host] snapshot: the host's monotonic clock fell ${(lag / 1000).toFixed(1)} s behind its wall clock while the kernel waited; the guest's moves on by that`);
+		}
 	}
 
 	wake(): void {
@@ -871,7 +1018,8 @@ export class Kernel {
 			wasm_stack_drop(task: bigint): void {
 				k.resumers.delete(task);
 			},
-			wasm_snapshot_point: (result: number, blocker: bigint, freeMap: bigint, freeBits: bigint): number => k.snapshotPoint(result, blocker, freeMap, freeBits),
+			// (JSPI) Suspends only for snapshot({ commit }), which holds the kernel at its consistent point.
+			wasm_snapshot_point: new WebAssembly.Suspending((result: number, blocker: bigint, freeMap: bigint, freeBits: bigint) => k.snapshotPoint(result, blocker, freeMap, freeBits)),
 
 			// (JSPI) Park prev, run next. Resolves with the task that later
 			// switches back to prev.

@@ -133,8 +133,19 @@ export type ToWorker =
 	| { t: "vsock"; packets: Uint8Array[] }
 	/** A kwshm call (shm.ts) for the worker's ShmDevice; answered by "shm-result" with the same rid. */
 	| { t: "shm"; rid: number; call: ShmCall }
-	/** Save the machine (KernelInstance.snapshot()); answered by "snapshot-result" with the same id. */
-	| { t: "snapshot"; id: number; stop?: boolean };
+	/**
+	 * Save the machine (KernelInstance.snapshot()); answered by
+	 * "snapshot-result" with the same id. With `commit` (SnapshotOptions)
+	 * the worker first posts "snapshot-held" and keeps the kernel at its
+	 * consistent point until "snapshot-commit" (or `commitTimeoutMs`); with
+	 * `hold` also, after a successful commit, until "snapshot-release" (no
+	 * timeout: a page frozen for hours meanwhile changes nothing).
+	 */
+	| { t: "snapshot"; id: number; stop?: boolean; commit?: boolean; commitTimeoutMs?: number; hold?: boolean }
+	/** The owner's commit of "snapshot-held" `id` succeeded (the kernel then stops, or with `hold` waits on) or failed (it goes on). */
+	| { t: "snapshot-commit"; id: number; ok: boolean; error?: string }
+	/** The owner's hold decision for snapshot `id` (after a successful commit): stop at the snapshot, or go on. */
+	| { t: "snapshot-release"; id: number; stop: boolean };
 
 /** Worker -> owner. Output, log and progress keep their order relative to "started" and "exit". */
 export type FromWorker =
@@ -182,10 +193,20 @@ export type FromWorker =
 	/** kwshm withdrew an export. */
 	| { t: "shm-detach"; id: number }
 	/**
-	 * The answer to "snapshot": the snapshot (its memory transferred), or why
-	 * it failed. Always posted before "exit" (a snapshot with stop ends the kernel).
+	 * A "snapshot" with `commit` at the kernel's consistent point, its disks
+	 * durable: the snapshot (memory transferred) for the owner to commit; the
+	 * kernel waits for "snapshot-commit".
 	 */
-	| { t: "snapshot-result"; id: number; ok: true; snapshot: KernelSnapshot } | { t: "snapshot-result"; id: number; ok: false; error: string }
+	| { t: "snapshot-held"; id: number; snapshot: KernelSnapshot }
+	/**
+	 * The answer to "snapshot": the snapshot (its memory transferred; none
+	 * after "snapshot-held", whose snapshot it confirms), or why it failed
+	 * (`commitFailed`: a SnapshotCommitError, the kernel went on unless it
+	 * ended). Always posted before "exit", for every "snapshot" (a snapshot
+	 * with stop or a commit ends the kernel).
+	 */
+	| { t: "snapshot-result"; id: number; ok: true; snapshot?: KernelSnapshot }
+	| { t: "snapshot-result"; id: number; ok: false; error: string; commitFailed?: boolean; timedOut?: boolean }
 	/** Sent after every save in flight has settled, so the worker can be ended at once. */
 	| { t: "exit"; result: WorkerExit; stats: InstanceStats; disks: DiskState[] };
 

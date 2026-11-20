@@ -1751,6 +1751,127 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal((await vm2.exited).code, 0);
 	});
 
+	// Detachable terminal sessions (kwtty's DETACH and ATTACH, tty.ts attachPty()): the restore's
+	// reset of every vsock connection detaches them, and attach() takes them over.
+	for (const { worker, name } of MODES) test(`snapshot() with detachable terminal sessions: attach() after the restore gets the same shell, jobs and pty (replay, resize, input, exit status); close(), the timeout and a plain session hang up; a snapshot without stop leaves them connected; restored twice (${name})`,
+		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
+		const vm = await boot(t, { worker, log: () => {} });
+		const a = screen(vm);
+		await a.waitFor(PROMPT);
+		const isNoEnt = (re?: RegExp) => (e: Error & { code?: string }) => e.name === "PtyError" && e.code === "ENOENT" && (!re || re.test(e.message));
+		const d = await vm.spawn(undefined, [], { cols: 80, rows: 24, detachable: true });
+		if (d.sessionId === undefined) {
+			// An image from before DETACH (UNKERNEL_TEST_KERNEL=an older bundle): ordinary sessions, and attach() is ENOENT.
+			assert.equal(d.features & sdk.TTY_FEATURE_DETACH, 0);
+			await assert.rejects(vm.attach("abc"), isNoEnt(/older than ATTACH/));
+			return;
+		}
+		assert.match(d.sessionId, /^[0-9a-f]{32}$/);
+		const alive = async (vmx: Instance, pid: number) => (await vmx.exec("sh", ["-c", `[ -d /proc/${pid} ] && echo yes || echo no`])).stdout.trim() === "yes";
+		const until = async (what: string, ok: () => Promise<boolean>, ms = 15000) => {
+			const end = Date.now() + ms;
+			while (!(await ok())) {
+				if (Date.now() > end) assert.fail(`timed out: ${what}`);
+				await new Promise((r) => setTimeout(r, 200));
+			}
+		};
+		// snapshot() refuses while vsock packets are in flight (kwtty's last output may still be); the guest goes on.
+		const quiet = async (vmx: Instance, opts: NonNullable<Parameters<Instance["snapshot"]>[0]>) => {
+			for (let i = 0; ; i++) {
+				try {
+					return await vmx.snapshot(opts);
+				} catch (e) {
+					if (i >= 40 || !/in flight/.test(String((e as Error)?.message))) throw e;
+					await new Promise((done) => setTimeout(done, 50));
+				}
+			}
+		};
+
+		// A deliberate close() hangs up: the shell is gone and its id with it.
+		const gone = await vm.spawn(undefined, [], { detachable: true });
+		await gone.close();
+		assert.deepEqual(await gone.ended, { type: "closed" });
+		await until("the closed session's shell exits", async () => !(await alive(vm, gone.pid)));
+		await assert.rejects(vm.attach(gone.sessionId!), isNoEnt(/no detachable session/));
+		await assert.rejects(vm.attach("no-such-session"), isNoEnt(/no detachable session no-such-session/));
+
+		const plain = await vm.spawn(undefined, [], { cols: 80, rows: 24 });
+		const short = await vm.spawn(undefined, [], { detachable: true, detachTimeout: 1500 });
+		// A full-screen program: the alternate screen, then more output than the 64 KiB kept for REPLAY.
+		const alt = await vm.spawn("sh", ["-c", 'trap "echo winch-\\$(stty size)" WINCH; printf "\\033[?1049h"; seq 1 15000; echo alt-ready; while :; do sleep 0.1; done'], { cols: 80, rows: 24, detachable: true });
+		assert.equal(plain.sessionId, undefined);
+		const sd = termScreen(d), salt = termScreen(alt);
+		void termScreen(plain).done;
+		void termScreen(short).done;
+		await d.write("X=kept; (i=0; while :; do i=$((i+1)); echo $i > /tmp/cnt; sleep 0.2; done) & echo ready-$((1+1))\n");
+		await sd.waitFor(/ready-2/);
+		await salt.waitFor(/alt-ready/);
+
+		// Without stop: the snapshot lists the detachable sessions, and they stay connected.
+		const live = await quiet(vm, {});
+		assert.deepEqual(live.ttys?.map((s) => s.id).sort(), [d.sessionId, short.sessionId, alt.sessionId].sort());
+		await d.write("echo still-$((3+3))\n");
+		await sd.waitFor(/still-6/);
+
+		// With a commit (the page's suspend), which already sees them.
+		let committed: string[] | undefined;
+		const snap = sdk.decodeSnapshot(sdk.encodeSnapshot(await quiet(vm, { commit: (s) => { committed = s.ttys?.map((x) => x.id); } })));
+		assert.deepEqual(committed?.sort(), [d.sessionId, short.sessionId, alt.sessionId].sort());
+		assert.deepEqual(snap.ttys?.find((s) => s.id === d.sessionId), { id: d.sessionId, pid: d.pid, pts: d.pts, cols: 80, rows: 24 });
+		assert.deepEqual(await d.ended, { type: "lost" }, "the old host's Pty ends with the kernel");
+
+		const vm2 = await boot(t, { worker, restore: snap, log: () => {} });
+		// The same shell: its pid, variable and background job; the replay first; the size of the attach.
+		const p = await vm2.attach(d.sessionId, { cols: 100, rows: 30 });
+		assert.equal(p.pid, d.pid);
+		assert.equal(p.pts, d.pts);
+		assert.equal(p.sessionId, d.sessionId);
+		const sp = termScreen(p);
+		await sp.waitFor(/ready-2[\s\S]*still-6/);
+		const count = async () => Number((await vm2.exec("cat", ["/tmp/cnt"])).stdout);
+		const n1 = await count();
+		await p.write("echo got-$X-$$; stty size\n");
+		await sp.waitFor(new RegExp(`got-kept-${d.pid}\\r?\\n30 100\\r?\\n`));
+		await until("the background job counts on", async () => (await count()) > n1);
+		p.resize(90, 20);
+		await p.write("stty size; echo r-$((4+4))\n");
+		await sp.waitFor(/\n20 90\r?\nr-8/);
+
+		// The full-screen program: the replay starts with its modes (the alternate screen) at a line start, then it redraws (SIGWINCH).
+		const q = await vm2.attach(snap.ttys!.find((s) => s.id === alt.sessionId)!);
+		q.resize(80, 24); // the same size again (the page does this): the redraw's second step still comes
+		const sq = termScreen(q);
+		await sq.waitFor(/winch-24 80/);
+		assert.match(sq.st.text, /^\x1b\[\?1049h\d+\r\n/, JSON.stringify(sq.st.text.slice(0, 40)));
+		assert.ok(sq.st.text.length < 70000, `${sq.st.text.length} bytes replayed`);
+		await q.close();
+
+		// The plain session's shell was hung up; the short one's after its 1.5 s; unknown ids are ENOENT.
+		await until("the plain session's shell exits", async () => !(await alive(vm2, plain.pid)));
+		await until("the unattached session is hung up after its timeout", async () => !(await alive(vm2, short.pid)));
+		await assert.rejects(vm2.attach(short.sessionId!), isNoEnt());
+		await assert.rejects(vm2.attach("no-such-session"), isNoEnt());
+
+		// A second attach takes the session over; the first connection ends.
+		const p2 = await vm2.attach(d.sessionId, { cols: 90, rows: 20, replay: false });
+		assert.deepEqual(await p.ended, { type: "lost" });
+		const sp2 = termScreen(p2);
+		await p2.write("exit 7\n");
+		assert.deepEqual(await p2.ended, { type: "exit", code: 7 });
+		await sp2.done;
+		await assert.rejects(vm2.attach(d.sessionId), isNoEnt());
+
+		// The same snapshot restored again: its sessions are there to attach again.
+		const vm3 = await boot(t, { worker, restore: snap, log: () => {} });
+		const r = await vm3.attach(d.sessionId, { replay: false });
+		const sr = termScreen(r);
+		await r.write("echo again-$X-$$\n");
+		await sr.waitFor(new RegExp(`again-kept-${d.pid}`));
+		await r.close();
+		assert.deepEqual(await r.ended, { type: "closed" });
+		await until("a closed attached session's shell exits", async () => !(await alive(vm3, d.pid)));
+	});
+
 	test("snapshot() with host file systems: the mounts and a process's open files on them survive; a file deleted on the host meanwhile answers ESTALE; refused without the mounts and in worker mode",
 		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
 		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
@@ -1920,6 +2041,312 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		};
 	};
 
+	for (const { worker, name } of MODES) test(`snapshot({ commit }) with a data disk (${name}): a rejected, a throwing and a timed-out commit leave the machine running (its tasks, clocks and disk); a committed one stops it, and it restores`, async (t) => {
+		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
+		t.after(() => rmSync(dir, { recursive: true, force: true }));
+		const module = await compileTestKernel();
+		const file = path.join(dir, "data.img");
+		await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
+		const open: Array<InstanceType<typeof FileDisk>> = [];
+		t.after(() => { for (const d of open) try { d.close(); } catch {} });
+		const disk = () => {
+			if (worker) return { kind: "file", path: file } as const;
+			const d = new FileDisk(file);
+			open.push(d);
+			return d;
+		};
+		const vm = await boot(t, { worker, kernel: module, vsock: false, disks: [disk()], log: () => {} } as BootOptions);
+		const a = screen(vm), sh = shell(vm, a);
+		await a.waitFor(PROMPT);
+		await sh("X=kept; (i=0; while :; do i=$((i+1)); echo $i > /tmp/n; usleep 20000; done) & echo one > /data/one; sync");
+		const counter = async () => Number((await sh("cat /tmp/n")).trim());
+		const uptime = async () => Number((await sh("cut -d' ' -f1 /proc/uptime")).trim());
+		const runsOn = async (what: string) => {
+			const n = await counter();
+			await new Promise((r) => setTimeout(r, 300));
+			assert.ok(await counter() > n, `the background task counts on after ${what}`);
+		};
+
+		// Rejected: the commit got the whole snapshot while the kernel waited; a second snapshot is refused meanwhile.
+		let held: import("../js/node.ts").KernelSnapshot | undefined;
+		let second: Promise<unknown> | undefined;
+		const e1 = await vm.snapshot({ commit: (s) => {
+			held = s;
+			second = vm.snapshot().then(() => "taken", (e: Error) => e.message);
+			return new Promise((_, reject) => setTimeout(() => reject(new Error("no room")), 200));
+		} }).catch((e: unknown) => e);
+		assert.ok(e1 instanceof sdk.SnapshotCommitError && /no room/.test(e1.message) && /runs on/.test(e1.message) && !e1.timedOut, String(e1));
+		assert.equal(held?.memory.byteLength, 512 * 1048576, "the commit got the snapshot");
+		assert.match(String(await second), /one is in progress/);
+		await runsOn("a rejected commit");
+
+		// Throwing at once.
+		const e2 = await vm.snapshot({ commit: () => { throw new Error("thrown"); } }).catch((e: unknown) => e);
+		assert.ok(e2 instanceof sdk.SnapshotCommitError && /thrown/.test(e2.message), String(e2));
+
+		// Timed out: the signal aborts, the guest's monotonic clock jumped by the wait, its wall clock is the host's.
+		let aborted = false;
+		const u1 = await uptime(), h1 = performance.now();
+		const e3 = await vm.snapshot({ commitTimeoutMs: 1500, commit: (_s, signal) => new Promise(() => signal.addEventListener("abort", () => { aborted = true; })) })
+			.catch((e: unknown) => e);
+		const u2 = await uptime(), h2 = performance.now();
+		assert.ok(e3 instanceof sdk.SnapshotCommitError && e3.timedOut && aborted, String(e3));
+		assert.ok(u2 - u1 >= 1.4 && u2 - u1 <= (h2 - h1) / 1000 + 0.5, `guest uptime ${(u2 - u1).toFixed(2)} s over ${((h2 - h1) / 1000).toFixed(2)} s on the host, a 1.5 s wait in it`);
+		const skew = Number((await sh("date +%s")).trim()) - Date.now() / 1000;
+		assert.ok(Math.abs(skew) < 3, `guest wall clock off by ${skew.toFixed(1)} s`);
+		await runsOn("a timed-out commit");
+		assert.equal((await sh(`dmesg | grep -cE '${KERNEL_TROUBLE}'; true`)).trim(), "0", await sh("dmesg | tail -30"));
+
+		// The disk after the failures: written on, so the held snapshot can no longer resume with it (below).
+		await sh("echo two > /data/two; sync");
+		let bytes: Uint8Array | undefined;
+		const snap = await vm.snapshot({ commit: (s) => { bytes = sdk.encodeSnapshot(s); } });
+		assert.equal((await vm.exited).kind, "stopped", "stopped once committed");
+		assert.equal(snap.memory.byteLength, 512 * 1048576);
+
+		const vm2 = await boot(t, { worker, kernel: module, vsock: false, disks: [disk()], restore: sdk.decodeSnapshot(bytes!), log: () => {} } as BootOptions);
+		const b = screen(vm2), sh2 = shell(vm2, b);
+		assert.equal((await sh2("echo got-$X-$(cat /data/one)-$(cat /data/two)")).trim(), "got-kept-one-two");
+		const n = Number((await sh2("cat /tmp/n")).trim());
+		await new Promise((r) => setTimeout(r, 300));
+		assert.ok(Number((await sh2("cat /tmp/n")).trim()) > n, "the background task counts on after the restore");
+		await vm2.stop({ reason: "test" });
+		await assert.rejects(boot(t, { worker, kernel: module, vsock: false, disks: [disk()], restore: held!, log: () => {} } as BootOptions), /was written after the snapshot/);
+	});
+
+	/**
+	 * snapshot({ commit, hold }) (the page's suspend in the background): a
+	 * machine with an ext4 data disk, a background counter, a detachable and a
+	 * plain terminal session, its snapshot committed (encoded, as the page
+	 * stores it) and the kernel held at its snapshot point. UNKERNEL_TEST_HOLD_MS
+	 * sets how long the hold of the "continue" test lasts (default 3 s).
+	 */
+	const holdMs = Number(process.env.UNKERNEL_TEST_HOLD_MS) || 3000;
+	const heldMachine = async (t: { after(fn: () => unknown): void }, worker: boolean) => {
+		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
+		t.after(() => rmSync(dir, { recursive: true, force: true }));
+		const module = await compileTestKernel();
+		const file = path.join(dir, "data.img");
+		await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
+		const open: Array<InstanceType<typeof FileDisk>> = [];
+		t.after(() => { for (const d of open) try { d.close(); } catch {} });
+		const disk = () => {
+			if (worker) return { kind: "file", path: file } as const;
+			const d = new FileDisk(file);
+			open.push(d);
+			return d;
+		};
+		const vm = await boot(t, { worker, kernel: module, disks: [disk()], log: () => {} } as BootOptions);
+		const a = screen(vm), sh = shell(vm, a);
+		await a.waitFor(PROMPT);
+		assert.match(await sh("grep ' /data ' /proc/mounts"), / ext4 /);
+		await sh("X=kept; (i=0; while :; do i=$((i+1)); echo $i > /tmp/n; usleep 20000; done) & echo one > /data/one; sync");
+		const d = await vm.spawn(undefined, [], { cols: 80, rows: 24, detachable: true });
+		const p = await vm.spawn(undefined, [], { cols: 80, rows: 24 });
+		const sd = termScreen(d), sp = termScreen(p);
+		await d.write("Y=det; echo d-ready-$((2+2))\n");
+		await p.write("Z=plain; echo p-ready-$((3+3))\n");
+		await Promise.all([sd.waitFor(/d-ready-4/), sp.waitFor(/p-ready-6/)]);
+		const counter = async () => Number((await sh("cat /tmp/n")).trim());
+		const alive = async (pid: number) => (await sh(`[ -d /proc/${pid} ] && echo yes || echo no`)).trim() === "yes";
+		// snapshot() refuses while vsock packets are in flight (kwtty's last output may still be); the guest goes on.
+		const quietly = async (opts: NonNullable<Parameters<Instance["snapshot"]>[0]>) => {
+			for (let i = 0; ; i++) {
+				try {
+					return await vm.snapshot(opts);
+				} catch (e) {
+					if (i >= 40 || !/in flight/.test(String((e as Error)?.message))) throw e;
+					await new Promise((done) => setTimeout(done, 50));
+				}
+			}
+		};
+		return { vm, module, disk, a, sh, d, p, sd, sp, counter, alive, quietly };
+	};
+
+	for (const { worker, name } of MODES) test(`snapshot({ commit, hold }) with a data disk, held, then continued (${name}): the same machine runs on (tasks, a detachable and a plain terminal session, input queued meanwhile), its clocks moved on as designed without kernel warnings, sync() and a second snapshot answer during the hold, the disk is written after it, and a later snapshot restores`,
+		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
+		const m = await heldMachine(t, worker);
+		const { vm, sh, d, p, sd, sp } = m;
+		// Inline: a wall clock of the test's own, which runs `lagMs` ahead while held (a device that slept for 6 h).
+		const kernel = vm instanceof sdk.KernelInstance ? vm.kernel : undefined;
+		const lagMs = kernel ? 6 * 3600e3 : 0;
+		let wallAhead = 0;
+		if (kernel) kernel.wallClock = () => Date.now() + wallAhead;
+		await sh("echo kw-hold-mark > /dev/kmsg");
+		const u1 = Number((await sh("cut -d' ' -f1 /proc/uptime")).trim()), h1 = performance.now();
+		const n1 = await m.counter();
+		let bytes: Uint8Array | undefined, during: { sync?: boolean; syncMs?: number; second?: string } = {};
+		const snap = await m.quietly({
+			commit: (s) => { bytes = sdk.encodeSnapshot(s); },
+			hold: async (s, signal) => {
+				assert.ok(s.ttys?.some((x) => x.id === d.sessionId), "the detachable session is in the snapshot");
+				const t0 = performance.now();
+				during.sync = await vm.sync();
+				during.syncMs = performance.now() - t0;
+				during.second = await vm.snapshot().then(() => "taken", (e: Error) => e.message);
+				vm.write("echo typed-$((40+2))\n"); // queued until it runs on
+				await d.write("echo det-typed-$((50+5))\n");
+				await new Promise((r) => setTimeout(r, holdMs));
+				wallAhead = lagMs;
+				assert.equal(signal.aborted, false);
+				return "continue" as const;
+			},
+		});
+		const heldS = (performance.now() - h1) / 1000;
+		assert.equal(snap.memory.byteLength, 512 * 1048576, "resolved with the snapshot");
+		// True, and not through the kernel (held, it would not flush: false after sync()'s 3 s).
+		assert.ok(during.sync === true && during.syncMs! < 2500, `sync() during the hold: ${during.sync} after ${during.syncMs?.toFixed(0)} ms`);
+		assert.match(String(during.second), /one is in progress/);
+		await m.a.waitFor(/typed-42/);
+		await sd.waitFor(/det-typed-55/);
+		// The same machine: its tasks count on, both sessions are the same shells (no hangup), with their variables.
+		const n2 = await m.counter();
+		await new Promise((r) => setTimeout(r, 300));
+		assert.ok(n2 >= n1 && await m.counter() > n2, "the background task counts on");
+		assert.ok(await m.alive(d.pid) && await m.alive(p.pid), "both sessions' shells are alive");
+		await d.write("echo det-$Y-$((1+1))\n");
+		await p.write("echo plain-$Z-$((2+1))\n");
+		await Promise.all([sd.waitFor(/det-det-2/), sp.waitFor(/plain-plain-3/)]);
+		assert.equal((await sh("echo $X")).trim(), "kept");
+		// Clocks: the monotonic clock moved on by the hold (and, inline, by the wall clock's lag); the wall clock is the host's.
+		const u2 = Number((await sh("cut -d' ' -f1 /proc/uptime")).trim()), h2 = performance.now();
+		const span = (h2 - h1) / 1000 + lagMs / 1000;
+		assert.ok(u2 - u1 >= heldS - 1 + lagMs / 1000 && u2 - u1 <= span + 1, `guest uptime +${(u2 - u1).toFixed(1)} s over ${((h2 - h1) / 1000).toFixed(1)} s held ${heldS.toFixed(1)} s, lag ${lagMs / 1000} s`);
+		const skew = Number((await sh("date +%s")).trim()) - (Date.now() + lagMs) / 1000;
+		assert.ok(Math.abs(skew) < 3, `guest wall clock off by ${skew.toFixed(1)} s`);
+		// Timers that expired meanwhile have fired; RCU, NOHZ and the rest said nothing (an SMP stall would come within 21 s).
+		await new Promise((r) => setTimeout(r, testCpus && testCpus > 1 ? 25000 : 2000));
+		assert.equal((await sh(`dmesg | sed -n '/kw-hold-mark/,$p' | grep -cE '${KERNEL_TROUBLE}|clocksource|watchdog|hung|rcu'; true`)).trim(), "0", await sh("dmesg | tail -30"));
+		assert.ok(await m.counter() > n2);
+		// The disk: written after the hold (a new generation), so the held snapshot no longer resumes with it.
+		assert.equal((await sh("echo two > /data/two; sync; cat /data/one /data/two")).trim().replace(/\s+/g, " "), "one two");
+		await assert.rejects(boot(t, { worker, kernel: m.module, disks: [m.disk()], restore: sdk.decodeSnapshot(bytes!), log: () => {} } as BootOptions), /was written after the snapshot/);
+		// A later suspend (commit and stop) restores, the detachable session reattached.
+		let later: Uint8Array | undefined;
+		await m.quietly({ commit: (s) => { later = sdk.encodeSnapshot(s); } });
+		assert.equal((await vm.exited).kind, "stopped");
+		const vm2 = await boot(t, { worker, kernel: m.module, disks: [m.disk()], restore: sdk.decodeSnapshot(later!), log: () => {} } as BootOptions);
+		const re = await vm2.attach(d.sessionId!);
+		assert.equal(re.pid, d.pid);
+		const sr = termScreen(re);
+		await re.write("echo again-$Y-$(cat /data/two)\n");
+		await sr.waitFor(/again-det-two/);
+		await vm2.stop({ reason: "test" });
+	});
+
+	for (const { worker, name } of MODES) test(`snapshot({ commit, hold }): held, then stopped, restores from the committed snapshot; held, then the kernel ended (the page killed), the committed snapshot restores in a new kernel; a failed commit holds nothing (${name})`,
+		{ skip: !kernelHasVsock && "the kernel under test has no kwvsock" }, async (t) => {
+		// Stopped: the hold's "stop" (the page's cap, or Suspend by hand during the hold).
+		const m = await heldMachine(t, worker);
+		let bytes: Uint8Array | undefined;
+		const snap = await m.quietly({ commit: (s) => { bytes = sdk.encodeSnapshot(s); }, hold: () => new Promise((r) => setTimeout(() => r("stop"), 500)) });
+		assert.equal(snap.memory.byteLength, 512 * 1048576);
+		assert.equal((await m.vm.exited).reason, "stopped after a snapshot");
+		const vm2 = await boot(t, { worker, kernel: m.module, disks: [m.disk()], restore: sdk.decodeSnapshot(bytes!), log: () => {} } as BootOptions);
+		const re = await vm2.attach(m.d.sessionId!);
+		const sr = termScreen(re);
+		await re.write("echo back-$Y-$(cat /data/one)\n");
+		await sr.waitFor(/back-det-one/);
+
+		// A failed commit: no hold is asked for, and the machine runs on.
+		const b2 = screen(vm2), sh2 = shell(vm2, b2);
+		let asked = false;
+		const e = await vm2.snapshot({ commit: () => { throw new Error("no room"); }, hold: () => { asked = true; return "stop"; } }).catch((x: unknown) => x);
+		assert.ok(e instanceof sdk.SnapshotCommitError && /no room/.test(e.message), String(e));
+		assert.equal(asked, false, "nothing held after a failed save");
+		assert.equal((await sh2("echo runs-on-$((7*6))")).trim(), "runs-on-42");
+
+		// Ended while held (the browser killed the page or its worker): the snapshot was committed and resolves;
+		// the hold's signal aborts; a new kernel restores it (nothing ran after it, so the disk is as sealed).
+		let signal: AbortSignal | undefined, bytes2: Uint8Array | undefined;
+		const snap2P = vm2.snapshot({ commit: (s) => { bytes2 = sdk.encodeSnapshot(s); }, hold: (_s, sig) => { signal = sig; return new Promise(() => {}); } });
+		for (let i = 0; !signal && i < 200; i++) await new Promise((r) => setTimeout(r, 50));
+		assert.ok(signal && !signal.aborted, "held");
+		assert.equal(await vm2.sync(), true, "sync() during the hold");
+		await vm2.stop({ reason: "the page went away" });
+		const snap2 = await snap2P;
+		assert.ok(snap2.memory.byteLength > 0 && signal.aborted, "resolved, the hold's signal aborted");
+		const vm3 = await boot(t, { worker, kernel: m.module, disks: [m.disk()], restore: sdk.decodeSnapshot(bytes2!), log: () => {} } as BootOptions);
+		const re3 = await vm3.attach(m.d.sessionId!);
+		const s3 = termScreen(re3);
+		await re3.write("echo third-$Y\n");
+		await s3.waitFor(/third-det/);
+		await vm3.stop({ reason: "test" });
+	});
+
+	/**
+	 * A kernel worker on this thread (serveKernel() over a MessageChannel)
+	 * with an extra disk kind: a file disk whose snapshot seal becomes
+	 * durable only after `delayMs`, or fails.
+	 */
+	const inProcessWorker = async () => {
+		const [{ serveKernel }, { createKernelOn }, { nodePlatform, nodeReadFile }, { nodeDevices }, { extendDevices }, { MessageChannel }] = await Promise.all([
+			import("../js/core/worker-serve.ts"), import("../js/core/instance.ts"), import("../js/node/platform.ts"),
+			import("../js/node/devices.ts"), import("../js/core/devices.ts"), import("node:worker_threads")]);
+		const devices = extendDevices(nodeDevices, { disks: { sealhook: (spec: { path: string; delayMs: number; fail?: boolean }) => {
+			const d = new FileDisk(spec.path);
+			const seal = d.snapshotSeal.bind(d);
+			d.snapshotSeal = () => {
+				const r = seal();
+				return { state: r.state, done: r.done.then(() => new Promise<void>((ok, no) => setTimeout(() => (spec.fail ? no(new Error("the store went away")) : ok()), spec.delayMs))) };
+			};
+			return d;
+		} } });
+		const platform = { ...nodePlatform(new URL(`file://${kernelFile}`)), spawnWorker: () => {
+			const { port1, port2 } = new MessageChannel();
+			serveKernel({ post: (m, tr) => port2.postMessage(m, tr), listen: (h) => port2.on("message", h) }, { readFile: nodeReadFile(), devices });
+			return {
+				post: (m, tr) => port1.postMessage(m, tr),
+				listen: (h) => port1.on("message", h.message),
+				terminate: () => { port1.close(); port2.close(); },
+			} satisfies import("../js/core/worker-protocol.ts").WorkerEndpoint;
+		} };
+		return (opts: BootOptions) => createKernelOn(platform, { ...opts, worker: true });
+	};
+
+	test("worker mode: a snapshot's result goes out before the exit its stop causes, also when a disk becomes durable only after the exit's 10 s wait for saves; with a commit, a disk that fails to become durable leaves the machine running",
+		{ skip: !!process.env.UNKERNEL_DIST && "an in-process worker from the sources" }, async (t) => {
+		const dir = mkdtempSync(path.join(tmpdir(), "unkernel-api-"));
+		t.after(() => rmSync(dir, { recursive: true, force: true }));
+		const module = await compileTestKernel();
+		const create = await inProcessWorker();
+		const image = async (name: string) => {
+			const file = path.join(dir, name);
+			await createImageFromKwsparse(file, bundledBoot(module).datadisk!);
+			return file;
+		};
+		const slow = await image("slow.img"), failing = await image("failing.img");
+		const vm = await create({ kernel: module, vsock: false, cpus: testCpus, disks: [{ kind: "sealhook", path: slow, delayMs: 11000 } as never], log: () => {} });
+		t.after(() => vm.stop({ reason: "test cleanup" }));
+		const vm2 = await create({ kernel: module, vsock: false, cpus: testCpus, disks: [{ kind: "sealhook", path: failing, delayMs: 100, fail: true } as never], log: () => {} });
+		t.after(() => vm2.stop({ reason: "test cleanup" }));
+		const a = screen(vm), b = screen(vm2), sh2 = shell(vm2, b);
+		await Promise.all([a.waitFor(PROMPT), b.waitFor(PROMPT)]);
+
+		const t0 = performance.now();
+		const snap = await vm.snapshot({ stop: true });
+		assert.ok(performance.now() - t0 >= 11000 && snap.memory.byteLength === 512 * 1048576, "resolved once the disk was durable");
+		assert.equal((await vm.exited).reason, "stopped after a snapshot");
+
+		await sh2("echo before > /data/f; sync");
+		const e = await vm2.snapshot({ commit: () => { throw new Error("must not be asked: the disk failed"); } }).catch((x: unknown) => x);
+		assert.ok(e instanceof sdk.SnapshotCommitError && /saving a disk failed: the store went away/.test(e.message), String(e));
+		assert.equal((await sh2("echo after > /data/g; sync; cat /data/f /data/g")).trim().replace(/\s+/g, " "), "before after");
+	});
+
+	test("awakeTimeout(): time a frozen thread spends asleep does not count", { skip: !!process.env.UNKERNEL_DIST && "an internal of the sources" }, async () => {
+		const { awakeTimeout } = await import("../js/core/snapshot.ts");
+		let fired = 0;
+		const t0 = performance.now();
+		awakeTimeout(() => { fired = performance.now() - t0; }, 200, 20);
+		// Blocked (as a frozen page) for longer than the timeout: on waking, a plain timer would fire at once.
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+		await new Promise((r) => setTimeout(r, 30));
+		assert.equal(fired, 0, "not fired on waking");
+		for (let i = 0; !fired && i < 100; i++) await new Promise((r) => setTimeout(r, 50)); // a busy test process delays the steps
+		assert.ok(fired >= 400, `fired after ${fired.toFixed(0)} ms`);
+	});
+
 	test("SMP: snapshot() of a machine busy on every CPU (saved while running, repeatedly), restored with as many CPUs; every task continues, kwtest's SMP checks pass in it and across its own snapshot, restored again; another CPU count is refused",
 		{ skip: !hasSmpPatch && "the kernel under test carries no SMP kernel" }, async (t) => {
 		const cpus = testCpus && testCpus > 1 ? testCpus : 4;
@@ -1988,7 +2415,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		};
 		const slept = await done(sh2, "/tmp/ffout /tmp/slept", (o) => /fifo-hi/.test(o) && /^\d+\.\d+ \d+\.\d+$/m.test(o));
 		const [u0, u1] = /^(\d+\.\d+) (\d+\.\d+)$/m.exec(slept)!.slice(1).map(Number) as [number, number];
-		assert.ok(u1 - u0 >= 3 && u1 - u0 < 30, `the sleep across the snapshot took ${u1 - u0} s of guest uptime`);
+		assert.ok(u1 - u0 >= 2.995 && u1 - u0 < 30, `the sleep across the snapshot took ${(u1 - u0).toFixed(2)} s of guest uptime`); // /proc/uptime has 2 decimals
 		assert.equal((await sh2(`dmesg | grep -cE '${KERNEL_TROUBLE}'; true`)).trim(), "0", await sh2("dmesg | tail -30"));
 
 		// kwtest's SMP checks in the restored machine (they need idle CPUs: the counters end), then across a

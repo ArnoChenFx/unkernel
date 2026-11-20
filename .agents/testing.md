@@ -21,7 +21,7 @@ Run the row for what you changed, and no more.
 | Block, ext4, data disk | `pnpm test:block` |
 | SDK (`js/`) | `pnpm typecheck`; `pnpm test:api` |
 | Host file systems (9p, `kw9p`) | `pnpm test:9p`; `pnpm test:api` (after a kw9p change, `kernel/build.sh base` first) |
-| Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh base` first) |
+| Inbound to the guest (`vm.connect`, `vm.fetch`, kwtty CONNECT, `--forward`), kwtty's detachable sessions (`vm.attach`) | `pnpm test:http`; `pnpm test:tty`; `pnpm test:api` (after a kwtty change, `kernel/build.sh base` first) |
 | Network | `pnpm test:net` |
 | SMP code (`CONFIG_SMP` paths, per-CPU data, IPIs, CPU parking, `js/core/cpu.ts`; kernel/smp.md) | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--cpus 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
 | Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |

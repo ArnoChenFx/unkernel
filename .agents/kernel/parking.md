@@ -72,7 +72,15 @@ kernel (SMP, below).
   during the call; otherwise with the error and the task that did not park.
   The host answers 0, or -EBUSY if its own block, net, vsock or shm queues
   are not empty or a disk cannot be sealed (js.md, Disks in snapshots). A
-  disk's seal happens during this call, while nothing runs.
+  disk's seal happens during this call, while nothing runs. For
+  `snapshot({ commit })` the host suspends the call (JSPI) until the
+  snapshot is stored (and, with `hold`, for as long as the host keeps it
+  there afterwards), then never returns (the stop) or answers 0, and the
+  cycle resumes everything as after any snapshot; on SMP the other CPUs
+  stay held meanwhile (SMP, below), idle and outside RCU, with no grace
+  period in flight, so a wait of minutes or hours trips no stall check: the
+  clock jumps by the wait when it returns, and nothing in the kernel needs
+  telling (js.md, Snapshots).
 - **Free pages**: just before that call, `kw_park_mark_free()` drains this
   CPU's per-cpu lists (`drain_local_pages()`, as hibernation's
   `swsusp_save()` does) and sets a bit for every page on the buddy free

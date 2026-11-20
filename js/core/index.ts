@@ -4,8 +4,8 @@
 
 export { IRQ_SYNC, Kernel, bundledBoot, moduleIsMemory64 } from "./kernel.ts";
 export type { BootStage, ExitKind, ExitResult, KernelConfig, KernelStats, MemoryStage, NetDevice } from "./kernel.ts";
-export { decodeSnapshot, encodeSnapshot, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch } from "./snapshot.ts";
-export type { DeviceKind, DeviceSnapshots, KernelSnapshot } from "./snapshot.ts";
+export { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, decodeSnapshot, encodeSnapshot, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch } from "./snapshot.ts";
+export type { DeviceKind, DeviceSnapshots, KernelSnapshot, SnapshotHoldDecision, SnapshotOptions } from "./snapshot.ts";
 export { BaseDisk, CowDisk, F_DISCARD, F_FLUSH, F_RO, F_WRITE_ZEROES, FlushTracker, HttpBase, readDistroHeader, SparseBase, ZERO_BLOCK, ZeroBase } from "./block.ts";
 export type { BlockDevice, BlockStats, CowDiskOptions, CowDiskStats, DiskBase, DiskSnapshotState, DistroHeader, HttpBaseOptions, HttpBaseStats, MaybePromise, OverlayStore, StoreIndex } from "./block.ts";
 export { KWSPARSE_MAGIC, decodeKwsparse, encodeKwsparse, gunzipIfNeeded, gzipBlob, isZeroBlock, kwsparseHeader, readKwsparse } from "./kwsparse.ts";
@@ -32,8 +32,8 @@ export { KernelInstance } from "./instance.ts";
 export type { BootProgress, CreateKernelOptions, InstanceStats, KernelHandle, VsockOption, WorkerOption } from "./instance.ts";
 export { VSOCK_GUEST_CID, VSOCK_HEADER_SIZE, VSOCK_HOST_CID, VsockDevice, VsockError, VsockHost, decodeVsockHeader, encodeVsockPacket } from "./vsock.ts";
 export type { Vsock, VsockConnection, VsockDeviceOptions, VsockDeviceStats, VsockHeader, VsockHostOptions, VsockListener, VsockStats } from "./vsock.ts";
-export { PtyError, TTY_FEATURE_CONNECT, TTY_FEATURE_PIPES, TTY_FEATURE_USER, TTY_PORT, TTY_SIGNALS, TTY_VERSION, TtyFrameParser, connectGuest, encodeTtyFrame, encodeTtyOpen, encodeTtyResize, execSubprocess, spawnPty, spawnSubprocess } from "./tty.ts";
-export type { ConnectOptions, ExecOptions, ExecResult, GuestSocket, PipeOptions, Pty, PtyEnd, PtyErrorCode, PtyOptions, PtySize, SpawnOptions, Subprocess, TtyFrame } from "./tty.ts";
+export { PtyError, TTY_DETACH_TIMEOUT, TTY_FEATURE_CONNECT, TTY_FEATURE_DETACH, TTY_FEATURE_PIPES, TTY_FEATURE_USER, TTY_PORT, TTY_SIGNALS, TTY_VERSION, TtyFrameParser, attachPty, connectGuest, encodeTtyAttach, encodeTtyFrame, encodeTtyOpen, encodeTtyResize, execSubprocess, spawnPty, spawnSubprocess } from "./tty.ts";
+export type { AttachOptions, ConnectOptions, ExecOptions, ExecResult, GuestSocket, PipeOptions, Pty, PtyEnd, PtyErrorCode, PtyOptions, PtySize, SpawnOptions, Subprocess, TtyFrame, TtySessionSnapshot } from "./tty.ts";
 export { HTTP_MAX_HEADER_BYTES, fetchOver } from "./http.ts";
 export type { ByteDuplex, GuestConnect } from "./http.ts";
 export { FS_DEFAULT_OWNER, FsError } from "./fs.ts";

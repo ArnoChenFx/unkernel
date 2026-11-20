@@ -94,14 +94,63 @@ parts that are easy to get wrong.
   says how much was left out) and seals every disk. It resolves with a
   `KernelSnapshot` (the whole memory, the kernel's `linux_banner` as its
   fingerprint, the guest's monotonic time, the console size, unread
-  console input, the CPU count (`cpus`), each disk's `DiskSnapshotState`
-  and the other devices' `DeviceSnapshots`) once the disks are durable.
+  console input, the CPU count (`cpus`), each disk's `DiskSnapshotState`,
+  the other devices' `DeviceSnapshots` and the host's detachable terminal
+  sessions, `ttys`) once the disks are durable.
   Without `stop` the guest keeps running; `stop: true` calls
   `Kernel.stop()` inside the import, so no task runs after the copy on
   CPU 0; with several CPUs the others run on until their threads end, but
   the exit has closed the console ring, so nothing they write comes out,
   and every device is CPU 0's. The copy of an SMP kernel's shared memory
-  is an ordinary ArrayBuffer (transferable in worker mode). It rejects when a disk cannot be in a
+  is an ordinary ArrayBuffer (transferable in worker mode).
+  `snapshot({ commit, commitTimeoutMs })` (`SnapshotOptions`) is the safe
+  way to suspend: `wasm_snapshot_point` is a JSPI suspending import, and
+  for a commit `Kernel.holdForCommit()` returns a promise, so the kernel
+  stays at its consistent point (every task parked, on SMP every other CPU
+  held) while the host waits for the disks to become durable and then for
+  `commit(snapshot, signal)`. Resolved: the kernel stops there (the
+  import's promise never settles; exit "stopped after a snapshot") and
+  snapshot() resolves. Rejected, thrown, past `commitTimeoutMs` (default
+  30 s of awake time, `awakeTimeout()` in snapshot.ts: steps of 1 s, each
+  counting at most 2 s however late it fired, so a frozen page or worker
+  does not use it up), or a disk that failed to become durable: the import
+  answers 0 and every task resumes as after a snapshot without `stop`, and
+  snapshot() rejects with `SnapshotCommitError` (`timedOut`); `signal`
+  aborts, and a commit that stored something then should remove it.
+  `hold(snapshot, signal)` (with `commit`) replaces the stop after a
+  successful commit: the kernel stays at its consistent point, with no
+  timeout, until the value it returns settles: "continue" goes on as after
+  a snapshot without `stop` (the stored snapshot is stale from then on),
+  "stop", anything else or a rejection stops there; snapshot() resolves
+  with the snapshot once the hold ends, also when the kernel ends meanwhile
+  (`signal` aborts; the snapshot is good). While it waits the guest runs
+  nothing and the host only queues (frames, input, vsock packets; host
+  terminal sessions stay connected); `sync()` answers at once with whether
+  the seals became durable (`Kernel.heldDurable`), since nothing was
+  written after them. When it goes on (a failed commit, a hold's
+  "continue") its clocks have advanced by the wait, as for a virtual
+  machine its hypervisor paused: the monotonic clock is the host's, so it
+  jumps by the wait, timers that expired meanwhile fire, and the wall clock
+  (which the kernel carries on from its monotonic clock) stays the host's;
+  if the host's wall clock moved more than its monotonic clock over the
+  wait (`HOLD_CLOCK_LAG_MS`: a device that slept), `Kernel.advanceClock()`
+  moves the guest's monotonic clock on by the difference, on every CPU
+  (`CpuInit.clock`, a shared copy of `epochMs`), so its wall clock stays
+  right. Making the hold invisible to the monotonic clock, as a restore
+  does, would leave the wall clock behind by the wait: the kernel reads the
+  host's wall clock only at boot and in a restore's kwparkd work. No kernel
+  warning comes of the jump (no RCU grace period is in flight at that
+  point and every CPU is idle; the build has no soft-lockup, hung-task,
+  workqueue or clocksource watchdog): `test/api.test.ts` holds for a
+  simulated 6 h (a wall clock of the test's own, `Kernel.wallClock`) on 1
+  and 2 CPUs and finds nothing in `dmesg` 25 s later; holds of 5.5 min on
+  1 and 2 CPUs (`UNKERNEL_TEST_HOLD_MS`) and a 5 min hold on 4 busy CPUs
+  (a scratch script, worker mode) likewise (2026-11-20). Held CPUs poll
+  their round every 1 ms (`KW_PARK_POLL_NS`): that 4-CPU hold cost the
+  Node process 2.4% of one core. A second
+  snapshot meanwhile is refused ("one is in progress"). Host writes to shm exports during the
+  wait are not in the snapshot. A snapshot asked for when the kernel ends
+  before its consistent point rejects. It rejects when a disk cannot be in a
   snapshot, when a task does not park (the error names it), when block,
   net, vsock or shm queues are not empty at that point, or a 9p request
   is in flight (`VsockDevice.blocker()`), and while a mount or unmount
@@ -132,7 +181,15 @@ parts that are easy to get wrong.
   snapshot runs in worker mode) are the test hooks; `test/api.test.ts`
   round-trips a shell through one, one with a data disk, and a machine
   busy on 4 CPUs (several snapshots while it runs, a restore, a snapshot
-  of the restored one restored again).
+  of the restored one restored again), and `snapshot({ commit })` with a
+  data disk inline and in worker mode (a rejected, a throwing and a
+  timed-out commit leave it running with its tasks, clocks and disk; a
+  committed one stops and restores; the held snapshot of a failed one is
+  refused once the disk changed), and `snapshot({ commit, hold })` with a
+  data disk and a detachable and a plain terminal session, inline and in
+  worker mode (continued: the same tasks and sessions, input queued
+  meanwhile, clocks as above, the disk written after; held then stopped,
+  and held while the kernel ended, each restored in a new kernel).
 - Disks in snapshots (core/block.ts, data-disk.md): disks are not copied.
   `BlockDevice.snapshotState()` gives a disk's identity, write generation
   and (files) a stamp; `snapshotSeal()`, called at the consistent point,
@@ -178,7 +235,8 @@ parts that are easy to get wrong.
     host does not keep (kwvsock's park restore notifier asks
     `wasm_driver_vsock_keep`, answered from `VsockDevice.keep`, kernel/parking.md),
     so kwtty's programs, `--forward` and `connect()` relays and guest
-    clients end, and listeners stay. The CLI's `--forward` listeners and
+    clients end, and listeners stay; detachable terminal sessions are kept
+    by kwtty for `attach()` (Programs on a pty, below). The CLI's `--forward` listeners and
     the SDK's `vsock.listen()` are the new host's own.
   - network: the MAC kwnet got; the restore calls `NetDevice.attach()`
     again. The stack keeps no state across it: a guest TCP segment of an
@@ -307,7 +365,7 @@ parts that are easy to get wrong.
   request open at exit is answered false; one left when the worker died
   resolves false if a persistent disk was attached, else true; after exit
   it resolves true at once. The worker reports the exit only after saves
-  in flight settled (at most 10 s), because ending a worker aborts its
+  in flight settled (at most 10 s of awake time), because ending a worker aborts its
   IndexedDB transactions; `stop()` waits for that (12 s at most). A worker
   crash is a 255 "fatal" exit. `detachDisk(i)` stops disk `i`'s saves,
   waits for the one in flight and closes its store, so the owner may then
@@ -317,8 +375,23 @@ parts that are easy to get wrong.
   point cannot save, so it refuses while anything is mounted) and posts
   `snapshot`; the worker
   runs `KernelInstance.snapshot()` and answers `snapshot-result` with the
-  memory transferred (no second copy). It posts that before `exit`, which
-  waits for it, so a snapshot with `stop` always arrives. Every device
+  memory transferred (no second copy). Every `snapshot` is answered before
+  `exit`: the exit waits for the snapshots in progress (at most 60 s of
+  awake time, `awakeTimeout()`), answers any still open as failed, then
+  waits for saves in flight (at most 10 s of awake time). With a wall-clock
+  bound a worker frozen in a background tab woke with its timer overdue,
+  ahead of the IndexedDB seal it waited for, and the owner's exit rejected
+  the snapshot (`test/api.test.ts` reproduces it with an in-process worker
+  whose disk seal takes 11 s). A commit runs on the owner: the worker posts
+  `snapshot-held` (memory transferred) and holds the kernel until the
+  owner's `snapshot-commit` (or the timeout, in the worker), then answers
+  `snapshot-result` (no snapshot: the owner has it). With `hold` the owner
+  runs it after its `snapshot-commit` and posts `snapshot-release` (stop or
+  go on) once it settles; the worker waits for that with no timer, so a
+  page frozen for hours meanwhile changes nothing (a release that comes
+  before the kernel asked is kept), and the CPU threads stay held. An owner whose commit
+  succeeded resolves even if the worker ends before answering (it held the
+  kernel until told to stop, so the kernel never ran past the snapshot). Every device
   state is the worker's `Kernel` (`saveDevices()`), including vsock's,
   because the worker's kwvsock holds the CID; the owner's `VsockHost`
   starts fresh on the `vsock-ready` the restore replays. `createKernel({
@@ -797,6 +870,34 @@ parts that are easy to get wrong.
   it shut down its sending side, so while nothing else is asked of the
   vsock socket the relay sends an empty message every second, which fails
   with EPIPE once the host no longer reads.
+- Detachable sessions (DETACH, ATTACH, REPLAY; OPENED feature bit 3
+  `TTY_FEATURE_DETACH`; kwtty.c and guest.md have the guest side):
+  `spawn(file, args, { detachable: true, detachTimeout })` sends DETACH
+  (not critical) with a random 128-bit id; `Pty.sessionId` is that id when
+  OPENED has the feature bit, else undefined (an image from before it: an
+  ordinary session). The guest keeps such a session through the reset a
+  snapshot restore does to every vsock connection, detached for
+  `detachTimeout` (default `TTY_DETACH_TIMEOUT`, 60 s of guest monotonic
+  time, which a restore continues), and `vm.attach(idOrSaved, { cols,
+  rows, replay })` (`attachPty()`, both handles, not gated on `mounts`)
+  sends OPEN with ATTACH (critical) and gets a live Pty on the same
+  program and pty. `close()` and the host's other ways of ending a session
+  hang it up as before; only a reset detaches. Every snapshot lists the
+  host's live detachable Ptys in `KernelSnapshot.ttys` (`{ id, pid, pts,
+  cols, rows }`, `ttySessions()`; inline from `Kernel.onSnapshot` at the
+  snapshot point, in worker mode added on the owner when the snapshot
+  arrives), so the snapshot handed to `commit` has them; it is in the
+  encoded header, and a snapshot without it decodes with none. A host that
+  ignores them lets them time out. After a snapshot with `stop` the old
+  host's Pty ends `lost` with the kernel. `attach()` with an unknown id, a
+  session that ended or timed out, or a guest from before ATTACH (its
+  ERROR "unknown critical OPEN option") rejects with `PtyError` ENOENT.
+  REPLAY (default on) sends the session's last 64 KiB of output first,
+  for a fresh terminal; ATTACH's size is set (SIGWINCH if it changed), and
+  a program on the alternate screen gets a one-row-short size first so
+  that it redraws. Another `attach()` takes the session over (the first
+  Pty ends `lost`). Pipes and CONNECT have no DETACH: a restore ends them
+  as before.
 - CLI `--forward HOSTPORT:GUESTPORT` (repeatable): listens on the host's
   127.0.0.1 before booting (a taken port exits 1), each connection is
   `vm.connect()` (node:net with `allowHalfOpen`, so half-closes pass
@@ -823,10 +924,15 @@ parts that are easy to get wrong.
   (2026-11-14), so the test sets the trap in a foreground `sh -c`.
 - Test: `pnpm test:tty` (`test/tty.test.ts`, no kernel: the protocol
   against a fake `Vsock` and a JS stand-in for the server, CONNECT's
-  handshake and raw bytes included) and `test/api.test.ts` (inline and
+  handshake and raw bytes, DETACH and ATTACH's frames and errors included)
+  and `test/api.test.ts` (inline and
   worker; for CONNECT a busybox `nc -lk -e` server in the guest: echo with
   half-close, 1 MiB each way, ECONNREFUSED, the relay's exit after an
-  idle close, `vm.fetch()` from a shell HTTP server). Skipped when the
+  idle close, `vm.fetch()` from a shell HTTP server; detachable sessions
+  across a snapshot with a commit and its restore, restored twice, with
+  a program on the alternate screen, the timeout, `close()` and a plain
+  session; with an older bundle as `UNKERNEL_TEST_KERNEL` it checks the
+  fallback instead). Skipped when the
   kernel has no kwvsock.
 
 ## Host file systems (`js/core/fs.ts`, `9p.ts`, `memfs.ts`, `mounts.ts`, `js/node/nodefs.ts`)

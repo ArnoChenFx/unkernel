@@ -19,7 +19,7 @@ import type { Evdev, InputState } from "./input.ts";
 import type { SoundOption, SoundState } from "./sound.ts";
 import { VsockHost, type VsockStats } from "./vsock.ts";
 import { ShmClient, ShmError, type ShmCallResult } from "./shm.ts";
-import { connectOn, execOn, spawnOn, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess } from "./tty.ts";
+import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess, type TtySessionSnapshot } from "./tty.ts";
 import { fetchOver } from "./http.ts";
 import { CommandTable, type HostCommand, type parseCommands } from "./commands.ts";
 import { MountTable, type FsSource, type Mount, type MountOptions, type parseMounts } from "./mounts.ts";
@@ -31,7 +31,7 @@ import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput } from "./output.ts";
-import type { KernelSnapshot } from "./snapshot.ts";
+import { SnapshotCommitError, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
 /** How long stop() waits for the worker to confirm (it first lets saves in flight commit, up to 10 s) before it ends the worker anyway. */
@@ -204,7 +204,16 @@ export class WorkerKernel implements KernelHandle {
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
-	#snapshots = new Map<number, { resolve: (s: KernelSnapshot) => void; reject: (e: Error) => void }>();
+	/**
+	 * Snapshots asked of the worker, by id. With a commit: the snapshot the
+	 * worker holds the kernel for ("snapshot-held"), the commit's signal, and
+	 * whether it succeeded (the worker was told to stop).
+	 */
+	#snapshots = new Map<number, {
+		resolve: (s: KernelSnapshot) => void; reject: (e: Error) => void;
+		commit?: SnapshotOptions["commit"]; hold?: SnapshotOptions["hold"];
+		held?: KernelSnapshot; abort?: AbortController; committed?: boolean; holding?: AbortController; decided?: boolean;
+	}>();
 
 	/** @internal Use createKernel({ worker: true }). */
 	constructor(endpoint: WorkerEndpoint, opts: WorkerKernelOptions) {
@@ -374,11 +383,23 @@ export class WorkerKernel implements KernelHandle {
 		case "shm-detach":
 			this.#shm?.detached(m.id);
 			break;
+		case "snapshot-held":
+			this.#commitHeld(m.id, this.#withTtys(m.snapshot));
+			break;
 		case "snapshot-result": {
 			const w = this.#snapshots.get(m.id);
 			this.#snapshots.delete(m.id);
-			if (m.ok) w?.resolve(m.snapshot);
-			else w?.reject(new Error(m.error));
+			if (!w) break;
+			// A hold not decided here ended in the worker (its kernel ended): as inline, its signal aborts.
+			if (w.holding && !w.decided) w.holding.abort(new Error("the kernel has ended"));
+			if (m.ok) {
+				const snap = m.snapshot ? this.#withTtys(m.snapshot) : w.held;
+				if (snap) w.resolve(snap);
+				else w.reject(new Error("snapshot: the worker sent no snapshot"));
+				break;
+			}
+			w.abort?.abort(new Error(m.error));
+			w.reject(m.commitFailed ? new SnapshotCommitError(m.error, { timedOut: m.timedOut }) : new Error(m.error));
 			break;
 		}
 		case "exit":
@@ -434,7 +455,19 @@ export class WorkerKernel implements KernelHandle {
 		this.#syncs.clear();
 		for (const op of this.#diskOps.values()) op.reject(new Error(`the kernel worker has ended (${res.reason})`));
 		this.#diskOps.clear();
-		for (const w of this.#snapshots.values()) w.reject(new Error(`snapshot: the kernel worker has ended (${res.reason})`));
+		// The worker answers every snapshot before "exit"; these are left when it died, did not
+		// answer, or was ended here. One whose commit succeeded is good: the worker held the
+		// kernel at the snapshot until told to stop, so it never ran past it.
+		for (const w of this.#snapshots.values()) {
+			if (w.committed && w.held) {
+				w.holding?.abort(new Error(`the kernel worker has ended (${res.reason})`));
+				w.resolve(w.held);
+				continue;
+			}
+			const why = `the kernel worker has ended (${res.reason})`;
+			w.abort?.abort(new Error(why));
+			w.reject(w.held ? new SnapshotCommitError(`snapshot: not committed (${why})`) : new Error(`snapshot: ${why}`));
+		}
 		this.#snapshots.clear();
 		this.#endpoint.terminate();
 		this.#resolveExit(res);
@@ -562,6 +595,23 @@ export class WorkerKernel implements KernelHandle {
 		return this.#mounts.gate(() => this.#commands.gate(() => spawnOn(this.#vsock, file, args, opts)));
 	}
 
+	/** Take over a detachable session, as inline (tty.ts attachPty(); the protocol runs on this thread). */
+	attach(session: string | TtySessionSnapshot, opts?: AttachOptions): Promise<Pty> {
+		return attachOn(this.#vsock, session, opts);
+	}
+
+	/**
+	 * The detachable sessions open here, added to a snapshot from the worker
+	 * (whose kernel only passes the packets). The kernel is at its snapshot
+	 * point or stopped there, and the exit that ends these Ptys comes after
+	 * the snapshot's answer, so they are the ones it has.
+	 */
+	#withTtys(snap: KernelSnapshot): KernelSnapshot {
+		const ttys = ttySessions(this.#vsock);
+		if (ttys.length) snap.ttys = ttys;
+		return snap;
+	}
+
 	exec(file: string, args?: readonly string[], opts?: ExecOptions & { encoding?: "utf8" }): Promise<ExecResult<string>>;
 	exec(file: string, args: readonly string[] | undefined, opts: ExecOptions & { encoding: "buffer" }): Promise<ExecResult<Uint8Array>>;
 	exec(file: string, args?: readonly string[], opts?: ExecOptions): Promise<ExecResult<string | Uint8Array>> {
@@ -650,14 +700,47 @@ export class WorkerKernel implements KernelHandle {
 	 * Resume it with createKernel({ restore }), in worker mode or inline.
 	 * Rejects while host file systems are mounted, as inline.
 	 */
-	snapshot(opts: { stop?: boolean } = {}): Promise<KernelSnapshot> {
+	snapshot(opts: SnapshotOptions = {}): Promise<KernelSnapshot> {
 		if (this.#result) return Promise.reject(new Error(`snapshot: the kernel has exited (${this.#result.reason})`));
 		const why = this.#mounts.snapshotBlocker();
 		if (why) return Promise.reject(new Error(`snapshot: ${why}`));
+		const { commit, hold } = opts;
+		if (commit !== undefined && typeof commit !== "function") return Promise.reject(new TypeError("snapshot: commit must be a function"));
+		if (hold !== undefined && (typeof hold !== "function" || !commit)) return Promise.reject(new TypeError("snapshot: hold must be a function, and needs commit"));
 		const id = this.#nextSync++;
 		return new Promise((resolve, reject) => {
-			this.#snapshots.set(id, { resolve, reject });
-			this.#endpoint.post({ t: "snapshot", id, stop: opts.stop });
+			this.#snapshots.set(id, { resolve, reject, commit, hold });
+			this.#endpoint.post(commit ? { t: "snapshot", id, commit: true, commitTimeoutMs: opts.commitTimeoutMs, ...(hold ? { hold: true } : {}) } : { t: "snapshot", id, stop: opts.stop });
+		});
+	}
+
+	/**
+	 * snapshot({ commit }): the worker holds the kernel at its consistent
+	 * point with `snap`; run the commit here and tell the worker how it went.
+	 * The worker's timeout (commitTimeoutMs) may give the snapshot up first:
+	 * its "snapshot-result" then aborts the signal.
+	 */
+	#commitHeld(id: number, snap: KernelSnapshot): void {
+		const w = this.#snapshots.get(id);
+		if (!w?.commit) return;
+		w.held = snap;
+		const abort = (w.abort = new AbortController());
+		void Promise.resolve().then(() => w.commit!(snap, abort.signal)).then(() => {
+			if (abort.signal.aborted || this.#result) return; // given up meanwhile (the worker's timeout, the exit)
+			w.committed = true;
+			this.#endpoint.post({ t: "snapshot-commit", id, ok: true });
+			if (!w.hold) return;
+			// The worker holds the kernel (no timeout) until told; the exit aborts `holding`.
+			const holding = (w.holding = new AbortController());
+			void Promise.resolve().then(() => w.hold!(snap, holding.signal)).then((how): string => how, (e: unknown) => {
+				this.#log(`[host] snapshot: the hold failed (${(e as Error)?.message ?? e}); stopping at the snapshot`);
+				return "stop";
+			}).then((how) => {
+				w.decided = true;
+				if (!this.#result && !holding.signal.aborted) this.#endpoint.post({ t: "snapshot-release", id, stop: how !== "continue" });
+			});
+		}, (e: unknown) => {
+			if (!this.#result) this.#endpoint.post({ t: "snapshot-commit", id, ok: false, error: (e as Error)?.message ?? String(e) });
 		});
 	}
 

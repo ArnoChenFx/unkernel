@@ -214,6 +214,22 @@ fn event(cpu: *Cpu, kind: core.Kind, access: u32, addr: u64, insn: u64) u32 {
     return @intFromEnum(kind);
 }
 
+/// Where kw_run saw the interrupt or the budget it returns for (a64.Priv
+/// stop_tier, kw_debug_last_stop; the kernel's profiler, arch/wasm/kernel/
+/// prof.c, has the same numbers): pending at entry, after a single step or
+/// in the reference loop, after decoded ops, after compiled code, or the
+/// budget ran out. The pc of an interrupt stop is the start of the block
+/// that would run next, so a sampler that wants the code that used the time
+/// takes `stop_block`, the block that ran before.
+pub const StopTier = enum(u32) { none = 0, entry = 1, reference = 2, decoded = 3, compiled = 4, budget = 5 };
+
+/// Record the stop (only on these returns, off the hot path) and return its event.
+pub fn stopEvent(cpu: *Cpu, kind: core.Kind, tier_: StopTier, block_pc: u64) u32 {
+    cpu.priv.a64.stop_tier = @intFromEnum(tier_);
+    cpu.priv.a64.stop_block = block_pc;
+    return event(cpu, kind, 0, 0, 0);
+}
+
 /// The event of a trapped instruction (Hart.trap; pc on it). SVC retires:
 /// pc moves past it (the caller charges it).
 pub fn trapEvent(cpu: *Cpu, regs: *Regs) u32 {
@@ -249,7 +265,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
     }
     _ = epochCheck(cpu); // an exception return: a context synchronisation
     const irq = cpu.irq_pending;
-    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+    if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .entry, 0);
     const x: [*]u64 = @ptrCast(&regs.x);
     const h = &cpu.priv.hart;
     const s: c.St = .{ .r = regs, .h = h, .m = cpu };
@@ -263,7 +279,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
     var xk: u32 = 0;
     var xb: *const Block = undefined;
     while (true) {
-        if (left == 0) return event(cpu, .budget, 0, 0, 0);
+        if (left == 0) return stopEvent(cpu, .budget, .budget, 0);
         const b = cpu.lookupIn(Blocks, regs.pc) catch |e| return switch (e) {
             error.Misaligned => event(cpu, .misaligned, 0, regs.pc, 0),
             error.PageFault => event(cpu, .fault, cpu.priv.fault_access, cpu.priv.fault_addr, 0),
@@ -287,7 +303,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 .next => left -= 1,
                 .jump => {
                     left -= 1;
-                    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+                    if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .reference, b.pc);
                 },
                 .trap => {
                     if (h.trap == .counter) {
@@ -336,7 +352,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 if (code >= jc.code_done) {
                     if (code >= jc.code_side) left += blk.ninsn - (code - jc.code_side + 1);
                     left_region = true;
-                    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+                    if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .compiled, blk.pc);
                     _ = epochCheck(cpu);
                     continue;
                 }
@@ -367,7 +383,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 const k = (@intFromPtr(r.op) - @intFromPtr(first)) / @sizeOf(Op);
                 left += blk.ninsn - (k + 1);
             }
-            if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+            if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .decoded, blk.pc);
             _ = epochCheck(cpu);
             continue;
         }
@@ -397,7 +413,7 @@ pub fn run(cpu: *Cpu, regs: *Regs) u32 {
                 regs.pc = pcAt(cpu, blk, k + 1);
             },
         }
-        if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+        if (irq) |p| if (p.* != 0) return stopEvent(cpu, .interrupt, .decoded, blk.pc);
         _ = epochCheck(cpu);
     }
 }

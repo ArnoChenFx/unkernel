@@ -54,6 +54,7 @@
     "test:9p": "node --test test/9p.test.ts",
     "test:http": "node --test test/http.test.ts",
     "test:kpatch": "node --test test/kpatch.test.ts",
+    "test:profile": "node --test test/profile.test.ts",
     "test:wasi": "node test/wasi-node.ts",
     "test:api": "node --test test/api.test.ts",
     "test:distro": "node --test test/distro.test.ts",

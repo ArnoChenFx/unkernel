@@ -19,6 +19,7 @@ import type { ShmCall, ShmCallResult, ShmInfo } from "./shm.ts";
 import type { ExitKind } from "./kernel.ts";
 import type { BootProgress, InstanceStats } from "./instance.ts";
 import type { KernelSnapshot } from "./snapshot.ts";
+import type { ProfileOptions, ProfileReport } from "./profile.ts";
 
 /**
  * A kernel or initrd source that crosses a thread: an absolute URL (the
@@ -80,6 +81,8 @@ export interface WorkerBootSpec {
 	 * the spec and checks them against it, as inline.
 	 */
 	restore?: KernelSnapshot;
+	/** Sample guest pcs (CreateKernelOptions.profile); the worker starts the sampler thread itself. */
+	profile?: ProfileOptions;
 }
 
 /**
@@ -145,7 +148,9 @@ export type ToWorker =
 	/** The owner's commit of "snapshot-held" `id` succeeded (the kernel then stops, or with `hold` waits on) or failed (it goes on). */
 	| { t: "snapshot-commit"; id: number; ok: boolean; error?: string }
 	/** The owner's hold decision for snapshot `id` (after a successful commit): stop at the snapshot, or go on. */
-	| { t: "snapshot-release"; id: number; stop: boolean };
+	| { t: "snapshot-release"; id: number; stop: boolean }
+	/** The profile so far (KernelHandle.profile()); answered by "profile-result" with the same id. */
+	| { t: "profile"; id: number };
 
 /** Worker -> owner. Output, log and progress keep their order relative to "started" and "exit". */
 export type FromWorker =
@@ -207,8 +212,10 @@ export type FromWorker =
 	 */
 	| { t: "snapshot-result"; id: number; ok: true; snapshot?: KernelSnapshot }
 	| { t: "snapshot-result"; id: number; ok: false; error: string; commitFailed?: boolean; timedOut?: boolean }
-	/** Sent after every save in flight has settled, so the worker can be ended at once. */
-	| { t: "exit"; result: WorkerExit; stats: InstanceStats; disks: DiskState[] };
+	/** The answer to "profile" (undefined: no profile option, or the kernel had none). */
+	| { t: "profile-result"; id: number; report?: ProfileReport }
+	/** Sent after every save in flight has settled, so the worker can be ended at once; with the profile option, its last report. */
+	| { t: "exit"; result: WorkerExit; stats: InstanceStats; disks: DiskState[]; profile?: ProfileReport };
 
 /** The worker's end of the channel (Node: parentPort; a web Worker: self). */
 export interface WorkerPort {

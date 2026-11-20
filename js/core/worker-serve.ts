@@ -47,6 +47,8 @@ export interface ServeKernelOptions {
 	spawnCpu?: Platform["spawnCpu"];
 	/** Why spawnCpu cannot work in this worker (Platform.whyNoCpus). */
 	whyNoCpus?: Platform["whyNoCpus"];
+	/** Starts the profiler's time sampler thread (Platform.spawnSampler), from this worker. */
+	spawnSampler?: Platform["spawnSampler"];
 }
 
 /** How long the exit waits for saves in flight before it is reported anyway (awake time: awakeTimeout()). */
@@ -245,6 +247,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				devices: options.devices,
 				spawnCpu: options.spawnCpu,
 				whyNoCpus: options.whyNoCpus,
+				spawnSampler: options.spawnSampler,
 			}, {
 				disks: spec.disks,
 				distro: spec.distro,
@@ -265,6 +268,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				flushOutput: flush,
 				consoleSize: spec.consoleSize,
 				restore: spec.restore,
+				profile: spec.profile,
 				// The owner sends the size its display function returns; the kernel asks at the first open.
 				display: typeof displaySize === "object" ? () => displaySize as DisplaySize : displaySize,
 				onDisplay: spec.display ? (mode) => {
@@ -320,10 +324,11 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 			for (const id of pendingSyncs) post({ t: "synced", id, ok: false });
 			pendingSyncs.clear();
 			const result = cloneableExit(res);
+			const profile = await vm.profile();
 			try {
-				post({ t: "exit", result, stats: stats(), disks: disks() });
+				post({ t: "exit", result, stats: stats(), disks: disks(), profile });
 			} catch {
-				post({ t: "exit", result: { ...result, error: String(result.error) }, stats: stats(), disks: disks() });
+				post({ t: "exit", result: { ...result, error: String(result.error) }, stats: stats(), disks: disks(), profile });
 			}
 		});
 	};
@@ -425,6 +430,12 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				holds.delete(msg.id);
 				h.decide(how);
 			} else holds.set(msg.id, { early: how }); // before the kernel asked (its microtasks after the commit)
+			break;
+		}
+		case "profile": {
+			const { id } = msg;
+			if (!instance) post({ t: "profile-result", id });
+			else void instance.profile().then((report) => post({ t: "profile-result", id, report }));
 			break;
 		}
 		case "stop":

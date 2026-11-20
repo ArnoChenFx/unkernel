@@ -27,6 +27,7 @@ import { FrameClient, RemoteEvdev, SoundBridge } from "./worker-devices.ts";
 import { SharedOwner, newSharedControl, sharedMemoryAvailable, type KernelTransport } from "./worker-shared.ts";
 import type { CreateKernelOptions, InstanceStats, KernelHandle, Platform, BootProgress, VsockOption } from "./instance.ts";
 import type { ExitResult } from "./kernel.ts";
+import type { ProfileReport } from "./profile.ts";
 import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
@@ -204,6 +205,10 @@ export class WorkerKernel implements KernelHandle {
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
+	/** profile() calls waiting for "profile-result", by id; the last report, from "exit". */
+	#profiles = new Map<number, (r: ProfileReport | undefined) => void>();
+	#nextProfile = 1;
+	#profile: ProfileReport | undefined;
 	/**
 	 * Snapshots asked of the worker, by id. With a commit: the snapshot the
 	 * worker holds the kernel for ("snapshot-held"), the commit's signal, and
@@ -402,9 +407,14 @@ export class WorkerKernel implements KernelHandle {
 			w.reject(m.commitFailed ? new SnapshotCommitError(m.error, { timedOut: m.timedOut }) : new Error(m.error));
 			break;
 		}
+		case "profile-result":
+			this.#profiles.get(m.id)?.(m.report);
+			this.#profiles.delete(m.id);
+			break;
 		case "exit":
 			this.#setStats(m.stats);
 			this.#disks = m.disks;
+			this.#profile = m.profile;
 			this.#finish(m.result as WorkerExit);
 			break;
 		}
@@ -443,6 +453,8 @@ export class WorkerKernel implements KernelHandle {
 		this.#commands.shutdown();
 		this.#mounts.shutdown();
 		this.#vsock?.shutdown();
+		for (const resolve of this.#profiles.values()) resolve(this.#profile);
+		this.#profiles.clear();
 		for (const c of this.#shmCalls.values()) c.reject(new ShmError("ECONNABORTED", "the kernel exited"));
 		this.#shmCalls.clear();
 		this.#shm?.shutdown();
@@ -795,6 +807,16 @@ export class WorkerKernel implements KernelHandle {
 		return this.#diskOp(index, "export") as Promise<{ size: number; blocks: number; parts: BlobPart[] }>;
 	}
 
+	/** With the profile option: the samples so far (a round trip), or after the exit the worker's last report. */
+	profile(): Promise<ProfileReport | undefined> {
+		if (this.#result) return Promise.resolve(this.#profile);
+		const id = this.#nextProfile++;
+		return new Promise((resolve) => {
+			this.#profiles.set(id, resolve);
+			this.#endpoint.post({ t: "profile", id });
+		});
+	}
+
 	/** The latest snapshot from the worker, with uptimeMs brought up to date while it runs. */
 	stats(): InstanceStats {
 		const s = this.#stats!;
@@ -867,6 +889,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 			shared,
 			console: consoleRing,
 			restore,
+			profile: opts.profile === true ? {} : opts.profile || undefined,
 		};
 		transfer = [...kernelTransfer, ...initrdTransfer, ...diskTransfer, ...restoreTransfer];
 	} catch (e) {

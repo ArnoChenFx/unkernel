@@ -65,12 +65,12 @@ pub fn runRef(cpu: *Cpu, regs: *Regs) u32 {
         cpu.icount +%= start - left;
     }
     const irq = cpu.irq_pending;
-    if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+    if (irq) |p| if (p.* != 0) return tier.stopEvent(cpu, .interrupt, .entry, 0);
     const h = &cpu.priv.hart;
     const s: c.St = .{ .r = regs, .h = h, .m = cpu };
     var since_poll: u32 = 0;
     while (true) {
-        if (left == 0) return event(cpu, .budget, 0, 0, 0);
+        if (left == 0) return tier.stopEvent(cpu, .budget, .budget, 0);
         if (regs.pc & 3 != 0) return event(cpu, .misaligned, 0, regs.pc, 0);
         const e = decode.step(s) catch {
             cpu.priv.smc = 0;
@@ -104,7 +104,7 @@ pub fn runRef(cpu: *Cpu, regs: *Regs) u32 {
             },
         }
         since_poll = 0;
-        if (irq) |p| if (p.* != 0) return event(cpu, .interrupt, 0, 0, 0);
+        if (irq) |p| if (p.* != 0) return tier.stopEvent(cpu, .interrupt, .reference, 0);
     }
 }
 
@@ -136,10 +136,12 @@ pub fn exportAbi() void {
     @export(&kw_set_isa, .{ .name = "kw_set_isa" });
     @export(&kw_host_reset, .{ .name = "kw_host_reset" });
     // Not part of the ABI: the reference loop for differential tests (the
-    // harness's --lockstep and --ref), and the counters of a -Dkwemu-stats
+    // harness's --lockstep and --ref), where the last interrupt or budget
+    // stop was seen (the kernel's profiler), and the counters of a -Dkwemu-stats
     // build, with the lookup from an emit buffer to its cpu that a host
     // (js/core/jit.ts) needs to read them.
     @export(&kw_debug_run_ref, .{ .name = "kw_debug_run_ref" });
+    @export(&kw_debug_last_stop, .{ .name = "kw_debug_last_stop" });
     if (kwemu.stats_on) @export(&kw_debug_stats, .{ .name = "kw_debug_stats" });
     if (kwemu.stats_on and @import("../emu/jitcore.zig").enabled)
         @export(&kwemu.kw_debug_cpu_of_jit_buf, .{ .name = "kw_debug_cpu_of_jit_buf" });
@@ -147,6 +149,13 @@ pub fn exportAbi() void {
 
 fn kw_debug_run_ref(cpu: *Cpu, regs: *Regs) callconv(.c) u32 {
     return runRef(cpu, regs);
+}
+/// How the last kw_run that returned KW_EV_INTERRUPT or KW_EV_BUDGET saw
+/// it (tier.StopTier), and in `block` the start pc of the block that ran
+/// before (0: unknown). For the kernel's profiler (arch/wasm/kernel/prof.c).
+fn kw_debug_last_stop(cpu: *Cpu, block: *u64) callconv(.c) u32 {
+    block.* = cpu.priv.a64.stop_block;
+    return cpu.priv.a64.stop_tier;
 }
 /// Word by word through volatile pointers (a struct copy would call memmove).
 fn kw_debug_stats(cpu: *Cpu, out: *kwemu.Stats) callconv(.c) void {

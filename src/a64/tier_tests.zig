@@ -371,6 +371,7 @@ test "a64 tier: budgets that end inside a block, and the interrupt poll at block
         try t.expectEqual(ic + budget, m.cpu.icount);
         try t.expectEqual(@as(u64, budget - budget / 40), m.regs.x[0]);
         try t.expectEqual(0x10000 + (budget % 40) * 4, m.regs.pc);
+        try t.expectEqual(@intFromEnum(tier.StopTier.budget), m.cpu.priv.a64.stop_tier);
     }
     // Interrupt: a doorbell rung by a store is seen at the end of that block.
     m.mapData(0x40000, 1);
@@ -388,6 +389,18 @@ test "a64 tier: budgets that end inside a block, and the interrupt poll at block
     try expectEv(&m, mach.EV_INTERRUPT, m.run(100000));
     try t.expect(m.cpu.icount - ic <= 64);
     try t.expect(m.cpu.icount - ic >= 11);
+    // The stop names the tier that saw it and the block that ran before
+    // (kw_debug_last_stop): this one, decoded or compiled.
+    const st = m.cpu.priv.a64.stop_tier;
+    try t.expect(st == @intFromEnum(tier.StopTier.decoded) or st == @intFromEnum(tier.StopTier.compiled) or
+        st == @intFromEnum(tier.StopTier.reference));
+    try t.expectEqual(@as(u64, if (@import("run.zig").use_ref) 0 else 0x12000), m.cpu.priv.a64.stop_block);
+    // Still pending: the next kw_run returns at its entry, having run nothing.
+    const ic2 = m.cpu.icount;
+    try expectEv(&m, mach.EV_INTERRUPT, m.run(100000));
+    try t.expectEqual(ic2, m.cpu.icount);
+    try t.expectEqual(@intFromEnum(tier.StopTier.entry), m.cpu.priv.a64.stop_tier);
+    try t.expectEqual(@as(u64, 0), m.cpu.priv.a64.stop_block);
     bell.* = 0;
     m.cpu.irq_pending = null;
 }

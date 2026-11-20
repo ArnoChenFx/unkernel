@@ -36,6 +36,7 @@ import { ConsoleRing, ConsoleRingReader, newConsoleRing, type ConsoleFull } from
 import { ConsoleOrder, type CpuEndpoint, type CpuInit, type CpuMessage } from "./cpu.ts";
 import { DisplayHost, type DisplayMode, type DisplayOption } from "./display.ts";
 import { InputHost, type InputState } from "./input.ts";
+import { Profiler, profileOff, type ProfileOptions, type SamplerHandle, type SamplerInit } from "./profile.ts";
 import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
@@ -215,6 +216,10 @@ export interface KernelConfig {
 	 * now (worker mode with the messages transport).
 	 */
 	flushOutput?: () => void;
+	/** Sample guest pcs (profile.ts): time samples need spawnSampler and a shared memory. */
+	profile?: ProfileOptions;
+	/** Start the time sampler's thread (Platform.spawnSampler). */
+	spawnSampler?: (init: SamplerInit) => SamplerHandle;
 }
 
 /**
@@ -370,6 +375,8 @@ export class Kernel {
 	consoleOrder: ConsoleOrder | null = null;
 	/** Ring bytes dropped that were reported. */
 	conDropped = 0;
+	/** Guest pc sampling (KernelConfig.profile), once attached to the instance. */
+	profiler: Profiler | null = null;
 
 	constructor(opts: KernelConfig) {
 		this.opts = opts;
@@ -388,6 +395,7 @@ export class Kernel {
 			// dropped (after a snapshot with stop, the other CPUs run on until
 			// their threads end; nothing they write may come out).
 			this.conRing?.close();
+			this.profiler?.stop();
 			this.result = res;
 			// A snapshot asked for that never reached its consistent point.
 			const w = this.snapshotWaiter;
@@ -1213,6 +1221,11 @@ export class Kernel {
 
 		this.retFromFork = WebAssembly.promising(ex.ret_from_fork as (...args: unknown[]) => unknown) as Kernel["retFromFork"];
 		if (restore) this.loadSnapshot(restore);
+		// After a snapshot's memory: a saved kernel may have been sampling.
+		if (this.opts.profile) {
+			const p = new Profiler(this.opts.profile);
+			if (p.attach(this, this.opts.spawnSampler)) this.profiler = p;
+		} else if (restore) profileOff(this);
 		const entry = restore ? "kw_resume" : "_start";
 		const start = WebAssembly.promising(ex[entry] as () => unknown);
 		this.bootTime = performance.now();

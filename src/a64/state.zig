@@ -53,4 +53,11 @@ pub const Priv = extern struct {
     /// memory only cpu-relative (jit/emit.zig `poll`). Set by kw_cpu_init
     /// and kw_host_reset (tier.epochInit).
     epoch_ptr: u64 = 0,
+    /// How the last kw_run that ended for an interrupt or the budget saw
+    /// it (tier.StopTier), and the start pc of the block that ran just
+    /// before (0: none or unknown). Written only on those returns; the
+    /// kernel's profiler reads them through kw_debug_last_stop.
+    stop_tier: u32 = 0,
+    _stop_pad: u32 = 0,
+    stop_block: u64 = 0,
 };

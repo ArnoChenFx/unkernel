@@ -28,6 +28,8 @@ export type { Evdev, InputHostOptions, InputState, InputStats } from "./input.ts
 export { SOUND_FORMAT_S16_LE, SOUND_FORMAT_U8, SoundHost, convertPcm, pcmToFloat32, wavHeader } from "./sound.ts";
 export type { SoundChunk, SoundEvent, SoundFormat, SoundHostOptions, SoundOption, SoundSink, SoundState, SoundStats } from "./sound.ts";
 export type { JitHostOptions, JitStats, KwemuStats } from "./jit.ts";
+export { formatProfile } from "./profile.ts";
+export type { ProfileCpu, ProfileOptions, ProfilePage, ProfileReport, ProfileRow, ProfileTier, SamplerHandle, SamplerInit } from "./profile.ts";
 export { KernelInstance } from "./instance.ts";
 export type { BootProgress, CreateKernelOptions, InstanceStats, KernelHandle, VsockOption, WorkerOption } from "./instance.ts";
 export { VSOCK_GUEST_CID, VSOCK_HEADER_SIZE, VSOCK_HOST_CID, VsockDevice, VsockError, VsockHost, decodeVsockHeader, encodeVsockPacket } from "./vsock.ts";

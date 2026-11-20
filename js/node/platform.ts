@@ -16,6 +16,7 @@ import type { Platform } from "../core/instance.ts";
 import { BootError } from "../core/load.ts";
 import { nodeDevices } from "./devices.ts";
 import { spawnNodeCpu } from "./cpu.ts";
+import { spawnNodeSampler } from "./sampler.ts";
 import { spawnNodeWorker } from "./worker.ts";
 
 /** A file: URL, or a string without a URL scheme (a path). */
@@ -53,6 +54,7 @@ export function nodePlatform(bundledKernel: URL): Platform {
 		readFile: nodeReadFile(fileURLToPath(bundledKernel)),
 		spawnWorker: spawnNodeWorker,
 		spawnCpu: spawnNodeCpu,
+		spawnSampler: spawnNodeSampler,
 		absoluteUrl: (src) => pathToFileURL(resolve(src)).href,
 		devices: nodeDevices,
 		distroSpec: nodeDistroSpec,

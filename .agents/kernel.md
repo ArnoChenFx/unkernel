@@ -46,11 +46,11 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   after a restore; `kw_defconfig`; then the SMP series (the atomics and
   shared-memory build, the atomic tweaks, the generic mm, sched, kthread,
   workqueue and csd hooks, the arch and per-driver SMP patches, blocking
-  waits, unfair spinlocks, not waiting for a compiling CPU); and last
+  waits, unfair spinlocks, not waiting for a compiling CPU);
   `wasm: run arm64 user space`, which rewrites the arch and ISA patches'
   riscv64 user ABI (registers, syscalls, uapi, ELF, signals, cpuinfo, the
   feature table and `kw.isa=`, the exclusive monitor, the kernel's copy of
-  `kw_emu.h`).
+  `kw_emu.h`); and last the guest pc sampling (prof.c).
 - A fix or an extension of a piece is a `git commit --fixup` of its patch,
   autosquashed; an arm64 fix, or a kwemu ABI change that changes the
   header or what the kernel advertises, is a fixup of the last patch. A
@@ -86,6 +86,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 | arm64 uapi | `arch/wasm/include/uapi/asm/`, `include/asm/elf.h` |
 | features: the table, `kw.isa=`, AT_HWCAP, cpuinfo | `arch/wasm/kernel/cpu.c`, `kw_isa_init()` from `tlb.c` |
 | IRQ numbers, IPI bits | `arch/wasm/include/asm/irq.h` |
+| guest pc sampling (`kw_prof`, its rings) | `arch/wasm/kernel/prof.c`, `asm/kwprof.h` |
 | devices | `drivers/tty/hvc/hvc_wasm.c`, `drivers/block/kwblk.c`, `drivers/net/kwnet.c`, `drivers/video/fbdev/kwfb.c`, `drivers/input/kwinput.c`, `sound/drivers/kwsnd.c`, `net/vmw_vsock/kwvsock.c`, `drivers/misc/kwshm.c` |
 
 ## The kwemu contract (`include/kw_emu.h`)
@@ -139,7 +140,9 @@ a patch re-export.
   arm64, so an STXR after a syscall, a fault, an interrupt, a signal or a
   task switch fails. That is the only call of `kw_run()` and nothing runs
   between the two (UP `local_irq_enable()` only sets a flag, SMP sets it
-  without delivering, and there is no preemption).
+  without delivering, and there is no preemption). A stop that was only an
+  instruction sample of the profiler (prof.c) enters `kw_run()` again
+  without it, as if user code had not stopped.
 - kwemu polls `*irq_pending` (`&wasm_host_irqs`, or the CPU's word on SMP)
   on entry and at every block end, so at least every 64 instructions, and
   returns `KW_EV_INTERRUPT`.
@@ -261,9 +264,10 @@ restored snapshot's `__kw_resume()`, which the host answers with
 `kw_host_jit_caps`/`compile`/`free` (host `js/core/jit.ts`). **`env`**
 holds only `memory`, fixed size, chosen by the host.
 
-The host writes kernel memory only for `wasm_host_irqs`, kwblk and kwnet
-data, kwinput events, kwvsock packets, kwshm requests, the pages of shmem
-files exported to it, and WASI results (and all of it for a restored
+The host writes kernel memory only for `wasm_host_irqs` (and with a
+profile the other CPUs' words, and `kw_prof`'s flags, period and ring
+tails), kwblk and kwnet data, kwinput events, kwvsock packets, kwshm
+requests, the pages of shmem files exported to it, and WASI results (and all of it for a restored
 snapshot, before `kw_resume`). It does not write `boot_command_line` or the
 initrd bounds. `node test/wasi-node.ts` checks the WASI side against
 Node's `node:wasi`.
@@ -276,8 +280,10 @@ Node's `node:wasi`.
   (`ksys_sync()` from a work item; host `Kernel.requestSync()`), input = 5,
   vsock = 6 (packets queued, or room again after a refused send), shm = 7
   (requests queued), snapshot = 8 (a park cycle that ends in
-  `wasm_snapshot_point`; host `Kernel.snapshot()`). Bits without a handler
-  are cleared and ignored. SMP adds a word per CPU and IPI bits 24-27
+  `wasm_snapshot_point`; host `Kernel.snapshot()`), profile = 9 (a time
+  sample, prof.c; the host's sampler sets it in every CPU's word, without
+  a notify: kwemu.md, Measuring). Bits without a handler are cleared and
+  ignored. SMP adds a word per CPU and IPI bits 24-27
   (smp.md).
 - The timer is a one-shot deadline, checked against the host monotonic
   clock.

@@ -50,6 +50,11 @@ and rejected designs are in kwemu.md.
   `claude -p` (no valid key) is not repeatable (4.5-12 G instructions per
   run); `claude --help` is (0.44 G), so use it for A/B comparisons, with 8
   or more interleaved rounds to resolve 3%.
+- **Guest profile**: `--profile FILE` (with `--cpus 2` or more for time
+  samples; kwemu.md, Measuring): where guest user time goes by command,
+  process and pc, against instruction samples at the same keys; a page
+  whose time share is well above its instruction share is slow per
+  instruction (interpreted, a hand-back, a slow path).
 - **Host profile**: `node --cpu-prof` of the CLI.
 
 ## Current numbers

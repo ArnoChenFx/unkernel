@@ -19,6 +19,7 @@ import { bundledBoot, moduleIsMemory64, type ExitResult } from "./core/kernel.ts
 import { smpKernelFromBundle } from "./core/kpatch.ts";
 import type { MountsOption } from "./core/mounts.ts";
 import { NetStack } from "./core/net.ts";
+import { formatProfile, type ProfileOptions } from "./core/profile.ts";
 import type { JitStats, KwemuStats } from "./core/jit.ts";
 import { createImageFromKwsparse, openDisk } from "./node/disk.ts";
 import { distroFetcher, isCheckout, type FetchDistroProgress } from "./node/distro-fetch.ts";
@@ -37,7 +38,7 @@ const fetchDistro = distroFetcher(new URL("..", import.meta.url));
 const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--distro alpine|debian|none|FILE|URL]
        [--initrd none|NAME|file.cpio[.gz]] [--append "cmdline"] [--user NAME]
        [--mem MiB] [--timeout seconds] [--input "text"] [--input-delay seconds]
-       [--size COLSxROWS] [--stats]
+       [--size COLSxROWS] [--stats] [--profile FILE [--profile-hz N] [--profile-insns N]]
        [--disk image.ext4[:ro]|URL[:ro]]... [--snapshot]
        [--data FILE [--data-template FILE.kwsparse.gz]]
        [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
@@ -108,6 +109,15 @@ kwemu's JIT tier (hot guest code compiled to WebAssembly) is offered by default;
 --no-jit runs the interpreter only (a kernel built without the JIT never
 asks, and --stats then says "not in this kernel"). --stats prints the JIT counters at exit, and kwemu's own (exits, compiled share) from a
 kernel built by kernel/build.sh stats.
+
+--profile FILE samples where guest user time goes and writes a JSON histogram
+to FILE at exit (by command, process and user pc: time samples, instruction
+samples, the block that ran before a time sample and the kwemu tier that saw
+it; per 4 KiB page, time against instructions), with a short table on stderr.
+Time samples (--profile-hz N per CPU, default 1000) need the SMP kernel's
+shared memory, so --cpus 2 or more; without it there are instruction samples
+only (one every --profile-insns N user instructions of a CPU, default
+1000000; 0 turns either off).
 
 --worker runs the kernel in a worker thread (createKernel({ worker: true })),
 with the disks and the network built there from specs; the display, the input
@@ -256,6 +266,15 @@ const timeout = Number(opt("timeout", "0"));
 const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;
 const workerArg = args.find((a) => a === "--worker" || a.startsWith("--worker="));
+const profileFile = opt("profile");
+const profile: ProfileOptions | undefined = profileFile === undefined ? undefined : {
+	hz: Number(opt("profile-hz", "1000")),
+	insns: Number(opt("profile-insns", "1000000")),
+};
+if (profile && (!profileFile || profileFile.startsWith("--") || !(profile.hz! >= 0) || !(profile.insns! >= 0))) {
+	process.stderr.write("[host] --profile FILE [--profile-hz N] [--profile-insns N]\n");
+	process.exit(1);
+}
 // A restore defaults to the snapshot's CPUs (another count is refused).
 const smpCpus = Number(opt("cpus", String(restore?.cpus ?? 1)));
 if (!Number.isInteger(smpCpus) || smpCpus < 1 || smpCpus > 32) {
@@ -548,6 +567,7 @@ try {
 		mounts,
 		restore,
 		distro,
+		profile,
 	};
 	vm = worker ? await createKernelOn(nodePlatform(bundledKernelUrl), {
 		...common, worker: true, disks: diskSpecsOut, net: netSpec,
@@ -689,7 +709,26 @@ function printKwemuStats(k: KwemuStats): void {
 		`insns/block=${(w(5) / Math.max(w(4), 1)).toFixed(2)} single_steps=${w(6)} walks r/w/x=${w(7)}/${w(8)}/${w(9)} generic=${w(10)}\n`);
 }
 
-function finish(res: ExitResult): never {
+// --profile: the report (a round trip in worker mode), its JSON file and table, then finish().
+let finishing = false;
+function finish(res: ExitResult): void {
+	if (!profileFile) return finishNow(res);
+	if (finishing) return;
+	finishing = true;
+	void Promise.race([vm.profile(), new Promise<undefined>((r) => setTimeout(r, 5000))]).then((report) => {
+		if (!report) process.stderr.write("[host] profile: no report\n");
+		else {
+			writeFileSync(profileFile, `${JSON.stringify(report, null, 1)}\n`);
+			process.stderr.write(`${formatProfile(report)}\n[host] profile: ${profileFile} (${report.rows.length} rows)\n`);
+		}
+		finishNow(res);
+	}, (e) => {
+		process.stderr.write(`[host] profile: ${(e as Error)?.message ?? e}\n`);
+		finishNow(res);
+	});
+}
+
+function finishNow(res: ExitResult): never {
 	if (interactive) process.stdin.setRawMode(false);
 	sound.close(flag("stats") ? vm.stats().sound : undefined);
 	if (flag("stats")) {

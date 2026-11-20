@@ -11,6 +11,7 @@ import type { CpuEndpoint, CpuInit } from "./cpu.ts";
 import type { DisplayFrame, DisplayHost, DisplayMode, DisplayOption, DisplayStats } from "./display.ts";
 import type { Evdev, InputHost, InputState, InputStats } from "./input.ts";
 import type { JitStats, KwemuStats } from "./jit.ts";
+import type { ProfileOptions, ProfileReport, SamplerHandle, SamplerInit } from "./profile.ts";
 import type { SoundHost, SoundOption, SoundState, SoundStats } from "./sound.ts";
 import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
 import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
@@ -218,6 +219,14 @@ export interface CreateKernelOptions {
 	/** Aborts the downloads; once booted, stops the kernel (stop()). */
 	signal?: AbortSignal;
 	/**
+	 * Sample where guest user time goes (profile.ts; read it with
+	 * profile()): true, or the rates. Time samples need the kernel's memory
+	 * shared (the SMP kernel, `cpus` > 1) and a platform that starts a
+	 * sampler thread (Node); otherwise only instruction samples are taken
+	 * (with a log line). Default: off.
+	 */
+	profile?: boolean | ProfileOptions;
+	/**
 	 * @internal Worker mode with the shared transport: the console ring the
 	 * owner reads (KernelConfig.consoleRing; console-ring.ts).
 	 */
@@ -326,6 +335,8 @@ export interface Platform {
 	devices?: DeviceRegistry;
 	/** A distro path or URL as a read-only disk spec (Node: a file or an http(s) URL; browsers: an absolute http(s) URL). */
 	distroSpec?: (src: string | URL) => DiskSpec;
+	/** Start the profiler's time sampler thread (profile.ts); without it there are no time samples. */
+	spawnSampler?: (init: SamplerInit) => SamplerHandle;
 }
 
 /**
@@ -357,6 +368,8 @@ export interface KernelHandle {
 	snapshot(opts?: SnapshotOptions): Promise<KernelSnapshot>;
 	/** Counters (in a worker: the latest snapshot, at most about 500 ms old while running). */
 	stats(): InstanceStats;
+	/** With the profile option: the samples so far (after the exit: all of them), else undefined. In a worker, a round trip. */
+	profile(): Promise<ProfileReport | undefined>;
 	/** Memory actually allocated, in MiB. */
 	readonly memoryMiB: number;
 	readonly memory64: boolean;
@@ -743,6 +756,11 @@ export class KernelInstance implements KernelHandle {
 		};
 	}
 
+	/** With the profile option: the samples so far (profile.ts), else undefined. */
+	profile(): Promise<ProfileReport | undefined> {
+		return Promise.resolve(this.kernel.profiler?.report());
+	}
+
 	/** The kernel runs on this thread. */
 	get transport(): KernelTransport {
 		return "inline";
@@ -897,6 +915,8 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		whyNoCpus: platform.whyNoCpus,
 		consoleRing: opts.consoleRing,
 		flushOutput: opts.flushOutput,
+		profile: opts.profile === true ? {} : opts.profile || undefined,
+		spawnSampler: platform.spawnSampler,
 		restore: opts.restore,
 		display: opts.display,
 		onDisplay: opts.onDisplay,

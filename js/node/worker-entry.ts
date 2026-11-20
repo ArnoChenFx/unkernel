@@ -9,6 +9,7 @@
 import { parentPort } from "node:worker_threads";
 import { serveKernel } from "../core/worker-serve.ts";
 import { spawnNodeCpu } from "./cpu.ts";
+import { spawnNodeSampler } from "./sampler.ts";
 import { nodeDevices } from "./devices.ts";
 import { nodeReadFile } from "./platform.ts";
 
@@ -17,4 +18,4 @@ if (!port) throw new Error("unkernel: the kernel worker runs only in a worker th
 serveKernel({
 	post: (msg, transfer) => port.postMessage(msg, transfer),
 	listen: (handler) => port.on("message", handler),
-}, { readFile: nodeReadFile(), devices: nodeDevices, spawnCpu: spawnNodeCpu });
+}, { readFile: nodeReadFile(), devices: nodeDevices, spawnCpu: spawnNodeCpu, spawnSampler: spawnNodeSampler });

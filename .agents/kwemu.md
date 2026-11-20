@@ -391,6 +391,30 @@ same region, a self-loop module, another region that could grow, or a
 full one). The A64 counters and bench scripts: a64/performance.md,
 Measuring.
 
+**Guest pc profile** (any build; CLI `--profile FILE [--profile-hz N]
+[--profile-insns N]`, SDK `createKernel({ profile })` and `vm.profile()`,
+`js/core/profile.ts`; kernel `arch/wasm/kernel/prof.c`): a histogram by
+command, process and user pc in two domains, as JSON (rows, 4 KiB pages,
+commands, per-CPU totals) and a table on stderr. Time samples: a sampler
+thread (`js/node/sampler.ts`; Node only) sets IRQ 9 in every CPU's word
+`hz` times a second (default 1000) without a notify, so it needs a shared
+memory (the SMP kernel, `--cpus 2` or more; otherwise instruction samples
+only). kwemu stops at its next poll; the kernel records the pc, and from
+`kw_debug_last_stop(cpu, &block)` (a kwemu export outside the ABI, written
+only on interrupt and budget returns) the tier that saw the bit (entry,
+reference, decoded, compiled, budget) and the start of the block that ran
+before, which is the code that used the time (the stop pc is the next
+block's start). A tick taken when the last kw_run retired nothing, or
+outside user mode, is a kernel or idle sample; a tick whose bit is still
+set from the last one counts as missed (the CPU idles or is in one long
+kernel stay). Instruction samples: every `insns` user instructions of a
+CPU (default 10^6), exact, at the next pc to retire: `user_mode_loop()`
+lowers `cpu->budget` to what is left of the period and gives the slice the
+rest back. Each CPU writes its own ring of 512 samples; the host drains
+them on the kernel's thread every 20 ms (at the 20 ms yields while user
+code runs) and counts what was dropped, which happens at periods under
+about 10^5 instructions. Off, the kernel's cost is one load per kw_run.
+
 ## Numbers
 
 Rules for numbers: a64/performance.md (interleaved medians, machine, date,

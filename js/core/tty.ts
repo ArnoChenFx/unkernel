@@ -26,12 +26,18 @@
 // marks ARG, CWD, PIPES, CONNECT and a USER other than "", "root" and "0"
 // critical, and always sends USER (empty unless `user` is given), so an old
 // guest, whose sessions are root's, refuses only a request for another
-// user), DATA
+// user), DETACH 8 (u32 timeout in ms, 0 for the guest's 60 s, then the
+// session id; not critical: a guest without it opens a session that is not
+// detachable, and OPENED lacks feature bit 3), ATTACH 9 (critical: a
+// session id; reattach to that detachable session, with the size of the
+// OPEN), REPLAY 10 (with ATTACH: the guest sends the session's recent
+// output first), DATA
 // (2: at most 4096 bytes from the host, for the pty or stdin; zero length is
 // a no-op), RESIZE (3: u16 rows, cols, xpixel, ypixel), SIGNAL (6, critical:
 // a signal name without "SIG", for the program), EOF (7: with PIPES, close
 // the program's stdin). Guest -> host: OPENED (1: u16 version, u32 features
-// (bit 0: PIPES, EOF and STDERR; bit 1: CONNECT; bit 2: USER), u32 pid (0 with CONNECT),
+// (bit 0: PIPES, EOF and STDERR; bit 1: CONNECT; bit 2: USER; bit 3: DETACH,
+// ATTACH and REPLAY), u32 pid (0 with CONNECT),
 // u32 pts (0xffffffff with PIPES or CONNECT)), DATA (2: the pty, or
 // stdout), EXIT (4: u8 how (0 exited, 1 signal), u8 code, u8 core_dumped),
 // ERROR (5: a UTF-8 message, then the guest closes), STDERR (8: with
@@ -44,6 +50,18 @@
 // stream to the TCP socket, and the guest passes EOF on as shutdown(SHUT_WR)
 // on the other side, both ways (half-close); it ends once both directions
 // are done, or at the first error or reset on either side.
+//
+// Detachable sessions (DETACH): a reset of the connection under the
+// session (what a snapshot restore does to every vsock connection the new
+// host does not keep) detaches it instead of hanging it up, and an ATTACH
+// within its timeout takes it over again: same program, pid and pty. The
+// host's own close still hangs it up. An unknown or ended session is an
+// ERROR "ENOENT: ...", a guest from before ATTACH refuses the critical
+// option ("unknown critical OPEN option"); both are PtyError ENOENT here.
+// REPLAY: the last 64 KiB of output, cut where a fresh terminal can start,
+// behind the terminal modes in force there; a full-screen program (the
+// alternate screen) then gets SIGWINCH twice (one row short, then the
+// size) so that it redraws. kwtty.c has the details.
 //
 // The protocol code only uses the Vsock interface, so it works the same
 // inline and in worker mode, and test/tty.test.ts runs it against a fake
@@ -84,12 +102,19 @@ export const TTY_OPT_CWD = 4;
 export const TTY_OPT_PIPES = 5;
 export const TTY_OPT_CONNECT = 6;
 export const TTY_OPT_USER = 7;
+export const TTY_OPT_DETACH = 8;
+export const TTY_OPT_ATTACH = 9;
+export const TTY_OPT_REPLAY = 10;
 /** OPENED feature bit: the guest has PIPES, EOF and STDERR. */
 export const TTY_FEATURE_PIPES = 1;
 /** OPENED feature bit: the guest has CONNECT (connectGuest()). */
 export const TTY_FEATURE_CONNECT = 2;
 /** OPENED feature bit: the guest has USER (SpawnOptions.user). */
 export const TTY_FEATURE_USER = 4;
+/** OPENED feature bit: the guest has DETACH, ATTACH and REPLAY (PtyOptions.detachable, attachPty()). */
+export const TTY_FEATURE_DETACH = 8;
+/** How long a detached session waits for an attach unless PtyOptions.detachTimeout says otherwise (kwtty.c DETACH_MS). */
+export const TTY_DETACH_TIMEOUT = 60000;
 
 /** The signals kill() can send (kwtty.c has the same list). */
 export const TTY_SIGNALS = ["HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
@@ -124,6 +149,8 @@ export type PtyErrorCode =
 	| "EPIPE"
 	/** spawn(), exec() or connect() on an instance created with `vsock: false`. */
 	| "ENODEV"
+	/** attach(): no such detachable session (an unknown id, one that ended or was hung up after its timeout), or a guest whose kwtty cannot reattach (older than ATTACH). */
+	| "ENOENT"
 	/** exec(): stdout or stderr went over `maxBuffer` (the program is killed). */
 	| "ENOBUFS";
 
@@ -176,6 +203,43 @@ export interface PtyOptions extends SpawnOptions, Partial<PtySize> {
 	rows?: number;
 	/** TERM for the program (printable ASCII, at most 64 bytes). Default "xterm-256color". */
 	term?: string;
+	/**
+	 * A session that survives a snapshot restore (kwtty's DETACH): when the
+	 * connection is reset under it (a restored kernel resets every vsock
+	 * connection), the guest keeps the program and its pty, detached, for
+	 * `detachTimeout`, and attach() with `Pty.sessionId` takes it over in the
+	 * restored machine. close() and kill() still end it. A guest without
+	 * the feature opens an ordinary session (`sessionId` undefined).
+	 */
+	detachable?: boolean;
+	/** How long a detached session waits for attach() before it is hung up, in ms of the guest's monotonic time (which a restore continues). Default TTY_DETACH_TIMEOUT (60 s). */
+	detachTimeout?: number;
+}
+
+/** A detachable session as a snapshot records it (KernelSnapshot.ttys): what attach() needs. */
+export interface TtySessionSnapshot {
+	/** Pty.sessionId. */
+	id: string;
+	pid: number;
+	pts: number;
+	/** The size last set. */
+	cols: number;
+	rows: number;
+}
+
+/** What attach() takes. */
+export interface AttachOptions extends Partial<PtySize> {
+	/** The window size now (default the saved size, else 80 by 24); the program gets SIGWINCH if it differs from the pty's. */
+	cols?: number;
+	rows?: number;
+	/** Send the session's recent output first (the last 64 KiB, for a fresh terminal). Default true. */
+	replay?: boolean;
+	/** The guest server's port. Default TTY_PORT (1022). */
+	port?: number;
+	/** How long to wait for the guest server, in ms (connect retries and the handshake). Default 30000. */
+	timeout?: number;
+	/** Aborts attaching (PtyError ABORTED). */
+	signal?: AbortSignal;
 }
 
 /** spawn() on pipes: stdin, stdout and stderr are pipes, with no pty (and no TERM unless `env` sets it). */
@@ -211,7 +275,7 @@ export type PtyEnd =
 	| { type: "signal"; signal: number; coreDumped: boolean }
 	/** The host called close(). */
 	| { type: "closed" }
-	/** EOF or a reset without EXIT, or the kernel exited. */
+	/** EOF or a reset without EXIT, or the kernel exited (a detachable session lives on in a snapshot taken then), or another attach() took the session over. */
 	| { type: "lost" };
 
 export interface Pty extends AsyncDisposable {
@@ -228,6 +292,14 @@ export interface Pty extends AsyncDisposable {
 	readonly version: number;
 	/** The guest's feature bits (TTY_FEATURE_PIPES). */
 	readonly features: number;
+	/**
+	 * The id attach() takes after a snapshot restore: set for a session
+	 * spawned with `detachable` on a guest that has the feature, and for
+	 * one attach() gave, else undefined. After a snapshot with `stop` this
+	 * Pty ends "lost" with the kernel, while the session lives on in the
+	 * snapshot.
+	 */
+	readonly sessionId: string | undefined;
 	/**
 	 * What the pty prints. A pull stream: vsock credit follows what is read,
 	 * so keep reading, or the guest program blocks once the window is full.
@@ -336,24 +408,14 @@ export function encodeTtyResize(s: PtySize): Uint8Array {
 
 /**
  * OPEN's payload: max_version, the size, then TERM, one ENV option per
- * entry, ARG options (`file`, then `args`), CWD, PIPES, CONNECT and USER
- * (always but with `connect`: empty for the default user). With `pipes` or
- * `connect`, TERM goes only when `term` is given. Throws a RangeError for
- * values the guest would refuse.
+ * entry, ARG options (`file`, then `args`), CWD, PIPES, CONNECT, USER
+ * (always but with `connect`: empty for the default user) and DETACH. With
+ * `pipes` or `connect`, TERM goes only when `term` is given. Throws a
+ * RangeError for values the guest would refuse.
  */
-export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<string, string>; cwd?: string; file?: string; args?: readonly string[]; pipes?: boolean; connect?: number; user?: string | number }): Uint8Array {
+export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<string, string>; cwd?: string; file?: string; args?: readonly string[]; pipes?: boolean; connect?: number; user?: string | number; detach?: { id: string; timeout?: number } }): Uint8Array {
 	const enc = new TextEncoder();
-	const parts: Uint8Array[] = [];
-	const head = new Uint8Array(2);
-	new DataView(head.buffer).setUint16(0, TTY_VERSION, true);
-	parts.push(head, sizeBytes(opts));
-	const opt = (tag: number, value: Uint8Array) => {
-		const h = new Uint8Array(3);
-		h[0] = tag;
-		h[1] = value.length & 0xff;
-		h[2] = value.length >> 8;
-		parts.push(h, value);
-	};
+	const { parts, opt } = openParts(opts);
 	const term = opts.term ?? (opts.pipes || opts.connect !== undefined ? undefined : DEFAULT_TERM);
 	if (term !== undefined) {
 		if (!/^[\x20-\x7e]{1,64}$/.test(term)) throw new RangeError(`kwtty: TERM ${JSON.stringify(term)} is not 1 to 64 printable ASCII characters`);
@@ -388,6 +450,49 @@ export function encodeTtyOpen(opts: PtySize & { term?: string; env?: Record<stri
 		// A guest from before USER runs every session as root: it may ignore a request for root or for its default.
 		opt(TTY_OPT_USER | (u === "" || u === "root" || u === "0" ? 0 : TTY_OPT_CRITICAL), enc.encode(u));
 	}
+	if (opts.detach) {
+		if (opts.pipes || opts.connect !== undefined) throw new RangeError("kwtty: only a session on a pty can be detachable");
+		const t = opts.detach.timeout ?? 0;
+		if (!Number.isInteger(t) || t < 0 || t > 0xffffffff) throw new RangeError(`kwtty: detachTimeout ${t} is not an integer number of ms from 0 to 2^32 - 1`);
+		const id = sessionIdBytes(opts.detach.id);
+		const v = new Uint8Array(4 + id.length);
+		new DataView(v.buffer).setUint32(0, t, true);
+		v.set(id, 4);
+		opt(TTY_OPT_DETACH, v); // not critical: a guest without it opens an ordinary session
+	}
+	return joinParts(parts);
+}
+
+/** ATTACH's OPEN payload: max_version, the size, ATTACH (critical) and REPLAY. */
+export function encodeTtyAttach(opts: PtySize & { id: string; replay?: boolean }): Uint8Array {
+	const { parts, opt } = openParts(opts);
+	opt(TTY_OPT_ATTACH | TTY_OPT_CRITICAL, sessionIdBytes(opts.id));
+	if (opts.replay) opt(TTY_OPT_REPLAY, EMPTY);
+	return joinParts(parts);
+}
+
+function sessionIdBytes(id: string): Uint8Array {
+	if (typeof id !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(id)) throw new RangeError(`kwtty: session id ${JSON.stringify(id)} is not 1 to 64 of A-Z a-z 0-9 . _ -`);
+	return new TextEncoder().encode(id);
+}
+
+/** OPEN's head (max_version, the size) and a function adding a TLV option. */
+function openParts(size: PtySize) {
+	const parts: Uint8Array[] = [];
+	const head = new Uint8Array(2);
+	new DataView(head.buffer).setUint16(0, TTY_VERSION, true);
+	parts.push(head, sizeBytes(size));
+	const opt = (tag: number, value: Uint8Array) => {
+		const h = new Uint8Array(3);
+		h[0] = tag;
+		h[1] = value.length & 0xff;
+		h[2] = value.length >> 8;
+		parts.push(h, value);
+	};
+	return { parts, opt };
+}
+
+function joinParts(parts: Uint8Array[]): Uint8Array {
 	let n = 0;
 	for (const p of parts) n += p.length;
 	if (n > TTY_MAX_PAYLOAD) throw new RangeError(`kwtty: the OPEN frame would be ${n} bytes (at most ${TTY_MAX_PAYLOAD}); pass less environment`);
@@ -696,19 +801,46 @@ class Session {
 	}
 }
 
+/** The detachable sessions open on each Vsock (ttySessions(), for a snapshot). */
+const detachables = new WeakMap<Vsock, Set<PtySession>>();
+
+/**
+ * The detachable sessions open on `vsock` now (live Ptys with a sessionId),
+ * as a snapshot records them (KernelSnapshot.ttys).
+ */
+export function ttySessions(vsock: Vsock | undefined): TtySessionSnapshot[] {
+	const set = vsock && detachables.get(vsock);
+	if (!set) return [];
+	return [...set].filter((s) => s.live).map((s) => ({ id: s.sessionId!, pid: s.pid, pts: s.pts, cols: s.cols, rows: s.rows }));
+}
+
 class PtySession extends Session implements Pty {
 	readonly pts: number;
 	cols: number;
 	rows: number;
 	readonly output: ReadableStream<Uint8Array>;
+	readonly sessionId: string | undefined;
+	/** @internal `ended` has not settled yet. */
+	live = true;
 
 	constructor(conn: VsockConnection, reader: ReadableStreamDefaultReader<Uint8Array>, writer: WritableStreamDefaultWriter<Uint8Array | string>,
-		parser: TtyFrameParser, opened: Opened, size: PtySize) {
+		parser: TtyFrameParser, opened: Opened, size: PtySize, vsock: Vsock, sessionId?: string) {
 		super(conn, reader, writer, parser, opened);
 		this.pts = opened.pts;
 		this.cols = size.cols;
 		this.rows = size.rows;
 		this.output = this.stream(TTY_DATA);
+		this.sessionId = sessionId;
+		if (sessionId !== undefined) {
+			let set = detachables.get(vsock);
+			if (!set) detachables.set(vsock, (set = new Set()));
+			set.add(this);
+			const gone = () => {
+				this.live = false;
+				set.delete(this);
+			};
+			this.ended.then(gone, gone);
+		}
 	}
 
 	write(data: Uint8Array | string): Promise<void> {
@@ -869,8 +1001,51 @@ async function openSession(vsock: Vsock, payload: Uint8Array, opts: SpawnOptions
  */
 export async function spawnPty(vsock: Vsock, file?: string, args: readonly string[] = [], opts: PtyOptions = {}): Promise<Pty> {
 	const size: PtySize = { cols: opts.cols ?? DEFAULT_COLS, rows: opts.rows ?? DEFAULT_ROWS, xpixel: opts.xpixel, ypixel: opts.ypixel };
-	const s = await openSession(vsock, encodeTtyOpen({ ...opts, ...size, file, args }), opts);
-	return new PtySession(s.conn, s.reader, s.writer, s.parser, s.opened, size);
+	const { detachable, detachTimeout, ...rest } = opts;
+	const detach = detachable ? { id: newSessionId(), timeout: detachTimeout } : undefined;
+	const s = await openSession(vsock, encodeTtyOpen({ ...rest, ...size, file, args, detach }), opts);
+	// A guest without DETACH ignored the option: an ordinary session.
+	const id = detach && s.opened.features & TTY_FEATURE_DETACH ? detach.id : undefined;
+	return new PtySession(s.conn, s.reader, s.writer, s.parser, s.opened, size, vsock, id);
+}
+
+/** 128 random bits as 32 hex digits: a session id nobody can guess. */
+function newSessionId(): string {
+	const b = crypto.getRandomValues(new Uint8Array(16));
+	let id = "";
+	for (const x of b) id += x.toString(16).padStart(2, "0");
+	return id;
+}
+
+/**
+ * Take over a detachable session (PtyOptions.detachable) by its id, or as
+ * a snapshot recorded it (KernelSnapshot.ttys), typically in a machine
+ * restored from a snapshot, where the restore detached it. Resolves with a
+ * live Pty (the same pid and pts; with `replay`, the default, its output
+ * starts with the session's recent output) once the guest took it over; a
+ * connection that still had the session is closed (its Pty ends "lost").
+ * Rejects with PtyError ENOENT when there is no such session (never
+ * spawned in this machine, ended, or hung up after its timeout) or the
+ * guest's kwtty cannot reattach (an image from before ATTACH), and
+ * otherwise as spawnPty().
+ */
+export async function attachPty(vsock: Vsock, session: string | TtySessionSnapshot, opts: AttachOptions = {}): Promise<Pty> {
+	const saved = typeof session === "string" ? undefined : session;
+	const id = typeof session === "string" ? session : session.id;
+	const size: PtySize = { cols: opts.cols ?? saved?.cols ?? DEFAULT_COLS, rows: opts.rows ?? saved?.rows ?? DEFAULT_ROWS, xpixel: opts.xpixel, ypixel: opts.ypixel };
+	const payload = encodeTtyAttach({ ...size, id, replay: opts.replay ?? true });
+	let s: Awaited<ReturnType<typeof openSession>>;
+	try {
+		s = await openSession(vsock, payload, { port: opts.port, timeout: opts.timeout, signal: opts.signal });
+	} catch (e) {
+		if (e instanceof PtyError && e.code === "EREMOTE") {
+			if (e.message.startsWith("kwtty: ENOENT:")) throw new PtyError("ENOENT", e.message);
+			if (e.message === "kwtty: unknown critical OPEN option")
+				throw new PtyError("ENOENT", "kwtty: the guest's kwtty cannot reattach sessions (it is older than ATTACH)", e);
+		}
+		throw e;
+	}
+	return new PtySession(s.conn, s.reader, s.writer, s.parser, s.opened, size, vsock, id);
 }
 
 /**
@@ -1062,6 +1237,12 @@ export function spawnOn(vsock: Vsock | undefined, file?: string, args?: readonly
 		return spawnSubprocess(vsock, file, args, rest);
 	}
 	return spawnPty(vsock, file, args, opts);
+}
+
+/** attachPty() for an instance's `vsock`, with a clear error when the instance has none. */
+export function attachOn(vsock: Vsock | undefined, session: string | TtySessionSnapshot, opts?: AttachOptions): Promise<Pty> {
+	if (!vsock) return Promise.reject(noDevice("attach()"));
+	return attachPty(vsock, session, opts);
 }
 
 /** execSubprocess() for an instance's `vsock`, with a clear error when the instance has none. */

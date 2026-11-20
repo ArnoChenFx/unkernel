@@ -47,7 +47,16 @@
  *                            name, or a uid in decimal; empty: the default
  *                            user; without USER the session is root's, as
  *                            before the option, so a host that does not
- *                            know it keeps its sessions)
+ *                            know it keeps its sessions), 8 DETACH (u32
+ *                            timeout in ms, 0 for 60 s, then the session id:
+ *                            1 to 64 of A-Z a-z 0-9 . _ -; a detachable
+ *                            session, below; refused with PIPES, ignored
+ *                            with CONNECT), 9 ATTACH (a session id: take
+ *                            over that detachable session instead of
+ *                            starting one; the size is the window's now,
+ *                            and every other option but REPLAY is
+ *                            ignored), 10 REPLAY (empty, with ATTACH: send
+ *                            the session's recent output first)
  *                  2 DATA    bytes for the pty, or stdin (zero length: no-op)
  *                  3 RESIZE  u16 rows, cols, xpixel, ypixel (pty only)
  *                  6 SIGNAL  a signal name without "SIG" ("INT", "TERM"),
@@ -55,7 +64,8 @@
  *                  7 EOF     with PIPES: close the program's stdin; ignored
  *                            on a pty
  *   guest -> host  1 OPENED  u16 version, u32 features (bit 0: PIPES, EOF
- *                            and STDERR; bit 1: CONNECT; bit 2: USER), u32 program pid
+ *                            and STDERR; bit 1: CONNECT; bit 2: USER; bit 3:
+ *                            DETACH, ATTACH and REPLAY), u32 program pid
  *                            (0 with CONNECT), u32 pts number (0xffffffff
  *                            with PIPES or CONNECT)
  *                  2 DATA    bytes from the pty, or stdout
@@ -76,11 +86,45 @@
  * shutdown(SHUT_WR) on the other, so half-closes pass through; the relay
  * ends once both directions are done, or at the first error or reset
  * (then both sockets are closed).
+ *
+ * Detachable sessions (DETACH, on a pty): when the connection is reset
+ * under the session (the socket's error is ECONNRESET, which only kwvsock's
+ * snapshot restore notifier sets on a connected socket: a restored kernel
+ * resets every connection its new host does not know), the session is
+ * detached instead of hung up: its program and pty stay, kwtty goes on
+ * reading the pty, and a later connection with ATTACH and the same id
+ * takes it over (OPENED again, the same pid and pts). A host's own close
+ * (EOF, EPIPE) still hangs it up, as does a protocol error. A session left
+ * detached for its timeout (DETACH's, default 60 s of the guest's monotonic
+ * clock, which a restore continues) is hung up. ATTACH while another
+ * connection has the session takes it over and closes that one. An unknown
+ * id, or a session that ended, is an ERROR "ENOENT: ...". The program
+ * exiting while detached keeps the session until an attach, which gets the
+ * replay and then EXIT.
+ *
+ * A detachable session keeps the last 64 KiB of the pty's output. REPLAY
+ * sends it after OPENED, for a fresh terminal: it starts where no escape
+ * sequence or UTF-8 character is cut (at a line start when there is one in
+ * its first 4 KiB), behind the DEC private modes in force there (cursor
+ * keys, the alternate screen, mouse reporting, bracketed paste, ...), which
+ * kwtty follows in the output it drops from the ring. Then, when the
+ * output has the alternate screen on (a full-screen program), ATTACH's
+ * size is set one row short and 150 ms later in full, so that the program
+ * gets SIGWINCH twice and redraws its screen; otherwise the size is just
+ * set (SIGWINCH if it changed). A RESIZE to another size meanwhile cancels
+ * the second step.
+ *
+ * The handover: the process forked for the ATTACH connection connects to
+ * the session's abstract unix socket "\0kwtty/<id>" (bound by the session
+ * at OPEN, so a second session with the id is refused: "EEXIST: ..."), and
+ * passes the vsock socket with SCM_RIGHTS and the size; the session takes
+ * it only from a root peer (SO_PEERCRED) and answers one byte.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <poll.h>
 #include <pty.h>
 #include <pwd.h>
@@ -94,7 +138,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#include <stddef.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <termios.h>
@@ -124,11 +170,15 @@
 #define TAG_PIPES	5
 #define TAG_CONNECT	6
 #define TAG_USER	7
+#define TAG_DETACH	8
+#define TAG_ATTACH	9
+#define TAG_REPLAY	10
 #define TAG_CRITICAL	0x80
 #define FEAT_PIPES	0x01		/* OPENED: PIPES, EOF and STDERR */
 #define FEAT_CONNECT	0x02		/* OPENED: CONNECT */
 #define FEAT_USER	0x04		/* OPENED: USER */
-#define FEATURES	(FEAT_PIPES | FEAT_CONNECT | FEAT_USER)
+#define FEAT_DETACH	0x08		/* OPENED: DETACH, ATTACH and REPLAY */
+#define FEATURES	(FEAT_PIPES | FEAT_CONNECT | FEAT_USER | FEAT_DETACH)
 #define NO_PTS		0xffffffffU
 /* The account sessions and the console run as unless asked otherwise. */
 #define DEFAULT_USER	"user"
@@ -145,6 +195,12 @@
 #define CONNECT_MS	10000		/* CONNECT: time for the TCP connect */
 #define RELAY_BUF	65536		/* CONNECT: bytes in flight per direction */
 #define PROBE_MS	1000		/* CONNECT: how often to check an idle host side */
+#define ID_MAX		64		/* DETACH: a session id's length */
+#define DETACH_MS	60000		/* DETACH: how long a session waits detached, by default */
+#define RING		65536		/* DETACH: the output kept for REPLAY */
+#define LINE_SKIP	4096		/* REPLAY: how far to look for a line start */
+#define JIGGLE_MS	150		/* ATTACH: between the two sizes of a redraw */
+#define HANDOVER_MS	5000		/* ATTACH: for the session to take the connection */
 
 static unsigned int get16(const unsigned char *p)
 {
@@ -155,6 +211,11 @@ static void put16(unsigned char *p, unsigned int v)
 {
 	p[0] = v;
 	p[1] = v >> 8;
+}
+
+static uint32_t get32(const unsigned char *p)
+{
+	return get16(p) | (uint32_t)get16(p + 2) << 16;
 }
 
 static void put32(unsigned char *p, uint32_t v)
@@ -260,7 +321,29 @@ struct open_req {
 	int connect;			/* CONNECT: relay to a TCP port */
 	unsigned int port;		/* its port */
 	char *user;			/* USER: a name or uid ("": the default user); NULL: root */
+	int detach;			/* DETACH: a detachable session */
+	uint32_t detach_ms;		/* its timeout (0: DETACH_MS) */
+	int attach;			/* ATTACH: take over the session `id` */
+	int replay;			/* REPLAY: with ATTACH */
+	char id[ID_MAX + 1];		/* DETACH's or ATTACH's session id */
 };
+
+/* A session id: 1 to ID_MAX of A-Z a-z 0-9 . _ - (it names a socket). */
+static int copy_id(char *id, const unsigned char *v, size_t len)
+{
+	if (!len || len > ID_MAX)
+		return -1;
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c = v[i];
+
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+			return -1;
+	}
+	memcpy(id, v, len);
+	id[len] = 0;
+	return 0;
+}
 
 /* Parses OPEN's payload; NULL, or what is wrong with it. */
 static const char *parse_open(const unsigned char *p, size_t len, struct open_req *o)
@@ -344,6 +427,20 @@ static const char *parse_open(const unsigned char *p, size_t len, struct open_re
 			o->user = strndup((const char *)v, vlen);
 			if (!o->user)
 				return "out of memory";
+			break;
+		case TAG_DETACH:
+			if (vlen < 4 || copy_id(o->id, v + 4, vlen - 4))
+				return "DETACH is not a u32 timeout and a session id of 1 to 64 of A-Z a-z 0-9 . _ -";
+			o->detach = 1;
+			o->detach_ms = get32(v);
+			break;
+		case TAG_ATTACH:
+			if (copy_id(o->id, v, vlen))
+				return "ATTACH is not a session id of 1 to 64 of A-Z a-z 0-9 . _ -";
+			o->attach = 1;
+			break;
+		case TAG_REPLAY:
+			o->replay = 1;
 			break;
 		default:
 			if (tag & TAG_CRITICAL)
@@ -481,8 +578,173 @@ shell_child(int ep, const struct account *a, const char *file, char **argv, char
 	_exit(127);
 }
 
+/*
+ * What REPLAY needs to know of a terminal's output: where escape sequences
+ * and strings end (so a replay starts in the ground state), and the DEC
+ * private modes (CSI ? Pm h / l), ESC = / ESC > and ESC c (a reset) set.
+ * Enough of ECMA-48 / the VT500 parser for that, nothing more.
+ */
+enum { TS_GROUND, TS_ESC, TS_ESC_INT, TS_CSI, TS_STR, TS_STR_ESC };
+
+/* The modes followed (bit i: dec_modes[i]); 7 (autowrap) and 25 (cursor shown) start on. */
+static const unsigned short dec_modes[] = {
+	1, 7, 25, 47, 1047, 1049, 9, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 2004,
+};
+#define MODES_DEFAULT	(1u << 1 | 1u << 2)
+#define MODES_ALT	(1u << 3 | 1u << 4 | 1u << 5)
+#define NPARAM		16
+
+struct term {
+	unsigned char st;
+	unsigned char priv, bad;	/* CSI: "?" first; another private marker or an intermediate */
+	unsigned char keypad;		/* ESC = (application keypad) */
+	int np;
+	unsigned int par[NPARAM];
+	uint32_t modes;
+};
+
+static void term_init(struct term *t)
+{
+	memset(t, 0, sizeof(*t));
+	t->modes = MODES_DEFAULT;
+}
+
+static void term_mode(struct term *t, unsigned int mode, int on)
+{
+	for (size_t i = 0; i < sizeof(dec_modes) / sizeof(dec_modes[0]); i++) {
+		if (dec_modes[i] == mode) {
+			if (on)
+				t->modes |= 1u << i;
+			else
+				t->modes &= ~(1u << i);
+		}
+	}
+}
+
+static void term_esc(struct term *t, unsigned char b)
+{
+	t->st = TS_GROUND;
+	switch (b) {
+	case '[':
+		t->st = TS_CSI;
+		t->np = 0;
+		t->par[0] = 0;
+		t->priv = t->bad = 0;
+		break;
+	case ']': case 'P': case '_': case '^': case 'X':
+		t->st = TS_STR;
+		break;
+	case '=':
+		t->keypad = 1;
+		break;
+	case '>':
+		t->keypad = 0;
+		break;
+	case 'c':
+		term_init(t);
+		break;
+	case 0x1b:
+		t->st = TS_ESC;
+		break;
+	default:
+		if (b >= 0x20 && b <= 0x2f)
+			t->st = TS_ESC_INT;
+	}
+}
+
+static void term_feed1(struct term *t, unsigned char b)
+{
+	if (b == 0x18 || b == 0x1a) {	/* CAN, SUB: abort a sequence */
+		t->st = TS_GROUND;
+		return;
+	}
+	switch (t->st) {
+	case TS_GROUND:
+		if (b == 0x1b)
+			t->st = TS_ESC;
+		break;
+	case TS_ESC:
+		term_esc(t, b);
+		break;
+	case TS_ESC_INT:
+		if (b == 0x1b)
+			t->st = TS_ESC;
+		else if (b >= 0x30 && b <= 0x7e)
+			t->st = TS_GROUND;
+		break;
+	case TS_CSI:
+		if (b >= '0' && b <= '9') {
+			if (t->par[t->np] < 100000)
+				t->par[t->np] = t->par[t->np] * 10 + (b - '0');
+		} else if (b == ';' || b == ':') {
+			if (t->np < NPARAM - 1)
+				t->par[++t->np] = 0;
+			else
+				t->bad = 1;
+		} else if (b >= 0x3c && b <= 0x3f) {
+			if (b == '?' && !t->np && !t->par[0] && !t->priv)
+				t->priv = 1;
+			else
+				t->bad = 1;
+		} else if (b >= 0x20 && b <= 0x2f) {
+			t->bad = 1;
+		} else if (b >= 0x40 && b <= 0x7e) {
+			if (t->priv && !t->bad && (b == 'h' || b == 'l'))
+				for (int i = 0; i <= t->np; i++)
+					term_mode(t, t->par[i], b == 'h');
+			t->st = TS_GROUND;
+		} else if (b == 0x1b) {
+			t->st = TS_ESC;
+		}
+		break;
+	case TS_STR:
+		if (b == 0x07)
+			t->st = TS_GROUND;
+		else if (b == 0x1b)
+			t->st = TS_STR_ESC;
+		break;
+	case TS_STR_ESC:
+		/* ESC \ ends the string; ESC and anything else starts a new sequence. */
+		if (b == '\\')
+			t->st = TS_GROUND;
+		else
+			term_esc(t, b);
+		break;
+	}
+}
+
+/* The sequences that set a fresh terminal's modes as t has them; their length. */
+static size_t term_modes(const struct term *t, char *out, size_t size)
+{
+	size_t n = 0;
+	int alt = 0;
+
+	for (size_t i = 0; i < sizeof(dec_modes) / sizeof(dec_modes[0]); i++) {
+		uint32_t bit = 1u << i;
+		int r;
+
+		if ((t->modes & bit) == (MODES_DEFAULT & bit))
+			continue;
+		if (bit & MODES_ALT) {
+			if (alt++)
+				continue;
+			r = snprintf(out + n, size - n, "\x1b[?1049h");
+		} else {
+			r = snprintf(out + n, size - n, "\x1b[?%u%c", dec_modes[i], t->modes & bit ? 'h' : 'l');
+		}
+		if (r < 0 || (size_t)r >= size - n)
+			return n;
+		n += r;
+	}
+	if (t->keypad && size - n > 2) {
+		memcpy(out + n, "\x1b=", 2);
+		n += 2;
+	}
+	return n;
+}
+
 struct session {
-	int s, m, pfd;			/* socket, pty master (-1 with PIPES), pidfd of the program */
+	int s, m, pfd;			/* socket (-1 while detached), pty master (-1 with PIPES), pidfd of the program */
 	int ifd;			/* the program's input: the master or the stdin pipe; -1 once closed */
 	int ofd[2];			/* its output: the master or the stdout pipe, and the stderr pipe (-1 on a pty) */
 	int oend[2];			/* that output has ended (EIO on the master, EOF on a pipe) */
@@ -500,6 +762,22 @@ struct session {
 	enum { ST_HDR, ST_DATA, ST_ARG, ST_SKIP } st;
 	unsigned char hdr[HDR], arg[16];	/* RESIZE's or SIGNAL's payload */
 	size_t have, want, rem;		/* bytes in hdr or arg, of arg wanted, payload left */
+	/* DETACH */
+	int detachable;
+	int lfd;			/* the session's unix socket for ATTACH, or -1 */
+	char id[ID_MAX + 1];
+	int64_t detach_ms;		/* how long it may stay detached */
+	int64_t until;			/* while detached: when it is hung up */
+	int out_done;			/* detached, and the program's output has ended: EXIT waits for an attach */
+	uint32_t pts;
+	unsigned char ring[RING];	/* the last RING bytes of output */
+	uint64_t rtotal;		/* bytes ever put in the ring */
+	struct term gone;		/* the terminal at the ring's oldest byte (fed what the ring drops) */
+	struct term now;		/* and after its newest */
+	unsigned char *rp;		/* the replay being sent, from rpoff to rplen */
+	size_t rplen, rpoff;
+	int64_t jiggle_at;		/* the second size of a redraw: when, and what */
+	struct winsize jiggle_ws;
 };
 
 static struct session x;
@@ -531,7 +809,10 @@ static void hangup(void)
 static void __attribute__((noreturn)) end_session(void)
 {
 	hangup();
-	close(x.s);
+	if (x.s >= 0)
+		close(x.s);
+	if (x.lfd >= 0)
+		close(x.lfd);
 	if (!x.reaped) {
 		struct pollfd pf = { .fd = x.pfd, .events = POLLIN };
 
@@ -541,15 +822,97 @@ static void __attribute__((noreturn)) end_session(void)
 	_exit(0);
 }
 
+/* DETACH: keep output for REPLAY; what falls out of the ring goes through `gone`. */
+static void ring_put(const unsigned char *p, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		term_feed1(&x.now, p[i]);
+	while (n) {
+		size_t pos = x.rtotal % RING, k = RING - pos < n ? RING - pos : n;
+
+		if (x.rtotal >= RING)
+			for (size_t i = 0; i < k; i++)
+				term_feed1(&x.gone, x.ring[pos + i]);
+		memcpy(x.ring + pos, p, k);
+		x.rtotal += k;
+		p += k;
+		n -= k;
+	}
+}
+
+static void set_size(const struct winsize *ws)
+{
+	ioctl(x.m, TIOCSWINSZ, ws);
+}
+
+/* A redraw's second size, now (it was due, or the session detaches). */
+static void jiggle_done(void)
+{
+	if (x.jiggle_at) {
+		x.jiggle_at = 0;
+		set_size(&x.jiggle_ws);
+	}
+}
+
+static void free_replay(void)
+{
+	free(x.rp);
+	x.rp = NULL;
+	x.rplen = x.rpoff = 0;
+}
+
+/*
+ * The connection was reset under a detachable session (a snapshot restore,
+ * see the top): let it go and keep the program; an attach takes it again.
+ * The frame in flight is dropped (its output is in the ring).
+ */
+static void detach(void)
+{
+	close(x.s);
+	x.s = -1;
+	x.olen = x.ooff = 0;
+	x.ilen = x.ioff = 0;
+	x.st = ST_HDR;
+	x.have = x.rem = 0;
+	free_replay();
+	jiggle_done();
+	x.until = now_ms() + x.detach_ms;
+}
+
+/*
+ * The connection failed (e: the errno of the failed call, 0 for POLLERR):
+ * detach if it was reset under a detachable session, else hang up. Only
+ * kwvsock's restore notifier resets a connected vsock socket (ECONNRESET
+ * as its error; recv and send then fail with ENOTCONN); the host's own
+ * close is EOF or EPIPE.
+ */
+static void conn_lost(int e)
+{
+	int err = 0;
+	socklen_t len = sizeof(err);
+
+	if (!x.detachable || x.m < 0 || x.final || x.err[0])
+		end_session();
+	if (e != ECONNRESET && e != ENOTCONN &&
+	    (getsockopt(x.s, SOL_SOCKET, SO_ERROR, &err, &len) || err != ECONNRESET))
+		end_session();
+	detach();
+}
+
 static void flush_out(void)
 {
+	if (x.s < 0) {
+		x.olen = x.ooff = 0;	/* detached */
+		return;
+	}
 	while (x.ooff < x.olen) {
 		ssize_t n = send(x.s, x.out + x.ooff, x.olen - x.ooff, MSG_NOSIGNAL);
 
 		if (n < 0) {
 			if (errno == EAGAIN || errno == EINTR)
 				return;
-			end_session();	/* EPIPE, ECONNRESET: the host hung up */
+			conn_lost(errno);	/* EPIPE: the host hung up; ENOTCONN: reset */
+			return;
 		}
 		x.ooff += n;
 	}
@@ -557,8 +920,11 @@ static void flush_out(void)
 	x.quiet_at = now_ms();
 }
 
+/* A frame for the host (dropped while detached). */
 static void queue(unsigned int type, const void *p, size_t len)
 {
+	if (x.s < 0)
+		return;
 	x.out[0] = type;
 	x.out[1] = 0;
 	put16(x.out + 2, len);
@@ -686,7 +1052,12 @@ static void parse_input(void)
 					.ws_xpixel = get16(x.arg + 4), .ws_ypixel = get16(x.arg + 6),
 				};
 
-				ioctl(x.m, TIOCSWINSZ, &ws);
+				if (x.jiggle_at && ws.ws_row == x.jiggle_ws.ws_row && ws.ws_col == x.jiggle_ws.ws_col) {
+					x.jiggle_ws = ws;	/* the redraw's second step sets it */
+				} else {
+					x.jiggle_at = 0;	/* another size wins over a redraw's */
+					set_size(&ws);
+				}
 			}
 			x.st = ST_SKIP;
 			break;
@@ -703,19 +1074,207 @@ static void parse_input(void)
 		x.ilen = x.ioff = 0;
 }
 
+/* Shorten *t (ms; -1: none) to ms, which may be past (0). */
+static void min_timeout(int *t, int64_t ms)
+{
+	if (ms < 0)
+		ms = 0;
+	if (ms > INT_MAX)
+		ms = INT_MAX;
+	if (*t < 0 || ms < *t)
+		*t = ms;
+}
+
+/* Wait up to ms for fd to be readable (1), or not (0). */
+static int poll_in(int fd, int ms)
+{
+	int64_t end = now_ms() + ms;
+
+	for (;;) {
+		struct pollfd pf = { .fd = fd, .events = POLLIN };
+		int64_t left = end - now_ms();
+		int r;
+
+		if (left <= 0)
+			return 0;
+		r = poll(&pf, 1, left);
+		if (r > 0)
+			return 1;
+		if (!r || errno != EINTR)
+			return 0;
+	}
+}
+
+static unsigned char ring_at(uint64_t off)
+{
+	return x.ring[off % RING];
+}
+
+/*
+ * REPLAY: the ring as a fresh terminal needs it (see the top): the modes in
+ * force where it starts, then its bytes from a point where nothing is cut.
+ */
+static void build_replay(void)
+{
+	uint64_t have = x.rtotal < RING ? x.rtotal : RING, start = x.rtotal - have;
+	struct term t = x.gone;
+	char modes[256];
+	size_t i = 0, nm;
+
+	free_replay();
+	if (x.rtotal > RING) {
+		/* The ring dropped bytes: its oldest may be inside a sequence or a character. */
+		while (i < have && t.st != TS_GROUND)
+			term_feed1(&t, ring_at(start + i++));
+		while (i < have && (ring_at(start + i) & 0xc0) == 0x80)
+			term_feed1(&t, ring_at(start + i++));
+		/* And a line start, if one is near. */
+		struct term u = t;
+
+		for (size_t j = i; j < have && j - i < LINE_SKIP;) {
+			unsigned char b = ring_at(start + j++);
+
+			term_feed1(&u, b);
+			if (b == '\n' && u.st == TS_GROUND) {
+				i = j;
+				t = u;
+				break;
+			}
+		}
+	}
+	nm = term_modes(&t, modes, sizeof(modes));
+	x.rp = malloc(nm + have - i);
+	if (!x.rp)
+		return;
+	memcpy(x.rp, modes, nm);
+	for (size_t j = i; j < have; j++)
+		x.rp[nm + j - i] = ring_at(start + j);
+	x.rplen = nm + have - i;
+	x.rpoff = 0;
+}
+
+/*
+ * ATTACH's size: set it (SIGWINCH if it changed); if it did not change and a
+ * full-screen program has the terminal (the alternate screen), one row
+ * short first and in full JIGGLE_MS later, so that it redraws.
+ */
+static void attach_size(struct winsize ws)
+{
+	struct winsize cur;
+
+	x.jiggle_at = 0;
+	if (ioctl(x.m, TIOCGWINSZ, &cur))
+		memset(&cur, 0, sizeof(cur));
+	if (!ws.ws_row || !ws.ws_col) {
+		ws.ws_row = cur.ws_row;
+		ws.ws_col = cur.ws_col;
+	}
+	if ((cur.ws_row == ws.ws_row && cur.ws_col == ws.ws_col) && x.now.modes & MODES_ALT && ws.ws_row > 1) {
+		struct winsize t = ws;
+
+		t.ws_row--;
+		set_size(&t);
+		x.jiggle_ws = ws;
+		x.jiggle_at = now_ms() + JIGGLE_MS;
+		return;
+	}
+	set_size(&ws);
+}
+
+/* Take over the session on vsock socket fd (ATTACH; msg: rows, cols, xpixel, ypixel, replay). */
+static void attach(int fd, const unsigned char *msg)
+{
+	struct winsize ws = {
+		.ws_row = get16(msg), .ws_col = get16(msg + 2),
+		.ws_xpixel = get16(msg + 4), .ws_ypixel = get16(msg + 6),
+	};
+	unsigned char opened[14];
+
+	if (x.s >= 0)
+		close(x.s);	/* another connection had it: it ends, its host sees the session lost */
+	x.s = fd;
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+	x.olen = x.ooff = 0;
+	x.ilen = x.ioff = 0;
+	x.st = ST_HDR;
+	x.have = x.rem = 0;
+	x.until = 0;
+	free_replay();
+	if (msg[8])
+		build_replay();
+	attach_size(ws);
+	put16(opened, KWTTY_VERSION);
+	put32(opened + 2, FEATURES);
+	put32(opened + 6, x.pid);
+	put32(opened + 10, x.pts);
+	queue(T_OPENED, opened, sizeof(opened));
+}
+
+/*
+ * A connection on the session's unix socket: an ATTACH handed over by the
+ * process kwtty forked for it (see the top). Taken only from root, and only
+ * while the session can go on; else that process sends the ERROR.
+ */
+static void take_attach(void)
+{
+	unsigned char msg[16];
+	union {
+		struct cmsghdr h;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} cm;
+	struct iovec iov = { .iov_base = msg, .iov_len = sizeof(msg) };
+	struct msghdr mh = {
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = cm.buf, .msg_controllen = sizeof(cm.buf),
+	};
+	struct ucred cr;
+	socklen_t crlen = sizeof(cr);
+	struct cmsghdr *ch;
+	int c, fd = -1;
+	ssize_t n;
+
+	c = accept4(x.lfd, NULL, NULL, SOCK_CLOEXEC);
+	if (c < 0)
+		return;
+	if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &crlen) || cr.uid != 0 || !poll_in(c, HANDOVER_MS))
+		goto out;
+	n = recvmsg(c, &mh, MSG_CMSG_CLOEXEC);
+	if (n > 0)
+		for (ch = CMSG_FIRSTHDR(&mh); ch; ch = CMSG_NXTHDR(&mh, ch))
+			if (ch->cmsg_level == SOL_SOCKET && ch->cmsg_type == SCM_RIGHTS && ch->cmsg_len >= CMSG_LEN(sizeof(int)))
+				memcpy(&fd, CMSG_DATA(ch), sizeof(int));
+	if (n < 9 || fd < 0 || x.m < 0 || x.final || x.err[0])
+		goto out;
+	if (send(c, "\1", 1, MSG_NOSIGNAL) != 1)
+		goto out;
+	close(c);
+	attach(fd, msg);
+	return;
+out:
+	if (fd >= 0)
+		close(fd);
+	close(c);
+}
+
 static void __attribute__((noreturn)) session_loop(void)
 {
 	for (;;) {
-		/* socket, the two outputs, the input, the pidfd */
-		struct pollfd p[5] = { { .fd = x.s }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 } };
+		/* socket, the two outputs, the input, the pidfd, the session's unix socket */
+		struct pollfd p[6] = {
+			{ .fd = x.s }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 }, { .fd = -1 },
+			{ .fd = x.lfd, .events = POLLIN },
+		};
+		int attached = x.s >= 0;
+		int replaying = attached && x.rpoff < x.rplen;
 		int open[2], rd[2];
-		int mwrite = x.ifd >= 0 && !x.in_dead && x.ioff < x.ilen;
-		int sread = !x.err[0] && x.ioff == x.ilen;
+		int mwrite = attached && x.ifd >= 0 && !x.in_dead && x.ioff < x.ilen;
+		int sread = attached && !x.err[0] && x.ioff == x.ilen;
 		int timeout = -1;
+		int64_t now = now_ms();
 
 		for (int i = 0; i < 2; i++) {
 			open[i] = x.ofd[i] >= 0 && !x.oend[i];
-			rd[i] = open[i] && !x.olen && !x.final;
+			rd[i] = open[i] && !x.olen && !x.final && !replaying && !x.out_done;
 		}
 
 		if (x.final && !x.olen)
@@ -723,6 +1282,29 @@ static void __attribute__((noreturn)) session_loop(void)
 		if (x.err[0] && !x.olen) {
 			queue(T_ERROR, x.err, strlen(x.err));
 			x.final = 1;
+			continue;
+		}
+		/* Detached: hung up once nobody attached within the timeout. */
+		if (!attached) {
+			if (now >= x.until)
+				end_session();
+			min_timeout(&timeout, x.until - now);
+		}
+		if (x.jiggle_at) {
+			if (now >= x.jiggle_at)
+				jiggle_done();
+			else
+				min_timeout(&timeout, x.jiggle_at - now);
+		}
+		/* REPLAY goes first, before new output. */
+		if (replaying && !x.olen) {
+			size_t n = x.rplen - x.rpoff < OUT_MAX ? x.rplen - x.rpoff : OUT_MAX;
+			const unsigned char *rp = x.rp + x.rpoff;
+
+			x.rpoff += n;
+			queue(T_DATA, rp, n);	/* copies it before a failed send could free it */
+			if (x.rp && x.rpoff >= x.rplen)
+				free_replay();
 			continue;
 		}
 		/*
@@ -733,14 +1315,18 @@ static void __attribute__((noreturn)) session_loop(void)
 		 * may still be in flight), or after DRAIN_MAX bytes: what the
 		 * program's own children left behind is far less, and a
 		 * background job that keeps printing (yes & exit) must not
-		 * keep the session open.
+		 * keep the session open. Detached, EXIT waits for an attach.
 		 */
-		if (x.reaped && !x.final && !x.olen) {
-			int64_t left = x.quiet_at + DRAIN_MS - now_ms();
+		if (x.reaped && !x.final && !x.olen && !replaying && (attached || !x.out_done)) {
+			int64_t left = x.quiet_at + DRAIN_MS - now;
 
-			if (!(open[0] || open[1]) || left <= 0 || x.drained > DRAIN_MAX) {
+			if (x.out_done || !(open[0] || open[1]) || left <= 0 || x.drained > DRAIN_MAX) {
 				unsigned char e[3] = { 0, WEXITSTATUS(x.status), 0 };
 
+				if (!attached) {
+					x.out_done = 1;
+					continue;
+				}
 				if (WIFSIGNALED(x.status)) {
 					e[0] = 1;
 					e[1] = WTERMSIG(x.status);
@@ -750,14 +1336,15 @@ static void __attribute__((noreturn)) session_loop(void)
 				x.final = 1;
 				continue;
 			}
-			timeout = left;
+			min_timeout(&timeout, left);
 		}
 		/*
 		 * The host's close is a SHUTDOWN, which vsock_poll() reports as
 		 * POLLRDHUP (with POLLIN), not POLLHUP: ask for it always, so a
 		 * hangup is seen while socket reads are paused.
 		 */
-		p[0].events = POLLRDHUP | (sread ? POLLIN : 0) | (x.olen ? POLLOUT : 0);
+		if (attached)
+			p[0].events = POLLRDHUP | (sread ? POLLIN : 0) | (x.olen ? POLLOUT : 0);
 		/*
 		 * A master or pipe with nothing asked would spin on POLLHUP:
 		 * leave it out then. On a pty the master is in twice, once per
@@ -777,13 +1364,20 @@ static void __attribute__((noreturn)) session_loop(void)
 			p[4].fd = x.pfd;
 			p[4].events = POLLIN;
 		}
-		if (poll(p, 5, timeout) < 0) {
+		if (poll(p, 6, timeout) < 0) {
 			if (errno == EINTR)
 				continue;
 			end_session();
 		}
-		if (p[0].revents & (POLLHUP | POLLERR) || (p[0].revents & POLLRDHUP && !sread))
-			end_session();
+		if (attached) {
+			/* An error is a reset (detach, if detachable); POLLHUP or EOF the host's close. */
+			if (p[0].revents & POLLERR) {
+				conn_lost(0);
+				continue;
+			}
+			if (p[0].revents & POLLHUP || (p[0].revents & POLLRDHUP && !sread))
+				end_session();
+		}
 		if (p[4].revents) {
 			pid_t r = waitpid(x.pid, &x.status, WNOHANG);
 
@@ -802,10 +1396,12 @@ static void __attribute__((noreturn)) session_loop(void)
 				continue;
 			n = read(x.ofd[i], x.out + HDR, OUT_MAX);
 			if (n > 0) {
+				if (x.detachable)
+					ring_put(x.out + HDR, n);
 				if (x.reaped)
 					x.drained += n;
 				x.next = i ^ 1;
-				queue(i ? T_STDERR : T_DATA, x.out + HDR, n);
+				queue(i ? T_STDERR : T_DATA, x.out + HDR, n);	/* dropped while detached */
 			} else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
 				/* EIO: the pty's slave side is closed; 0: EOF on the pipe */
 				x.oend[i] = 1;
@@ -813,21 +1409,28 @@ static void __attribute__((noreturn)) session_loop(void)
 					x.in_dead = 1;
 			}
 		}
-		if (p[3].revents & (POLLOUT | POLLHUP | POLLERR) && mwrite)
+		if (x.s >= 0 && p[3].revents & (POLLOUT | POLLHUP | POLLERR) && mwrite)
 			parse_input();
-		if (p[0].revents & POLLOUT)
+		if (x.s >= 0 && p[0].revents & POLLOUT)
 			flush_out();
-		if (p[0].revents & (POLLIN | POLLRDHUP) && sread) {
+		if (x.s >= 0 && p[0].revents & (POLLIN | POLLRDHUP) && sread) {
 			ssize_t n = recv(x.s, x.in, sizeof(x.in), 0);
 
-			if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR))
-				end_session();	/* EOF or ECONNRESET: the host hung up */
+			if (n == 0)
+				end_session();	/* EOF: the host hung up */
+			if (n < 0 && errno != EAGAIN && errno != EINTR) {
+				conn_lost(errno);	/* ENOTCONN: reset */
+				continue;
+			}
 			if (n > 0) {
 				x.ilen = n;
 				x.ioff = 0;
 				parse_input();
 			}
 		}
+		/* Last: an attach replaces the socket whose events were handled above. */
+		if (p[5].revents & POLLIN)
+			take_attach();
 	}
 }
 
@@ -1012,6 +1615,78 @@ out:
 	_exit(0);
 }
 
+/* The abstract unix socket address of session `id` (see the top). */
+static socklen_t session_addr(struct sockaddr_un *a, const char *id)
+{
+	int n;
+
+	memset(a, 0, sizeof(*a));
+	a->sun_family = AF_UNIX;
+	n = snprintf(a->sun_path + 1, sizeof(a->sun_path) - 1, "kwtty/%s", id);
+	return offsetof(struct sockaddr_un, sun_path) + 1 + n;
+}
+
+/* DETACH: the session's unix socket for ATTACH, or -1 (EADDRINUSE: the id is taken). */
+static int session_listen(const char *id)
+{
+	struct sockaddr_un a;
+	socklen_t len = session_addr(&a, id);
+	int l = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0), e;
+
+	if (l < 0)
+		return -1;
+	if (bind(l, (struct sockaddr *)&a, len) || listen(l, 4)) {
+		e = errno;
+		close(l);
+		errno = e;
+		return -1;
+	}
+	return l;
+}
+
+/*
+ * ATTACH: hand the connection to the session's process with the window
+ * size and REPLAY (see the top), which answers on it from then on; or
+ * refuse with ENOENT.
+ */
+static void __attribute__((noreturn)) attach_client(int s, const struct open_req *o)
+{
+	unsigned char msg[9], ack = 0;
+	union {
+		struct cmsghdr h;
+		char buf[CMSG_SPACE(sizeof(int))];
+	} cm;
+	struct iovec iov = { .iov_base = msg, .iov_len = sizeof(msg) };
+	struct msghdr mh = {
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = cm.buf, .msg_controllen = sizeof(cm.buf),
+	};
+	struct sockaddr_un a;
+	socklen_t len = session_addr(&a, o->id);
+	struct cmsghdr *ch;
+	int u;
+
+	put16(msg, o->ws.ws_row);
+	put16(msg + 2, o->ws.ws_col);
+	put16(msg + 4, o->ws.ws_xpixel);
+	put16(msg + 6, o->ws.ws_ypixel);
+	msg[8] = !!o->replay;
+	memset(&cm, 0, sizeof(cm));
+	ch = CMSG_FIRSTHDR(&mh);
+	ch->cmsg_level = SOL_SOCKET;
+	ch->cmsg_type = SCM_RIGHTS;
+	ch->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(ch), &s, sizeof(int));
+	u = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+	if (u < 0)
+		refuse(s, "socket: %s", strerror(errno));
+	if (connect(u, (struct sockaddr *)&a, len) || sendmsg(u, &mh, MSG_NOSIGNAL) < 0)
+		refuse(s, "ENOENT: no detachable session %s", o->id);
+	if (poll_in(u, HANDOVER_MS) && recv(u, &ack, 1, 0) == 1 && ack == 1)
+		_exit(0);	/* the session has the connection now */
+	refuse(s, "ENOENT: session %s has ended", o->id);
+}
+
 static void __attribute__((noreturn)) session(int s)
 {
 	const char *base, *file;
@@ -1046,6 +1721,8 @@ static void __attribute__((noreturn)) session(int s)
 	bad = parse_open(p, n, &o);
 	if (bad)
 		refuse(s, "%s", bad);
+	if (o.attach)
+		attach_client(s, &o);
 	if (o.connect) {
 		int t = tcp_connect(s, o.port);
 
@@ -1061,6 +1738,8 @@ static void __attribute__((noreturn)) session(int s)
 		relay(s, t);
 	}
 
+	if (o.detach && o.pipes)
+		refuse(s, "DETACH needs a pty (not PIPES)");
 	if (find_account(o.user, &a))
 		refuse(s, "no user %s", o.user);
 	env = calloc(6 + o.nenv + 1, sizeof(*env));
@@ -1095,6 +1774,20 @@ static void __attribute__((noreturn)) session(int s)
 	if (o.cwd ? chdir(o.cwd) : chdir(a.home) && chdir("/"))
 		refuse(s, "chdir %s: %s", o.cwd ? o.cwd : a.home, strerror(errno));
 
+	x.s = x.lfd = -1;
+	term_init(&x.gone);
+	term_init(&x.now);
+	if (o.detach) {
+		/* Before the program starts: a taken id refuses the session. */
+		x.lfd = session_listen(o.id);
+		if (x.lfd < 0 && errno == EADDRINUSE)
+			refuse(s, "EEXIST: a session %s exists", o.id);
+		if (x.lfd < 0)
+			refuse(s, "session socket: %s", strerror(errno));
+		x.detachable = 1;
+		x.detach_ms = o.detach_ms ? o.detach_ms : DETACH_MS;
+		strcpy(x.id, o.id);
+	}
 	if (pipe2(ep, O_CLOEXEC))
 		refuse(s, "pipe: %s", strerror(errno));
 	if (o.pipes) {
@@ -1152,6 +1845,7 @@ static void __attribute__((noreturn)) session(int s)
 	}
 	if (x.m >= 0)
 		ioctl(x.m, TIOCGPTN, &pts);
+	x.pts = pts;
 	/* On a pty these are all the master. */
 	fcntl(x.ifd, F_SETFL, fcntl(x.ifd, F_GETFL) | O_NONBLOCK);
 	for (int i = 0; i < 2; i++)

@@ -450,7 +450,17 @@ within what kwemu implements: check it with the coverage classifier
   its own (a hangup goes to its process group), and EOF closes its stdin.
   With CONNECT there is no program: kwtty connects to a TCP port on
   127.0.0.1 and relays bytes, passing half-closes on (`vm.connect()`,
-  `vm.fetch()`, the CLI's `--forward`). The protocol is described at the
+  `vm.fetch()`, the CLI's `--forward`). A session opened with DETACH (on
+  a pty) survives a snapshot restore: the restore's reset of its
+  connection (ECONNRESET as the socket error, which only kwvsock's restore
+  notifier sets) detaches it instead of hanging it up; the program runs on,
+  kwtty keeps reading the pty into a 64 KiB ring, and a connection with
+  ATTACH and the session's id takes it over (REPLAY: the ring from where a
+  fresh terminal can start, behind the modes in force there; a program on
+  the alternate screen gets two SIGWINCHs to redraw). The handover goes
+  over the session's abstract unix socket `\0kwtty/<id>` (SCM_RIGHTS, root
+  peers only). Hung up when nobody attaches within its timeout (60 s by
+  default), and on the host's own close as any session. The protocol is described at the
   top of `kwtty.c` and `js/core/tty.ts` (js.md). `socket(AF_VSOCK)` works
   without a transport, so kwtty asks `/dev/vsock` for the local CID
   (`IOCTL_VM_SOCKETS_GET_LOCAL_CID`) and, without a device, sleeps in

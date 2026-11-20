@@ -8,7 +8,7 @@
 //   node --test test/tty.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TTY_PORT, PtyError, connectGuest, connectOn, encodeTtyOpen, execOn, execSubprocess, spawnOn, spawnPty, spawnSubprocess, type PtyOptions, type Pty, type Subprocess } from "../js/core/tty.ts";
+import { TTY_PORT, PtyError, attachOn, attachPty, connectGuest, connectOn, encodeTtyAttach, encodeTtyOpen, execOn, execSubprocess, spawnOn, spawnPty, spawnSubprocess, ttySessions, type PtyOptions, type Pty, type Subprocess } from "../js/core/tty.ts";
 import type { ByteDuplex } from "../js/core/http.ts";
 import { VsockError, type Vsock, type VsockConnection, type VsockListener } from "../js/core/vsock.ts";
 
@@ -826,4 +826,96 @@ test("connectGuest(): ECONNREFUSED, other guest errors EREMOTE, an old guest ERE
 	await tick(50);
 	ac.abort();
 	await assert.rejects(p, isPtyError("ABORTED"));
+});
+
+// Detachable sessions (DETACH, ATTACH, REPLAY; feature bit 3).
+const FEAT_DETACH = 8;
+const tlvBytes = (tag: number, v: ArrayLike<number>) => [tag, ...le16(v.length), ...Array.from(v)];
+
+test("detachable: a DETACH option (not critical: u32 timeout, then a random id); sessionId only when the guest has the feature; ttySessions() lists the live ones", async () => {
+	const f = fakeVsock();
+	const p = spawnPty(f.vsock, undefined, [], { rows: 24, cols: 80, detachable: true, detachTimeout: 5000 });
+	const c = await f.next();
+	const [open] = await c.waitFrames(1);
+	const pl = [...open!.payload];
+	const head = [...le16(1), ...le16(24), ...le16(80), 0, 0, 0, 0, ...tlvBytes(1, enc.encode("xterm-256color")), ...tlvBytes(7, [])];
+	assert.deepEqual(pl.slice(0, head.length), head);
+	const rest = pl.slice(head.length);
+	assert.equal(rest[0], 8, "DETACH, not critical");
+	assert.equal(rest[1]! | (rest[2]! << 8), 4 + 32);
+	assert.deepEqual(rest.slice(3, 7), le32(5000));
+	const id = dec.decode(Uint8Array.from(rest.slice(7)));
+	assert.match(id, /^[0-9a-f]{32}$/);
+	assert.equal(rest.length, 3 + 4 + 32, "DETACH is the last option");
+	c.send(OPENED(77, 3, 1, FEAT_DETACH | 7));
+	const s = await p;
+	assert.equal(s.sessionId, id);
+	assert.deepEqual(ttySessions(f.vsock), [{ id, pid: 77, pts: 3, cols: 80, rows: 24 }]);
+	s.resize(100, 30);
+	assert.deepEqual(ttySessions(f.vsock), [{ id, pid: 77, pts: 3, cols: 100, rows: 30 }], "the size last set");
+	await s.close();
+	await tick();
+	assert.deepEqual(ttySessions(f.vsock), [], "an ended session is not listed");
+
+	// Another spawn gets another id; a guest without the feature: an ordinary session.
+	const g = fakeVsock();
+	const p2 = spawnPty(g.vsock, undefined, [], { detachable: true });
+	const c2 = await g.next();
+	const [open2] = await c2.waitFrames(1);
+	assert.notEqual(dec.decode(open2!.payload.slice(-32)), id);
+	c2.send(OPENED(5, 1, 1, 7));
+	const s2 = await p2;
+	assert.equal(s2.sessionId, undefined);
+	assert.deepEqual(ttySessions(g.vsock), []);
+	await s2.close();
+	// Not detachable: no DETACH, no sessionId.
+	const { s: s3, c: c3 } = await session();
+	assert.deepEqual([...c3.frames[0]!.payload.slice(-3)], [7, 0, 0], "USER is the last option");
+	assert.equal(s3.sessionId, undefined);
+	await s3.close();
+
+	assert.throws(() => encodeTtyOpen({ rows: 1, cols: 1, pipes: true, detach: { id: "a" } }), RangeError);
+	for (const timeout of [-1, 1.5, 2 ** 32]) assert.throws(() => encodeTtyOpen({ rows: 1, cols: 1, detach: { id: "a", timeout } }), RangeError, String(timeout));
+	for (const bad of ["", "a/b", "x".repeat(65), "a b", "\u00e9"]) assert.throws(() => encodeTtyAttach({ rows: 1, cols: 1, id: bad }), RangeError, bad);
+});
+
+test("attach(): OPEN with the size, a critical ATTACH and REPLAY; a live Pty with the id; ENOENT for an unknown session and for a guest without ATTACH; ENODEV", async () => {
+	const f = fakeVsock();
+	const p = attachPty(f.vsock, { id: "abc.DEF_1-2", pid: 9, pts: 4, cols: 120, rows: 40 }, { xpixel: 960 });
+	const c = await f.next();
+	const [open] = await c.waitFrames(1);
+	assert.deepEqual([...open!.payload], [...le16(1), ...le16(40), ...le16(120), ...le16(960), 0, 0, ...tlvBytes(9 | 0x80, enc.encode("abc.DEF_1-2")), ...tlvBytes(10, [])]);
+	c.send(OPENED(9, 4, 1, FEAT_DETACH | 7), DATA("replayed"));
+	const s = await p;
+	assert.equal(s.sessionId, "abc.DEF_1-2");
+	assert.equal(s.pid, 9);
+	assert.deepEqual([s.cols, s.rows], [120, 40]);
+	assert.deepEqual(ttySessions(f.vsock).map((t) => t.id), ["abc.DEF_1-2"]);
+	const text = readAll(s);
+	c.send(DATA(" and live"), EXIT(0, 0));
+	assert.equal(await text, "replayed and live");
+	assert.deepEqual(await s.ended, { type: "exit", code: 0 });
+
+	// By id, without replay, with a size: no REPLAY option.
+	const g = fakeVsock();
+	const p2 = attachOn(g.vsock, "s1", { cols: 10, rows: 5, replay: false });
+	const c2 = await g.next();
+	const [open2] = await c2.waitFrames(1);
+	assert.deepEqual([...open2!.payload], [...le16(1), ...le16(5), ...le16(10), 0, 0, 0, 0, ...tlvBytes(9 | 0x80, enc.encode("s1"))]);
+	c2.send(OPENED(1, 2, 1, FEAT_DETACH));
+	await (await p2).close();
+
+	const answer = async (...reply: Uint8Array[]) => {
+		const h = fakeVsock();
+		const q = attachPty(h.vsock, "gone");
+		const d = await h.next();
+		await d.waitFrames(1);
+		d.send(...reply);
+		return q;
+	};
+	await assert.rejects(answer(ERROR("ENOENT: no detachable session gone")), isPtyError("ENOENT", /no detachable session gone/));
+	await assert.rejects(answer(ERROR("unknown critical OPEN option")), isPtyError("ENOENT", /older than ATTACH/));
+	await assert.rejects(answer(ERROR("something else")), isPtyError("EREMOTE", /something else/));
+	await assert.rejects(attachOn(undefined, "x"), isPtyError("ENODEV", /attach\(\)/));
+	await assert.rejects(attachPty(fakeVsock().vsock, "a b"), RangeError);
 });

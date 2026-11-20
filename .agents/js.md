@@ -1249,6 +1249,20 @@ parts that are easy to get wrong.
   198.18.0.0/15 and a bad name fails at connect time. It also has no
   connect acknowledgement (a refused connect becomes a reset), no
   half-close, and flow control in one direction only.
+- `fetchRoutes(inner, routes)` (`net-fetch.ts`) wraps a backend: the host
+  names in `routes` resolve to reserved addresses in 198.51.100.0/24, and
+  port 80 on them is a minimal HTTP/1.1 server (GET and HEAD, keep-alive,
+  pipelined requests answered in order) that answers with `fetch()`: a
+  string route rewrites the prefix (`http://HOST/p` to `BASE/p`) and
+  forwards only Range, If-Range, If-Modified-Since and If-None-Match, a
+  function route gets a `Request`. Other ports on those addresses are refused; everything else
+  goes to `inner`. In a browser the target's CORS must allow those
+  four headers, and one that
+  compresses must expose Content-Encoding (the answer is then chunked;
+  unseen, the decoded body goes out with the encoded length). The wisp spec
+  takes the string form as `routes` (`buildNet()`). The page routes
+  `deb.debian.org` to a CORS mirror (`web/src/config.ts` DEFAULT_ROUTES,
+  `?routes=0` turns it off).
 - Not implemented: IPv6, IP fragments, UDP beyond DHCP and DNS, ICMP beyond
   10.0.2.2/3, SACK, timestamps and inbound connections. A raw-Ethernet
   relay backend is not useful: v86's relay gave DHCP but no upstream DNS

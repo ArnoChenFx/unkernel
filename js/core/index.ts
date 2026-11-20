@@ -14,6 +14,8 @@ export { NetStack, ip4, ip4str } from "./net.ts";
 export type { NetBackend, NetConnection, NetConnectionEvents, NetStackOptions, NetStats } from "./net.ts";
 export { DEFAULT_WISP_SERVERS, wispBackend } from "./net-wisp.ts";
 export type { WispBackend, WispBackendOptions } from "./net-wisp.ts";
+export { fetchRoutes } from "./net-fetch.ts";
+export type { FetchRoute, FetchRoutesBackend, FetchRoutesOptions } from "./net-fetch.ts";
 export { ANSI, ConsoleRouter, IMPORTANT, KSTAMP } from "./console.ts";
 export type { ConsoleRouterOptions, KernelLineInfo } from "./console.ts";
 export { checkJspi, checkSupport } from "./support.ts";

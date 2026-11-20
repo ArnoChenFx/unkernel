@@ -5,12 +5,12 @@
 // (virtual:unkernel-kernel's list) attached read-only.
 //
 // The settings below are kept in localStorage (SETTINGS_KEY: {name: value},
-// only those that differ from the defaults). Each one except ?simulate and
-// ?showcase has a control under Options in the status panel; Reboot saves
+// only those that differ from the defaults). Each one except ?simulate,
+// ?showcase and ?routes has a control under Options in the status panel; Reboot saves
 // them there (ui.ts nextSettings()) and loads the page's bare URL. A URL
 // parameter of the same name overrides the saved one for that load (links,
-// the browser tests); the page never writes the URL. ?simulate and
-// ?showcase are read from the URL only.
+// the browser tests); the page never writes the URL. ?simulate, ?showcase
+// and ?routes are read from the URL only.
 //
 //   ?mem=MiB                           kernel memory (default: auto, from the SDK's autoMemoryMiB():
 //                                      256 on phones, 512 otherwise, less on low-memory devices)
@@ -18,6 +18,9 @@
 //   ?net=0                             no network device (else: the Wisp server(s), default:
 //                                      the project's)
 //   ?wisp=<url>[,<url>...] | ?wisp=0   Wisp servers to race (0 = no network device)
+//   ?routes=0                          URL only: plain HTTP to the hosts of DEFAULT_ROUTES goes
+//                                      through Wisp too (default: answered with fetch() from
+//                                      their CORS mirrors, the SDK's fetchRoutes(); net.ts)
 //   ?jit=0                             kwemu interprets only (default: its JIT tier compiles hot
 //                                      guest code to WebAssembly; counters in KW.jitStats())
 //   ?verbose=1                         write every kernel message to the terminal, in gray
@@ -111,6 +114,15 @@ export const DISTROS_OFFERED: readonly DistroEntry[] = DISTROS;
 /** The ?distro= default. */
 export const DEFAULT_DISTRO = DISTROS_OFFERED.find((d) => d.name === "debian")?.name ?? DISTROS_OFFERED[0]?.name ?? "none";
 
+/**
+ * Plain-HTTP hosts the guest's network answers with fetch() (net.ts), each
+ * from a CORS-enabled mirror with the same paths under the base: Debian's
+ * apt sources. ?routes=0 turns them off.
+ */
+export const DEFAULT_ROUTES: Readonly<Record<string, string>> = Object.freeze({
+	"deb.debian.org": "https://mirror.unkernel.dev/deb",
+});
+
 /** The project's source, linked from About and the boot notes. */
 export const REPO = "https://github.com/pithings/unkernel";
 
@@ -174,6 +186,8 @@ export interface Config {
 	net: boolean;
 	/** ?wisp= servers, or null for the SDK's DEFAULT_WISP_SERVERS. */
 	wisp: string[] | null;
+	/** Plain-HTTP hosts answered with fetch(): DEFAULT_ROUTES, or null with ?routes=0. */
+	routes: Record<string, string> | null;
 	/** kwemu's JIT tier (?jit=0 turns it off). */
 	jit: boolean;
 	/** A display, /dev/fb0 (on unless ?display=0). */
@@ -351,6 +365,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		cmdlineGiven: !!append || !!root,
 		net: wispParam !== "0",
 		wisp: wisp?.length ? wisp : null,
+		routes: url.get("routes") === "0" ? null : { ...DEFAULT_ROUTES },
 		jit: params.get("jit") !== "0",
 		display: params.get("display") !== "0",
 		sound: params.get("sound") !== "0",

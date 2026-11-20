@@ -23,11 +23,13 @@
 //                  kernel bundle's unkernel.datadisk template or bytes;
 //                  the page's /data, openDataDisk())
 //   net    a NetStack over a backend: "direct" (Node: host sockets, the
-//          CLI's default) or "wisp" (a Wisp server; everywhere)
+//          CLI's default) or "wisp" (a Wisp server; everywhere, with
+//          `routes` answered by fetch(), net-fetch.ts)
 
 import { BaseDisk, CowDisk, F_RO, HttpBase, type BlockDevice, type CowDiskStats } from "./block.ts";
 import { BootError } from "./load.ts";
 import { NetStack, type NetBackend } from "./net.ts";
+import { fetchRoutes } from "./net-fetch.ts";
 import { wispBackend } from "./net-wisp.ts";
 
 /** The spec format. A spec may carry `v`; a factory refuses other versions. */
@@ -85,7 +87,11 @@ export interface NetSpec extends SpecCommon {
 	kind: "net";
 	backend:
 		| { kind: "direct" }
-		| { kind: "wisp"; servers: string | string[]; headers?: Record<string, string> };
+		| {
+			kind: "wisp"; servers: string | string[]; headers?: Record<string, string>;
+			/** Plain HTTP to these host names is answered with fetch() from these base URLs (net-fetch.ts fetchRoutes()). */
+			routes?: Record<string, string>;
+		};
 	/** TCP to the gateway (10.0.2.2) goes to the host's 127.0.0.1 (direct only). */
 	hostLoopback?: boolean;
 	mtu?: number;
@@ -189,7 +195,10 @@ export function buildNet(spec: NetSpec, registry: DeviceRegistry | undefined, ct
 	const make = registry?.backends[spec.backend.kind] as ((s: NetBackendSpec, c: DeviceContext) => NetBackend) | undefined;
 	try {
 		if (!make) throw new BootError("support", `network backend "${spec.backend.kind}" is not available on this platform`);
-		return new NetStack({ backend: make(spec.backend, { ...ctx, index: 0 }), hostLoopback: spec.hostLoopback, mtu: spec.mtu, mac: spec.mac, log: ctx.log });
+		const inner = make(spec.backend, { ...ctx, index: 0 });
+		const routes = spec.backend.kind === "wisp" ? spec.backend.routes : undefined;
+		const backend = routes && Object.keys(routes).length ? fetchRoutes(inner, routes, { log: ctx.log }) : inner;
+		return new NetStack({ backend, hostLoopback: spec.hostLoopback, mtu: spec.mtu, mac: spec.mac, log: ctx.log });
 	} catch (e) {
 		if (!spec.optional) throw e;
 		ctx.log(`[host] network left out: ${(e as Error)?.message ?? e}`);

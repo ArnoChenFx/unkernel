@@ -1,23 +1,32 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The suspended session: Suspend (Ctrl-A z, KW.suspend()) saves the running
-// machine with the SDK's snapshot({ stop: true }) and keeps it here, in
+// machine with the SDK's snapshot({ commit }) and keeps it here, in
 // IndexedDB "kwsnap:session-v2" (its own database, older versions are
 // deleted on first use; the data disk's kwdisk:kwdata-v1 is never touched
-// here); the next load offers to resume
-// it (boot.ts). One session at a time: "meta" (small, read to decide
-// whether to offer) and "bytes" (the encoded snapshot, a Blob) are written
-// in one transaction and deleted together. A session saved on several CPUs
+// here); the next load resumes it where it can
+// (boot.ts). One session at a time: "meta" (small, read to decide
+// whether it can resume) and "bytes" (the encoded snapshot, a Blob) are written
+// in one transaction and deleted together. Suspend writes it while the
+// kernel waits at its snapshot point (snapshot({ commit }), boot.ts), and the
+// kernel stops only once that transaction committed: a write that fails
+// (WebKit aborts the IndexedDB transactions of a page in the background, no
+// room) leaves the machine running, and the earlier record as it was (a
+// suspend in the background holds the kernel there instead of stopping it,
+// and deletes the record if the machine goes on: autosuspend.ts). The
+// snapshot is encoded into a Blob before the transaction opens, so it holds
+// only the two puts. A session saved on several CPUs
 // resumes only on as many (every task resumes on the CPU it ran on), with
 // the SMP kernel; its snapshot is bigger (each CPU adds its emulator's 8
 // MiB: about 35 MiB on 2 CPUs, 54 on 4, 90 on 8).
 //
-// Saving when the tab closes is not done: the save needs the kernel to
+// Saving at the moment the tab closes is not done: the save needs the kernel to
 // park, the memory copied and encoded (about 150 ms with the CLI,
 // 2026-11-15) and about 30 MiB committed to IndexedDB, and a page that is
-// going away gets no guarantee that a transaction it starts commits. A snapshot taken
-// without stopping (when the tab is hidden) would not help either: the
-// guest keeps writing /data, which makes it unrestorable within seconds.
+// going away gets no guarantee that a transaction it starts commits. The
+// page suspends a hidden tab instead (autosuspend.ts). A snapshot taken
+// without stopping would not help: the guest keeps writing /data, which
+// makes it unrestorable within seconds.
 import { decodeSnapshot, encodeSnapshot, type DiskSnapshotState, type KernelSnapshot } from "./sdk.ts";
 
 const DB_PREFIX = "kwsnap:session-v";
@@ -39,7 +48,7 @@ function dropOldDbs(): void {
 	}
 }
 
-/** What the page needs to decide whether it can offer to resume. */
+/** What the page needs to decide whether it can resume it. */
 export interface SessionMeta {
 	/** Date.now() when it was saved. */
 	saved: number;
@@ -68,6 +77,16 @@ export interface SessionMeta {
 	 * worker checks it.
 	 */
 	distro?: { name: string; url: string } | null;
+	/** The guest preview panel open at the suspend (the store's preview), opened again on resume once its port answers. */
+	preview?: { port: number; path?: string; shown: boolean; fill: boolean } | null;
+	/**
+	 * The terminal windows 1-9 open at the suspend whose sessions are in the
+	 * snapshot (windows.ts saved(): number, name, session id), opened and
+	 * attached again on resume; absent in sessions from before them.
+	 */
+	windows?: Array<{ n: number; name: string; tty: boolean; id: string }>;
+	/** The window shown at the suspend (0: the console). */
+	win?: number;
 }
 
 export interface SessionDevices {
@@ -90,18 +109,25 @@ function openDb(): Promise<IDBDatabase> {
 	});
 }
 
-async function run<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => Promise<T> | T): Promise<T> {
+/** One transaction; `signal` aborts it (a commit given up: nothing of it is kept). */
+async function run<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => Promise<T> | T, signal?: AbortSignal): Promise<T> {
 	const db = await openDb();
+	const abort = () => { try { tx?.abort(); } catch { /* finished already */ } };
+	let tx: IDBTransaction | undefined;
 	try {
-		const tx = db.transaction(STORE, mode, mode === "readwrite" ? { durability: "strict" } : undefined);
+		signal?.throwIfAborted();
+		tx = db.transaction(STORE, mode, mode === "readwrite" ? { durability: "strict" } : undefined);
+		const t = tx;
 		const done = new Promise<void>((resolve, reject) => {
-			tx.oncomplete = () => resolve();
-			tx.onerror = tx.onabort = () => reject(tx.error ?? new DOMException("IndexedDB transaction aborted", "AbortError"));
+			t.oncomplete = () => resolve();
+			t.onerror = t.onabort = () => reject(t.error ?? (signal?.aborted ? signal.reason : new DOMException("IndexedDB transaction aborted", "AbortError")));
 		});
-		const r = await fn(tx.objectStore(STORE));
+		signal?.addEventListener("abort", abort, { once: true });
+		const r = await fn(t.objectStore(STORE));
 		await done;
 		return r;
 	} finally {
+		signal?.removeEventListener("abort", abort);
 		db.close();
 	}
 }
@@ -120,15 +146,19 @@ export async function loadSession(): Promise<KernelSnapshot> {
 	return decodeSnapshot(new Uint8Array(await b.arrayBuffer()));
 }
 
-/** Encode and keep `snap` (replacing any saved session). Returns the encoded size. */
-export async function saveSession(snap: KernelSnapshot, meta: Omit<SessionMeta, "fingerprint" | "memoryMiB" | "cpus" | "disks" | "bytes">): Promise<number> {
+/**
+ * Encode and keep `snap` (replacing any saved session) in one transaction,
+ * resolved once it committed (strict durability where the engine has it).
+ * `signal` aborts it. Returns the encoded size.
+ */
+export async function saveSession(snap: KernelSnapshot, meta: Omit<SessionMeta, "fingerprint" | "memoryMiB" | "cpus" | "disks" | "bytes">, signal?: AbortSignal): Promise<number> {
 	const bytes = encodeSnapshot(snap);
 	const blob = new Blob([bytes as Uint8Array<ArrayBuffer>]);
 	const full: SessionMeta = { ...meta, fingerprint: snap.fingerprint, memoryMiB: snap.memory.byteLength / 1048576, cpus: snap.cpus ?? 1, disks: snap.disks, bytes: bytes.length };
 	await run("readwrite", (s) => {
 		s.put(blob, "bytes");
 		s.put(full, "meta");
-	});
+	}, signal);
 	return bytes.length;
 }
 

@@ -294,7 +294,7 @@ printf '\\033[90m[run.sh ended (status %s); ./run.sh runs it again]\\033[0m\\n' 
 exec "\${SHELL:-/bin/sh}" -l`;
 
 /** Resolves once http://localhost:port answers at all (any status), or rejects after timeout ms. */
-async function waitPort(vm: KernelHandle, port: number, timeout: number, signal?: AbortSignal) {
+export async function waitPort(vm: KernelHandle, port: number, timeout: number, signal?: AbortSignal) {
 	const end = performance.now() + timeout;
 	for (;;) {
 		signal?.throwIfAborted();
@@ -330,9 +330,9 @@ export const demoWindow = (d: Demo) => KW.windows?.list().find((w) => w.n !== 0 
 export async function launch(d: Demo): Promise<void> {
 	const ui = KW.ui!;
 	const why = unavailable(d);
-	if (why) return ui.toast(`${d.title}: ${why}`);
+	if (why) { ui.toast(`${d.title}: ${why}`); return; }
 	const vm = KW.vm as KernelHandle | undefined;
-	if (!KW.windows || !vm) return ui.toast("The system is not running yet");
+	if (!KW.windows || !vm) { ui.toast("The system is not running yet"); return; }
 	const open = demoWindow(d);
 	if (open) return selectWindow(open.n);
 	if (starting.has(d.id)) return;

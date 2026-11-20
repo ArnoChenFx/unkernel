@@ -90,8 +90,15 @@ export interface KWGlobal {
 	exportData?: () => Promise<{ name: string; blocks: number; bytes: number }>;
 	importData?: (file: Blob | Uint8Array) => Promise<{ size: number; blocks: number }>;
 	resetData?: () => Promise<void>;
-	/** Save the running machine in this browser and stop it (session.ts); the next load offers to resume it. */
-	suspend?: () => Promise<{ bytes: number; ms: number }>;
+	/**
+	 * Save the running machine in this browser and stop it (session.ts); the next load resumes it.
+	 * `hold`: saved, then held at its snapshot point instead of stopped (a suspend in the background; boot.ts).
+	 */
+	suspend?: (opts?: { hold?: boolean }) => Promise<{ bytes: number; ms: number; held?: boolean }>;
+	/** Pause by hand (boot.ts, autosuspend.ts Pause): save and hold until continuePaused(); a failure is a toast (the system runs on). */
+	pause?: () => void;
+	/** End a pause by hand: the machine goes on where it was, and its saved session is deleted. */
+	continuePaused?: () => void;
 	/** The running showcase (showcase.ts): skip the current step, pause and resume between steps. */
 	showcase?: { skip(): void; pause(): void; resume(): void };
 	/** The kernel once user space runs (rejects if it never does), once the boot module runs. */

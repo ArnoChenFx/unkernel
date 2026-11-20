@@ -16,7 +16,7 @@
 //   ⌘K on Apple devices (free there: the terminal sends nothing for ⌘) and
 //   Ctrl-Shift-O everywhere (Ctrl-K is readline's kill-line, so not that);
 // - Ctrl-A p opens the guest preview (preview.ts), or hides and shows it;
-//   Ctrl-A z suspends (session.ts: the next load offers to resume).
+//   Ctrl-A z suspends at once (session.ts: Resume, or the next load, resumes it).
 // While a dialog is open the keys act on it directly (DIALOG_KEYS) and
 // never reach the terminal or the guest under it.
 //
@@ -109,7 +109,7 @@ export const COMMANDS: Command[] = [
 	{ keys: ["p"], label: "Preview a web server in the guest (the last port, or 8000; again hides or shows it)", run: togglePreview },
 	{ keys: ["y"], label: "Copy diagnostics (in a dialog, c also)", run: () => KW.ui!.copyDiagnostics() },
 	{ keys: ["r"], label: "Reboot (asks first)", run: () => KW.ui!.confirmReboot() },
-	{ keys: ["z"], label: "Suspend: save the system in this browser and stop (asks first; the next load offers to resume)", run: () => void KW.ui!.confirmSuspend() },
+	{ keys: ["z"], label: "Suspend: save the system in this browser and stop (Resume, or the next load, resumes it)", run: () => KW.ui!.suspend() },
 	{ keys: ["a"], label: "About: credits and the build", run: openAbout },
 ];
 
@@ -121,7 +121,7 @@ export const DIALOG_KEYS: Array<[string, string]> = [
 	["Tab  ⇧Tab", "Move between controls (they stay in the dialog)"],
 	["c", "Copy diagnostics"],
 	["r", "Reboot (asks first)"],
-	["z", "Suspend (asks first)"],
+	["z", "Suspend"],
 	["Esc  q", "Close"],
 ];
 
@@ -204,7 +204,7 @@ export function installShortcuts(): () => void {
 		else if (e.key === "q") ui.closePanel();
 		else if (e.key === "c") ui.copyDiagnostics();
 		else if (e.key === "r") ui.confirmReboot();
-		else if (e.key === "z") void ui.confirmSuspend();
+		else if (e.key === "z") ui.suspend();
 		else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
 			const body = document.getElementById("pbody");
 			body?.scrollBy({ top: (e.key === "ArrowDown" ? 1 : -1) * 48 });

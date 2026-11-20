@@ -63,6 +63,8 @@ export interface UiState {
 	label: string;
 	/** Suspend saved the system and the kernel stopped (halted): the page offers Resume (components/Overlays.tsx, Bar.tsx). */
 	suspended: boolean;
+	/** The saved session's size in bytes, for the Resume card (0: not known). */
+	suspendedBytes: number;
 	splash: { title: string; msg: string; hidden: boolean; error: boolean; details: boolean };
 	checks: Check[];
 	/** KW.errors, copied on each change. */
@@ -70,7 +72,8 @@ export interface UiState {
 	fatal: { title: string; msg: string; hint: string } | null;
 	panelOpen: boolean;
 	tab: Tab;
-	toast: { msg: string; id: number } | null;
+	/** The toast (ui.toast()); `action`: its one button's label. */
+	toast: { msg: string; id: number; action?: string } | null;
 	dataStatus: string;
 	/** The data disk's blocks in use (non-zero, written at some point) and its size, in bytes; null: none. */
 	disk: { used: number; size: number; saved: boolean } | null;
@@ -89,6 +92,8 @@ export interface UiState {
 	pasteOpen: boolean;
 	/** A question in the confirm dialog (ui.ask()), or null. */
 	ask: Ask | null;
+	/** Paused by hand (boot.ts, autosuspend.ts Pause): saved and held; the notice offers Continue (components/Overlays.tsx). */
+	paused: boolean;
 	/** The shortcut prefix (Ctrl-A, shortcuts.ts) was pressed: the next key is a command. */
 	prefix: boolean;
 	/** The Font size option: "auto" or a size in px. */
@@ -125,6 +130,10 @@ export interface Options {
 	cpus: string;
 	/** The distro image (?distro=): a name, or "none". */
 	distro: string;
+	/** Suspend in the background (?autosuspend=): "0" (off), "now" or seconds. */
+	autosuspend: string;
+	/** Ask before closing (?askleave=0: off). */
+	askleave: "on" | "off";
 }
 
 type Listener = () => void;

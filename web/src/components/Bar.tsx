@@ -134,7 +134,7 @@ function More() {
 		],
 		[
 			...(suspended ? [["Resume", <PlayIcon />, ui.resume] as Item]
-				: state === "running" && KW.suspend ? [["Suspend", <PauseIcon />, () => void ui.confirmSuspend()] as Item] : []),
+				: state === "running" && KW.suspend ? [["Suspend", <PauseIcon />, () => ui.suspend()] as Item] : []),
 			["Reboot", <RebootIcon />, () => void ui.confirmReboot()],
 		],
 		[["About", <svg width="11" height="11" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 23 21.5H1Z" fill="currentColor" /></svg>, openAbout]],
@@ -231,7 +231,7 @@ export function Bar() {
 				)}
 				{suspended
 					? <Seg id="bar-resume" title="Resume the suspended system" label="Resume" onClick={ui.resume} className="text-ok max-sm:hidden"><PlayIcon /></Seg>
-					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="z" label="Suspend" onClick={() => void ui.confirmSuspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
+					: state === "running" && KW.suspend && <Seg id="bar-suspend" title="Suspend: save the system in this browser and stop it" hint="z" label="Suspend" onClick={() => ui.suspend()} className="max-sm:hidden"><PauseIcon /></Seg>}
 				<Seg id="bar-reboot" title="Reboot (asks first while the system runs)" hint="r" label="Reboot" onClick={() => void ui.confirmReboot()} className="max-sm:hidden"><RebootIcon /></Seg>
 				<About hint={<Hint k="a" />} className="max-sm:hidden" />
 				<More />

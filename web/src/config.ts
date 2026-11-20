@@ -79,12 +79,22 @@
 //                                      Firefox; one on phones, on fewer than 4 threads and in
 //                                      WebKit, where several CPUs ran slower), else one.
 //                                      ?cpus=1: one CPU, the UP kernel.
+//   ?autosuspend=now|<s>|0             save the machine and pause it by itself once the tab has been
+//                                      hidden that long (now: at once; seconds; 0: never); it goes
+//                                      on (or, after the page was dropped, resumes) when the tab is
+//                                      shown again (autosuspend.ts, boot.ts); only
+//                                      a machine the user has used since it booted. Default: now
+//                                      on phones and tablets (a background tab may be frozen or
+//                                      discarded at any time), off elsewhere.
+//   ?askleave=0                        no question when the page is closed or left while such a
+//                                      machine runs (beforeunload; staying suspends)
 //   ?showcase[=warm,<step>,...]        URL only: a fast scripted tour of the demos with captions;
 //                                      warm pre-installs them, step ids pick a subset
 //                                      (showcase.ts); read in launcher.ts
 //   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
+import { autoSuspendDefault, parseAutoSuspend } from "./autosuspend.ts";
 
 /** A distro image the page offers (virtual:unkernel-kernel). */
 export interface DistroEntry {
@@ -110,7 +120,7 @@ export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 /** localStorage: the saved settings (the header above), a JSON object of strings. */
 export const SETTINGS_KEY = "kw.settings";
 /** The settings' names. ?net=0 is read as ?wisp=0 and never saved. */
-export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus"];
+export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave"];
 
 /** The saved settings ({} where there are none or localStorage refuses). */
 export function loadSettings(): Record<string, string> {
@@ -204,6 +214,14 @@ export interface Config {
 	shared: boolean;
 	verbose: boolean;
 	simulate: string[];
+	/** Seconds the tab is hidden before the page suspends the machine by itself (0: at once), or null: never (?autosuspend=, autosuspend.ts). */
+	autosuspend: number | null;
+	/** The Auto-suspend option: "0", "now" or seconds. */
+	autosuspendParam: string;
+	/** Its default on this device: "now" on phones and tablets, else "0". */
+	autosuspendDefault: string;
+	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
+	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
 	mobile: boolean;
 	coarse: boolean;
@@ -314,6 +332,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	else if (distroAsked && names.includes(distroAsked)) distroParam = distroAsked;
 	else if (distroAsked) distroWhy = `distro ${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
 	const distro = DISTROS_OFFERED.find((d) => d.name === distroParam) ?? null;
+	const autosuspend = parseAutoSuspend(params.get("autosuspend"), mobile);
 	return {
 		settings: Object.fromEntries(params),
 		kernelUrl: kernelUrl.pathname,
@@ -353,6 +372,10 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		shared: params.get("shared") !== "0",
 		verbose: params.get("verbose") === "1",
 		simulate: (url.get("simulate") || "").split(",").filter(Boolean),
+		autosuspend: autosuspend.delayS,
+		autosuspendParam: autosuspend.value,
+		autosuspendDefault: autoSuspendDefault(mobile),
+		askLeave: params.get("askleave") !== "0",
 		mobile,
 		coarse,
 		mobileUA,

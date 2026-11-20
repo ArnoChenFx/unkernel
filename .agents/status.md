@@ -309,9 +309,10 @@ Open:
 10. **Snapshots** (save and restore the machine). Parking and snapshots
     with the console, disks, display, input, sound, shm, vsock and network
     are in (kernel/parking.md; js.md; data-disk.md): the SDK's
-    `snapshot({ stop })` and `restore` (inline and in worker mode), the
+    `snapshot({ stop })`, `snapshot({ commit })` (stops only once the
+    caller stored it) and `restore` (inline and in worker mode), the
     CLI's `{save=FILE}`, `{suspend=FILE}` and `--restore`, and the page's
-    Suspend and resume offer (web.md). A snapshot stays restorable only
+    Suspend and resume (web.md). A snapshot stays restorable only
     while its disks are unchanged; vsock sessions and guest TCP
     connections do not survive a restore (the guest's ends are reset), but
     host file systems do, with their open files (inline only; worker-mode
@@ -329,9 +330,12 @@ Open:
       woken blocks a snapshot. The SDK error names the blocker; the page
       shows it as a failed Suspend.
     - **Page**: a browser test for Suspend and Resume (checked by hand
-      only); saving by itself when the tab goes away (web.md, Suspend and
-      resume says why not); resuming in place instead of the reload that
-      Resume does.
+      only); suspending in the background (the commit, then the hold
+      that goes on in place when the tab is shown) and the question on
+      leaving tried on real phones, iOS first, and desktop browsers
+      (web.md, Suspend and resume; saving at the moment the tab closes
+      stays out, it says why); resuming in place instead of the reload
+      that Resume does.
     - **Size**: dropping clean page cache before the seal pays off only
       with a root on a disk (the default root is tmpfs: no gain measured,
       2026-11-15).

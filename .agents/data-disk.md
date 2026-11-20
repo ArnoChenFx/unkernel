@@ -166,10 +166,12 @@ kernel/guest.md (Distro images).
   `FILE.kwsnap`. The guest mounts `/data` with `commit=1` and 1 s dirty
   expiry, so a machine that keeps running after a snapshot usually makes
   it unrestorable within seconds; `snapshot({ stop: true })` (the CLI's
-  `{suspend=FILE}`, the page's Suspend, web.md) is the way to save a
-  machine with its data disk.
-- The page calls `sync()` when it is hidden, on `pagehide` and before
-  Reboot. Export, import and reset (`KW.exportData()`, `importData()`,
+  `{suspend=FILE}`) or `snapshot({ commit })` (the page's Suspend, web.md:
+  stopped only once the session is stored, else it runs on and the record
+  never claims the disk) is the way to save a machine with its data disk.
+- The page calls `sync()` when it is hidden (unless it suspends at once
+  then, which seals the disks; web.md, Suspend and resume), on `pagehide`
+  and before Reboot. Export, import and reset (`KW.exportData()`, `importData()`,
   `resetData()`) first stop the running disk's saves and refuse while
   another tab holds the lock.
 

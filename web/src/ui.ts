@@ -6,6 +6,7 @@
 // React components (components/) render. Also the actions those components
 // run: Copy diagnostics, the data disk buttons, the key bar, paste, font size.
 import { flushSync } from "react-dom";
+import { RESUME_AUTO, RESUME_BY_HAND, RESUME_FRESH, allowLeave, resumeAskedFor, resumeRequestKind, type ResumeRequest } from "./autosuspend.ts";
 import { DEFAULT_CMDLINE, DEFAULT_DISTRO, SETTING_NAMES, saveSettings, type Config } from "./config.ts";
 import { KW, type KWError } from "./kw.ts";
 import { initStore, type Ask, type PadLayout, type CheckResult, type Options, type State, type Tab, type UiState } from "./store.ts";
@@ -25,18 +26,48 @@ export function store(k: string, v?: string): string | null {
 	return null;
 }
 
-/** sessionStorage: the Resume button reloaded the page, so resume the suspended session without asking. */
+/**
+ * sessionStorage: what this tab's next load does with the suspended
+ * session: "1" resume it after the Resume button, "auto" after a suspend in
+ * the background (autosuspend.ts), "fresh" boot fresh after Reboot
+ * (autosuspend.ts resumeChoice()). A plain load resumes a session it can
+ * too. Every resume is quiet and ends in the same toast (boot.ts).
+ */
 const RESUME_KEY = "kw-resume";
-/** True once after the Resume button's reload (boot.ts). */
-export function takeResumeRequest(): boolean {
+/**
+ * Resume on this tab's next load. `auto`: after a suspend in the background
+ * (boot.ts; a reload after the browser discarded the tab resumes too).
+ */
+export function setResumeRequest(auto = false): void {
+	try { sessionStorage.setItem(RESUME_KEY, auto ? RESUME_AUTO : RESUME_BY_HAND); } catch { /* a plain load, which resumes it too */ }
+}
+/** Do not resume on the next load after all (boot.ts: a held machine went on, so its saved session is stale). */
+export function clearResumeRequest(): void {
+	try { sessionStorage.removeItem(RESUME_KEY); } catch { /* nothing set */ }
+}
+/** What the last load asked of this one, read once (boot.ts): "auto", "hand", "fresh" or null. */
+export function takeResumeRequest(): ResumeRequest {
 	try {
 		const v = sessionStorage.getItem(RESUME_KEY);
 		sessionStorage.removeItem(RESUME_KEY);
-		return v === "1";
+		return resumeRequestKind(v);
 	} catch {
-		return false;
+		return null;
 	}
 }
+/** The same without taking it (the splash, before boot.ts runs). */
+function peekResumeRequest(): ResumeRequest {
+	try { return resumeRequestKind(sessionStorage.getItem(RESUME_KEY)); } catch { return null; }
+}
+/** Reload and resume (boot.ts reads RESUME_KEY once); `auto`: after a suspend in the background. */
+function reloadToResume(auto: boolean): void {
+	setResumeRequest(auto);
+	allowLeave();
+	location.reload();
+}
+
+/** The "Suspending…" toast stays up to this long (the save takes about a second; the Resume card replaces it). */
+const SUSPEND_TOAST_MS = 20000;
 
 const padLayout = (v: string | null): PadLayout => (v === "keys" ? v : "gamepad");
 
@@ -86,6 +117,19 @@ function hintFor(msg: string): string {
 
 const LABEL: Record<State, string> = { checking: "Checking", loading: "Downloading", booting: "Booting", running: "Running", halted: "Halted", error: "Error" };
 
+/**
+ * The tab title's first character: ▶ running, ‖ paused (held in the
+ * background, boot.ts) or suspended, … starting, resuming or suspending,
+ * ■ halted or powered off, ! failed. Plain text glyphs (▶ with U+FE0E, the
+ * text presentation, so no browser draws it as a colour emoji).
+ */
+export function titleMark(state: State, label: string, suspended: boolean): string {
+	if (state === "error") return "!";
+	if (state === "halted") return suspended || label === "Suspended" ? "‖" : "■";
+	if (state === "running") return label === "Paused" ? "‖" : label === "Suspending" ? "…" : "▶︎";
+	return "…";
+}
+
 interface Stage { id: string; label: string; s: StageState; t0: number | null; t1: number | null; detail: string }
 export interface LogLine { t: number; line: string; cls: string }
 
@@ -111,13 +155,18 @@ export function createUi(cfg: Config) {
 		worker: cfg.workerParam ? "on" : "off",
 		cpus: String(cfg.smpParam),
 		distro: cfg.distroParam,
+		autosuspend: cfg.autosuspendParam,
+		askleave: cfg.askLeave ? "on" : "off",
 	};
 	// Where the root's changes live on the data disk: per distro (guest/base/initramfs/init).
 	const upperDir = `/data/distros/${cfg.guest}/upper`;
 	const imageName = `${cfg.guest} image`;
 	const $ = initStore({
-		state: "checking", label: LABEL.checking, suspended: false,
-		splash: { title: "Starting", msg: "Loading the page scripts…", hidden: false, error: false, details: false },
+		state: "checking", label: LABEL.checking, suspended: false, suspendedBytes: 0,
+		// A resume asked for (the Resume button, a suspend in the background) keeps the splash until the screen is restored (boot.ts).
+		splash: resumeAskedFor(peekResumeRequest()) && !cfg.verbose
+			? { title: "Resuming", msg: "Restoring the suspended session…", hidden: false, error: false, details: false }
+			: { title: "Starting", msg: "Loading the page scripts…", hidden: false, error: false, details: false },
 		checks: [], errors: [], fatal: null,
 		panelOpen: false, tab: "status", toast: null,
 		dataStatus: "Not attached yet.", disk: null,
@@ -125,7 +174,7 @@ export function createUi(cfg: Config) {
 			? `Safe mode: the root is the plain ${imageName} (kw.root=initramfs, until you leave safe mode); /data is mounted as usual and your root changes stay in ${upperDir}. kw-overlay status explains, sudo kw-overlay discard starts over from the image.`
 			: null,
 		distro: cfg.distro ? { name: cfg.distro.name, image: cfg.distro.imageId ?? "", url: cfg.distro.url } : null,
-		ctrl: false, keysOn: false, pasteOpen: false, ask: null, prefix: false,
+		ctrl: false, keysOn: false, pasteOpen: false, ask: null, paused: false, prefix: false,
 		fontPref, fontSize: cfg.fontSize, copyText: null,
 		display: { attached: false, shown: true, width: 0, height: 0, keyboard: false, mouse: false, tablet: false,
 			rotate: store("fbRotate") === "1", layout: padLayout(store("padLayout")),
@@ -134,6 +183,24 @@ export function createUi(cfg: Config) {
 		win: 0, wins: [], preview: null, launcher: false,
 		options,
 	} satisfies UiState);
+
+	// ---- the tab's title ---------------------------------------------------
+	// One character before the title says how the machine is (titleMark()),
+	// set synchronously with each state change, so the tab switcher shows it
+	// even when the page is frozen right after (a hold begins as the tab hides).
+	// Whatever else sets the title keeps its text: only our own mark is replaced.
+	let markPrefix = "";
+	const showMark = () => {
+		const s = $.get();
+		const prefix = `${titleMark(s.state, s.label, s.suspended)} `;
+		if (prefix === markPrefix && document.title.startsWith(prefix)) return;
+		const cur = document.title;
+		const base = markPrefix && cur.startsWith(markPrefix) ? cur.slice(markPrefix.length) : cur;
+		markPrefix = prefix;
+		document.title = prefix + (base || "unkernel");
+	};
+	$.subscribe(showMark);
+	showMark();
 
 	// ---- boot stages ------------------------------------------------------
 	// Timed here, shown on the terminal by boot.ts and in Copy diagnostics.
@@ -153,6 +220,7 @@ export function createUi(cfg: Config) {
 	let opener: HTMLElement | null = null;
 	let toastId = 0, toastTimer: ReturnType<typeof setTimeout> | undefined;
 	let askId = 0, answer: ((ok: boolean) => void) | null = null;
+	let toastRun: (() => void) | null = null;
 
 	const ui = {
 		state: (): State => $.get().state,
@@ -253,26 +321,33 @@ export function createUi(cfg: Config) {
 				!await ui.ask({ title: "reboot", msg: "The running system and its unsaved state are lost.", ok: "Reboot", danger: true })) return;
 			reboot();
 		},
-		/** Suspend from a shortcut or the dialog: asks first (boot.ts does it: KW.suspend). */
-		async confirmSuspend() {
-			if (!KW.suspend || $.get().state !== "running") { ui.toast("Suspend works once the system runs"); return; }
-			if (!await ui.ask({ title: "suspend", msg: "Save the running system in this browser and stop it? The next load offers to resume it. Terminal windows 1-9 and network connections do not survive.", ok: "Suspend" })) return;
+		/**
+		 * Suspend from a shortcut, the status line or the dialog, at once (boot.ts
+		 * does it: KW.suspend). Nothing to confirm: the machine stops only once its
+		 * session is stored, and Resume (or the next load) brings it back.
+		 */
+		suspend() {
+			const s = $.get();
+			if (!KW.suspend || s.state !== "running") { ui.toast("Suspend works once the system runs"); return; }
+			if (s.label === "Suspending") return; // pressed twice
 			ui.closePanel();
-			ui.toast("Suspending…");
-			KW.suspend().then((r) => ui.toast(`Suspended: ${fmtMiB(r.bytes)} saved in this browser`),
+			// The Resume card says the rest (the size included), so this toast goes once it is saved.
+			const id = ui.toast("Suspending…", { ms: SUSPEND_TOAST_MS });
+			KW.suspend().then(() => ui.toastHide(id),
 				(e: Error) => KW.report("suspend", `Suspend failed: ${e?.message ?? String(e)}`, e?.stack ?? "", false));
 		},
-		/** boot.ts, once Suspend has saved the system and the kernel stopped. */
-		setSuspended() { $.set({ suspended: true }); },
+		/** boot.ts, once Suspend has saved the system (`bytes`: its size) and the kernel stopped: the Resume card. */
+		setSuspended(bytes = 0) { $.set({ suspended: true, suspendedBytes: bytes }); },
+		/** boot.ts: paused by hand (autosuspend.ts Pause), saved and held: the notice with Continue (components/Overlays.tsx). */
+		setPaused(on: boolean) { if ($.get().paused !== on) $.set({ paused: on }); },
 		/**
-		 * Resume after Suspend: reload the page and resume without asking
+		 * Resume after Suspend: reload the page and resume
 		 * (boot.ts reads RESUME_KEY once). The reload keeps the URL, so the
 		 * devices match the saved session.
 		 */
-		resume() {
-			try { sessionStorage.setItem(RESUME_KEY, "1"); } catch { /* the next load asks instead */ }
-			location.reload();
-		},
+		resume() { reloadToResume(false); },
+		/** The same after a suspend in the background (autosuspend.ts). */
+		resumeAuto() { reloadToResume(true); },
 
 		/**
 		 * Ask in the confirm dialog (components/Overlays.tsx, a modal <dialog>)
@@ -289,10 +364,32 @@ export function createUi(cfg: Config) {
 		/** The confirm dialog's answer. */
 		answer(ok: boolean) { answer?.(ok); },
 
-		toast(msg: string) {
-			$.set({ toast: { msg: msg.length > 140 ? `${msg.slice(0, 137)}…` : msg, id: ++toastId } });
+		/**
+		 * A short message at the bottom right, for `ms` (default 3.2 s). With
+		 * `action`, one button that runs `run` and hides the toast (it does not
+		 * take the focus). Returns its id, for toastHide().
+		 */
+		toast(msg: string, o: { action?: string; run?: () => void; ms?: number } = {}): number {
+			const id = ++toastId;
+			toastRun = o.action && o.run ? o.run : null;
+			$.set({ toast: { msg: msg.length > 140 ? `${msg.slice(0, 137)}…` : msg, id, ...(toastRun ? { action: o.action } : {}) } });
 			clearTimeout(toastTimer);
-			toastTimer = setTimeout(() => $.set({ toast: null }), 3200);
+			toastTimer = setTimeout(() => ui.toastHide(id), o.ms ?? 3200);
+			return id;
+		},
+		/** Hide the toast (only toast `id`, if given). */
+		toastHide(id?: number) {
+			const t = $.get().toast;
+			if (!t || (id !== undefined && t.id !== id)) return;
+			clearTimeout(toastTimer);
+			toastRun = null;
+			$.set({ toast: null });
+		},
+		/** The toast's button. */
+		toastAction() {
+			const run = toastRun;
+			ui.toastHide();
+			run?.();
 		},
 
 		/** The Data disk section's status line (boot.ts). */
@@ -465,6 +562,9 @@ export function createUi(cfg: Config) {
 		const cpuNext = o.worker === "on" && !cfg.smpBlocked && cfg.cpuSuggested ? cfg.cpuSuggested : 1;
 		set("cpus", o.cpus === String(cpuNext) ? null : o.cpus);
 		set("distro", o.distro === DEFAULT_DISTRO ? null : o.distro);
+		// Auto-suspend: saved only where it differs from this device's default (config.ts).
+		set("autosuspend", o.autosuspend === cfg.autosuspendDefault ? null : o.autosuspend);
+		set("askleave", o.askleave === "off" ? "0" : null);
 		return Object.fromEntries([...p].sort(([a], [b]) => a.localeCompare(b)));
 	}
 	/** The options differ from the settings this load booted with (the Reboot button says so). */
@@ -488,6 +588,10 @@ export function createUi(cfg: Config) {
 		for (const k of SETTING_NAMES) u.searchParams.delete(k);
 		if (!saveSettings(next)) for (const [k, v] of Object.entries(next)) u.searchParams.set(k, v);
 		const go = () => {
+			// A boot from scratch: not the resume a background suspend asked for (setResumeRequest()), nor the one a
+			// plain load does (boot.ts: a saved session is kept, or with a data disk asked about), and no question on leaving.
+			try { sessionStorage.setItem(RESUME_KEY, RESUME_FRESH); } catch {}
+			allowLeave();
 			if (u.href === location.href) location.reload();
 			else location.assign(u);
 		};

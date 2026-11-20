@@ -24,6 +24,16 @@
 //   it (or window 0). A lost session or a failed one keeps the window
 //   with a message until it is closed (Enter in it, or the prefix, x). The kernel stopping
 //   (halt, power off, reboot, panic) closes them all.
+// - Suspend and resume: every window's session is detachable (kwtty's
+//   DETACH, js.md), so the restore's reset of its connection leaves its
+//   shell and programs running in the guest. The suspend records the open
+//   windows (saved(): number, name, session id) in the session record, and
+//   the resume opens them again with the same numbers and names and
+//   attach()es each (reattach()); kwtty replays the session's recent
+//   output into the fresh terminal and makes a full-screen program redraw.
+//   A session that is gone (not attached within kwtty's 60 s) gives a tty N
+//   window a new shell, with a gray line saying so; a named window (a demo)
+//   shows that it ended.
 // - Each window's size follows the stage like window 0's (the hidden ones
 //   too: they are hidden with visibility, so they keep their box), and goes
 //   to the shell with resize() (SIGWINCH).
@@ -136,6 +146,16 @@ export interface WindowsOptions {
 	autoFocus: boolean;
 }
 
+/** A window as the session record keeps it across a suspend (SessionMeta.windows). */
+export interface SavedWindow {
+	n: number;
+	name: string;
+	/** A tty N window (no name given). */
+	tty: boolean;
+	/** Its session's id (Pty.sessionId), for attach(). */
+	id: string;
+}
+
 export interface Windows extends WindowsApi {
 	/** The current window's terminal. */
 	currentTerm(): WTerm;
@@ -147,6 +167,10 @@ export interface Windows extends WindowsApi {
 	setFont(px: number): void;
 	/** The kernel stopped: close every window (window 0 stays). */
 	closeAll(): void;
+	/** The open windows whose sessions can be reattached after a restore (those among `ttys`, a snapshot's, when given). */
+	saved(ttys?: readonly { id: string }[]): SavedWindow[];
+	/** After a resume: open the saved windows again and attach their sessions; `current` is shown. */
+	reattach(list: readonly SavedWindow[], current?: number): void;
 }
 
 /** An error from open() after the window was made: the window shows it. */
@@ -330,6 +354,7 @@ export function createWindows(opts: WindowsOptions): Windows {
 				"The distro's init must keep /usr/bin/kwtty serve running (Alpine: the line ::respawn:/usr/bin/kwtty serve in /etc/inittab). " +
 				"A root changed on the data disk can hide the image's init files (kw-overlay status says where the changes are).";
 		if (code === "ENODEV") return "This kernel was started without the vsock device, so it has no terminal sessions.";
+		if (code === "ENOENT") return `The session did not survive the suspend: ${(e as Error).message.replace(/^kwtty: /, "")}`;
 		if (code === "EREMOTE") return `The guest refused the session: ${(e as Error).message.replace(/^kwtty: /, "")}`;
 		return `The terminal session could not open: ${(e as Error)?.message ?? e}`;
 	}
@@ -342,9 +367,10 @@ export function createWindows(opts: WindowsOptions): Windows {
 		p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
 	});
 
-	async function open({ select: sel = true, name, file, args }: { select?: boolean; name?: string; file?: string; args?: string[] } = {}): Promise<WindowInfo> {
+	/** attach: the session to take over (a resume), in window `at` if it is free. */
+	async function open({ select: sel = true, name, file, args, at, attach }: { select?: boolean; name?: string; file?: string; args?: string[]; at?: number; attach?: string } = {}): Promise<WindowInfo> {
 		if (!opts.alive()) throw new Error("The kernel is not running: reboot to open terminal windows");
-		let n = 1;
+		let n = at !== undefined && !wins.has(at) ? at : 1;
 		while (wins.has(n)) n++;
 		if (n > MAX_WINDOWS) throw new Error(`All ${MAX_WINDOWS} terminal windows are open`);
 		const tty = name === undefined;
@@ -388,7 +414,23 @@ export function createWindows(opts: WindowsOptions): Windows {
 		try {
 			const vm = await abortable(opts.ready(), w.abort.signal);
 			const px = pixels(w);
-			s = await vm.spawn(file, args ?? [], { cols: w.term.cols, rows: w.term.rows, xpixel: px.x, ypixel: px.y, timeout: OPEN_TIMEOUT, signal: w.abort.signal });
+			const size = { cols: w.term.cols, rows: w.term.rows, xpixel: px.x, ypixel: px.y, timeout: OPEN_TIMEOUT, signal: w.abort.signal };
+			// Detachable: the session outlives a suspend (see the top).
+			const spawn = () => vm.spawn(file, args ?? [], { ...size, detachable: true });
+			if (attach === undefined) s = await spawn();
+			else {
+				try {
+					s = await vm.attach(attach, size);
+				} catch (e) {
+					// Gone (kwtty hung it up, or the guest cannot reattach): a tty N window gets a new shell.
+					if (!(e instanceof PtyError && e.code === "ENOENT") || !tty || w.gone) throw e;
+					clearTimeout(waitTimer);
+					if (waiting) write(w, "\r\x1b[2K");
+					waiting = false;
+					write(w, `${SGR.gray}[host] window ${n}: the suspended session is gone (${e.message.replace(/^kwtty: /, "")}); a new shell${SGR.off}\r\n`);
+					s = await spawn();
+				}
+			}
 		} catch (e) {
 			clearTimeout(waitTimer);
 			const msg = openFailure(e);
@@ -452,6 +494,19 @@ export function createWindows(opts: WindowsOptions): Windows {
 				const s = w.session;
 				remove(w);
 				if (s) void s.close().catch(() => {});
+			}
+		},
+		saved(ttys) {
+			const ids = ttys && new Set(ttys.map((t) => t.id));
+			return [...wins.values()].sort((a, b) => a.n - b.n)
+				.filter((w) => w.state === "open" && w.session?.sessionId !== undefined && (!ids || ids.has(w.session.sessionId)))
+				.map((w) => ({ n: w.n, name: w.name, tty: w.tty, id: w.session!.sessionId! }));
+		},
+		reattach(list, current) {
+			for (const sw of [...list].sort((a, b) => a.n - b.n)) {
+				if (!Number.isInteger(sw?.n) || sw.n < 1 || sw.n > MAX_WINDOWS || wins.has(sw.n) || typeof sw.id !== "string") continue;
+				// A failure stays in its window (open() shows it).
+				open({ at: sw.n, name: sw.tty ? undefined : String(sw.name), attach: sw.id, select: sw.n === current }).catch(() => {});
 			}
 		},
 	};

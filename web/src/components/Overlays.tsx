@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The splash card over the stage (before the terminal shows the boot, and
-// for an early failure), the Resume card after Suspend, the toast, and the
-// paste dialog (the key bar's Paste where the Clipboard API is unavailable).
+// for an early failure), the Resume card after Suspend (and the Continue
+// card while paused) in the middle of the stage, the toast, and the paste dialog (the key bar's Paste
+// where the Clipboard API is unavailable).
 import { useEffect, useRef, useState } from "react";
 import { KW } from "../kw.ts";
 import { useStore } from "../store.ts";
+import { fmtMiB } from "../ui.ts";
 import { Mark } from "./icons.tsx";
 
 /**
@@ -36,32 +38,73 @@ export function Splash() {
 }
 
 /**
- * After Suspend: a small card at the bottom of the stage with Resume, which
- * reloads the page and resumes without asking (ui.resume). The terminal
- * above it keeps showing the last output.
+ * After Suspend: a card in the middle of the stage with Resume, which
+ * reloads the page and resumes (ui.resume()). Paused by hand (boot.ts,
+ * autosuspend.ts Pause): the same card with Continue, which lets the held
+ * machine go on. App.tsx puts it over every window (the display, the
+ * preview, the terminal windows), whose last screen shows dimmed behind it;
+ * the dim takes no clicks, so the terminal still scrolls.
+ *
+ * Focus: Resume takes it when the card appears (the stopped machine takes no
+ * keys), so Enter or Space resumes; not from a field or dialog the user is
+ * in. Continue does not: any key typed for the guest continues (boot.ts
+ * guestKey), so the focus stays in the terminal; Tab reaches the button.
  */
 export function ResumeCard() {
 	const suspended = useStore((s) => s.suspended);
-	if (!suspended) return null;
+	const paused = useStore((s) => s.paused);
+	const bytes = useStore((s) => s.suspendedBytes);
+	const resume = useRef<HTMLButtonElement>(null);
+	useEffect(() => {
+		if (!suspended) return;
+		const a = document.activeElement;
+		if (a?.closest?.("#panel, #confirm, #paste, #launcher, #copy-area") || (a?.closest?.("input, select, textarea, [contenteditable]") && !a.closest("#terms"))) return;
+		resume.current?.focus({ preventScroll: true });
+	}, [suspended]);
+	if (!suspended && !paused) return null;
+	const title = suspended ? "suspended" : "paused";
+	const msg = suspended
+		? `The system is saved in this browser${bytes ? ` (${fmtMiB(bytes)})` : ""}.`
+		: "The session is saved in this browser: you can close this tab.";
 	return (
-		<div id="resume-card" role="status" className="pointer-events-none absolute inset-x-0 bottom-4 z-1 flex justify-center px-4">
-			<div className="pointer-events-auto flex max-w-full items-center gap-3 border border-line-strong bg-bg px-4 py-3 font-mono text-[12.5px] shadow-[0_16px_48px_rgba(0,0,0,.8)]">
-				<span className="text-muted">Suspended: the system is saved in this browser.</span>
-				<button id="resume" type="button" className="btn btn-sm btn-primary flex-none" onClick={() => KW.ui!.resume()}>Resume</button>
-			</div>
+		<div id="resume-card" data-paused={(!suspended && paused) || undefined}
+			className="pointer-events-none absolute inset-0 z-20 grid place-items-center bg-black/40 px-4">
+			<section role="region" aria-labelledby="resume-card-title"
+				className="pointer-events-auto relative w-[min(360px,100%)] border border-line-strong bg-bg px-5 pt-6 pb-5 font-mono text-[12.5px] shadow-[0_16px_48px_rgba(0,0,0,.8)]">
+				<h2 id="resume-card-title" className="absolute -top-2 left-3 bg-bg px-1.5 text-[12px] leading-4 font-normal"><span className="text-faint">┤</span> {title} <span className="text-faint">├</span></h2>
+				<p id="resume-card-msg" role="status" className="leading-relaxed text-muted">{msg}</p>
+				{suspended
+					? <button id="resume" ref={resume} type="button" aria-describedby="resume-card-msg"
+						className="btn btn-primary mt-4 w-full pointer-coarse:h-11" onClick={() => KW.ui!.resume()}>Resume</button>
+					: <>
+						<button id="continue" type="button" aria-describedby="resume-card-msg"
+							className="btn btn-primary mt-4 w-full pointer-coarse:h-11" onMouseDown={(e) => e.preventDefault()}
+							onClick={() => { KW.continuePaused?.(); if (!KW.config.coarse) KW.term?.focus(); }}>Continue</button>
+						{!KW.config.coarse && <p className="mt-2 text-center text-[11.5px] text-faint">or press any key</p>}
+					</>}
+			</section>
 		</div>
 	);
 }
 
+/**
+ * The toast (ui.toast()): a line at the bottom right, over everything, that
+ * goes by itself. One may carry a button (`action`, ui.toastAction()); a
+ * mouse click on it leaves the focus where it was (the terminal).
+ */
 export function Toast() {
 	const t = useStore((s) => s.toast);
 	// Keep the last message while it fades out.
-	const last = useRef("");
-	if (t) last.current = t.msg;
+	const last = useRef<{ msg: string; action?: string }>({ msg: "" });
+	if (t) last.current = t;
 	return (
 		<div id="toast" role="status" aria-live="polite" data-show={!!t || undefined}
-			className="pointer-events-none fixed right-[max(12px,var(--sr))] bottom-[calc(var(--bar-h)+var(--sb)+8px)] z-40 max-w-[min(640px,calc(100%-24px))] translate-y-1 bg-fg px-2.5 py-1.5 font-mono text-[12px] text-black opacity-0 shadow-[0_8px_30px_rgba(0,0,0,.6)] transition-[opacity,translate] duration-150 data-show:translate-y-0 data-show:opacity-100">
-			{last.current}
+			className={`${t?.action ? "pointer-events-auto flex items-center gap-3" : "pointer-events-none"} fixed right-[max(12px,var(--sr))] bottom-[calc(var(--bar-h)+var(--sb)+8px)] z-40 max-w-[min(640px,calc(100%-24px))] translate-y-1 bg-fg px-2.5 py-1.5 font-mono text-[12px] text-black opacity-0 shadow-[0_8px_30px_rgba(0,0,0,.6)] transition-[opacity,translate] duration-150 data-show:translate-y-0 data-show:opacity-100`}>
+			<span>{last.current.msg}</span>
+			{t?.action && (
+				<button id="toast-action" type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => KW.ui!.toastAction()}
+					className="flex-none cursor-pointer border border-black px-2 py-0.5 font-medium hover:bg-black hover:text-fg">{t.action}</button>
+			)}
 		</div>
 	);
 }

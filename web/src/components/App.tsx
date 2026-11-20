@@ -50,9 +50,10 @@ export function App() {
 					<main id="stage" ref={setStageEl} className="relative min-h-0 min-w-0 flex-1 pt-[max(8px,var(--st))] pr-[max(12px,var(--sr))] pb-1 pl-[max(12px,var(--sl))]">
 						<TermHost />
 						<Splash />
-						<ResumeCard />
 					</main>
 					<Preview />
+					{/* Over the stage and whatever window is shown on it: the display (z-10), the preview (z-15). */}
+					<ResumeCard />
 				</div>
 				<Keys />
 				<Bar />

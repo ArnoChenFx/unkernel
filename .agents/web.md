@@ -18,7 +18,7 @@ drive, plus `nextSettings()`), `shortcuts.ts`, `boot.ts` (terminal and boot,
 a separate chunk loaded only after the preflight passes), `windows.ts`
 (terminal windows 1-9), `bottom.ts` (keeps a terminal at its bottom when
 it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `download.ts` (files the page fetches for the guest), `sudo.ts` (root in the guest: `SUDO_SH`, `execAsRoot()`), `sdk.ts`, `kw.ts` (`window.KW`),
-`data.ts` (the data disk), `session.ts` (the suspended session), `display.ts` (the guest display's state, the
+`data.ts` (the data disk), `session.ts` (the suspended session), `autosuspend.ts` (suspending in the background and the question on leaving: when, decided without a DOM), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
 `preview.ts` (the guest preview's page side), `open.ts` (the guest's
 `open` and `xdg-open`, host commands: a URL on the guest's own address in
@@ -159,7 +159,7 @@ deploying the page needs no kernel toolchain.
     max-age=31536000, immutable`, with the strong ETag
     `"<hash>-<size in hex>"`, the same on every server and deploy. A new
     image is a new URL, so a session suspended on the old one is not
-    offered (Suspend and resume).
+    resumed (Suspend and resume).
   - The built Node server answers them in `web/server/distros.ts` (a Nitro
     handler for `/distros/**`, reading `../public/distros/` next to its
     `index.mjs`). On Vercel the CDN serves them as static files (its
@@ -256,6 +256,14 @@ deploying the page needs no kernel toolchain.
   status bar style is `black`, not `black-translucent`: with that, iOS 26+ makes the
   viewport shorter than the screen by the status bar and shows nothing below it (WebKit
   bug 301108). iOS reads the style when the app is added to the home screen.
+- The tab's title is `<mark> unkernel`: one character for the machine's
+  state (ui.ts `titleMark()`, from the store's state, label and
+  `suspended`, set in the store's listener, so synchronously with each
+  change and before a hidden page may be frozen): `▶` (U+25B6 with U+FE0E,
+  text presentation) running, `‖` paused (held in the background or by
+  Pause) or suspended, `…` starting, resuming or suspending, `■` halted or
+  powered off, `!` failed. Only that mark is replaced; the rest of the
+  title is kept as found.
 - An unknown or failed boot step must end in `ui.fail(...)`, so the
   indicator turns red and the panel opens. The page must never stay blank.
   `index.html` installs `error`/`unhandledrejection` handlers first and
@@ -299,7 +307,9 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   unread `Pty` blocks its programs; the reader takes the next chunk only
   after `write()` returned and yields a task (a MessageChannel, which
   background tabs do not throttle) every 16 ms or 256 KiB. `KW.windows`
-  is their API. Checked by hand only (no browser test yet).
+  is their API. Every window's session is detachable (`detachable: true`),
+  so it survives Suspend and resume (below). Checked by hand only (no
+  browser test yet).
 - Worker mode (the default where the page is cross-origin isolated, else
   off; `?worker=0` / `?worker=1` pick; implied by several CPUs) boots through the SDK's worker mode (js.md):
   the page compiles the kernel and passes the `WebAssembly.Module`; disks
@@ -506,23 +516,52 @@ other options.
 
 Suspend (Ctrl-A z, `z` in the dialog, the dialog footer's `#suspend`, the
 status line's pause icon `#bar-suspend` while the system runs, or
-`KW.suspend()` without asking) saves the running machine with the SDK's
-`snapshot({ stop: true })` (js.md, Snapshots), inline or in worker mode, and
-stops it. The page then shows "Suspended", the store's `suspended` is set,
-and a Resume card (`#resume`, Overlays.tsx) sits at the bottom of the stage,
-with a play icon `#bar-resume` in the status line. Resume (`ui.resume()`)
+`KW.suspend()`; `ui.suspend()`, no question: the machine stops only once its
+session is stored, and Resume brings it back) saves the running machine with the SDK's
+`snapshot({ commit })` (js.md, Snapshots), inline or in worker mode: the
+kernel waits at its snapshot point while the page writes the session, and
+stops only once that transaction committed. A write that fails, or that
+takes longer than 20 s of awake time (`SUSPEND_COMMIT_MS` in boot.ts; a
+page frozen meanwhile does not use it up), leaves the machine running and
+the saved session as it was (`SuspendSaveError`, autosuspend.ts: "the
+session was not saved (why); the system runs on"); a record written but
+given up after all (the timeout came first) is deleted. The page then shows "Suspended" (an `[  OK  ]` line, not a red
+notice; the "Suspending…" toast goes), the store's `suspended` is set,
+and a Resume card (`#resume-card` with `#resume`, Overlays.tsx: "The system
+is saved in this browser (N MiB).") sits in the middle of the stage, over
+whatever window is shown there (App.tsx renders it above the display and
+the preview), which shows dimmed behind it (the dim takes no clicks), with
+a play icon `#bar-resume` in the status line. Resume takes the focus when
+the card appears (not from a field or dialog the user is in), so Enter or
+Space resumes; toasts keep their corner, below it. Resume (`ui.resume()`)
 sets sessionStorage `kw-resume` and reloads the same URL; the load reads it
-once and resumes without asking. A plain load offers to resume (`ui.ask`
-with Resume and Boot fresh) before the kernel starts.
+once and resumes. A plain load resumes a session it can resume as it is too,
+without a question. Every resume of a saved session (the Resume button, a
+plain load, a suspend in the background, the reload on the session's CPU
+count) is quiet (below) and ends in the same informational toast, "Resumed
+the session suspended …" (`sayResumed()` in boot.ts, 5 s,
+`RESUMED_TOAST_MS`; a hidden tab gets it once shown); a machine that goes
+on in place (a hold in the background ended, Continue) never stopped and
+shows nothing. Reboot sets
+`kw-resume` to `fresh` and first deletes any record of the running machine
+still saved (held, the resumed one, one a given-up save left;
+`KW.beforeReboot`); the load after it boots fresh and, for a session it
+could resume (one kept from before), keeps it without a data disk (the next
+plain load resumes it) and asks with one (Resume, or Boot fresh, which
+deletes it: the fresh boot changes the disk; autosuspend.ts
+`resumeChoice()`). So Reboot never leads to the same session again.
 
 - `session.ts` keeps one session in IndexedDB `kwsnap:session-v2`, its own
   database (the first open on a page deletes `kwsnap:session-v1` and any
   other older version, unawaited): `meta` (time, the page's kernel URL, UP
   or SMP, the CPU count, the banner, the device
-  options, the disks' snapshot state, the console's last 64 KiB) and
-  `bytes` (the `encodeSnapshot()` Blob), written in one transaction. It
-  never opens `kwdisk:kwdata-v1`.
-- Offered only when the CPU count (another: Several CPUs, above), the
+  options, the disks' snapshot state, the console's last 64 KiB, the
+  preview panel, the terminal windows 1-9 whose sessions the snapshot lists
+  (number, name, session id) and the window shown) and `bytes` (the `encodeSnapshot()` Blob, made before the
+  transaction opens), written in one transaction with strict durability
+  (where the engine has it), which a given-up commit aborts. It never opens
+  `kwdisk:kwdata-v1`.
+- Resumed only when the CPU count (another: Several CPUs, above), the
   kernel URL (a hashed asset: another release cannot
   resume), the distro image's URL (`meta.distro`; a build's names its
   content, so another build of the same distro cannot resume) and the device
@@ -531,21 +570,193 @@ with Resume and Boot fresh) before the kernel starts.
   data disk. A disk that changed makes the session useless, so it is
   deleted then. In worker mode the worker checks the disk; a tab without
   the disk lock is not offered it. Any refusal (a disk, a device, another
-  kernel build) boots fresh with a warning line and a toast. Boot fresh
-  deletes the session when it has a data disk (the fresh boot changes the
-  disk), else keeps it. A resumed or refused session is deleted.
-- On resume the terminal shows "Resumed the session suspended …", the
-  summary, then the console's saved tail (the guest redraws nothing).
-  Terminal windows 1-9 and network connections do not survive (their vsock
-  and TCP ends are reset).
-- No save when the tab goes away: a save needs the kernel to park, the
-  memory copied and encoded (about 150 ms with the CLI, 2026-11-15) and
-  about 30 MiB committed to IndexedDB, and a closing page has no
+  kernel build) boots fresh with a warning line and a toast. A resumed or
+  refused session is deleted.
+- On a resume the terminal shows only the console's saved tail (the guest
+  redraws nothing; below); where the boot lines showed after all (a plain
+  load whose session took over 2 s to read), "Resumed the
+  session suspended …" and the summary come first.
+  Terminal windows 1-9 survive: their sessions are kwtty's detachable ones
+  (js.md), which the restore's reset of their vsock connections detaches
+  instead of hanging up, so their shells and programs run on. The resume
+  opens each saved window again with its number and name, `attach()`es its
+  session (`windows.reattach()`) and shows the window shown at the
+  suspend. The screen comes from kwtty: it replays the last 64 KiB of the
+  session's output into the fresh wterm (from a line start, behind the
+  terminal modes in force there), and a full-screen program on the
+  alternate screen gets two SIGWINCHs and redraws (busybox vi does not use
+  the alternate screen: its last full draw in the replay is what shows).
+  The guest keeps a detached session for 60 s; one gone by then gives a
+  tty N window a new shell with a gray line saying so, and a demo's window
+  shows that it ended; a record without windows reopens none. Not yet
+  checked in a browser (the SDK side: `test/api.test.ts`). Network
+  connections do not survive (their TCP ends are reset), nor do
+  `vm.exec()` pipes. A guest server keeps running and listening, but
+  its connections from the old page (the preview's requests) are reset. The
+  preview panel open at the suspend (port, path, shown, filling) opens again
+  once its port answers (`reopenPreview()`, `waitPort()` from launcher.ts,
+  at most 15 s; else a toast says Ctrl-A p opens it), on the new kernel's
+  vmId: the old iframe could not have been kept, since the resume is a
+  reload.
+- Suspend in the background (`autosuspend.ts`, wired in boot.ts;
+  `?autosuspend=now|<seconds>|0`, the Options radios
+  `#opt-autosuspend-<value>`): once the tab has been hidden that long, the
+  page saves the session as Suspend does (written while the kernel waits at
+  its snapshot point), but holds the kernel there instead of stopping it
+  (`KW.suspend({ hold: true })`, the SDK's `snapshot({ commit, hold })`,
+  js.md), for as long as the tab stays hidden; the status is "Paused". As
+  soon as the session is stored it sets `kw-resume` to `auto`.
+  - Shown again with the page alive (the common case on a phone: a short
+    switch to another app), the machine goes on where it was
+    (`continueHeld()`): no reload, every terminal window, vsock connection,
+    the preview and the guest's state as they were, its clocks moved on by
+    the hold (js.md, Snapshots). `kw-resume` is cleared in the same task as
+    the release, and the session saved for the hold is deleted after it (by
+    its time, as a given-up save's; stale once the guest writes its disks
+    again). A page killed between the release and that deletion leaves a
+    stale record: the next load resumes it (with its toast), and refuses it
+    once the data disk changed, as for a record a given-up save could not
+    delete. Quiet: only
+    the status ("Paused", then "Running"), the Kernel log and the
+    Environment row ("held for N s, continued"). Wisp connections may have
+    been closed by their servers meanwhile; the guest's TCP connections over
+    them then fail when it goes on (acceptable: a resume loses them too).
+  - Killed or discarded by the browser while held: the session is stored,
+    so the next load resumes it quietly (`kw-resume` `auto`; Reboot
+    deletes the record). After `AUTO_SUSPEND_HOLD_MS` held (10 min, autosuspend.ts;
+    counted by the page's timers, so not while the page is frozen) the hold
+    becomes the stop, which frees the machine's memory (a held machine keeps
+    it all, which may make a phone kill the page sooner); so does a kernel
+    or worker that ended while held. The tab, when shown, then resumes it
+    (`ui.resumeAuto()`, the Resume reload).
+  - The resume is quiet: the suspend wrote nothing to the terminal and showed
+    no Resume card (the status is "Suspended", the Kernel log and the
+    Environment row say it), and with `kw-resume` `auto` (or `1`, after the
+    Resume button: every resume is the same, autosuspend.ts `quietStart()`)
+    the load keeps the splash ("Resuming") over the terminal and holds back
+    the host's boot lines until the restore, whose first paint is the screen
+    as it was, then the toast; a load that boots fresh or fails after all
+    shows them (`unquiet()` in boot.ts). A plain load does the same once
+    the session's meta says it can resume it (CPU count, kernel, image,
+    devices; else, or after 2 s without an answer, the boot lines show at
+    once).
+    Real failures still say so (a toast and the row; a machine
+    stopped without its session saved, a red notice).
+  - During a hold the guest runs nothing: console and terminal input queue
+    until it goes on, `sync()` (hiding, `pagehide`, Reboot's) answers at
+    once (the disks were sealed at the snapshot point), Suspend (by hand or
+    `KW.suspend()`) turns the hold into the stop, and Reboot deletes the
+    record and boots fresh. Closing the page asks nothing (the session is
+    stored).
+  Default
+  `now` (at once on `visibilitychange`) where `cfg.mobile` (pointer coarse
+  or a mobile user agent): phones and tablets freeze or discard background
+  tabs when they like, and iOS stops a hidden page's scripts within
+  seconds, so a timer may never fire there. Off on desktops, where a
+  background tab keeps running and a machine working there (a build, a
+  server used from another tab) is the user's work. Saved only where it
+  differs from the device's default.
+  - Only a machine worth keeping: one the user typed into, tapped or
+    clicked since it booted (trusted `keydown`, `pointerdown`, `input`,
+    `paste` outside `#panel`, `#bar` and `#confirm`), or a resumed one. An
+    untouched machine boots again in about a second.
+  - Shown again before the snapshot started, nothing happens (the timer is
+    cancelled); while it saves, it finishes and then goes on. A refusal
+    before the copy (a task that does not park, I/O in flight; the machine
+    runs on) is tried again while the tab stays hidden, at most 3 times
+    1 s apart, then the page syncs the disks as hiding does otherwise; the
+    Environment row "Suspend in the background" and a toast once the tab is
+    shown say why. A suspend that starts at once skips that sync: the
+    snapshot seals the disks at its consistent point.
+  - A save that fails (`SuspendSaveError`: the transaction aborted, the
+    commit's timeout, a disk seal that did not become durable) leaves the
+    machine running as it was (its tasks resume as after a snapshot without
+    stop; the guest's clocks move on by the wait), and the disks synced as
+    hiding does otherwise; nothing is held. It is not tried again while the tab stays hidden,
+    but the next time it is hidden; after 2 failed saves
+    (`AUTO_SUSPEND_SAVE_FAILURES`) it stays off for the page load. The row
+    and a toast once the tab is shown say why.
+  - It never does what doing nothing would not: it does not replace a
+    session kept from before (the load after Reboot keeps one without a data disk;
+    only Suspend by hand replaces it; a record of this machine's own, the
+    resumed one or one a given-up save could not delete, does not count),
+    and it does not start when `navigator.storage.estimate()` reports less
+    free space than twice a session's usual size (`sessionRoom()`: 80 MiB on
+    one CPU, 192 on 8), where the save would only fail after parking the
+    machine and writing tens of MiB. The estimate is the browser's own and
+    approximate; insecure contexts have none. The checks run at once (a
+    hidden page may have seconds), and the snapshot is encoded before its
+    transaction opens.
+  - What can still be lost: a page that the browser kills (not just
+    freezes) while the session is being written loses the running machine,
+    as it would have without the suspend; the data disk is then as sealed
+    at the snapshot point and the record the earlier one (one transaction).
+    A page frozen during the write and woken later goes on: the commit's
+    timeout counts awake time, so the transaction's own result (committed,
+    or aborted by WebKit) decides. A record given up after all whose
+    removal also failed stays: the next load resumes it, a machine with a
+    data disk refuses it once the disk changed.
+  - WebKit (Safari, every iOS browser): on 2026-11-20 an iPhone lost the
+    machine twice before the commit existed (it saved after the stop), once
+    with "IndexedDB transaction aborted" for the page's session write
+    (Chrome on iOS), once with the worker's exit ahead of the snapshot
+    (Safari, worker mode, a data disk: most likely the worker's IndexedDB
+    seal had not settled within the exit's 10 s, which then counted wall
+    time, so a freeze used it up; reproduced with a slow seal under Node,
+    js.md, Worker mode). WebKit is widely reported to drop the IndexedDB
+    connections and transactions of pages it suspends in the background
+    ("Connection to Indexed Database server lost"); nothing the page does makes a hidden
+    page's transaction commit, so those failures now leave the machine
+    running instead. Not yet tried on an iPhone with the commit.
+- Closing or leaving the page while such a machine runs or is being saved
+  asks first (`beforeunload`; `?askleave=0`, the `#opt-askleave` box, turns
+  it off). Browsers show their own text and only after the user
+  interacted with the page; most phone browsers never ask. The page's own
+  reloads and navigations (Reboot, Resume, `bootUpOnce()`, the reload on
+  another CPU count, data disk import and reset) call `allowLeave()`
+  first. Nothing can be saved from inside the question and no browser
+  shows the page's text, and a user who stays (Cancel, Stay) may simply
+  want to go on working, so staying changes nothing by itself: once the
+  page's timers run again (`LEAVE_STAYED_MS`) and it has the focus back
+  (Firefox asks from its parent process, where the page's timers keep
+  running), a toast offers "Pause to save this session before closing?"
+  with a Pause button (`#toast-action`; the toast's one optional action,
+  `ui.toast(msg, { action, run, ms })`, which does not take the focus) for
+  `LEAVE_OFFER_MS` (9 s), or until a key is typed for the guest. Doing
+  nothing keeps it running. `pagehide` cancels the wait.
+- Pause (that button; `KW.pause()`, autosuspend.ts `Pause`) is the hold of
+  a suspend in the background with the tab shown: the session committed,
+  `kw-resume` set to `auto`, the kernel held at its snapshot point, the
+  status "Paused" and the title mark `‖`, and the Resume card shows
+  "paused: The session is saved in this browser: you can close this tab."
+  with Continue (`#continue`), which does not take the focus: it stays in
+  the terminal, where any key continues (Tab reaches the button; the
+  display's keyboard routing leaves the card's keys alone). Closing the tab then asks nothing (held), and the next
+  load resumes it quietly, as after a hold in the background. Continue, or
+  any key typed for the guest (a terminal or the display; not the
+  shortcut prefix, the dialog or the page's fields), goes on in place
+  (`continueHeld()`, which deletes the record, as when a held tab is
+  shown). Unlike that hold, hiding and showing the tab does not end it
+  (AutoSuspend leaves a held machine alone). After `AUTO_SUSPEND_HOLD_MS`
+  (10 min of awake time) paused it becomes the stop, and the page shows
+  the Resume card as after Suspend (so does a kernel or worker that ended
+  while paused, or Suspend pressed meanwhile). A save that fails is a
+  toast, "Not saved: why; the system runs on", and the machine runs on.
+- No save at the moment the tab closes: a save needs the kernel to park,
+  the memory copied and encoded (about 150 ms with the CLI, 2026-11-15)
+  and about 30 MiB committed to IndexedDB, and a closing page has no
   guarantee that a transaction it starts commits (with several CPUs
-  more: 35 MiB on 2, 54 on 4, 90 on 8; kernel/parking.md, SMP). A snapshot without `stop`
-  when the tab is hidden would not help: the guest writes `/data` within
-  seconds, which makes it unrestorable.
-- Checked by hand only (no browser test).
+  more: 35 MiB on 2, 54 on 4, 90 on 8; kernel/parking.md, SMP). A
+  suspend started by the `visibilitychange` of a closing tab does not
+  finish; on a phone the tab is usually hidden (the tab switcher) before
+  it is closed, and that suspend has finished by then. A snapshot without
+  `stop` would not help: the guest writes `/data` within seconds, which
+  makes it unrestorable.
+- Checked by hand only (no browser test); suspending in the background
+  (with the hold) and the question on leaving not yet on a real phone or
+  desktop browser (their decisions: `web/test/autosuspend.test.ts`; the
+  SDK's commit, hold and their failures, inline, in worker mode and on
+  several CPUs: `test/api.test.ts`).
 
 ## Service worker and updates
 
@@ -821,8 +1032,9 @@ server). They use the newest Playwright Chromium in `~/.cache/ms-playwright`
 unless `--chrome PATH` or `CHROME=` is given. There is no WebKit test
 script.
 
-`open.test.ts` is no browser test: a plain unit test of `src/open.ts`
-(`node --test web/test/open.test.ts`).
+`open.test.ts` and `autosuspend.test.ts` are no browser tests: plain unit
+tests of `src/open.ts` and `src/autosuspend.ts` (`node --test
+web/test/open.test.ts web/test/autosuspend.test.ts`).
 
 ## Engines
 

@@ -9,6 +9,8 @@
 // and is kept in localStorage. The
 // CPUs slider is disabled, with the reason, where the page cannot boot more
 // than one (config.ts smpBlocker()). Distro (?distro=) lists the page's images and none.
+// Suspend in the background (?autosuspend=, autosuspend.ts) offers off, at once, 30 s and 5 min,
+// plus a ?autosuspend= of other seconds; this device's default is marked.
 //
 // The fields are controlled by the store. Besides onChange, native listeners
 // on the form (capture phase, so non-bubbling events count too) read every
@@ -16,6 +18,7 @@
 // the browser tests), and the store would miss it. A check box stores its
 // data-on or data-off value, so the options keep the values nextSettings() reads.
 import { useEffect, useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
+import { AUTO_SUSPEND_CHOICES, autoSuspendLabel } from "../autosuspend.ts";
 import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED, webkitEngine } from "../config.ts";
 import { KW } from "../kw.ts";
 import { useStore, type Options as Opts } from "../store.ts";
@@ -174,6 +177,10 @@ export function Options() {
 	const distroNote = cfg.distroWhy ? `${cfg.distroWhy}.`
 		: `A read-only image under the root overlay; its changes are kept per distro on the data disk. Default ${DEFAULT_DISTRO}.`;
 
+	// Suspend in the background: the choices, a ?autosuspend= of other seconds, this device's default marked.
+	const autoValues = [...new Set([...AUTO_SUSPEND_CHOICES, cfg.autosuspendParam])];
+	const autoNote = `When the tab has been hidden that long, a system you have used since it booted is saved as with Suspend and paused; shown again, it goes on where it was (or, if the browser dropped the page meanwhile, resumes from the saved session). Default: ${autoSuspendLabel(cfg.autosuspendDefault).toLowerCase()} ${cfg.mobile ? "on phones and tablets, which may drop a background tab at any time" : "on desktops, where a background tab keeps running"}.`;
+
 	// Enter in a text field reboots, like the button.
 	const enter = (e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); ui.reboot(); } };
 
@@ -188,6 +195,7 @@ export function Options() {
 				<Check id="opt-root" name="root" on="safe" off="overlay" value={o.root} label="Safe mode" note="boot without your changes" />
 				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" forced={smp}
 					note={smp ? "always on with several CPUs" : "the kernel off the page's main thread"} />
+				<Check id="opt-askleave" name="askleave" on="on" off="off" value={o.askleave} label="Ask before closing" note="while a system you used runs" />
 			</div>
 
 			<fieldset className="col-span-full flex flex-col gap-1.5">
@@ -213,6 +221,17 @@ export function Options() {
 					))}
 				</div>
 				<small id="opt-distro-note" className="text-[11.5px] text-faint">{distroNote}</small>
+			</fieldset>
+
+			<fieldset className="col-span-full flex flex-col gap-1.5">
+				<legend className="mb-1.5 text-[11.5px] text-faint">Suspend in the background</legend>
+				<div className="flex flex-wrap gap-x-5 gap-y-1" role="radiogroup" id="opt-autosuspend">
+					{autoValues.map((v) => (
+						<Radio key={v} id={`opt-autosuspend-${v}`} name="autosuspend" value={v} current={o.autosuspend}
+							label={`${autoSuspendLabel(v)}${v === cfg.autosuspendDefault ? " (default)" : ""}`} />
+					))}
+				</div>
+				<small id="opt-autosuspend-note" className="text-[11.5px] text-faint">{autoNote}</small>
 			</fieldset>
 
 			<div className="col-span-full mt-3 grid grid-cols-[repeat(auto-fit,minmax(200px,1fr))] items-start gap-x-12 gap-y-5">

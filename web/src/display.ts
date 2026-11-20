@@ -173,9 +173,10 @@ export function createDisplayUi(opts: DisplayUiOptions): DisplayUi {
 	const $ = ui$();
 
 	// ---- keyboard: capture phase, ahead of the terminal ------------------------
+	// The Resume card's buttons too: Enter or Space on a focused Resume or Continue is theirs.
 	const editable = (t: EventTarget | null) => {
 		const el = t as HTMLElement | null;
-		return !!el?.closest?.("input, select, textarea, [contenteditable], dialog") && !el.closest("#terms");
+		return !!el?.closest?.("input, select, textarea, [contenteditable], dialog, #resume-card") && !el.closest("#terms");
 	};
 	function onKey(e: KeyboardEvent) {
 		const ev = evdev();

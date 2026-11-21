@@ -5,7 +5,8 @@
 // ?renderer=wasm (the default) is virglrenderer compiled to wasm
 // (gl/wasm) on this page's WebGL2 context, loaded from ./virgl.mjs or
 // ?module=URL; ?renderer=relay&relay=ws://HOST:PORT/ is the stand-in that
-// relays to a native server (README.md).
+// relays to a native server (README.md). ?wait=strict: the wasm renderer
+// answers busy waits as vtest does (gl/wasm/kw_virgl.h, KW_VIRGL_STRICT_WAIT).
 import { MUX, encode, decode, connect } from "./mux.js";
 import { RelayRenderer } from "./relay.js";
 
@@ -85,7 +86,8 @@ async function wasmRenderer() {
   });
   if (!gl) throw new Error("no WebGL2");
   gl.canvas.addEventListener("webglcontextlost", () => log("error: the WebGL2 context was lost"));
-  return new Module.virgl.Renderer(params.has("glcheck") ? checkedGL(gl) : params.has("glcount") ? countedGL(gl) : gl);
+  return new Module.virgl.Renderer(params.has("glcheck") ? checkedGL(gl) : params.has("glcount") ? countedGL(gl) : gl,
+    { strictWaits: params.get("wait") === "strict" });
 }
 
 async function createRenderer() {
@@ -93,6 +95,11 @@ async function createRenderer() {
   if (kind === "wasm") return wasmRenderer();
   if (kind === "relay") return new RelayRenderer(params.get("relay") || "ws://127.0.0.1:7801/", transport);
   throw new Error(`unknown renderer ${kind}`);
+}
+
+// The renderer's counters (gl/wasm/post.js, r.totals()), rounded.
+function statsLine(t) {
+  return Object.entries(t).map(([k, x]) => `${k} ${k.endsWith("Ms") ? x.toFixed(1) : x}`).join(", ");
 }
 
 async function main() {
@@ -113,7 +120,7 @@ async function main() {
     if (type === MUX.OPEN) renderer.open(id);
     else if (type === MUX.CLOSE) {
       const s = renderer.stats?.(id);
-      if (s) log(`client ${id}: closed after ${s.parks} parked busy waits, ${s.parkedMs.toFixed(0)} ms parked`);
+      if (s) log(`client ${id}: closed after ${s.parks} parked busy waits, ${s.parkedMs.toFixed(0)} ms parked; renderer so far: ${statsLine(renderer.totals())}`);
       renderer.close(id);
     }
     else if (type === MUX.DATA) {

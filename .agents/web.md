@@ -452,7 +452,13 @@ there), and frames come back to the guest by readback.
 - `showGl()` (boot.ts): the Guest GL row says "starting", then the WebGL2
   renderer (the unmasked name, `WEBGL_debug_renderer_info`, as the SDK logs
   it), with the forwarder links and GL clients (`vm.gl.stats`, every 2 s
-  while they change) in its note; a software renderer (SwiftShader,
+  while they change) in its note, and from the renderer's counters
+  (`vm.gl.stats.renderer`) where a frame's time went in the renderer over
+  the last 2 s with readbacks (`glFrameTimes()`: per readback, time parked
+  in busy waits, reading back, issuing GL, uploading; how busy waits were
+  answered; gl.md, Stats). `?glwait=strict` passes `gl: { strictWaits:
+  true }` (busy waits answered as vtest does) for comparing frame times,
+  and the note says so. A software renderer (SwiftShader,
   llvmpipe, WARP...) is a warning row and a toast. The browser console
   gets `[unkernel] guest GL: WebGL2 renderer ...`, the Kernel log the
   SDK's `[host] gl:` lines. A `vm.gl.ready` that rejects (no WebGL2

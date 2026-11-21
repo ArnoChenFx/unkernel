@@ -58,6 +58,11 @@
 //                                      fetched only then. Off with another distro, without
 //                                      WebGL2 on the page's thread, or in a build without the
 //                                      renderer (glBlocker()). Default off.
+//   ?glwait=strict                     with ?gl=1: the renderer answers the guest's busy waits
+//                                      as vtest does, once WebGL tells that the fences have
+//                                      retired (the SDK's gl.strictWaits), for comparing frame
+//                                      times; the Guest GL row shows them. Default: at once where
+//                                      safe (.agents/gl.md, Busy waits).
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
 //                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
@@ -252,6 +257,8 @@ export interface Config {
 	glBlocked: string | null;
 	/** Why this load runs without GL although ?gl=1 asks for it, or null. */
 	glWhy: string | null;
+	/** ?glwait=strict: the SDK's gl.strictWaits. */
+	glStrictWaits: boolean;
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
@@ -431,6 +438,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		glParam,
 		glBlocked,
 		glWhy,
+		glStrictWaits: params.get("glwait") === "strict",
 		mobile,
 		coarse,
 		mobileUA,

@@ -3,8 +3,8 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Run gl/wasm/test/index.html in headless Chromium against the wasm
 // virglrenderer build and exit 0 when the module loaded, the renderer started
-// on WebGL2, answered the capability queries, parked and answered a waiting
-// busy wait, and served two clients of the inline dialect (index.html says
+// on WebGL2, answered the capability queries, answered a waiting busy wait
+// ahead of its fence and parked and answered a second, and served two clients of the inline dialect (index.html says
 // what each stage does); 1 otherwise; 2 when it could not run (no build, no
 // browser, timeout). Prints the page's JSON result.
 //
@@ -105,6 +105,6 @@ if (body === null) {
 }
 const res = JSON.parse(body);
 console.log(JSON.stringify(res, (k, v) => (k === 'extensions' ? v.join(' ') : v), 2));
-console.log(res.ok ? `PASS: loaded, initialised on WebGL2, answered GET_CAPS2 and GET_CAPSET, parked and answered a busy wait, served two inline clients, drove virgl.Renderer${res.stages.transfer ? '' : ' (the plain TRANSFER_PUT/GET probe failed)'}`
+console.log(res.ok ? `PASS: loaded, initialised on WebGL2, answered GET_CAPS2 and GET_CAPSET, answered a busy wait ahead and parked a second, served two inline clients, drove virgl.Renderer${res.stages.transfer ? '' : ' (the plain TRANSFER_PUT/GET probe failed)'}`
   : `FAIL: ${res.error || 'see stages'}`);
 process.exit(res.ok ? 0 : 1);

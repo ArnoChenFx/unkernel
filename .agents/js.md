@@ -834,6 +834,10 @@ parts that are easy to get wrong.
   forwarder's LOG line "ready: vtest clients on ..." arrives (the guest's
   vtest socket exists then), and rejects (logged) when the renderer or the
   forwarder fails or the link does not come within 30 s.
+- `vm.gl.stats` is `StreamHost.stats`, with the renderer's counters
+  (`VtestRenderer.totals()`, `VirglTotals`: the wasm module's
+  `KW_VIRGL_STAT_*`; gl.md, Stats) as `renderer`. `gl.strictWaits` makes
+  the wasm renderer answer busy waits as vtest does (gl.md, Busy waits).
 - Where there is no OffscreenCanvas (Node) or no module (an entry without
   one; the page's `web/src/sdk.ts` passes its `glUrl`, web.md, Guest GL),
   `gl` is ignored with a `[host]` log line

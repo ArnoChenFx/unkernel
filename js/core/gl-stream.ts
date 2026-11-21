@@ -33,6 +33,45 @@ export interface VtestRenderer {
 	onclose: (id: number, why: string) => void;
 	/** How often and how long the client's busy waits were parked. */
 	stats?(id: number): { parks: number; parkedMs: number } | undefined;
+	/** Counters over all clients since init (the wasm renderer: VirglTotals). */
+	totals?(): VirglTotals;
+}
+
+/**
+ * The wasm renderer's counters since init (gl/wasm/kw_virgl.h,
+ * KW_VIRGL_STAT_*; .agents/gl.md, Stats). Times are in ms, each command's
+ * GL calls included: WebGL runs most of them asynchronously, but a read
+ * that returns data waits for the GPU work it reads.
+ */
+export interface VirglTotals {
+	/** VCMD_SUBMIT_CMD: decoding a command buffer and issuing its GL calls. */
+	submits: number;
+	submitMs: number;
+	/** TRANSFER_GET(2): readbacks (glReadPixels, getBufferSubData); about one a frame for a program that shows its frames. */
+	reads: number;
+	readMs: number;
+	/** TRANSFER_PUT(2): uploads. */
+	writes: number;
+	writeMs: number;
+	/** Every other command. */
+	others: number;
+	otherMs: number;
+	/** Waiting VCMD_RESOURCE_BUSY_WAITs, answered as the next four count. */
+	waits: number;
+	/** At once, right after a readback of the same resource. */
+	waitsRead: number;
+	/** At once, their fences retired already. */
+	waitsDone: number;
+	/** At once, ahead of their fences. */
+	waitsAhead: number;
+	/** After parking until fences retired (WebGL tells only between tasks). */
+	parks: number;
+	parkedMs: number;
+	parkMaxMs: number;
+	/** Polls of parked clients: kw_virgl_poll calls that found one, and the tasks that ran them. */
+	polls: number;
+	messagePolls: number;
+	timerPolls: number;
 }
 
 /** One message for the stream link: u32 length, u32 client id, u8 type, payload. */
@@ -91,6 +130,8 @@ export interface StreamHostStats {
 	clients: number;
 	/** Clients opened since the start. */
 	opened: number;
+	/** The renderer's counters, when it keeps them (the wasm renderer does). */
+	renderer?: VirglTotals;
 }
 
 export class StreamHost {
@@ -117,7 +158,8 @@ export class StreamHost {
 	}
 
 	get stats(): StreamHostStats {
-		return { streams: this.#streams, clients: this.#routes.size, opened: this.#opened };
+		const renderer = this.#renderer.totals?.();
+		return { streams: this.#streams, clients: this.#routes.size, opened: this.#opened, ...(renderer && { renderer }) };
 	}
 
 	/**

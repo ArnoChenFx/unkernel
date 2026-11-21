@@ -43,6 +43,7 @@ import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from ".
 import {
 	BootError, ConsoleRouter, KernelInstance, SnapshotCommitError, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot, type SnapshotHoldDecision,
+	type VirglTotals,
 } from "./sdk.ts";
 
 /** An error tagged with what failed (fetch, compile, memory, boot) and the boot stage it belongs to. */
@@ -1183,7 +1184,8 @@ export function start(): void {
 	 * Environment tab's "Guest GL" row, the console and the Kernel log; a
 	 * software renderer (SwiftShader, llvmpipe, WARP) is a warning, since GL
 	 * is then no faster than the host's CPU. Then the bridges and clients
-	 * served (vm.gl.stats), every 2 s while they change.
+	 * served (vm.gl.stats), every 2 s while they change, and where a frame's
+	 * time went in the renderer over the last 2 s with readbacks (glFrameTimes).
 	 */
 	function showGl(vm: KernelHandle) {
 		if (!cfg.gl) {
@@ -1204,10 +1206,16 @@ export function start(): void {
 				"Guest shells have GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1; Mesa: sudo apt-get install mesa-utils (eglinfo -B), glmark2-es2-x11 ...";
 			console.log(`[unkernel] guest GL: WebGL2 renderer ${webgl}${soft ? " (software rendering)" : ""}`);
 			ui.hostLog(`[host] guest GL ready: ${what}${soft ? " (software rendering)" : ""}`);
-			let shown = "";
+			let shown = "", times = "", prev: VirglTotals | undefined, prevAt = performance.now();
 			const show = () => {
-				const st = gl.stats;
-				const now = `${st.streams} forwarder link${st.streams === 1 ? "" : "s"}, ${st.clients} GL client${st.clients === 1 ? "" : "s"} now, ${st.opened} so far`;
+				const st = gl.stats, at = performance.now();
+				if (st.renderer) {
+					times = glFrameTimes(st.renderer, prev, at - prevAt) ?? times;
+					prev = st.renderer;
+					prevAt = at;
+				}
+				const now = `${st.streams} forwarder link${st.streams === 1 ? "" : "s"}, ${st.clients} GL client${st.clients === 1 ? "" : "s"} now, ${st.opened} so far` +
+					`${cfg.glStrictWaits ? "; busy waits answered as vtest does (?glwait=strict)" : ""}${times ? `. ${times}` : ""}`;
 				if (now === shown) return;
 				shown = now;
 				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `${note} ${now}.`);
@@ -1220,6 +1228,28 @@ export function start(): void {
 			ui.check("gl", "Guest GL", "fail", "failed", why);
 			ui.toast(`Guest GL failed: ${why}`);
 		});
+	}
+
+	/**
+	 * Where the renderer's time went per readback (TRANSFER_GET2, about one a
+	 * frame for a program that shows its frames) between two of its counters
+	 * (vm.gl.stats.renderer; .agents/gl.md, Stats), MS apart; null without a
+	 * readback in between. Parked: busy waits held until WebGL said the GPU
+	 * was done; reading: glReadPixels or getBufferSubData, which wait for the
+	 * GPU work they read; issuing: decoding command buffers into GL calls. The
+	 * rest of a frame is outside the renderer (the guest, Mesa, kwvsock).
+	 */
+	function glFrameTimes(r: VirglTotals, p: VirglTotals | undefined, ms: number): string | null {
+		const d = (k: keyof VirglTotals) => r[k] - (p?.[k] ?? 0);
+		const n = d("reads");
+		if (!n || ms <= 0) return null;
+		const per = (k: keyof VirglTotals) => `${(d(k) / n).toFixed(2)} ms`;
+		const busy = d("submitMs") + d("readMs") + d("writeMs") + d("otherMs");
+		const atOnce = d("waitsRead") + d("waitsDone") + d("waitsAhead");
+		return `Last ${(ms / 1000).toFixed(0)} s: ${(n * 1000 / ms).toFixed(0)} readbacks/s (about one a frame), ${(ms / n).toFixed(2)} ms apart: ` +
+			`${per("parkedMs")} parked in busy waits, ${per("readMs")} reading back (waits for the GPU), ${per("submitMs")} issuing GL, ` +
+			`${per("writeMs")} uploading; renderer busy ${(100 * busy / ms).toFixed(0)}% of the time; busy waits ${d("waits")}: ${atOnce} answered at once ` +
+			`(${d("waitsAhead")} ahead of the GPU), ${d("parks")} parked (longest so far ${r.parkMaxMs.toFixed(1)} ms)`;
 	}
 
 	// --- boot --------------------------------------------------------------------
@@ -1376,7 +1406,7 @@ export function start(): void {
 			display: cfg.display ? display.size : false, onDisplay: display.onDisplay, onInput: display.onInput,
 			sound: cfg.sound ? createAudioOut({ log }) : false, // Web Audio, ?sound=0 (audio.ts)
 			vsock: true, // the terminal windows (windows.ts: kwtty sessions)
-			gl: cfg.gl, // guest GL on this thread's WebGL2 (?gl=1, Debian; showGl())
+			gl: cfg.gl && (cfg.glStrictWaits ? { strictWaits: true } : true), // guest GL on this thread's WebGL2 (?gl=1, Debian; showGl())
 		};
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);

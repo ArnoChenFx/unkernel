@@ -168,15 +168,22 @@ renderer.onclose = (id, why) => {}   // set by the page: the renderer dropped th
 ```
 
 A renderer may also have `stats(id)`, `{ parks, parkedMs }`, which the page
-logs when the client closes.
+logs when the client closes, and `totals()`, counters over all its clients
+(the wasm renderer's are `KW_VIRGL_STAT_*` in `gl/wasm/kw_virgl.h`), which
+the page logs with it and the SDK passes on in `vm.gl.stats.renderer`.
 
 The wasm renderer is `Module.virgl.Renderer` (`gl/wasm/post.js`) over the
 module's C API (`gl/wasm/kw_virgl.h`): `kw_virgl_open(KW_VIRGL_INLINE)` per
 client, `kw_virgl_feed` with each chunk (it buffers partial commands and runs
 the complete ones; it never blocks and never returns a promise), then the
 reply bytes (`kw_virgl_reply_ptr`, `kw_virgl_reply_len`,
-`kw_virgl_consume`). A waiting `RESOURCE_BUSY_WAIT` parks its client
+`kw_virgl_consume`). A waiting `RESOURCE_BUSY_WAIT` is answered at once
+right after a readback of its resource, or ahead of its fences when the
+client's previous answer ahead has retired or been followed by a readback
+(`.agents/gl.md`, Busy waits); otherwise it parks its client
 (`KW_VIRGL_PARKED`): a WebGL fence only signals between tasks, so the
 renderer calls `kw_virgl_poll` from later tasks (a message for the first 16
-rounds, then 1 ms timeouts) and passes the reply on once the fences
-submitted before the wait have retired.
+rounds, then 1 ms timeouts) and passes the reply on once the fences it
+waits for have retired. `?wait=strict` (the page; `bridge-check.sh
+--strict-waits`) parks every waiting busy wait until the fences submitted
+before it have retired, as vtest answers it.

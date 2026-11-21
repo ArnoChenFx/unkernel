@@ -64,6 +64,12 @@ struct kw_client {
 	int state; // KW_VIRGL_OK, KW_VIRGL_PARKED or a negative errno
 	bool waiting; // in a waiting VCMD_RESOURCE_BUSY_WAIT: for implicit fence wait_seq
 	uint32_t wait_seq;
+	bool strict; // KW_VIRGL_STRICT_WAIT
+	bool ahead; // a wait was answered ahead of fences ahead_seq (busy_wait)
+	uint32_t ahead_seq;
+	double parked_at; // when the wait parked (emscripten_get_now), or 0
+	uint32_t got; // resource handle of the client's last request when that was
+		      // a TRANSFER_GET(2) or a busy wait following one, else 0
 	struct vtest_context *context;
 	struct kw_bytes in, out;
 	uint32_t in_pos; // first unconsumed byte of in
@@ -73,6 +79,13 @@ static struct kw_client clients[KW_MAX_CLIENTS + 1]; // [0] unused: ids start at
 static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gl_context;
 static bool initialized;
 static struct kw_client *current; // the client whose command runs
+static double stats[KW_VIRGL_STAT_COUNT]; // kw_virgl_stats
+
+static void stat_time(int count, int ms, double since)
+{
+	stats[count]++;
+	stats[ms] += emscripten_get_now() - since;
+}
 
 static int bytes_reserve(struct kw_bytes *b, uint32_t more)
 {
@@ -326,6 +339,88 @@ static int run_command(int id, struct kw_client *c, const uint32_t *hdr, uint32_
 	return 0;
 }
 
+enum { WAIT_RUN, WAIT_ANSWERED, WAIT_PARKED };
+
+// A waiting VCMD_RESOURCE_BUSY_WAIT. vtest loops in it until no client has
+// a fence in flight (the implicit fence of every VCMD_SUBMIT_CMD), and a
+// WebGL fence only signals between tasks, so it cannot loop here. What
+// Mesa needs of the wait (.agents/gl.md, Busy waits): after a
+// TRANSFER_GET2 it reads the data from its memfd, and before mapping a
+// resource or at glFinish (fences) it wants the GPU done with the work
+// submitted. Here the guest shares no memory with the GPU: every byte it
+// reads came in a TRANSFER_GET2 (inline) or TRANSFER_GET (plain) reply,
+// read with glReadPixels or getBufferSubData, which return only once the
+// commands before them that write those bytes have run, and every byte it
+// writes goes in with TRANSFER_PUT(2), which GL orders after the commands
+// before it. The one result the host writes outside the command stream, a
+// query's, reads as pending until it is there (patch 12), and Mesa reads
+// it again until then. So no answer to a wait can make the guest read
+// data that is not valid; what the answer decides is timing: how far the
+// guest may run ahead of the GPU. The answer:
+//
+// - at once (WAIT_ANSWERED), right after a TRANSFER_GET(2) of the same
+//   resource with only busy waits between: its reply carried the data;
+// - by vtest (WAIT_RUN) when the fences submitted before it have retired;
+// - at once, ahead of those fences, when the client's last answer ahead
+//   has retired or has been followed by a TRANSFER_GET(2) of the client
+//   (a read that waited for the GPU work it reads), so that a client runs
+//   at most one wait ahead of the GPU, and one that reads back each frame
+//   never parks;
+// - else it parks (WAIT_PARKED) until the fences of that earlier answer
+//   have retired, and kw_virgl_poll answers it ahead then.
+//
+// A strict client (KW_VIRGL_STRICT_WAIT) parks until the fences submitted
+// before the wait have retired, every time: vtest's answer.
+static int busy_wait(int id, struct kw_client *c, uint32_t handle)
+{
+	static const uint32_t idle[3] = { 1, VCMD_RESOURCE_BUSY_WAIT, 0 };
+	uint32_t done, submitted = vtest_renderer_fences(&done);
+	bool read = handle && handle == c->got && !c->strict;
+	int ret;
+
+	if (!c->waiting) {
+		c->waiting = true;
+		c->wait_seq = submitted;
+		stats[KW_VIRGL_STAT_WAITS]++;
+	}
+	if (c->ahead && (int32_t)(done - c->ahead_seq) >= 0)
+		c->ahead = false;
+	if (read) {
+		stats[KW_VIRGL_STAT_WAITS_READ]++;
+		ret = WAIT_ANSWERED;
+	} else if ((int32_t)(done - c->wait_seq) >= 0) {
+		if (!c->parked_at)
+			stats[KW_VIRGL_STAT_WAITS_DONE]++;
+		// others' work may be in flight, which vtest would wait for
+		ret = done == submitted ? WAIT_RUN : WAIT_ANSWERED;
+	} else if (!c->ahead && !c->strict) {
+		c->ahead = true;
+		c->ahead_seq = c->wait_seq;
+		if (!c->parked_at)
+			stats[KW_VIRGL_STAT_WAITS_AHEAD]++;
+		ret = WAIT_ANSWERED;
+	} else {
+		if (!c->parked_at) {
+			c->parked_at = emscripten_get_now();
+			stats[KW_VIRGL_STAT_PARKS]++;
+		}
+		c->state = KW_VIRGL_PARKED;
+		return WAIT_PARKED;
+	}
+	c->waiting = false;
+	if (c->parked_at) {
+		double ms = emscripten_get_now() - c->parked_at;
+
+		stats[KW_VIRGL_STAT_PARKED_MS] += ms;
+		if (ms > stats[KW_VIRGL_STAT_PARK_MAX_MS])
+			stats[KW_VIRGL_STAT_PARK_MAX_MS] = ms;
+		c->parked_at = 0;
+	}
+	if (ret == WAIT_ANSWERED && vtest_block_write(id, (void *)idle, sizeof(idle)) < 0)
+		c->state = -ENOMEM;
+	return ret;
+}
+
 // Run the client's complete commands until it runs out of bytes, parks or
 // fails; sets and returns its state.
 static int client_run(int id, struct kw_client *c)
@@ -334,6 +429,8 @@ static int client_run(int id, struct kw_client *c)
 		uint32_t avail = c->in.len - c->in_pos;
 		const uint32_t *hdr;
 		int64_t size;
+		uint32_t cmd;
+		double t;
 		int ret;
 
 		if (avail < 8)
@@ -357,35 +454,44 @@ static int client_run(int id, struct kw_client *c)
 		if (hdr[VTEST_CMD_ID] == VCMD_RESOURCE_BUSY_WAIT && c->context &&
 		    size >= 8 + 4 * VCMD_BUSY_WAIT_SIZE &&
 		    (hdr[VTEST_CMD_DATA_START + VCMD_BUSY_WAIT_FLAGS] & VCMD_BUSY_WAIT_FLAG_WAIT)) {
-			// vtest would loop here until no client has work in flight,
-			// and a WebGL fence only signals between tasks: park the
-			// client until the fences submitted so far, its own among
-			// them, have retired (kw_virgl_poll, from a later task), and
-			// then answer for vtest.
-			uint32_t done, submitted = vtest_renderer_fences(&done);
+			int w = busy_wait(id, c, hdr[VTEST_CMD_DATA_START + VCMD_BUSY_WAIT_HANDLE]);
 
-			if (!c->waiting) {
-				c->waiting = true;
-				c->wait_seq = submitted;
-			}
-			if ((int32_t)(done - c->wait_seq) < 0) {
-				c->state = KW_VIRGL_PARKED;
+			if (w == WAIT_PARKED)
 				break;
-			}
-			c->waiting = false;
-			if (done != submitted) {
-				// others' work is in flight, which vtest would wait for
-				static const uint32_t idle[3] = { 1, VCMD_RESOURCE_BUSY_WAIT, 0 };
-
+			if (w == WAIT_ANSWERED) {
 				c->in_pos += (uint32_t)size;
-				if (vtest_block_write(id, (void *)idle, sizeof(idle)) < 0)
-					c->state = -ENOMEM;
 				continue;
 			}
 		}
+		cmd = hdr[VTEST_CMD_ID];
+		t = emscripten_get_now();
 		current = c;
 		ret = run_command(id, c, hdr, (uint32_t)size);
 		current = NULL;
+		switch (cmd) {
+		case VCMD_SUBMIT_CMD:
+			stat_time(KW_VIRGL_STAT_SUBMITS, KW_VIRGL_STAT_SUBMIT_MS, t);
+			c->got = 0;
+			break;
+		case VCMD_TRANSFER_GET:
+		case VCMD_TRANSFER_GET2:
+			stat_time(KW_VIRGL_STAT_READS, KW_VIRGL_STAT_READ_MS, t);
+			// the handle, the first argument of either
+			c->got = size >= 12 ? hdr[VTEST_CMD_DATA_START] : 0;
+			c->ahead = false; // busy_wait
+			break;
+		case VCMD_TRANSFER_PUT:
+		case VCMD_TRANSFER_PUT2:
+			stat_time(KW_VIRGL_STAT_WRITES, KW_VIRGL_STAT_WRITE_MS, t);
+			c->got = 0;
+			break;
+		case VCMD_RESOURCE_BUSY_WAIT:
+			stat_time(KW_VIRGL_STAT_OTHERS, KW_VIRGL_STAT_OTHER_MS, t);
+			break;
+		default:
+			stat_time(KW_VIRGL_STAT_OTHERS, KW_VIRGL_STAT_OTHER_MS, t);
+			c->got = 0;
+		}
 		c->in_pos += (uint32_t)size;
 		if (ret < 0)
 			c->state = ret;
@@ -430,7 +536,7 @@ EMSCRIPTEN_KEEPALIVE int kw_virgl_open(uint32_t flags)
 {
 	int id;
 
-	if (flags & ~KW_VIRGL_INLINE)
+	if (flags & ~(KW_VIRGL_INLINE | KW_VIRGL_STRICT_WAIT))
 		return -EINVAL;
 	if (!initialized)
 		return -ENODEV;
@@ -439,6 +545,7 @@ EMSCRIPTEN_KEEPALIVE int kw_virgl_open(uint32_t flags)
 			memset(&clients[id], 0, sizeof(clients[id]));
 			clients[id].used = true;
 			clients[id].inline_data = flags & KW_VIRGL_INLINE;
+			clients[id].strict = flags & KW_VIRGL_STRICT_WAIT;
 			return id;
 		}
 	}
@@ -483,6 +590,7 @@ EMSCRIPTEN_KEEPALIVE int kw_virgl_feed(int id, const uint8_t *data, uint32_t len
 EMSCRIPTEN_KEEPALIVE int kw_virgl_poll(void)
 {
 	int id, parked = 0;
+	bool polled = false;
 
 	if (!initialized)
 		return 0;
@@ -492,6 +600,10 @@ EMSCRIPTEN_KEEPALIVE int kw_virgl_poll(void)
 
 		if (!c->used || c->state != KW_VIRGL_PARKED)
 			continue;
+		if (!polled) {
+			polled = true;
+			stats[KW_VIRGL_STAT_POLLS]++;
+		}
 		c->state = KW_VIRGL_OK;
 		if (client_run(id, c) == KW_VIRGL_PARKED)
 			parked++;
@@ -525,6 +637,11 @@ EMSCRIPTEN_KEEPALIVE void kw_virgl_consume(int id, uint32_t n)
 	}
 	memmove(c->out.data, c->out.data + n, c->out.len - n);
 	c->out.len -= n;
+}
+
+EMSCRIPTEN_KEEPALIVE const double *kw_virgl_stats(void)
+{
+	return stats;
 }
 
 EMSCRIPTEN_KEEPALIVE int kw_virgl_state(int id)

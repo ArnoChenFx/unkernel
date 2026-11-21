@@ -6,7 +6,8 @@
 //   const Module = await createVirgl({ print, printErr });
 //   const v = Module.virgl;
 //   v.init(gl);                  // a WebGL2RenderingContext (canvas or OffscreenCanvas)
-//   const c = v.open(v.INLINE);  // one per vtest connection; 0: the plain dialect
+//   const c = v.open(v.INLINE);  // one per vtest connection; 0: the plain dialect;
+//                                // | v.STRICT_WAIT: vtest's busy waits (kw_virgl.h)
 //   v.feed(c, bytes);            // a Uint8Array chunk of the client's stream
 //   const out = v.take(c);       // its reply bytes so far (a copy), maybe empty
 //   v.poll();                    // from a later task while a client is parked
@@ -15,15 +16,21 @@
 // feed and poll return what kw_virgl_feed and kw_virgl_poll do.
 //
 // v.Renderer is the same in the renderer shape of gl/bridge (relay.js):
-//   const r = new v.Renderer(gl);      // { inline: true } by default
+//   const r = new v.Renderer(gl);      // { inline: true, strictWaits: false } by default
 //   r.onreply = (id, bytes) => ...;    r.onclose = (id, why) => ...;
 //   await r.init(); r.open(id); r.feed(id, bytes); r.close(id);
 // with the page's own client ids; it polls parked clients by itself.
 // r.stats(id): { parks, parkedMs }, how often and how long the client's
-// busy waits were parked.
+// busy waits were parked. r.totals(): the counters of all clients since
+// init (v.stats(), kw_virgl.h, KW_VIRGL_STAT_*), and how many later tasks
+// polled parked clients, through a message or a timeout (messagePolls,
+// timerPolls).
 
 Module['virgl'] = (() => {
   let scratch = 0, scratchSize = 0, initGL = null;
+  // KW_VIRGL_STAT_*, in order
+  const STATS = ['submits', 'submitMs', 'reads', 'readMs', 'writes', 'writeMs', 'others', 'otherMs',
+    'waits', 'waitsRead', 'waitsDone', 'waitsAhead', 'parks', 'parkedMs', 'parkMaxMs', 'polls'];
   const check = (r, what) => {
     if (r < 0) throw new Error(`${what}: error ${-r}`);
     return r;
@@ -32,6 +39,7 @@ Module['virgl'] = (() => {
     OK: 0,
     PARKED: 1,
     INLINE: 1,
+    STRICT_WAIT: 2,
     // Register GL (a WebGL2 context) with emscripten and start the renderer;
     // again with the same context: nothing.
     init(gl, attributes = {}) {
@@ -69,6 +77,11 @@ Module['virgl'] = (() => {
     },
     poll: () => _kw_virgl_poll(),
     state: (client) => _kw_virgl_state(client),
+    // The module's counters (kw_virgl_stats), named as in STATS.
+    stats() {
+      const a = new Float64Array(HEAPU8.buffer, _kw_virgl_stats(), STATS.length);
+      return Object.fromEntries(STATS.map((k, i) => [k, a[i]]));
+    },
   };
 
   v.Renderer = class {
@@ -82,10 +95,12 @@ Module['virgl'] = (() => {
     #polling = false;
     #rounds = 0;
     #wake = null;
+    #messagePolls = 0;
+    #timerPolls = 0;
 
-    constructor(gl, { inline = true } = {}) {
+    constructor(gl, { inline = true, strictWaits = false } = {}) {
       this.#gl = gl;
-      this.#flags = inline ? v.INLINE : 0;
+      this.#flags = (inline ? v.INLINE : 0) | (strictWaits ? v.STRICT_WAIT : 0);
     }
 
     async init() {
@@ -101,6 +116,10 @@ Module['virgl'] = (() => {
     stats(id) {
       const s = this.#stats.get(id);
       return s && { parks: s.parks, parkedMs: s.parkedMs };
+    }
+
+    totals() {
+      return { ...v.stats(), messagePolls: this.#messagePolls, timerPolls: this.#timerPolls };
     }
 
     feed(id, bytes) {
@@ -145,8 +164,12 @@ Module['virgl'] = (() => {
           ch.port1.onmessage = () => this.#poll();
           this.#wake = ch.port2;
         }
+        this.#messagePolls++;
         this.#wake.postMessage(0);
-      } else setTimeout(() => this.#poll(), 1);
+      } else {
+        this.#timerPolls++;
+        setTimeout(() => this.#poll(), 1);
+      }
     }
 
     // Parked clients: poll from later tasks (WebGL fences signal between

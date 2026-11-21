@@ -194,7 +194,7 @@ build_module() {
 		-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
 		-sGL_EMULATE_GLES_VERSION_STRING_FORMAT=1 -sGL_EXTENSIONS_IN_PREFIXED_FORMAT=1 \
 		-sGL_SUPPORT_AUTOMATIC_ENABLE_EXTENSIONS=1 \
-		-sEXPORTED_FUNCTIONS=_kw_virgl_init,_kw_virgl_open,_kw_virgl_close,_kw_virgl_feed,_kw_virgl_poll,_kw_virgl_reply_ptr,_kw_virgl_reply_len,_kw_virgl_consume,_kw_virgl_state,_malloc,_free \
+		-sEXPORTED_FUNCTIONS=_kw_virgl_init,_kw_virgl_open,_kw_virgl_close,_kw_virgl_feed,_kw_virgl_poll,_kw_virgl_reply_ptr,_kw_virgl_reply_len,_kw_virgl_consume,_kw_virgl_state,_kw_virgl_stats,_malloc,_free \
 		-sEXPORTED_RUNTIME_METHODS=HEAPU8 \
 		'-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL' \
 		--js-library "$here/kw_gl.js" --post-js "$here/post.js" ${KW_LDFLAGS:-}

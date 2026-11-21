@@ -48,7 +48,7 @@ export { MountError } from "./mounts.ts";
 export type { FsSource, Mount, MountErrorCode, MountOptions, MountSpec, MountStats, MountsOption } from "./mounts.ts";
 export { CMD_PORT, CommandError } from "./commands.ts";
 export { GL_FORWARDER, GL_PORT, GlHost } from "./gl.ts";
-export type { GlOption, GlOptions, GlStats } from "./gl.ts";
+export type { GlOption, GlOptions, GlStats, VirglTotals } from "./gl.ts";
 export { Deframer, MUX, StreamHost, frame } from "./gl-stream.ts";
 export type { StreamHostStats, VtestRenderer } from "./gl-stream.ts";
 export type { CommandErrorCode, CommandsOption, HostCommand, HostCommandContext, HostCommandResult } from "./commands.ts";

@@ -1,0 +1,61 @@
+From 146400565178ae34d1cee8df71aed022948b36cc Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 18:25:38 +0000
+Subject: [PATCH] vrend: mark a query's result pending when the guest asks for
+ it
+
+Mesa's virgl driver writes VIRGL_QUERY_STATE_WAIT_HOST into a query's
+buffer when it ends the query, in memory it shares with the host, asks
+for the result (VIRGL_CCMD_GET_QUERY_RESULT), and reads the buffer until
+the host has written DONE and the result there. An embedder that carries
+a resource's backing store in its stream (vtest with VTEST_EXTERNAL_IO)
+shares no memory with the guest: the guest's write never reaches the
+host, the buffer still says DONE from the query's last use, and a read
+of it before the new result is written returns the old result. The
+host writes WAIT_HOST itself now, when the result is asked for; with
+shared memory that is the value the guest wrote already.
+---
+ src/vrend/vrend_renderer.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 5ba8064..892f3ea 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -11654,6 +11654,18 @@ vrend_update_oq_samples_multiplier(struct vrend_context *ctx)
+ }
+ 
+ 
++/* Only the state word of the query's virgl_host_query_state. */
++static void vrend_write_query_state(struct vrend_query *query, uint32_t query_state)
++{
++   if (query->res->iov) {
++      vrend_write_to_iovec(query->res->iov, query->res->num_iovs, 0,
++                           (const void *)&query_state, sizeof(query_state));
++   } else if (query->res->ptr &&
++              query->res->base.width0 >= sizeof(struct virgl_host_query_state)) {
++      ((struct virgl_host_query_state *)query->res->ptr)->query_state = query_state;
++   }
++}
++
+ static bool vrend_check_query(struct vrend_query *query)
+ {
+    struct virgl_host_query_state state;
+@@ -12311,6 +12323,14 @@ int vrend_get_query_result(struct vrend_context *ctx, uint32_t handle,
+    if (!q)
+       return EINVAL;
+ 
++   /* The guest marks the query's state WAIT_HOST before it asks for the
++    * result, in memory it shares with the host. Where it shares none (an
++    * embedder that carries the backing store in its stream: the guest's
++    * write never arrives), the state of the query's last result would
++    * still say DONE, and a read of it before the new result is in would
++    * return the old one: mark it here too. */
++   vrend_write_query_state(q, VIRGL_QUERY_STATE_WAIT_HOST);
++
+    ret = vrend_check_query(q);
+    if (ret) {
+       list_delinit(&q->waiting_queries);
+-- 
+2.56.0
+

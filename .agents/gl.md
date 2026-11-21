@@ -41,7 +41,7 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | --- | --- |
 | `gl/patches/virglrenderer/` | the one series on virglrenderer 1.3.0 (tag commit ca50e00), both builds; see Patches |
 | `gl/wasm/` | the wasm module: `build.sh` (emscripten pinned in `pins.sh`; also the `native` build), `kw_virgl.c`/`.h` (C API, GL context hooks, vtest I/O), `kw_gl.js` (GL entry points made from WebGL2), `gl-missing.txt` (the stubs), `epoxy/` (libepoxy stand-in), `post.js` (`Module.virgl`, the page's renderer); see WebGL2 |
-| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, a parked busy wait, two inline clients, `Module.virgl.Renderer` |
+| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, busy waits (one answered ahead of its fence, one parked), two inline clients, `Module.virgl.Renderer` |
 | `gl/bridge/` | `vtest-bridge.c` (vtest socket to WebSocket or byte stream, fd termination) and the page that hosts a renderer: the wasm module or the relay to a native server; `README.md` has the wire dialect and the renderer interface |
 | `test/gl/vtest-check.sh` | the check suite on this host; see Testing |
 | `test/gl/bridge-check.sh` | the same suite with every byte through the page in headless Chromium; `--wasm` against the wasm renderer |
@@ -90,6 +90,13 @@ In order, each with its reason in the commit message:
 10. `VIRGL_RENDERER_COARSE_GL_ERRORS`: GL errors checked once per command
     buffer instead of after each command (glGetError is a round trip in
     WebGL; every command of a buffer is one context's).
+11. caps filled on context 0 and the current context forgotten when one is
+    created (Measured, the two upstream bugs);
+12. a query's state marked pending (`VIRGL_QUERY_STATE_WAIT_HOST`) in its
+    buffer when the guest asks for the result: Mesa writes that into memory
+    it shares with the host, which the inline dialect does not share, so
+    the buffer kept saying DONE from the query's last use, and a read
+    before the new result was in returned the old one (Busy waits).
 
 ## Single GL context
 
@@ -218,19 +225,119 @@ resource's backing holds (Weston's 500x400 client asks 819,200 bytes of an
 800,000-byte backing); the native server does not check, and the module,
 like vtest-bridge, copies what the backing has and pads the reply.
 
-Fences: a fence is a `glFenceSync` plus `glFlush` at submit, retired by
-polling (`glClientWaitSync`, timeout 0). Without the sync thread vtest's
-`RESOURCE_BUSY_WAIT` with the wait flag loops until no client has a fence
-in flight, and in WebGL a sync object signals only between tasks, so the
-loop would never end. The module parks the client instead, noting the last
-fence submitted; `kw_virgl_poll` from a later task answers the wait once
-that fence has retired (the page polls through a message for the first 16
-rounds, then 1 ms timeouts). Waiting for that fence rather than for all to
-be idle matters with several clients, whose submissions would otherwise
-keep the parked one waiting. Measured (2026-11-21, bridge-check `--wasm`):
-glmark2-es2 over 16 scenes of 2 s parked 2,674 busy waits for 13.9 s in
-all (5 ms each); the six `multi` clients 110 to 300 each. The page logs
-these counts when a client closes.
+Fences and busy waits: Busy waits, below.
+
+## Busy waits
+
+A fence is a `glFenceSync` plus `glFlush` at submit (the implicit fence of
+every `VCMD_SUBMIT_CMD`), retired by polling (`glClientWaitSync`, timeout
+0). Without the sync thread vtest's `RESOURCE_BUSY_WAIT` with the wait flag
+loops until no client has a fence in flight, and in WebGL a sync object
+signals only between tasks, so that loop would never end.
+
+What Mesa's vtest winsys (25.0, 26.2) waits for with the flag: after every
+`TRANSFER_GET2` (protocol 2 and later), before it reads its memfd;
+`resource_wait` before and after a readback and before mapping a busy
+resource; `fence_wait` without a timeout: glFinish, glClientWaitSync,
+drisw's swap (it finishes the frame's fence, then copies the back buffer
+out with `TRANSFER_GET2` and waits again), the shader link sync; and a
+query result read with wait. Without the flag a busy wait is a poll, which
+vtest answers as ever.
+
+Where a frame's time goes with vtest's answers (strict, below;
+2026-11-21, `bridge-check.sh --wasm es2`, SwiftShader, the counters of
+Stats): one parked wait a frame, drisw's fence wait before the readback
+(3,052 parks for 3,053 readbacks, 4.5 ms each, 14.0 s of the run's 32.8
+s), then 1.1 ms reading back the finished frame, 0.6 ms issuing GL; every
+wait right after a readback is answered at once even so (its fence retired
+during the park). With that wait answered at once the readback takes 3.3
+ms: of the 4.5 ms park about 2.2 ms is the GPU drawing, the rest WebGL
+telling late (probably Chromium's GPU process polling fences, and the page
+seeing the result only in a later task; not examined) and the polling
+(19 polls a park: 16 messages, then 1 ms timeouts).
+
+Why an early answer cannot make the guest read data that is not valid: the
+guest shares no memory with the GPU. Every byte it reads comes in a
+`TRANSFER_GET2` (inline) or `TRANSFER_GET` (plain) reply, read with
+`glReadPixels` or `getBufferSubData` (`kw_gl.js`, buffer maps), which
+return only once the commands before them that write those bytes have run;
+every byte it writes goes in with `TRANSFER_PUT(2)`, which GL orders after
+the commands before it. The one result the host writes outside the command
+stream, a query's (at fence retirement, `vrend_check_query`), reads as
+pending until it is written (patch 12), and Mesa reads it again until then.
+So the answer to a wait decides only timing: how far the guest runs ahead
+of the GPU. `busy_wait()` in `kw_virgl.c` answers:
+
+- at once, right after a `TRANSFER_GET(2)` of the same resource with only
+  busy waits between: the reply carried the data;
+- through vtest when the fences submitted before it have retired;
+- at once, ahead of those fences, when the client's last answer ahead has
+  retired or a `TRANSFER_GET(2)` of the client has come since (a read that
+  waited for the GPU work it reads): a client runs at most one wait ahead
+  of the GPU, and one that reads back every frame never parks;
+- else it parks until the fences of that earlier answer have retired (the
+  page polls `kw_virgl_poll` through a message for the first 16 rounds,
+  then 1 ms timeouts), then answers ahead. A program that glFinishes in a
+  loop without reading back is held one frame behind the GPU this way.
+
+A parked wait waits for the fences submitted before it, not for all to be
+idle, which matters with several clients, whose submissions would
+otherwise keep it waiting. `KW_VIRGL_STRICT_WAIT` (`kw_virgl_open`;
+`Renderer`'s `strictWaits`, the SDK's `gl.strictWaits`, the page's
+`?glwait=strict`, the bridge page's `?wait=strict`, `bridge-check.sh
+--strict-waits`) parks every waiting busy wait until the fences submitted
+before it have retired, vtest's answer, for comparison.
+
+Not taken: no capability bit makes Mesa skip a wait (the winsys waits
+after every `TRANSFER_GET2` from protocol 2 on, drisw's fence wait is
+unconditional); Chromium's WebGL `finish()` is a flush and WebGL allows no
+`clientWaitSync` timeout but 0, so nothing completes a fence within a task;
+prompter wake-ups for parks were left, as parks are rare (188 in the run
+below, state and es2, mostly as scenes start, 0.5 s in all).
+
+Measured (2026-11-21, `bridge-check.sh --wasm state es2`, SwiftShader, a
+noisy shared host, one run each): state 60 of 60 frames match with either
+answer; glmark2-es2 (800x600, 2 s a scene), vtest's answers (the build
+before these rules) / these rules: build 121 / 153,
+texture 128 / 168, shading 116 / 141, bump 125 / 169, effect2d 126 / 143,
+pulsar 123 / 150, desktop 48 / 55, buffer 91 / 93, ideas 64 / 74,
+jellyfish 83 / 96, terrain 12 / 12, shadow 92 / 101, refract 31 / 33,
+conditionals 123 / 156, function 124 / 155, loop 124 / 147. 3,766
+readbacks in the run instead of 3,053: 3.35 ms reading back, 0.61 ms
+issuing GL and almost nothing parked per readback; the renderer was busy
+about 47% of the run, the rest is the client side (Mesa, the bridge, the
+WebSocket carrying 1.2 MB a frame back, Xvfb). Two more pairs, default /
+`--strict-waits` alternating, with the host loaded by others (load 6 to
+10): 3,447 / 2,500 and 3,114 / 1,954 readbacks in the 32 s of es2; build
+142 / 107 and 143 / 86, jellyfish 88 / 76 and 84 / 70.
+
+### Stats
+
+The module counts, over all clients since init (`kw_virgl_stats()`,
+`KW_VIRGL_STAT_*` in `kw_virgl.h`; `Renderer.totals()` adds the polls by
+message and by timer; the SDK's `vm.gl.stats.renderer`, `VirglTotals`):
+commands by kind with the time each took, GL calls included (submits,
+reads = readbacks, writes = uploads, others), the waiting busy waits and
+how each was answered (`waitsRead`, `waitsDone`, `waitsAhead`, `parks`),
+time parked and the longest park, and polls. Two `emscripten_get_now()`
+calls a command: cheap enough to leave on (with vtest's answers, es2 ran
+within noise of the build without counters: 119 / 121 build, 84 / 83
+jellyfish). The page's Guest GL row
+(web.md, Guest GL) shows, over the last 2 s with readbacks, readbacks a
+second and per readback the time parked, reading back, issuing GL and
+uploading, how busy the renderer was, and how the waits were answered; the
+bridge page logs the totals when a client closes.
+
+Reading them on a GPU: parked per readback near 0 and `waitsAhead` about
+one a frame is the expected state. Parked time with `waitsAhead` low means
+waits the rules hold (a client that waits twice without a readback) or
+`?glwait=strict`. A high reading-back time is the GPU's frame plus the
+copy of the frame out (`glReadPixels` of 800x600 RGBA is 1.9 MB,
+synchronous); its lever would be a pixel pack buffer read after a fence,
+or not reading back at all (frames to the page's display). A high issuing
+time is per-draw cost in emscripten and WebGL (desktop, ideas). A renderer
+busy for a small share of the frame interval means the frame time is
+outside it: the guest's Mesa under kwemu, kwvsock carrying the frame, Xvfb.
 
 ## Measured (2026-11-21, Fedora 44 container, no GPU)
 
@@ -334,7 +441,7 @@ GPU). One run each, on the shared host:
 5. **unkernel.** Done: unkernel, below. Check: `node test/gl/unkernel-check.mjs`.
    The page's option: done (The page). Check: `node test/gl/page-check.mjs`.
    Next: frames to the page's display (X on kwfb, unverified; kwshm, or
-   wland), and the busy wait (Open questions).
+   wland). Busy waits: done (Busy waits).
 
 ## unkernel
 
@@ -385,8 +492,10 @@ the page adds `kw.gl=1` to the command line, for which the base's
 LIBGL_ALWAYS_SOFTWARE=1` in the guest's shells, so plain `eglinfo` or
 `glmark2-es2` uses virgl. The Environment tab's Guest GL row names the
 WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
-is a warning and a toast) and `vm.gl.stats`; the browser console has
-`[unkernel] guest GL: WebGL2 renderer ...`.
+is a warning and a toast) and `vm.gl.stats` with the per-readback
+breakdown of the renderer's counters (Stats); `?glwait=strict` answers busy
+waits as vtest does. The browser console has `[unkernel] guest GL: WebGL2
+renderer ...`.
 
 Checked 2026-11-21, `test/gl/page-check.mjs` (the dev server, Playwright's
 headless Chromium on SwiftShader, `?gl=1&data=0&cpus=1`, worker mode):
@@ -409,6 +518,7 @@ gl/wasm/build.sh && gl/wasm/build.sh native
 node gl/wasm/test/check.mjs                  # the module alone, a few s
 test/gl/bridge-check.sh --wasm               # the suite on the wasm renderer, about 5 min
 test/gl/bridge-check.sh --wasm --keep state  # one test, keep the logs and frames
+test/gl/bridge-check.sh --wasm --strict-waits es2  # busy waits as vtest answers them
 test/gl/bridge-check.sh --single             # the suite through the page to the native server
 test/gl/vtest-check.sh --single              # the native server alone, about 2 min
 test/gl/vtest-check.sh --fork                # a server process per client
@@ -496,11 +606,14 @@ Workloads that need no window system of ours (so nothing waits on wland):
 - Not tried in unkernel: the SMP kernel (`cpus` > 1; vsock and so GL stay
   on the owner's thread, as on one CPU), Firefox and Safari (WebGL2 and
   OffscreenCanvas in a page's main thread exist there), and a GPU.
-- The busy wait costs about 5 ms a frame (fence latency across tasks).
-  Through the inline dialect a readback's data travels with its
-  `TRANSFER_GET2` reply, which `glReadPixels` fills synchronously, so a
-  busy wait could be answered at once; whether anything else relies on it
-  (glFinish timing, back pressure) is unexamined.
+- Busy waits on a GPU: not measured. On SwiftShader the rules of Busy
+  waits remove the per-frame park (4.5 ms, about half of it WebGL's lag
+  in telling a fence retired); on a GPU the page's Guest GL row shows the
+  per-readback breakdown, and `?glwait=strict` vtest's answers for
+  comparison.
+- glFinish may return one wait before the GPU is done (Busy waits): a
+  program that times the GPU with glFinish alone measures too little.
+  Nothing else found relies on it.
 - Draw-heavy scenes run at half the relay's rate in the browser; the
   remaining per-draw cost (state calls through emscripten, the base vertex
   emulation's attribute queries) is unmeasured in detail (`--glcount`).

@@ -10,8 +10,8 @@
 #   relay    (the default) the stand-in: WebSocket -> vtest-bridge helper ->
 #            unix socket -> virgl_test_server
 #
-#   test/gl/bridge-check.sh [--wasm] [--glcheck|--glcount] [--server PATH] [--single] [--loose]
-#                           [--keep] [--transport websocket] [TEST...]
+#   test/gl/bridge-check.sh [--wasm] [--glcheck|--glcount] [--strict-waits] [--server PATH]
+#                           [--single] [--loose] [--keep] [--transport websocket] [TEST...]
 #
 # Starts the renderer side (relay: the server, configured as vtest-check.sh
 # configures its own, and the helper), the bridge and Chromium, runs
@@ -19,7 +19,8 @@
 # its tests), checks the logs of the server, the bridge and the page, and
 # tears everything down. --single and --loose are vtest-check.sh's, for the
 # server of the relay. --transport websocket makes the page use WebSocket in
-# place of WebSocketStream. --glcheck (--wasm) logs every WebGL call that
+# place of WebSocketStream. --strict-waits (--wasm) has the renderer answer
+# busy waits as vtest does (KW_VIRGL_STRICT_WAIT). --glcheck (--wasm) logs every WebGL call that
 # raises an error, slowly; --glcount the calls made most often (both fail
 # bridge-log by design). CHROMIUM names the browser (default:
 # chromium-headless, else Playwright's headless shell). Needs: what
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
 	--loose) loose=1; pass+=(--loose) ;;
 	--keep) keep=1; pass+=(--keep) ;;
 	--transport) query+="&transport=$2"; shift ;;
+	--strict-waits) query+="&wait=strict" ;;
 	-*) pass+=("$1") ;;
 	*) tests+=("$1") ;;
 	esac

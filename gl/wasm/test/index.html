@@ -8,8 +8,9 @@
   version handshake, GET_CAPS2, GET_CAPSET), feeding the bytes in odd-sized
   chunks. A second, informational stage creates a texture and moves data
   through it (TRANSFER_PUT, TRANSFER_GET). Then a waiting busy wait behind
-  a fence must park the client and be answered by kw_virgl_poll from a
-  later task, and two clients of the inline dialect (protocol version 3,
+  a fence must be answered at once (ahead of the fence), a second one
+  behind another fence must park the client and be answered by
+  kw_virgl_poll from a later task, and two clients of the inline dialect (protocol version 3,
   transfer data in the stream, as gl/bridge speaks it) must get their own
   resource ids and move data through a texture; last, Module.virgl.Renderer
   (the renderer shape of gl/bridge) must answer a parked busy wait by itself.
@@ -228,15 +229,23 @@ async function main() {
     out.stages.transfer = false;
   }
 
-  // a waiting busy wait behind a fence: SUBMIT_CMD (one VIRGL_CCMD_NOP) makes
-  // an implicit fence; RESOURCE_BUSY_WAIT with VCMD_BUSY_WAIT_FLAG_WAIT parks
-  // the client until kw_virgl_poll, from later tasks, sees the fence signal
-  // (WebGL sync objects change only between tasks)
+  // waiting busy waits behind fences: SUBMIT_CMD (one VIRGL_CCMD_NOP) makes
+  // an implicit fence; the first RESOURCE_BUSY_WAIT with
+  // VCMD_BUSY_WAIT_FLAG_WAIT is answered at once, ahead of it; the second,
+  // behind a second fence in the same task, parks the client until
+  // kw_virgl_poll, from later tasks, sees the first fence signal (WebGL sync
+  // objects change only between tasks; kw_virgl.c, busy_wait)
   stage('busyWait');
-  const t2 = performance.now();
-  let fed = v.feed(c, bytesOf(new Uint32Array([1, VCMD.SUBMIT_CMD, 0, 2, VCMD.RESOURCE_BUSY_WAIT, 0, 1])));
+  const t2 = performance.now(), s0 = v.stats();
+  const fenceWait = bytesOf(new Uint32Array([1, VCMD.SUBMIT_CMD, 0, 2, VCMD.RESOURCE_BUSY_WAIT, 0, 1]));
+  let fed = v.feed(c, fenceWait);
+  if (fed !== v.OK) throw new Error(`busy wait: feed ${fed}, expected an answer ahead`);
+  rep.header(VCMD.RESOURCE_BUSY_WAIT);
+  if (rep.u32(1)[0] !== 0) throw new Error('busy wait answered busy');
+  fed = v.feed(c, fenceWait);
   if (fed < 0) throw new Error(`busy wait: feed ${fed}`);
   out.busyWait = { parked: fed === v.PARKED, polls: 0 };
+  if (!out.busyWait.parked) throw new Error('a second busy wait behind fences did not park');
   while (v.state(c) === v.PARKED) {
     if (++out.busyWait.polls > 1000) throw new Error('busy wait never answered');
     await new Promise((r) => setTimeout(r, 1));
@@ -247,6 +256,10 @@ async function main() {
   out.busyWait.busy = rep.u32(1)[0];
   out.busyWait.ms = Math.round(performance.now() - t2);
   if (out.busyWait.busy !== 0) throw new Error('busy wait answered busy');
+  const s1 = v.stats();
+  out.busyWait.stats = { waits: s1.waits - s0.waits, ahead: s1.waitsAhead - s0.waitsAhead, parks: s1.parks - s0.parks };
+  if (out.busyWait.stats.waits !== 2 || out.busyWait.stats.ahead !== 1 || out.busyWait.stats.parks !== 1)
+    throw new Error(`busy wait counters ${JSON.stringify(out.busyWait.stats)}`);
   out.stages.busyWait = true;
   v.close(c);
 
@@ -303,20 +316,24 @@ async function main() {
   const got = [];
   let closed = null;
   const done = new Promise((resolve) => {
-    ren.onreply = (id, bytes) => { got.push(...bytes); if (got.length >= 24) resolve(); };
+    ren.onreply = (id, bytes) => { got.push(...bytes); if (got.length >= 36) resolve(); };
     ren.onclose = (id, why) => { closed = why; resolve(); };
   });
   ren.open(7);
   ren.feed(7, create);
   ren.feed(7, bytesOf(cmd(VCMD.PROTOCOL_VERSION, [4])));
-  ren.feed(7, bytesOf(new Uint32Array([1, VCMD.SUBMIT_CMD, 0, 2, VCMD.RESOURCE_BUSY_WAIT, 0, 1])));
+  // the second wait parks (above)
+  ren.feed(7, fenceWait);
+  ren.feed(7, fenceWait);
   await Promise.race([done, new Promise((res) => setTimeout(res, 5000))]);
+  out.renderer.stats = ren.stats(7);
   ren.close(7);
   const w = new Uint32Array(new Uint8Array(got).buffer);
   out.renderer.reply = Array.from(w);
-  // [1, PROTOCOL_VERSION, 3], [1, RESOURCE_BUSY_WAIT, 0]
-  if (closed || w.length !== 6 || w[1] !== VCMD.PROTOCOL_VERSION || w[2] !== 3 ||
-      w[4] !== VCMD.RESOURCE_BUSY_WAIT || w[5] !== 0)
+  // [1, PROTOCOL_VERSION, 3], [1, RESOURCE_BUSY_WAIT, 0] twice
+  if (closed || w.length !== 9 || w[1] !== VCMD.PROTOCOL_VERSION || w[2] !== 3 ||
+      w[4] !== VCMD.RESOURCE_BUSY_WAIT || w[5] !== 0 || w[7] !== VCMD.RESOURCE_BUSY_WAIT || w[8] !== 0 ||
+      out.renderer.stats.parks !== 1)
     throw new Error(`v.Renderer: ${closed || 'unexpected reply ' + Array.from(w)}`);
   out.stages.renderer = true;
   delete out.running;

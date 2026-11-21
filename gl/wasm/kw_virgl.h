@@ -4,10 +4,12 @@
 // hands the module a WebGL2 context, opens a client per vtest connection,
 // feeds each client's bytes as they arrive and sends back the reply bytes.
 // Nothing here blocks: input may arrive in any chunks (a command runs once
-// all its bytes are in), and a waiting busy wait parks the client until the
-// fences submitted before it (every client's) have retired; kw_virgl_poll,
-// called from a later task, answers it then (a WebGL fence only signals
-// between tasks).
+// all its bytes are in), and a waiting busy wait is answered at once where
+// that cannot make the guest read invalid data (kw_virgl.c, busy_wait: right
+// after a readback, or at most one wait ahead of the GPU) and otherwise parks
+// the client until the fences it waits for (every client's) have retired;
+// kw_virgl_poll, called from a later task, answers it then (a WebGL fence
+// only signals between tasks).
 // Single-threaded: call everything from the thread that owns the context.
 #ifndef KW_VIRGL_H
 #define KW_VIRGL_H
@@ -29,6 +31,10 @@ int kw_virgl_init(int webgl_context);
 // with no fds, transfer data inline (TRANSFER_PUT2 followed by its data,
 // TRANSFER_GET2 answered with it), as gl/bridge/vtest-bridge.c speaks it.
 #define KW_VIRGL_INLINE 1
+// Another flag: every waiting busy wait of the client parks until the fences
+// submitted before it have retired (vtest's own answer, slower), in place of
+// the answers ahead of the GPU that busy_wait in kw_virgl.c gives.
+#define KW_VIRGL_STRICT_WAIT 2
 
 // Open a client (one vtest connection): its id (> 0), or a negative errno.
 int kw_virgl_open(uint32_t flags);
@@ -58,5 +64,30 @@ void kw_virgl_consume(int client, uint32_t n);
 // The client's state: KW_VIRGL_OK, KW_VIRGL_PARKED, or a negative errno
 // (-ENOENT: no such client).
 int kw_virgl_state(int client);
+
+// Counters over all clients since init, for the page: KW_VIRGL_STAT_COUNT
+// doubles, indexed by these (times in ms of emscripten_get_now, the time
+// each command took, the GL calls it made included; WebGL runs most GL
+// calls asynchronously, but reads that return data wait for the GPU).
+enum {
+	KW_VIRGL_STAT_SUBMITS,      // VCMD_SUBMIT_CMD: decoding and issuing GL
+	KW_VIRGL_STAT_SUBMIT_MS,
+	KW_VIRGL_STAT_READS,        // TRANSFER_GET(2): glReadPixels or getBufferSubData
+	KW_VIRGL_STAT_READ_MS,
+	KW_VIRGL_STAT_WRITES,       // TRANSFER_PUT(2): uploads
+	KW_VIRGL_STAT_WRITE_MS,
+	KW_VIRGL_STAT_OTHERS,       // every other command
+	KW_VIRGL_STAT_OTHER_MS,
+	KW_VIRGL_STAT_WAITS,        // waiting VCMD_RESOURCE_BUSY_WAITs, which are answered:
+	KW_VIRGL_STAT_WAITS_READ,   //   at once, right after a readback of the same resource
+	KW_VIRGL_STAT_WAITS_DONE,   //   at once, their fences retired already
+	KW_VIRGL_STAT_WAITS_AHEAD,  //   at once, ahead of their fences
+	KW_VIRGL_STAT_PARKS,        //   after parking
+	KW_VIRGL_STAT_PARKED_MS,    // from parking to the answer, all parks
+	KW_VIRGL_STAT_PARK_MAX_MS,  // the longest park
+	KW_VIRGL_STAT_POLLS,        // kw_virgl_poll calls that found a parked client
+	KW_VIRGL_STAT_COUNT
+};
+const double *kw_virgl_stats(void);
 
 #endif

@@ -28,7 +28,7 @@
 // `gl: true` is ignored with a log line, unless `renderer` gives one.
 
 import { PtyError } from "./tty.ts";
-import { StreamHost, type StreamHostStats, type VtestRenderer } from "./gl-stream.ts";
+import { StreamHost, type StreamHostStats, type VirglTotals, type VtestRenderer } from "./gl-stream.ts";
 import { guestRun } from "./mounts.ts";
 import type { Vsock, VsockConnection, VsockListener } from "./vsock.ts";
 
@@ -59,12 +59,24 @@ export interface GlOptions {
 	 * bridge --link vsock:2:1019 --daemon`).
 	 */
 	forwarder?: boolean;
+	/**
+	 * The wasm renderer answers every waiting busy wait as vtest does: once
+	 * the fences submitted before it have retired, which WebGL tells only
+	 * between tasks. Default false: it answers at once where that cannot
+	 * make the guest read data before it is valid (gl/wasm/kw_virgl.c,
+	 * busy_wait), which saves most of that wait in each frame. For
+	 * comparison.
+	 */
+	strictWaits?: boolean;
 }
 
 /** createKernel's `gl`: true, or options. */
 export type GlOption = boolean | GlOptions;
 
+/** KernelHandle.gl.stats: bridges and clients, and the renderer's counters (`renderer`, VirglTotals). */
 export interface GlStats extends StreamHostStats {}
+
+export type { VirglTotals };
 
 /** The host side of guest GL (KernelHandle.gl). */
 export class GlHost {
@@ -97,7 +109,7 @@ export class GlHost {
 	}
 
 	async #start(opts: GlOptions, module: string | undefined): Promise<string> {
-		const wasm = opts.renderer ? undefined : await wasmRenderer(module!, this.#log);
+		const wasm = opts.renderer ? undefined : await wasmRenderer(module!, opts.strictWaits ?? false, this.#log);
 		const renderer = opts.renderer ?? wasm!.renderer;
 		let what = await renderer.init();
 		if (wasm) what += `; ${webglName(wasm.gl)}`;
@@ -156,10 +168,10 @@ export class GlHost {
 
 /** The module's JS helpers (gl/wasm/post.js) that GlHost uses. */
 interface VirglModule {
-	virgl: { Renderer: new (gl: WebGL2RenderingContext) => VtestRenderer };
+	virgl: { Renderer: new (gl: WebGL2RenderingContext, opts?: { strictWaits?: boolean }) => VtestRenderer };
 }
 
-async function wasmRenderer(url: string, log: (msg: string) => void): Promise<{ renderer: VtestRenderer; gl: WebGL2RenderingContext }> {
+async function wasmRenderer(url: string, strictWaits: boolean, log: (msg: string) => void): Promise<{ renderer: VtestRenderer; gl: WebGL2RenderingContext }> {
 	if (typeof OffscreenCanvas !== "function") throw new Error("no OffscreenCanvas here, so no WebGL2");
 	const mod = await import(/* @vite-ignore */ url) as { default: (o: object) => Promise<VirglModule> };
 	const say = (s: string) => log(`[gl] virgl: ${s}`);
@@ -169,7 +181,7 @@ async function wasmRenderer(url: string, log: (msg: string) => void): Promise<{ 
 	});
 	if (!gl) throw new Error("no WebGL2 context (OffscreenCanvas.getContext(\"webgl2\") gave none)");
 	gl.canvas.addEventListener("webglcontextlost", () => log("[host] gl: the WebGL2 context was lost; GL clients will fail"));
-	return { renderer: new Module.virgl.Renderer(gl), gl };
+	return { renderer: new Module.virgl.Renderer(gl, { strictWaits }), gl };
 }
 
 /** The WebGL2 implementation's name (WEBGL_debug_renderer_info), for the log. */

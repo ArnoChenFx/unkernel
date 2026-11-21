@@ -270,7 +270,8 @@ its own thread, on one shared memory. The JIT is per CPU:
   never reachable from another; a task that moves finds a cold cache and
   compiles again. Sharing modules would need instantiating in every CPU's
   thread, a slot installed in every table before any CPU enters it, and a
-  free that waits until no CPU runs it.
+  free that waits until no CPU runs it; and V8 compiles the same bytes
+  again in each thread (a64/performance.md, Rejected designs).
 - **Interrupts.** Compiled code polls the `irqp` it is called with (taken
   from the CPU's own `irq_pending` at every call; nothing is baked into a
   module). With a shared memory (caps bit 3) the load is
@@ -385,7 +386,8 @@ host driver calls the exported `kw_debug_stats` at markers the guest
 prints (for example `@@S name` / `@@E name` around each command). Either
 finds the cpu through the stats-only export
 `kw_debug_cpu_of_jit_buf(ptr)`, where `ptr` is what `kw_host_jit_compile`
-receives; `icount` is at offset 32. Exit counters (`[kwemu-exits]` and
+receives; `icount` is at offset 32. `[kwemu-free]` counts the modules
+freed by reason (`jc.Why`, `Jx.free_why`). Exit counters (`[kwemu-exits]` and
 `[kwemu-jx]`, indices in `jc.Jx`): every entry ends as a hand-back, a
 side exit (`exit_side`, of which `exit_side_region` from region members),
 a direct or indirect terminator, or a stop (`exit_stop`: budget,

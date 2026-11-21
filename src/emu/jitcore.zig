@@ -337,9 +337,18 @@ pub inline fn memberOf(b: *const Block) usize {
     return (b.jx.st >> member_shift) & 0xff;
 }
 
+/// Why a pool entry is freed (Jx.free_why): its region is compiled again
+/// with an added block (a block of its page that got hot / a block it was
+/// often left towards: `grows`, `exit_grows`), the
+/// pool's clock needs the entry, the tenured ring dropped its last home
+/// member's ops, or anything else (that block was decoded again or its
+/// table entry replaced; a cache reset).
+const Why = enum(u8) { grow, exit_grow, clock, ring, other };
+
 /// Give pool entry `i` back to the host and detach it from its blocks.
-fn freeSlot(cpu: *Cpu, i: usize) void {
+fn freeSlot(cpu: *Cpu, i: usize, why: Why) void {
     const st = &cpu.priv.jit;
+    jx(cpu, Jx.free_why + @intFromEnum(why), 1);
     for (&st.members[i]) |*m| {
         if (m.* == 0) continue;
         const b = &cpu.priv.blocks[m.* - 1];
@@ -355,7 +364,7 @@ fn freeSlot(cpu: *Cpu, i: usize) void {
 /// live members stays: its code checks a member's `st` before entering it,
 /// and the overwrite resets that.
 pub inline fn drop(cpu: *Cpu, b: *Block) void {
-    if (b.jx.st >= compiled) dropMember(cpu, b);
+    if (b.jx.st >= compiled) dropMember(cpu, b, .other);
 }
 
 /// The tenured ring drops b's ops (kwemu.zig, `tenMakeRoom`): its code goes
@@ -363,25 +372,25 @@ pub inline fn drop(cpu: *Cpu, b: *Block) void {
 /// threshold again.
 pub fn evict(cpu: *Cpu, b: *Block) void {
     if (b.jx.st >= compiled) {
-        dropMember(cpu, b);
+        dropMember(cpu, b, .ring);
         b.jx.st = cpu.priv.jit.threshold;
     }
 }
 
-noinline fn dropMember(cpu: *Cpu, b: *Block) void {
+noinline fn dropMember(cpu: *Cpu, b: *Block, why: Why) void {
     const i = b.jx.st & slot_mask;
     const me: u16 = @intCast(blockIndex(cpu, b) + 1);
     b.jx.st = never;
     for (cpu.priv.jit.members[i]) |m| {
         if (m != 0 and m != me and slotOf(&cpu.priv.blocks[m - 1]) == i + 1) return;
     }
-    freeSlot(cpu, i);
+    freeSlot(cpu, i, why);
 }
 
 /// Free every slot in use (cache reset).
 pub fn releaseAll(cpu: *Cpu) void {
     for (0..npool) |i| {
-        if (cpu.priv.jit.owner[i] != 0) freeSlot(cpu, i);
+        if (cpu.priv.jit.owner[i] != 0) freeSlot(cpu, i, .other);
     }
 }
 
@@ -410,7 +419,7 @@ fn allocSlot(cpu: *Cpu) usize {
         const o = st.owner[i];
         if (o == 0) return i;
         if (referenced(cpu, i) and tries < 2 * npool) continue; // second chance
-        freeSlot(cpu, i);
+        freeSlot(cpu, i, .clock);
         st.evictions += 1;
         return i;
     }
@@ -551,7 +560,9 @@ pub const Jx = struct {
     /// interpreter (and MRS NZCV).
     pub const sync_site = next_by + 4 * n_nx;
     pub const n_sites = 5;
-    pub const end = sync_site + n_sites;
+    /// Pool entries freed (modules given back to the host), by `Why`.
+    pub const free_why = sync_site + n_sites;
+    pub const end = free_why + 5;
 };
 
 /// Exit reasons of Jx.next_by.
@@ -1350,7 +1361,7 @@ pub fn Jit(comptime I: type) type {
             };
             if (grow) |g| {
                 // (Making room in the tenured ring may have freed it already.)
-                if (st.owner[g] != 0) freeSlot(cpu, g);
+                if (st.owner[g] != 0) freeSlot(cpu, g, .exit_grow);
                 st.exit_grows += 1;
             }
             const i = allocSlot(cpu);
@@ -1661,7 +1672,7 @@ pub fn Jit(comptime I: type) type {
                 for (st.members[i]) |m| {
                     if (m != 0 and usable(cpu, &cpu.priv.blocks[m - 1])) addMember(rg, m - 1);
                 }
-                freeSlot(cpu, i);
+                freeSlot(cpu, i, .grow);
                 st.grows += 1;
             }
             var q: usize = 0;

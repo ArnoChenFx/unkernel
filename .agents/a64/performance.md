@@ -35,6 +35,24 @@ and rejected designs are in kwemu.md.
   report first and later runs apart. The A/B numbers below are SDK boots
   (`createKernel` inline, the disk with `snapshot: true`), one per variant
   and workload, timing 3-5 `vm.exec` runs of the command each.
+- **Node, Bun and Claude Code in one script**: `node test/app-bench.mjs
+  [--rounds N] [--cpus N] [--stats] [NAME=]BUNDLE.wasm[,VAR=VALUE]...`
+  boots Debian on that disk (`--snapshot --no-net`, so runs share it and
+  fetch nothing) once per bundle and round, the order rotated, and runs
+  `test/app-bench.sh` from a mount: `claude --help`, `npm --version`, `bun
+  cpu.js 150`, `node cpu.js 40`, `node -e 0`, `claude --version` x 5 and
+  `bun build` of a generated 0.5 MB TypeScript file, three times each, then
+  one mixed pass over claude, npm and bun. It prints the median first and
+  later run per command with the difference to the first bundle; a boot
+  takes about a minute. `test/guest/app/cpu.js` is not the `cpu.js` of the
+  numbers above. `,ASLR=0` (or another variable of the guest script) makes
+  a variant of the same bundle. With `--stats` (a stats bundle) the guest
+  powers off at the end and each boot's output, with the counters of the
+  whole boot, goes to `app-bench-NAME-ROUND.log`. Look at the host's load
+  first (`uptime`): with about six other busy cores the same bundle
+  differed from itself by 14-68% per row (2026-11-21), while its counters
+  stayed within 3%; on a quiet host rows spread 3-5% (`node cpu.js` first
+  runs more).
 - **Counters**: a `-Dkwemu-stats` kernel (`kernel/build.sh stats`, CLI
   `--stats`, or `kw_debug_stats` per window: kwemu.md, Measuring). The
   A64 tier adds `tier.Ax` in JitStats.hb_gen (interpreted instructions by
@@ -44,7 +62,8 @@ and rejected designs are in kwemu.md.
   tail of Stats.op_hist (nursery resets and what was live, tenured blocks,
   decodes by what the table way held, countdown taken over), `tier.fpForm`
   (generic executions by FP form), `Jx.sync_site` (where NZCV is
-  materialised, counted in the generated code), and generic ops by
+  materialised, counted in the generated code), `Jx.free_why` (modules
+  freed by reason, `jc.Why`; the CLI's `[kwemu-free]` line), and generic ops by
   instruction word (`kwemu.countGenWord`, `JitStats.gen_words`: 512
   entries of key = word with Rd and Rn cleared, executions, calls from
   compiled code; `KwemuStats.words` from word 501 on; disassemble the
@@ -137,6 +156,20 @@ runs): `npm --version` 3.91 and 3.54, `npx --version` 3.53 and 3.55, `npx
 4.12; Bun `bun -e` x10 0.65, `bun run t.ts` x5 0.79. SMP kernel with
 `--cpus 2`: `npm --version` 3.47 and 2.99. Compiled share: npm 44%, `node
 -e 0` 63%, V8 loops 80-92%.
+
+`test/app-bench.mjs` (2026-11-21, the profile disk, quiet host, ms,
+medians of 5 boots on one CPU and 4 on two, first / later runs):
+
+| command | 1 CPU | 2 CPUs |
+| --- | ---: | ---: |
+| `claude --help` | 3196 / 2502 | 3231 / 2622 |
+| `npm --version` | 3225 / 2388 | 2728 / 2033 |
+| `bun cpu.js 150` | 3329 / 3148 | 1961 / 1603 |
+| `node cpu.js 40` | 3566 / 3049 | 2075 / 2063 |
+| `node -e 0` | 385 / 348 | 343 / 324 |
+| `claude --version` x 5 | 585 / 539 | 615 / 581 |
+| `bun build` | 947 / 753 | 946 / 856 |
+| mixed pass | 13150 | 11747 |
 
 **OpenSSL** (2026-11-18, UP bundle, libcrypto built with gcc `-O2`; the
 image now has Alpine's `-Os` build, whose NEON and crypto paths are the
@@ -237,6 +270,26 @@ evicts 78-706 compiled blocks per step after the first.
   compiled block evicted from the ring (about 1500), 23-25 nursery resets
   (25-27), and 55-57% of decodes re-decode blocks a reset discarded
   (56-60%).
+- **Why compiled modules are freed** (2026-11-21, stats bundle, one
+  `test/app-bench.mjs` boot each: 9.7-10.1 G instructions, 9.0-9.8 M
+  decodes, about 650-700 nursery resets). The tenured ring and the
+  1024-entry slot pool are two limits one behind the other, and neither is
+  what keeps a third of the instructions out of compiled code:
+
+  | | 128K ring, 1024 slots | 512K ring (15 MiB) | 512K ring, 4096 slots (16 MiB) |
+  | --- | ---: | ---: | ---: |
+  | compiled share of instructions | 63.4% | 63.5% | 65.1% |
+  | modules compiled | 6531 | 5867 | 5504 |
+  | most live at once | 624 | 900 | 1925 |
+  | freed: the ring made room | 3322 | 0 | 623 |
+  | freed: the pool's clock | 0 | 2307 | 0 |
+  | freed: region compiled again with another block | 2425 | 2375 | 2422 |
+  | freed: other (re-decoded, table entry replaced) | 260 | 327 | 596 |
+
+  A larger ring moves the evictions to the slot pool; with both raised
+  they nearly stop and the compiled share gains 1.7 points, for no time
+  (Rejected designs). About 2400 frees per boot are regions growing, which
+  no cache size removes. Compiling was 2.6-2.7 s of a boot of about 80 s.
 - **Compiled code across processes.** node, bun and claude are non-PIE,
   so a later process maps their code at the same addresses and its blocks
   revalidate: code compiled by an earlier process runs again if the
@@ -293,13 +346,15 @@ Node, Bun and Claude Code (Where the time goes), in this order:
 
 1. **Measure again with the 128K ring**: V8's worker
    threads' share of cycles and the decode share (`perf`, Measuring).
-2. **More tenured capacity or a second-chance ring**: the mixed sequence
-   still evicts compiled blocks (`Ar.ten_evicted_compiled`, Tenured
-   ring), but a bigger ring needs a bigger `KW_CPU_SIZE` (1 MiB of guest
-   RAM per CPU for 64K ops) or takes from the nursery, which costs npm;
-   worth it only if long sessions show the same.
+2. **Fewer compiles of the same code**: about 2400 of the 6500 compiles of
+   a `test/app-bench.mjs` boot are regions compiled again to add one block
+   (Where the time goes, Why compiled modules are freed). More cache does
+   not help (Rejected designs: the 512K ring with 4096 slots, the shared
+   op store).
 3. **Per-CPU code caches on SMP**: each CPU compiles the same code again
-   (kwemu.md, JIT on several CPUs, says what sharing needs).
+   (kwemu.md, JIT on several CPUs, says what sharing needs); V8 does not
+   reuse a compile of the same bytes in another thread, so sharing would
+   save only kwemu's own gathering and emitting.
 4. **A cheaper decoder**, only if decode stays above about 8% of npm's
    time (about 300 host instructions per decoded guest instruction).
 5. **Binaryen `-O2` after the 32-bit lowering**: 2-3.5% fewer main-thread
@@ -346,6 +401,8 @@ bundle, boots interleaved.
 | `jc.enter` inlined into `run` | within noise |
 | Exec TLB of 1024 sets instead of 256 | npm exec-TLB walks 160K to 30K and revalidations 1.3M to 0.5M per command, time within noise: a revalidation is cheap |
 | A nursery beyond 320K with the 128K ring: 384K (`KW_CPU_SIZE` 10 MiB) or 512K (12 MiB); earlier 16 MiB (64K blocks, a 704K nursery) | 2026-11-21, against the 320K nursery (Tenured ring; UP 8 boots, 2 CPUs 5): `claude --help` later runs -1.0% and -1.5%, npm later runs -1.4% and -1.4%, the mixed sequence -0.1% and -1.2% (on 2 CPUs 512K -4.3%), bun cpu.js later runs +1.2% and +3.3%, the Alpine sum +1.5% and +2.0%: within noise or mixed, for 1 and 3 MiB more guest RAM per CPU. 16 MiB (2026-11-18/19, Alpine's node, single runs, before the ring change): npm decodes 880K to 565K, time within noise, `node -e 0` slower |
+| A 512K-op tenured ring with 4096 JIT slots (`KW_CPU_SIZE` 16 MiB), so that compiled code is almost never evicted (2026-11-21, `test/app-bench.mjs`, quiet host) | no faster, partly slower. One CPU, 5 boots: later runs of `claude --help` +3.0%, npm +4.5%, `bun cpu.js` -2.2%, `bun build` +24.5% (753 to 937 ms, ranges apart), the mixed pass +8.8%. Two CPUs, 4 boots: claude +9.8%, npm +2.1%, the mixed pass -0.1% (ranges overlapping). Compiles 6531 to 5504 per boot, compiled share 63.4% to 65.1%; the 512K ring alone only moves the evictions to the slot pool (Where the time goes, Why compiled modules are freed). Why it is slower is not traced |
+| A store of decoded ops keyed by physical page and shared by processes and CPUs, with position-independent ops, in memory from the kernel (no nursery, no ring; "as Rosetta keeps translations per binary"), not built (2026-11-21) | bounded first. Guest ASLR off (`randomize_va_space` 0: libraries and PIE programs at the same addresses in every process, which is what such a store would give) changed nothing on one CPU: 8.916M against 8.909M decodes and 6291 against 6522 compiles per `test/app-bench.mjs` boot, because node, bun and claude are non-PIE and already revalidate. Not evicting compiled code gains no time (the row above), not evicting decoded ops neither (the nursery row above). Persisted translations do not carry over: a wasm module cannot be mapped from a file, and V8 (Node 24.22.1) compiles the same 1.3 KiB module in a second thread as slowly as a new one (62-73 against 70-81 µs, `new WebAssembly.Module`, instantiate and first call). Sharing would also need a replacement for the per-CPU exec-TLB generations and code-page write marks, a compile window that no longer reads only its own `kw_cpu`, and a rule for ops freed while another CPU runs them |
 | Chaining interpreted blocks inside `runOps` | the `run` loop is 12% of npm's host time, but every node row got 2-4% slower: the chain code in each branch kind costs more than the returns it saves |
 | Shorter blocks: `max_block` 32, 48 or 16 instead of 64 (2026-11-20, UP bundle) | 32 with the 128K ring, the profile disk (6 boots): `claude --help` +0.8% / -15.9% (first / later runs; the ring alone -15.7%), npm -4.9% / -2.8%, bun cpu.js 0.0% / -9.0%, the mixed sequence -4.8%; the Alpine 20-row sum -3.3% and -5.6% in two sessions (gzip -32%, sha256sum +4-6%); but OpenSSL (5 boots, two sessions) chacha20-poly1305 -25%, sha512 -10%, aes-128-gcm -5..-9%, aes-256-ctr -6%. 32 alone (an earlier round, 6 boots): claude +0.9% / -12.1%, npm -3.4% / -1.8%, bun cpu.js -4.3% / -5.0%; hot guests (`kwemu-harness-jit.wasm`) -0.9..+3.7% (noise ±4%). 48 with the ring: OpenSSL chacha20-poly1305 -11%, aes-256-ctr -6%, sha512 -5%, aes-128-gcm -5%, and no gzip gain. 16: claude +10.9% / -2.9%, hot sha -15.8%, interp -6.0%. The OpenSSL losses are not traced; a length rule that does not cut OpenSSL's blocks might keep the gains (untested) |
 | Interpreter-loop work for cold code: fewer dispatch mispredicts, denser ops (2026-11-20, perf) | hot and cold code mispredict alike (Where the time goes, Per-unit costs); if every mispredict vanished, at most about 23% of `runOps`; L1/L2 misses on ops bound denser ops below 5% of `runOps` |

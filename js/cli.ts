@@ -709,6 +709,7 @@ function printKwemuStats(k: KwemuStats): void {
 	process.stderr.write(`[kwemu] instret=${k.icount} compiled insns=${(w(11 + nk) * 100 / ic).toFixed(2)}% handbacks=${w(12 + nk)}\n`);
 	process.stderr.write(`[kwemu-exits] entries=${jx(0)} handbacks=${jx(1)} side=${jx(2)} (region ${jx(25)}) direct=${jx(3)} jalr=${jx(4)} stop=${jx(24)}\n`);
 	process.stderr.write(`[kwemu-jx] ${k.words.slice(base, base + 64).join(" ")}\n`);
+	process.stderr.write(`[kwemu-free] grow=${jx(59)} exit_grow=${jx(60)} clock=${jx(61)} ring=${jx(62)} other=${jx(63)}\n`);
 	process.stderr.write(`[kwemu-stats] lookups_slow=${w(0)} revalidated=${w(1)} decoded=${w(2)} resets=${w(3)} blocks=${w(4)} ` +
 		`insns/block=${(w(5) / Math.max(w(4), 1)).toFixed(2)} single_steps=${w(6)} walks r/w/x=${w(7)}/${w(8)}/${w(9)} generic=${w(10)}\n`);
 }

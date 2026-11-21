@@ -1,7 +1,7 @@
 unkernel (https://github.com/pithings/unkernel) adds these files to this
 system: the kw layer of its base initramfs (/usr/bin/kwtty, kw9p, kwvsock,
 kwshm, kwwasi and glimmer, /usr/sbin/kw-overlay, /usr/lib/kw/, /usr/lib/kw-base,
-/etc/profile.d/kw-path.sh and kw-term.sh, /etc/X11/xorg.conf.d/*-kw-*.conf,
+/etc/profile.d/kw-path.sh, kw-term.sh and kw-gl.sh, /etc/X11/xorg.conf.d/*-kw-*.conf,
 this file) and, in the distro image, the files named kw-* or under
 /usr/lib/kw/ and the ones its build changes.
 

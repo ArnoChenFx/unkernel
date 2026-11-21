@@ -134,6 +134,8 @@ export interface Options {
 	autosuspend: string;
 	/** Ask before closing (?askleave=0: off). */
 	askleave: "on" | "off";
+	/** Guest GL (?gl=1), Debian only. */
+	gl: "on" | "off";
 }
 
 type Listener = () => void;

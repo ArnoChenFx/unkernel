@@ -10,7 +10,7 @@
 import { createKernelOn, type CreateKernelOptions, type KernelHandle, type KernelInstance, type WorkerOption } from "../../js/core/instance.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
 import { webPlatform } from "../../js/web/platform.ts";
-import { kernelSmpUrl, kernelUrl } from "virtual:unkernel-kernel";
+import { glUrl, kernelSmpUrl, kernelUrl } from "virtual:unkernel-kernel";
 
 export * from "../../js/core/index.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
@@ -28,7 +28,14 @@ export { serveWasiPrograms } from "../../js/web/wasi.ts";
  */
 export { kernelSmpUrl, kernelUrl };
 
-const platform = webPlatform(kernelUrl);
+/**
+ * The guest GL renderer (virgl.mjs, with virgl.wasm next to it), or null
+ * when the page's build has none: imported by the SDK only for
+ * createKernel({ gl }) (the GL option, config.ts).
+ */
+export { glUrl };
+
+const platform = webPlatform(kernelUrl, glUrl ?? undefined);
 
 /**
  * js/web.ts's createKernel(), with the page's kernel as the default; with

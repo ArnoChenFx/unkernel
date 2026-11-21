@@ -137,6 +137,19 @@ The page takes a few URL parameters:
 | `?data=0` | No persistent disk, a fresh system every time |
 | `?worker=0` | Run the kernel on the page's thread (default: in a Web Worker where the page is cross-origin isolated) |
 | `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox, one on phones, in Safari and on iOS, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
+| `?gl=1` | Guest GL on Debian: the guest's Mesa renders through your browser's WebGL2 (see below) |
+
+With `?gl=1` (or Options, Guest GL) the guest's shells use Mesa's virgl
+driver, which draws through your browser's WebGL2; the status panel's
+Guest GL row names the GPU (a software renderer such as SwiftShader is
+flagged). Mesa is installed in the guest, not shipped:
+
+```sh
+sudo apt-get install -y mesa-utils libegl-mesa0 libgles2
+eglinfo -B -p surfaceless         # OpenGL ES renderer: virgl (<your GPU>)
+sudo apt-get install -y xvfb xauth glmark2-es2-x11
+xvfb-run -a -s "-screen 0 640x480x24" glmark2-es2   # frame rates
+```
 
 Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you

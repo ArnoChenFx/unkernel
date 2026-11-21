@@ -47,9 +47,9 @@ border, corners filled, opaque) and `apple-touch-icon.png` are `assets/logo.svg`
 and scaled nearest neighbour (`magick -filter point`).
 `web/vite.config.ts` holds the COOP/COEP headers (Nitro route rules, plus
 the dev server's own responses), `__KW_BUILD__`, `virtual:unkernel-kernel`
-(the kernel's URLs and the list of images), the dev server's `/distros/`
-middleware, and the build step that copies the images into the output
-(below).
+(the kernel's URLs, the GL renderer's URL and the list of images), the dev
+server's `/distros/` and `/_gl/` middleware, and the build step that copies
+the images into the output (below).
 
 ## The page's kernel and distro images
 
@@ -213,6 +213,22 @@ deploying the page needs no kernel toolchain.
     Alpine 2 requests, 4.1 MiB (0.36 s), then 1 on the network (304) and 1
     from the cache (0.34 s). The dev server: the same counts (Debian's
     second load 0.67 s).
+- The guest GL renderer (`virgl.mjs` and `virgl.wasm`, gl/wasm; Guest GL,
+  below), optional, picked with the kernel (`withGl()` in
+  `web/scripts/kernel.ts`): `KW_GL=<dir>` (`KW_GL=0`: none), else with a
+  local kernel `vendor/build/gl-wasm/` (`gl/wasm/build.sh`), else the
+  release's `virgl.mjs` and `virgl.wasm` assets (the release workflow
+  attaches them; a release without them, every one before guest GL, gives
+  none and the page builds without GL: `release.json`'s `gl` is null). The
+  build log's `GL renderer:` line says which. `virtual:unkernel-kernel`'s
+  `glUrl` (null without one; `src/sdk.ts` passes it to `webPlatform()`):
+  in a build both files are emitted under fixed names into
+  `/assets/virgl-<16 hex digits of their sha256>/` (virgl.mjs loads
+  `./virgl.wasm` next to itself, so neither may be renamed alone); the dev
+  server answers `/_gl/virgl.mjs` and `/_gl/virgl.wasm` itself (`serveGl()`,
+  `no-cache` with an ETag, untransformed: Vite would rewrite the module).
+  Either is fetched only by a load with GL on (the SDK imports the module
+  then).
 - `web/src/sdk.ts` imports `js/core/index.ts`, `js/web/memory.ts` and
   `js/web/platform.ts`, not `js/web.ts`, whose own bundled kernel would
   become a second 10 MB asset. Its `kernelUrl` is a hashed Vite asset,
@@ -409,6 +425,61 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   touchmoves and Safari's `gesture*` events are cancelled (iOS ignores
   `user-scalable=no`), and wterm's hidden textarea is 16 px, because iOS
   zooms on focusing a smaller field.
+
+## Guest GL
+
+The Guest GL option (`?gl=1`, the `#opt-gl` box in Options; default off)
+boots with the SDK's `createKernel({ gl: true })` (js.md, Guest GL;
+gl.md): the guest's Mesa renders through virglrenderer compiled to wasm on
+a WebGL2 context of the page's thread (in worker mode too: vsock is served
+there), and frames come back to the guest by readback.
+
+- Only on Debian (`GL_DISTROS`, config.ts: Alpine's Mesa has no virgl
+  driver) and only where `glBlocker()` passes: the page's build has the
+  renderer (`glUrl`, above) and the page's thread has `OffscreenCanvas` and
+  `WebGL2RenderingContext`. Otherwise the box is unticked and disabled with
+  the reason in its note (it follows the Distro radios as chosen), its
+  saved value kept; a load with `?gl=1` that cannot have it boots without
+  and says why in the Environment tab's Guest GL row (`cfg.glWhy`).
+- With GL on the page appends `kw.gl=1` to the command line;
+  `/etc/profile.d/kw-gl.sh` (the base's kw layer, kernel/guest.md) then
+  exports `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` in every login
+  and interactive shell (the console, terminal windows, `bash -l`), so a
+  plain `eglinfo` or `glmark2-es2` uses virgl. Mesa is not in the image:
+  `sudo apt-get install` it (deb.debian.org goes through the page's
+  CORS mirror). Programs `vm.exec()` starts without a shell do not get the
+  variables.
+- `showGl()` (boot.ts): the Guest GL row says "starting", then the WebGL2
+  renderer (the unmasked name, `WEBGL_debug_renderer_info`, as the SDK logs
+  it), with the forwarder links and GL clients (`vm.gl.stats`, every 2 s
+  while they change) in its note; a software renderer (SwiftShader,
+  llvmpipe, WARP...) is a warning row and a toast. The browser console
+  gets `[unkernel] guest GL: WebGL2 renderer ...`, the Kernel log the
+  SDK's `[host] gl:` lines. A `vm.gl.ready` that rejects (no WebGL2
+  context, no forwarder in an older bundle) is a failed row and a toast,
+  not fatal.
+- A suspended session records GL with the device options (`gl` in
+  `SessionDevices`; absent in older records: off) and resumes only with the
+  same setting, since its kernel's command line has `kw.gl=1` or not. The
+  renderer's state is not saved: a resume ends the guest's GL clients, and
+  the forwarder relinks by itself (gl.md, unkernel).
+- Trying it (the display is kwfb with X on it: Display and input, above;
+  kernel/guest.md, X.Org on the framebuffer): `sudo apt-get install
+  mesa-utils libegl-mesa0 libgles2` and `eglinfo -B -p surfaceless`
+  (the GLES renderer must be `virgl (<the WebGL2 renderer>)`); for a
+  picture, `sudo apt-get install xserver-xorg-core
+  xserver-xorg-video-fbdev xserver-xorg-input-evdev glmark2-es2-x11
+  libgl1-mesa-dri libglx-mesa0`, `sudo Xorg :0 -nolisten tcp &`, then
+  `DISPLAY=:0 glmark2-es2`; for frame rates without the display,
+  `sudo apt-get install xvfb xauth glmark2-es2-x11` and `xvfb-run -a -s
+  "-screen 0 640x480x24" glmark2-es2`. Installed packages live in Debian's
+  upper layer on the data disk (data-disk.md).
+- Checked 2026-11-21 with `test/gl/page-check.mjs` (testing.md): the dev
+  server, headless Chromium (Playwright's) on SwiftShader, `?gl=1`, worker
+  mode, one CPU, `?data=0`. Not checked: X on kwfb with virgl (a picture on
+  the page's display, its frame rate), packages kept across reloads on the
+  data disk, a real GPU, Firefox and Safari, the built server's
+  `/assets/virgl-*/` files in a browser.
 
 ## Several CPUs
 
@@ -999,7 +1070,9 @@ Doom build come from the data disk on later tours. `KW.showcase` has
 
 ## Running and deploying
 
-- `pnpm dev`: Vite on port 8080, all interfaces, with the local build once
+- `pnpm dev`: Vite on port 8080, all interfaces (`server.host: true` in
+  `vite.config.ts`; `pnpm -C web dev --host 127.0.0.1 --port 8090` binds
+  and moves it), with the local build once
   `kernel/build.sh all` (or `base` and `distro`) has run, else the newest
   release (The page's kernel and distro images). `pnpm build:web` writes
   `web/.output/` the same way (a build beside the main outputs:

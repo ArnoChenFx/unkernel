@@ -1,7 +1,8 @@
 # Guest GL through virgl on WebGL2
 
 The design, what was measured, how to test, and what is open. It is in
-unkernel: `createKernel({ gl: true })` in a browser (unkernel, below). All
+unkernel: `createKernel({ gl: true })` in a browser (unkernel, below), and
+the page's Guest GL option, `?gl=1` (The page, below; web.md, Guest GL). All
 work happens on the `webgl` branch (this worktree). Do not change `main`,
 and do not commit until asked.
 
@@ -48,6 +49,9 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
+| `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, `?gl=1`); see The page |
+| `guest/base/rootfs/etc/profile.d/kw-gl.sh` | the guest's shells' `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` when the command line has `kw.gl=1` |
+| `web/` (`config.ts`, `boot.ts` `showGl()`, `scripts/kernel.ts`, `vite.config.ts`) | the page's Guest GL option and how the page gets `virgl.*` (web.md, Guest GL) |
 | `test/gl/build-guest-state.sh` | `kwgl-state.c` for the Debian guest (aarch64 glibc, linked against stand-ins for libEGL and libGLESv2) |
 | `vendor/src/virglrenderer-wasm` (gitignored) | the source of both builds: branch `kw-wasm` = 1.3.0 + the series |
 | `vendor/build/gl-wasm`, `vendor/build/gl-native` | `virgl.{mjs,wasm}`; `vtest/virgl_test_server` |
@@ -328,9 +332,9 @@ GPU). One run each, on the shared host:
 4. **Bridge and browser harness.** Done: `gl/bridge`, `bridge-check.sh`
    (relay or `--wasm`).
 5. **unkernel.** Done: unkernel, below. Check: `node test/gl/unkernel-check.mjs`.
-   Next: frames to the page (kwshm, or wland), the page's own `gl`
-   option (web/: it needs the module served and `glModule` passed), and
-   the busy wait (Open questions).
+   The page's option: done (The page). Check: `node test/gl/page-check.mjs`.
+   Next: frames to the page's display (X on kwfb, unverified; kwshm, or
+   wland), and the busy wait (Open questions).
 
 ## unkernel
 
@@ -366,6 +370,38 @@ GPU). One run each, on the shared host:
   before the snapshot and after the restore, the same forwarder process.
 - Alpine's Mesa has no virgl driver: Debian only.
 
+## The page
+
+`?gl=1` (Options: Guest GL; default off; web.md, Guest GL) boots with
+`gl: true` on Debian, where the page's build has the renderer and the
+page's thread has WebGL2; otherwise the option is disabled with the
+reason. The page builds with `virgl.mjs` and `virgl.wasm` from
+`vendor/build/gl-wasm/` (with a local kernel), `KW_GL=<dir>`, or the
+release's assets of those names (release.yml attaches them); the dev
+server answers `/_gl/virgl.*`, a build emits both into
+`/assets/virgl-<hash>/`; only a load with GL on fetches them. With GL on
+the page adds `kw.gl=1` to the command line, for which the base's
+`/etc/profile.d/kw-gl.sh` exports `GALLIUM_DRIVER=virpipe
+LIBGL_ALWAYS_SOFTWARE=1` in the guest's shells, so plain `eglinfo` or
+`glmark2-es2` uses virgl. The Environment tab's Guest GL row names the
+WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
+is a warning and a toast) and `vm.gl.stats`; the browser console has
+`[unkernel] guest GL: WebGL2 renderer ...`.
+
+Checked 2026-11-21, `test/gl/page-check.mjs` (the dev server, Playwright's
+headless Chromium on SwiftShader, `?gl=1&data=0&cpus=1`, worker mode):
+`vm.gl.ready` 2.7 s after the page was opened; a login shell had the
+variables and `/tmp/.virgl_test`; `apt-get install mesa-utils
+libegl-mesa0 libgles2` over the page's network (deb.debian.org through the
+CORS mirror) took 46 s; then `eglinfo -B -p surfaceless`: `virgl (ANGLE
+(Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`, OpenGL ES 3.0 Mesa
+25.0.7. The built server sends `/assets/virgl-*/virgl.{mjs,wasm}` with
+JavaScript and wasm types, br-encoded, immutable (curl, not a browser).
+Not checked: a GL client on the page's display (X.Org's fbdev driver on
+kwfb, `sudo Xorg :0`, then `DISPLAY=:0 glmark2-es2`) and its frame rate
+(kwfb is read about 50 times a second, at most about 1M pixels), packages
+kept across reloads on the data disk, a real GPU, Firefox and Safari.
+
 ## Testing
 
 ```sh
@@ -382,6 +418,8 @@ test/gl/stream-check.sh --guest state        # the same through the guest's buil
 node test/gl/debian-disk.mjs                 # the prepared disk, once (skipped when it exists)
 node test/gl/unkernel-check.mjs              # unkernel in headless Chromium, about 4 min
 node test/gl/unkernel-check.mjs --worker --skip c   # worker mode, without the benchmark
+node test/gl/page-check.mjs                  # the page's option (dev server, port 8091), about 1 min; needs the internet
+node test/gl/page-check.mjs --no-apt         # without Mesa: GL up and the guest's environment only
 ```
 
 `unkernel-check.mjs` builds what it needs and skips what exists: `pnpm
@@ -434,6 +472,7 @@ Results (2026-11-21, the series of Patches):
 | `stream-check.sh state`, `--guest state` | pass |
 | `stream-check.sh info state` | state times out (its clients wait 120 s for replies the relay never brings), also at the commit before unkernel; `state` alone passes. Not examined |
 | `unkernel-check.mjs` (inline; `--worker --skip c`) | all pass; Measured |
+| `page-check.mjs` | all pass; The page |
 
 Workloads that need no window system of ours (so nothing waits on wland):
 
@@ -451,9 +490,9 @@ Workloads that need no window system of ours (so nothing waits on wland):
   640x480 the guest gets as many frames as a host client through the
   bridge (unkernel, Measured), so kwvsock is not the limit on SwiftShader;
   not measured with a GPU-backed WebGL2, where it may be.
-- The page (web/) does not offer `gl` yet: it would need virgl.mjs served
-  with the page's assets and `glModule` passed to `webPlatform()`, and a
-  way to get Mesa (apt over Wisp works there; routes for deb.debian.org).
+- Frames on the page's display: whether X.Org's fbdev driver on kwfb
+  presents virgl's frames as Xvfb does (the driver reads each frame back
+  and puts it to X either way), and at what rate.
 - Not tried in unkernel: the SMP kernel (`cpus` > 1; vsock and so GL stay
   on the owner's thread, as on one CPU), Firefox and Safari (WebGL2 and
   OffscreenCanvas in a page's main thread exist there), and a GPU.

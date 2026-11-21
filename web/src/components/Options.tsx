@@ -9,6 +9,8 @@
 // and is kept in localStorage. The
 // CPUs slider is disabled, with the reason, where the page cannot boot more
 // than one (config.ts smpBlocker()). Distro (?distro=) lists the page's images and none.
+// Guest GL (?gl=1) is disabled, unticked, with the reason, where the page cannot offer it
+// (config.ts glBlocker()) or the Distro chosen is not one of GL_DISTROS; its stored value stays.
 // Suspend in the background (?autosuspend=, autosuspend.ts) offers off, at once, 30 s and 5 min,
 // plus a ?autosuspend= of other seconds; this device's default is marked.
 //
@@ -19,7 +21,7 @@
 // data-on or data-off value, so the options keep the values nextSettings() reads.
 import { useEffect, useRef, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
 import { AUTO_SUSPEND_CHOICES, autoSuspendLabel } from "../autosuspend.ts";
-import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED, webkitEngine } from "../config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, DISTROS_OFFERED, GL_DISTROS, webkitEngine } from "../config.ts";
 import { KW } from "../kw.ts";
 import { useStore, type Options as Opts } from "../store.ts";
 import { autoFont } from "../ui.ts";
@@ -48,13 +50,15 @@ function Field({ label, wide, hidden, id, children }: { label: string; wide?: bo
 
 /**
  * [x] Label, with a note under it. The input is real (keyboard, screen readers), drawn as text.
- * A forced box is shown ticked and disabled, its stored value kept (Worker thread with several CPUs).
+ * A forced box is shown ticked and disabled, its stored value kept (Worker thread with several CPUs);
+ * a blocked one unticked and disabled, its stored value kept (Guest GL with another distro).
  */
-function Check({ id, name, on, off, value, label, note, forced }: { id: string; name: keyof Opts; on: string; off: string; value: string; label: string; note?: string; forced?: boolean }) {
-	const checked = forced || value === on;
+function Check({ id, name, on, off, value, label, note, forced, blocked }: { id: string; name: keyof Opts; on: string; off: string; value: string; label: string; note?: string; forced?: boolean; blocked?: boolean }) {
+	const checked = !blocked && (forced || value === on);
+	const locked = forced || blocked;
 	return (
-		<label className={`group flex items-start gap-2 py-0.5 text-muted select-none ${forced ? "cursor-not-allowed" : "cursor-pointer hover:text-fg"}`}>
-			<input id={id} name={name} type="checkbox" data-on={on} data-off={off} checked={checked} disabled={forced} onChange={onField} className="peer sr-only" />
+		<label className={`group flex items-start gap-2 py-0.5 text-muted select-none ${locked ? "cursor-not-allowed" : "cursor-pointer hover:text-fg"}`}>
+			<input id={id} name={name} type="checkbox" data-on={on} data-off={off} checked={checked} disabled={locked} onChange={onField} className="peer sr-only" />
 			<span aria-hidden="true" className="whitespace-pre peer-focus-visible:outline-2 peer-focus-visible:outline-accent">
 				<span className="text-faint">[</span><span className={checked ? "text-ok" : ""}>{checked ? "x" : " "}</span><span className="text-faint">]</span>
 			</span>
@@ -181,6 +185,10 @@ export function Options() {
 	const autoValues = [...new Set([...AUTO_SUSPEND_CHOICES, cfg.autosuspendParam])];
 	const autoNote = `When the tab has been hidden that long, a system you have used since it booted is saved as with Suspend and paused; shown again, it goes on where it was (or, if the browser dropped the page meanwhile, resumes from the saved session). Default: ${autoSuspendLabel(cfg.autosuspendDefault).toLowerCase()} ${cfg.mobile ? "on phones and tablets, which may drop a background tab at any time" : "on desktops, where a background tab keeps running"}.`;
 
+	// Guest GL: Debian only, and only where the page has the renderer and WebGL2.
+	const glOff = cfg.glBlocked ?? (GL_DISTROS.includes(o.distro) ? null : `${GL_DISTROS.join(", ")} only (its Mesa has the virgl driver)`);
+	const glNote = glOff ? `Off: ${glOff}` : cfg.glWhy ? `This boot runs without it: ${cfg.glWhy}` : "guest Mesa on this browser's WebGL2 (virgl)";
+
 	// Enter in a text field reboots, like the button.
 	const enter = (e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); ui.reboot(); } };
 
@@ -196,6 +204,7 @@ export function Options() {
 				<Check id="opt-worker" name="worker" on="on" off="off" value={o.worker} label="Worker thread" forced={smp}
 					note={smp ? "always on with several CPUs" : "the kernel off the page's main thread"} />
 				<Check id="opt-askleave" name="askleave" on="on" off="off" value={o.askleave} label="Ask before closing" note="while a system you used runs" />
+				<Check id="opt-gl" name="gl" on="on" off="off" value={o.gl} label="Guest GL" blocked={!!glOff} note={glNote} />
 			</div>
 
 			<fieldset className="col-span-full flex flex-col gap-1.5">

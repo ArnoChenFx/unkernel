@@ -157,6 +157,7 @@ export function createUi(cfg: Config) {
 		distro: cfg.distroParam,
 		autosuspend: cfg.autosuspendParam,
 		askleave: cfg.askLeave ? "on" : "off",
+		gl: cfg.glParam ? "on" : "off",
 	};
 	// Where the root's changes live on the data disk: per distro (guest/base/initramfs/init).
 	const upperDir = `/data/distros/${cfg.guest}/upper`;
@@ -565,6 +566,7 @@ export function createUi(cfg: Config) {
 		// Auto-suspend: saved only where it differs from this device's default (config.ts).
 		set("autosuspend", o.autosuspend === cfg.autosuspendDefault ? null : o.autosuspend);
 		set("askleave", o.askleave === "off" ? "0" : null);
+		set("gl", o.gl === "on" ? "1" : null);
 		return Object.fromEntries([...p].sort(([a], [b]) => a.localeCompare(b)));
 	}
 	/** The options differ from the settings this load booted with (the Reboot button says so). */

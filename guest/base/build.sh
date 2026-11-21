@@ -26,7 +26,7 @@
 #                           `gl` option starts;
 #                           shim and bin/: fx, claude, opencode, node,
 #                           npm, npx, bun, bunx, uv, uvx on first use),
-#                           etc/profile.d/{kw-path.sh,kw-term.sh}, the X.Org
+#                           etc/profile.d/{kw-path.sh,kw-term.sh,kw-gl.sh}, the X.Org
 #                           fbdev/evdev config, usr/share/licenses/unkernel,
 #                           usr/lib/kw-base (the base's id), and an empty
 #                           /data mount point. Its scripts run the base's

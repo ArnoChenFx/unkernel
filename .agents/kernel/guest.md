@@ -90,7 +90,10 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/sbin/kw-overlay` (data-disk.md), `/etc/profile.d/kw-path.sh`
   (`/run/kw/bin`, then `~/.local/bin` first on PATH, the sbin directories
   where the distro leaves them out for users (Debian), `/usr/lib/kw/bin`
-  last, below), `/etc/profile.d/kw-term.sh`
+  last, below), `/etc/profile.d/kw-gl.sh` (with `kw.gl=1` on the command
+  line, which the page's GL option adds: `GALLIUM_DRIVER=virpipe
+  LIBGL_ALWAYS_SOFTWARE=1`, so Mesa renders through the host's WebGL2;
+  gl.md), `/etc/profile.d/kw-term.sh
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
   `/usr/share/licenses/unkernel` (the GPL notice for these files).

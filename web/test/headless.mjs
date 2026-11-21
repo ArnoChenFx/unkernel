@@ -191,6 +191,8 @@ const scenarios = {
 			if (cpus) range("opt-cpus", "2");
 			// Distro: none (the base shell) is always there; the default is the radio checked now.
 			const distroDefault = document.querySelector("#opt-distro input:checked")?.id;
+			// Guest GL, before the distro: its box is disabled with another distro (and without a renderer or WebGL2), its value kept.
+			check("opt-gl", true);
 			check("opt-distro-none", true);
 			// Suspend in the background: this device's default is the radio checked now; Ask before closing is on.
 			const autoDefault = document.querySelector("#opt-autosuspend input:checked")?.id;
@@ -205,6 +207,7 @@ const scenarios = {
 			if (distroDefault) check(distroDefault, true);
 			if (autoDefault) check(autoDefault, true);
 			check("opt-askleave", true);
+			check("opt-gl", false);
 			await tick();
 			return { before, all, wispShown, label, off, reset: KW.ui.nextSettings(), wispHidden: $("opt-wisp-row").hidden, cpus, distroDefault, autoDefault, workerDefault: KW.config.workerDefault, cpuNext: !KW.config.smpBlocked && KW.config.cpuSuggested || 1 };
 		})()`);
@@ -214,7 +217,7 @@ const scenarios = {
 		if (JSON.stringify(opts.before) !== JSON.stringify(opts.reset) || [...home.keys()].some((k) => k !== "worker" && k !== "cpus") || !opts.wispShown || !opts.wispHidden || opts.label !== "Reboot to apply"
 			|| q.get("mem") !== "64" || q.get("wisp") !== "wss://a.example/,wss://b.example/" || q.get("jit") !== "0" || q.get("verbose") !== "1"
 			|| q.get("append") !== "console=hvc0 rdinit=/bin/sh" || q.get("data") !== "0" || q.get("root") !== "initramfs" || q.get("worker") !== (opts.workerDefault ? null : "1") || q.get("cpus") !== (opts.cpus && opts.cpuNext !== 2 ? "2" : null) || opts.distroDefault !== "opt-distro-debian" || q.get("distro") !== "none" || opts.off.wisp !== "0"
-			|| opts.autoDefault !== "opt-autosuspend-0" || q.get("autosuspend") !== "30" || q.get("askleave") !== "0")
+			|| opts.autoDefault !== "opt-autosuspend-0" || q.get("autosuspend") !== "30" || q.get("askleave") !== "0" || q.get("gl") !== "1")
 			throw new Error(`options do not map to the settings: ${JSON.stringify(opts)}`);
 		console.log(`  options -> ${q}`);
 		await page.click('.tabs [data-tab="log"]');

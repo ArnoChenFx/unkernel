@@ -48,6 +48,16 @@
 //                                      an unknown name boots the default and says so; none: no
 //                                      image, the base shell). Its changes to the root
 //                                      live in /data/distros/<name>/ on the data disk.
+//   ?gl=1                              guest GL (Debian only): the guest's Mesa renders through
+//                                      this browser's WebGL2 (virglrenderer compiled to wasm, on
+//                                      the page's thread; the SDK's createKernel({ gl }),
+//                                      .agents/gl.md). Adds kw.gl=1 to the command line, for
+//                                      which the guest's shells set GALLIUM_DRIVER=virpipe and
+//                                      LIBGL_ALWAYS_SOFTWARE=1 (kw-gl.sh). Mesa is not in the
+//                                      image: apt-get install it. virgl.mjs and virgl.wasm are
+//                                      fetched only then. Off with another distro, without
+//                                      WebGL2 on the page's thread, or in a build without the
+//                                      renderer (glBlocker()). Default off.
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
 //                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
@@ -95,7 +105,7 @@
 //                                      warm pre-installs them, step ids pick a subset
 //                                      (showcase.ts); read in launcher.ts
 //   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
-import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
+import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, glUrl, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
 import { autoSuspendDefault, parseAutoSuspend } from "./autosuspend.ts";
 
@@ -132,7 +142,7 @@ export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 /** localStorage: the saved settings (the header above), a JSON object of strings. */
 export const SETTINGS_KEY = "kw.settings";
 /** The settings' names. ?net=0 is read as ?wisp=0 and never saved. */
-export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave"];
+export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave", "gl"];
 
 /** The saved settings ({} where there are none or localStorage refuses). */
 export function loadSettings(): Record<string, string> {
@@ -234,6 +244,14 @@ export interface Config {
 	autosuspendParam: string;
 	/** Its default on this device: "now" on phones and tablets, else "0". */
 	autosuspendDefault: string;
+	/** Guest GL this load (?gl=1, on a distro of GL_DISTROS, where glBlocker() allows). */
+	gl: boolean;
+	/** The GL option: ?gl=1. */
+	glParam: boolean;
+	/** Why this page cannot offer guest GL (glBlocker()), or null. */
+	glBlocked: string | null;
+	/** Why this load runs without GL although ?gl=1 asks for it, or null. */
+	glWhy: string | null;
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
@@ -241,6 +259,21 @@ export interface Config {
 	coarse: boolean;
 	mobileUA: boolean;
 	fontSize: number;
+}
+
+/** The distros whose Mesa has the virgl driver (Alpine's has none). */
+export const GL_DISTROS: readonly string[] = ["debian"];
+
+/**
+ * Why this page cannot offer guest GL, or null: no GL renderer in the
+ * page's build (sdk.ts glUrl; web/scripts/kernel.ts), or no WebGL2 on the
+ * page's thread, where the renderer runs in both modes (OffscreenCanvas;
+ * whether the browser then gives a WebGL2 context shows at boot).
+ */
+export function glBlocker(): string | null {
+	if (!glUrl) return "this page's build has no GL renderer (virgl.mjs: gl/wasm/build.sh, or a release that carries it)";
+	if (typeof OffscreenCanvas !== "function" || typeof WebGL2RenderingContext !== "function") return "this browser has no WebGL2 on the page's thread (OffscreenCanvas)";
+	return null;
 }
 
 /** The kernel's limit (NR_CPUS in kw_smp.config). */
@@ -347,6 +380,9 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	else if (distroAsked) distroWhy = `distro ${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
 	const distro = DISTROS_OFFERED.find((d) => d.name === distroParam) ?? null;
 	const autosuspend = parseAutoSuspend(params.get("autosuspend"), mobile);
+	const glParam = params.get("gl") === "1";
+	const glBlocked = glBlocker();
+	const glWhy = !glParam ? null : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
 	return {
 		settings: Object.fromEntries(params),
 		kernelUrl: kernelUrl.pathname,
@@ -391,6 +427,10 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		autosuspendParam: autosuspend.value,
 		autosuspendDefault: autoSuspendDefault(mobile),
 		askLeave: params.get("askleave") !== "0",
+		gl: glParam && !glWhy,
+		glParam,
+		glBlocked,
+		glWhy,
 		mobile,
 		coarse,
 		mobileUA,

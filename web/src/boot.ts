@@ -650,7 +650,7 @@ export function start(): void {
 	}
 
 	// --- the suspended session (session.ts) ------------------------------------------
-	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data });
+	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data, gl: cfg.gl });
 	const ago = (t: number) => {
 		const m = Math.round((Date.now() - t) / 60000);
 		return m < 1 ? "just now" : m < 120 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
@@ -1178,6 +1178,50 @@ export function start(): void {
 		}
 	}
 
+	/**
+	 * Guest GL (?gl=1): the WebGL2 renderer the guest's Mesa draws on, in the
+	 * Environment tab's "Guest GL" row, the console and the Kernel log; a
+	 * software renderer (SwiftShader, llvmpipe, WARP) is a warning, since GL
+	 * is then no faster than the host's CPU. Then the bridges and clients
+	 * served (vm.gl.stats), every 2 s while they change.
+	 */
+	function showGl(vm: KernelHandle) {
+		if (!cfg.gl) {
+			if (cfg.glWhy) ui.check("gl", "Guest GL", "warn", "off", cfg.glWhy);
+			return;
+		}
+		const gl = vm.gl;
+		if (!gl) {
+			ui.check("gl", "Guest GL", "fail", "unavailable", "the SDK started no GL renderer (the Kernel log says why)");
+			return;
+		}
+		ui.check("gl", "Guest GL", "info", "starting", "loading the renderer (virgl.mjs, virgl.wasm) and starting the guest's forwarder");
+		gl.ready.then((what) => {
+			// "<renderer>; <WebGL's unmasked renderer>" (js/core/gl.ts)
+			const webgl = what.slice(what.lastIndexOf("; ") + 2);
+			const soft = /SwiftShader|llvmpipe|softpipe|Software|Basic Render|WARP/i.test(webgl);
+			const note = `WebGL2: ${webgl}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${what.slice(0, what.lastIndexOf("; "))}. ` +
+				"Guest shells have GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1; Mesa: sudo apt-get install mesa-utils (eglinfo -B), glmark2-es2-x11 ...";
+			console.log(`[unkernel] guest GL: WebGL2 renderer ${webgl}${soft ? " (software rendering)" : ""}`);
+			ui.hostLog(`[host] guest GL ready: ${what}${soft ? " (software rendering)" : ""}`);
+			let shown = "";
+			const show = () => {
+				const st = gl.stats;
+				const now = `${st.streams} forwarder link${st.streams === 1 ? "" : "s"}, ${st.clients} GL client${st.clients === 1 ? "" : "s"} now, ${st.opened} so far`;
+				if (now === shown) return;
+				shown = now;
+				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `${note} ${now}.`);
+			};
+			show();
+			if (soft) ui.toast(`Guest GL runs on a software WebGL renderer (${webgl}), not a GPU`);
+			const timer = setInterval(() => (ended() ? clearInterval(timer) : show()), 2000);
+		}, (e: unknown) => {
+			const why = (e as Error)?.message ?? String(e);
+			ui.check("gl", "Guest GL", "fail", "failed", why);
+			ui.toast(`Guest GL failed: ${why}`);
+		});
+	}
+
 	// --- boot --------------------------------------------------------------------
 	async function boot() {
 		ui.setState("loading", "Downloading");
@@ -1252,6 +1296,8 @@ export function start(): void {
 		ok(`Found the base initramfs (${fmtMiB(b.length)})`);
 		// The bundle's own command line unless ?append= gives one, with ?root= (kw.root=) after it.
 		if (!cfg.append && bundle.cmdline) cfg.cmdline = cfg.root ? `${bundle.cmdline} kw.root=${cfg.root}` : bundle.cmdline;
+		// Guest GL: the guest's shells point Mesa at virgl (kw-gl.sh in the base's kw layer).
+		if (cfg.gl) cfg.cmdline += " kw.gl=1";
 		if (distroOpening) {
 			try {
 				const { d, ms } = await distroOpening;
@@ -1330,6 +1376,7 @@ export function start(): void {
 			display: cfg.display ? display.size : false, onDisplay: display.onDisplay, onInput: display.onInput,
 			sound: cfg.sound ? createAudioOut({ log }) : false, // Web Audio, ?sound=0 (audio.ts)
 			vsock: true, // the terminal windows (windows.ts: kwtty sessions)
+			gl: cfg.gl, // guest GL on this thread's WebGL2 (?gl=1, Debian; showGl())
 		};
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);
@@ -1470,6 +1517,7 @@ export function start(): void {
 			ui.check("jit", "JIT tier", j.failed ? "warn" : j.compiled ? "pass" : "info", value, note);
 		};
 		showJit();
+		showGl(vm);
 
 		// Not fatal, but worth flagging: the kernel started and printed nothing.
 		const bootTime = inst ? inst.kernel.bootTime : performance.now();

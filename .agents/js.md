@@ -834,8 +834,9 @@ parts that are easy to get wrong.
   forwarder's LOG line "ready: vtest clients on ..." arrives (the guest's
   vtest socket exists then), and rejects (logged) when the renderer or the
   forwarder fails or the link does not come within 30 s.
-- Where there is no OffscreenCanvas (Node) or no module (the page's
-  `web/src/sdk.ts` passes none), `gl` is ignored with a `[host]` log line
+- Where there is no OffscreenCanvas (Node) or no module (an entry without
+  one; the page's `web/src/sdk.ts` passes its `glUrl`, web.md, Guest GL),
+  `gl` is ignored with a `[host]` log line
   and `vm.gl` is undefined; `gl.renderer` (any object of the renderer
   shape, `VtestRenderer`) works anywhere, which is how a Node run can
   serve the guest with the relay to a native server.
@@ -845,6 +846,10 @@ parts that are easy to get wrong.
   Renderer state is not in snapshots: a restore resets the link (the guest's
   GL clients end), the forwarder in the restored guest reconnects by itself,
   and the new host's forwarder start exits 0 (one already runs).
+- The guest's environment is the caller's: with `kw.gl=1` on the command
+  line the base's `/etc/profile.d/kw-gl.sh` sets `GALLIUM_DRIVER=virpipe
+  LIBGL_ALWAYS_SOFTWARE=1` for the guest's shells (the page adds it with
+  its GL option); `gl` alone does not add it.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 

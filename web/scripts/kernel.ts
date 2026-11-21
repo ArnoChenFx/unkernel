@@ -45,6 +45,16 @@
 // with the same initramfs, command line and data disk template
 // (js/core/kpatch.ts); without the section there is no SMP bundle.
 //
+// The guest GL renderer (createKernel({ gl }), the page's GL option):
+// virgl.mjs and virgl.wasm (gl/wasm/build.sh), optional. KW_GL=<dir> gives
+// them (KW_GL=0: none); else a local build's vendor/build/gl-wasm/ with a
+// local kernel, or the release's virgl.mjs and virgl.wasm assets with a
+// release (a release without them, every one before guest GL, has none).
+// Without them the page offers no GL. The dev server serves them at
+// /_gl/virgl.mjs and /_gl/virgl.wasm; a build emits both into
+// /assets/virgl-<16 hex digits of their sha256>/, side by side, because
+// virgl.mjs finds virgl.wasm next to itself.
+//
 // The images' URLs: the dev server answers /distros/<name>.erofs itself
 // (vite.config.ts, server/range.ts; revalidated, since a local image is
 // rebuilt in place). A build names each by its content,
@@ -58,6 +68,7 @@
 //                             KW_KERNEL=../vendor/build/bundle/unkernel.wasm
 //   KW_DISTROS=<dir>          the images (<name>.erofs; distros.json there
 //                             gives their image ids)
+//   KW_GL=<dir> | 0           the GL renderer (virgl.mjs, virgl.wasm) | none
 //   KW_KERNEL_RELEASE=<tag>   this release instead of the newest (e.g. v0.2.0)
 //   KW_LOCAL=1 | 0            use a local build when there is one (default,
 //                             except when CI or VERCEL is set) | never
@@ -90,6 +101,9 @@ const PAGE_DIR = `${DIR}page/`;
 /** A local build's base bundle and images. */
 const LOCAL_BASE = `${ROOT}vendor/build/bundle/unkernel.wasm`;
 const LOCAL_DISTROS = `${ROOT}vendor/build/distro/`;
+const LOCAL_GL = `${ROOT}vendor/build/gl-wasm/`;
+/** The guest GL renderer's files (gl/wasm/build.sh; release assets of the same names). */
+export const GL_FILES = ["virgl.mjs", "virgl.wasm"] as const;
 const BASE_ASSET = "unkernel.wasm";
 const INDEX_ASSET = "distros.json";
 /** An image file: NAME.erofs or NAME.ext4 (distros.json's `file`). */
@@ -132,13 +146,29 @@ export interface PageSource {
 	base: string;
 	/** The images, debian first. */
 	distros: PageImage[];
+	/** The guest GL renderer (see the top), or null: the page offers no GL. */
+	gl: PageGl | null;
+	/** Where the GL renderer comes from, or why there is none (logged). */
+	glWhy: string;
+}
+
+/** The guest GL renderer's files: virgl.mjs and virgl.wasm, in one directory. */
+export interface PageGl {
+	mjs: string;
+	wasm: string;
+	/** sha256 of both (the build's directory name). */
+	sha256: string;
 }
 
 /** One entry of distros.json (guest/tools/distros-json.mjs). */
 interface IndexEntry { name: string; file: string; size: number; sha256: string; image?: string | null }
 interface DistrosIndex { abi: number | null; base: string | null; distros: IndexEntry[] }
 /** web/kernel/release/release.json. */
-interface ReleaseMeta extends KernelRelease { abi: number; baseId: string | null; distros: IndexEntry[] }
+interface ReleaseMeta extends KernelRelease {
+	abi: number; baseId: string | null; distros: IndexEntry[];
+	/** The GL renderer's files' sha256 (GL_FILES), or null: the release has none; absent in a copy made before the page knew them. */
+	gl?: Record<string, string> | null;
+}
 
 const UA = { "user-agent": "unkernel-web-build" };
 const sha256 = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
@@ -263,7 +293,7 @@ async function localSource(base: string, images: PageImage[], why: string): Prom
 	const want = await wantAbi();
 	const { abi } = await bundleInfo(bytes);
 	if (abi !== want) log(`warning: ${rel(base)} has kwemu ABI ${abi ?? "unknown"}, this checkout's include/kw_emu.h has ${want} (a stale local build?)`);
-	return { why, kernel: { tag: "local", date: (await stat(base)).mtime.toISOString(), sha256: sha256(bytes) }, linux: banner(bytes), base, distros: images };
+	return { why, kernel: { tag: "local", date: (await stat(base)).mtime.toISOString(), sha256: sha256(bytes) }, linux: banner(bytes), base, distros: images, gl: null, glWhy: "" };
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +402,9 @@ async function fetchRelease(dev: boolean, why: string): Promise<ReleaseMeta> {
 		return have;
 	}
 	const sameDigest = (name: string, sum: string) => !r.assets?.get(name)?.sha256 || r.assets.get(name)!.sha256 === sum;
-	if (have?.tag === r.tag && sameDigest(BASE_ASSET, have.sha256) && have.distros.every((d) => sameDigest(d.file, d.sha256))) return have;
+	// A copy made before the page knew the GL renderer is fetched again when the release has one.
+	const glKnown = have?.gl !== undefined || (r.assets !== null && !r.assets.has(GL_FILES[0]));
+	if (have?.tag === r.tag && glKnown && sameDigest(BASE_ASSET, have.sha256) && have.distros.every((d) => sameDigest(d.file, d.sha256))) return have;
 	log(`downloading ${r.tag} (was ${have?.tag ?? "none"})`);
 	const abi = await wantAbi();
 	// distros.json first: it is small, and an old or foreign release fails here.
@@ -408,7 +440,8 @@ async function fetchRelease(dev: boolean, why: string): Promise<ReleaseMeta> {
 			await writeFile(to, bytes);
 			log(`${r.tag}: ${d.file} ${mib(d.size)}, sha256 ${sum.slice(0, 16)} (${d.image ?? "no image id"})`);
 		}
-		const meta: ReleaseMeta = { tag: r.tag, date: r.date, sha256: sha256(base), abi, baseId: info.base, distros: entries };
+		const gl = await downloadGl(r, tmp, why);
+		const meta: ReleaseMeta = { tag: r.tag, date: r.date, sha256: sha256(base), abi, baseId: info.base, distros: entries, gl };
 		await writeFile(path.join(tmp, META), `${JSON.stringify(meta, null, "\t")}\n`);
 		// Swap: the old copy aside, the new one in, the old one gone.
 		const old = `${DIR}release.old-${process.pid}/`;
@@ -422,6 +455,42 @@ async function fetchRelease(dev: boolean, why: string): Promise<ReleaseMeta> {
 	}
 }
 
+/**
+ * The release's GL renderer (GL_FILES) into `dir`, checked; null when the
+ * release has none (not listed, or a 404 without the API's list).
+ */
+async function downloadGl(r: Resolved, dir: string, why: string): Promise<Record<string, string> | null> {
+	if (r.assets && !GL_FILES.every((f) => r.assets!.has(f))) {
+		log(`${r.tag}: no GL renderer (${GL_FILES.join(", ")}): the page offers no guest GL`);
+		return null;
+	}
+	const sums: Record<string, string> = {};
+	for (const f of GL_FILES) {
+		let bytes: Uint8Array;
+		try {
+			bytes = await download(r, f, why);
+		} catch (e) {
+			if (!r.assets && /has no virgl/.test((e as Error).message)) {
+				log(`${r.tag}: no GL renderer (${f}): the page offers no guest GL`);
+				return null;
+			}
+			throw e;
+		}
+		checkGlFile(f, bytes, `${r.tag}: ${f}`);
+		await writeFile(path.join(dir, f), bytes);
+		sums[f] = sha256(bytes);
+	}
+	log(`${r.tag}: GL renderer ${GL_FILES.join(", ")}`);
+	return sums;
+}
+
+/** virgl.wasm is wasm; virgl.mjs is the ES module build that finds virgl.wasm next to itself. */
+function checkGlFile(name: string, bytes: Uint8Array, what: string): void {
+	if (name.endsWith(".wasm")) return checkWasm(bytes, what);
+	if (!Buffer.from(bytes).toString("utf8").includes(`new URL("virgl.wasm",import.meta.url)`))
+		throw new Error(`${what}: not the ES module build of the GL renderer (it does not locate virgl.wasm next to itself)`);
+}
+
 /** The release in web/kernel/release/ as the page's source; `why`: why no local build. */
 async function releaseSource(dev: boolean, why: string): Promise<PageSource> {
 	const meta = await fetchRelease(dev, why);
@@ -430,11 +499,42 @@ async function releaseSource(dev: boolean, why: string): Promise<PageSource> {
 	const distros = meta.distros.map((d) => ({
 		name: d.name, url: "", size: d.size, file: path.join(RELEASE_DIR, d.file), sha256: d.sha256, ...(d.image ? { imageId: d.image } : {}),
 	})).sort(byName);
-	return { why: `release ${meta.tag} (${why})`, kernel: { tag: meta.tag, date: meta.date, sha256: meta.sha256 }, linux: banner(bytes), base, distros };
+	const gl = meta.gl ? await glDir(RELEASE_DIR) : null;
+	return {
+		why: `release ${meta.tag} (${why})`, kernel: { tag: meta.tag, date: meta.date, sha256: meta.sha256 }, linux: banner(bytes), base, distros,
+		gl, glWhy: gl ? `release ${meta.tag}` : `release ${meta.tag} has no ${GL_FILES.join(" and ")}`,
+	};
 }
 
 // ---------------------------------------------------------------------------
 // The choice (see the top).
+
+/** GL_FILES in `dir`, checked and hashed, or null when either is missing. */
+async function glDir(dir: string): Promise<PageGl | null> {
+	const [mjs, wasm] = GL_FILES.map((f) => path.join(dir, f)) as [string, string];
+	if (!(await isFile(mjs)) || !(await isFile(wasm))) return null;
+	const h = createHash("sha256");
+	for (const f of [mjs, wasm]) {
+		const bytes = new Uint8Array(await readFile(f));
+		checkGlFile(path.basename(f), bytes, rel(f));
+		h.update(bytes);
+	}
+	return { mjs, wasm, sha256: h.digest("hex") };
+}
+
+/** The page's GL renderer (see the top): KW_GL, else a local kernel's vendor/build/gl-wasm/, else the release's. */
+async function withGl(s: PageSource): Promise<PageSource> {
+	const kg = process.env.KW_GL;
+	if (kg === "0") return { ...s, gl: null, glWhy: "KW_GL=0" };
+	if (kg) {
+		const gl = await glDir(path.resolve(kg));
+		if (!gl) throw new Error(`KW_GL=${kg}: no ${GL_FILES.join(" and ")} there (gl/wasm/build.sh)`);
+		return { ...s, gl, glWhy: `KW_GL=${kg}` };
+	}
+	if (s.kernel.tag !== "local") return s;
+	const gl = await glDir(LOCAL_GL);
+	return { ...s, gl, glWhy: gl ? `a local build in ${rel(LOCAL_GL)}` : `no ${rel(LOCAL_GL)}${GL_FILES[0]} (gl/wasm/build.sh)` };
+}
 
 async function choose(dev: boolean): Promise<PageSource> {
 	const kk = process.env.KW_KERNEL, kd = process.env.KW_DISTROS;
@@ -459,7 +559,7 @@ async function choose(dev: boolean): Promise<PageSource> {
 }
 
 const describe = (s: PageSource) => `${s.kernel.tag === "local" ? "a local build" : `release ${s.kernel.tag}`}, Linux ${s.linux || "?"}; ` +
-	s.distros.map((d) => `${d.name} ${mib(d.size)}`).join(", ");
+	s.distros.map((d) => `${d.name} ${mib(d.size)}`).join(", ") + `; GL renderer: ${s.gl ? "yes" : "none"}`;
 
 let once: Promise<PageSource> | undefined;
 
@@ -468,7 +568,7 @@ let once: Promise<PageSource> | undefined;
  * dev server's; once per process; see the top). It logs the choice.
  */
 export function pageSource(dev: boolean): Promise<PageSource> {
-	return (once ??= choose(dev).then((s) => {
+	return (once ??= choose(dev).then(withGl).then((s) => {
 		for (const d of s.distros) d.url = `/distros/${dev ? path.basename(d.file) : servedName(d)}`;
 		if (dev) log(`${describe(s)} (${s.why})`);
 		else {
@@ -478,6 +578,7 @@ export function pageSource(dev: boolean): Promise<PageSource> {
 			log(`  why: ${s.why}`);
 			log(`  base: ${rel(s.base)}`);
 			for (const d of s.distros) log(`  ${d.url} <- ${rel(d.file)}${d.imageId ? ` (${d.imageId})` : ""}`);
+			log(`  GL renderer: ${s.gl ? `${rel(path.dirname(s.gl.mjs))}/ (${s.glWhy})` : `none (${s.glWhy})`}`);
 			log(line);
 		}
 		return s;

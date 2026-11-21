@@ -1,0 +1,30 @@
+From 3120d09d48497cfdc3e99951cc59f98213e24869 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 14:54:54 +0000
+Subject: [PATCH] mm: skip folio_ref_add() of zero when mapping an order-0
+ anonymous folio
+
+map_anon_folio_pte_nopf() adds nr_pages - 1 references, which is zero for
+an order-0 folio but still an atomic read-modify-write on every
+anonymous fault.
+---
+ mm/memory.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index 9e395ad33ff..97b2921e48a 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -5401,7 +5401,8 @@ void map_anon_folio_pte_nopf(struct folio *folio, pte_t *pte,
+ 	if (uffd_wp)
+ 		entry = pte_mkuffd(entry);
+ 
+-	folio_ref_add(folio, nr_pages - 1);
++	if (nr_pages > 1)
++		folio_ref_add(folio, nr_pages - 1);
+ 	folio_add_new_anon_rmap(folio, vma, addr, RMAP_EXCLUSIVE);
+ 	folio_add_lru_vma(folio, vma);
+ 	set_ptes(vma->vm_mm, addr, pte, entry, nr_pages);
+-- 
+2.56.0
+

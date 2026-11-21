@@ -42,7 +42,8 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 - One patch per piece, in this order: generic changes (Joel's two, stock
   LLVM, `VMALLOC_FLAT`, 9p `metatimeout`, the kthread park points, the
   random vmfork reseed, the switches for NET_DEVMEM, DRM_PANEL_BRIDGE,
-  DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backport); the arch; the ISA; each driver (kwblk, kwnet,
+  DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backport
+  and capset wait); the arch; the ISA; each driver (kwblk, kwnet,
   kwfb, kwinput, sysrq, kwsnd, kwvsock, kwshm, kwvirtio); parking; kwvsock's reset
   after a restore; `kw_defconfig`; then the SMP series (the atomics and
   shared-memory build, the atomic tweaks, the generic mm, sched, kthread,
@@ -51,10 +52,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   `wasm: run arm64 user space`, which rewrites the arch and ISA patches'
   riscv64 user ABI (registers, syscalls, uapi, ELF, signals, cpuinfo, the
   feature table and `kw.isa=`, the exclusive monitor, the kernel's copy of
-  `kw_emu.h`); the guest pc sampling (prof.c); and last the virtio-gpu
-  capset wait (`drm/virtio: wait up to 30 s for a capset`, a generic
-  change kept at the end of the DRM series' export so that the others
-  keep their numbers).
+  `kw_emu.h`); and last the guest pc sampling (prof.c).
 - A fix or an extension of a piece is a `git commit --fixup` of its patch,
   autosquashed; an arm64 fix, or a kwemu ABI change that changes the
   header or what the kernel advertises, is a fixup of `wasm: run arm64

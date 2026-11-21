@@ -1,0 +1,45 @@
+From 6edb866099c9294cb103b470a606cc6867eeeab2 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 21:12:05 +0000
+Subject: [PATCH] drm/virtio: wait up to 30 s for a capset, and killably
+
+A host may make its 3D renderer only when the guest first asks for a
+capset: unkernel loads virglrenderer, compiled to WebAssembly, and a
+WebGL2 context on the guest's first GL use, which fetches about 185 KB
+over the network. Five seconds is short for that on a slow link, and on a
+timeout DRM_IOCTL_VIRTGPU_GET_CAPS gives -EBUSY, which Mesa takes for no
+caps, so the client falls back to software rendering although the answer
+comes moments later and serves every later client from the cache.
+
+Wait up to 30 s, and let a fatal signal end the wait, since a task now
+waits long enough for someone to want to kill it.
+---
+ drivers/gpu/drm/virtio/virtgpu_ioctl.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_ioctl.c b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+index 81e70a12b35..53f563fd734 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -468,8 +468,16 @@ static int virtio_gpu_get_caps_ioctl(struct drm_device *dev,
+ 	virtio_gpu_notify(vgdev);
+ 
+ copy_exit:
+-	ret = wait_event_timeout(vgdev->resp_wq,
+-				 atomic_read(&cache_ent->is_valid), 5 * HZ);
++	/*
++	 * A host may start its 3D renderer only when a capset is first asked
++	 * for (it may have to fetch it), so give it longer than the replies to
++	 * other commands, but let a fatal signal end the wait.
++	 */
++	ret = wait_event_killable_timeout(vgdev->resp_wq,
++					  atomic_read(&cache_ent->is_valid),
++					  30 * HZ);
++	if (ret < 0)
++		return ret;
+ 	if (!ret)
+ 		return -EBUSY;
+ 
+-- 
+2.56.0
+

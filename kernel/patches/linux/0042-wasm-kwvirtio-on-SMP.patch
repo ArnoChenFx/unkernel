@@ -1,0 +1,96 @@
+From e816d769a4f6d09595f068f69dadcbb6777bbb14 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 18:55:03 +0000
+Subject: [PATCH] wasm: kwvirtio on SMP
+
+The host's imports answer on CPU 0 alone, and its interrupt arrives
+there. The config, status, feature and queue calls, made in process
+context, run through kw_host_call(). A queue notification may come in
+atomic context on any CPU: on another CPU it sets the queue's bit in the
+device's pending mask and raises WASM_IRQ_VIRTIO on CPU 0, whose handler
+sends the pending notifications before it reads the interrupt status.
+The UP build is unchanged.
+---
+ drivers/virtio/kwvirtio.c | 37 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/virtio/kwvirtio.c b/drivers/virtio/kwvirtio.c
+index f0568d40cda..2d84ba7db87 100644
+--- a/drivers/virtio/kwvirtio.c
++++ b/drivers/virtio/kwvirtio.c
+@@ -37,6 +37,13 @@
+  * Present only when the host offers devices: wasm_driver_virtio_init(0) <=
+  * 0 means none, and then nothing is registered or allocated. Device N
+  * exists if devices 0..N-1 do. No import here suspends.
++ *
++ * SMP: the host's imports answer on CPU 0 alone, and its interrupt arrives
++ * there. The config, status, feature and queue calls (process context)
++ * run through kw_host_call(); a notification on another CPU (often atomic)
++ * sets the queue's bit in the device's pending mask and raises
++ * WASM_IRQ_VIRTIO on CPU 0, whose handler sends the pending notifications
++ * before it reads the interrupt status.
+  */
+ 
+ #include <linux/dma-mapping.h>
+@@ -100,6 +107,9 @@ struct kwvirtio_device {
+ 	struct platform_device *pdev;
+ 	u32 index;		/* the host's device number */
+ 	u8 status;
++#ifdef CONFIG_SMP
++	unsigned long notify_pending;	/* queues another CPU notified, for CPU 0 */
++#endif
+ };
+ 
+ #define to_kwvirtio(v) container_of(v, struct kwvirtio_device, vdev)
+@@ -151,7 +161,11 @@ static long kwvirtio_host(void *arg)
+ 
+ static long kwvirtio_call(struct kwvirtio_call *c)
+ {
++#ifdef CONFIG_SMP
++	return kw_host_call(kwvirtio_host, c);
++#else
+ 	return kwvirtio_host(c);
++#endif
+ }
+ 
+ static u64 kwvirtio_get_features(struct virtio_device *vdev)
+@@ -227,7 +241,18 @@ static void kwvirtio_reset(struct virtio_device *vdev)
+ /* Atomic context: the host takes the buffers during the call or later. */
+ static bool kwvirtio_notify(struct virtqueue *vq)
+ {
+-	wasm_driver_virtio_notify(to_kwvirtio(vq->vdev)->index, vq->index);
++	struct kwvirtio_device *kd = to_kwvirtio(vq->vdev);
++
++#ifdef CONFIG_SMP
++	if (smp_processor_id()) {
++		if (WARN_ON_ONCE(vq->index >= BITS_PER_LONG))
++			return false;
++		set_bit(vq->index, &kd->notify_pending);
++		kw_irq_raise(0, BIT(WASM_IRQ_VIRTIO));
++		return true;
++	}
++#endif
++	wasm_driver_virtio_notify(kd->index, vq->index);
+ 	return true;
+ }
+ 
+@@ -238,6 +263,16 @@ static irqreturn_t kwvirtio_interrupt(int irq, void *opaque)
+ 	struct virtqueue *vq;
+ 	u32 status;
+ 
++#ifdef CONFIG_SMP
++	if (READ_ONCE(kd->notify_pending)) {
++		unsigned long pending = xchg(&kd->notify_pending, 0);
++		int q;
++
++		for_each_set_bit(q, &pending, BITS_PER_LONG)
++			wasm_driver_virtio_notify(kd->index, q);
++		ret = IRQ_HANDLED;
++	}
++#endif
+ 	status = wasm_driver_virtio_interrupt(kd->index);
+ 	if (unlikely(status & KWVIRTIO_INT_CONFIG)) {
+ 		virtio_config_changed(&kd->vdev);
+-- 
+2.56.0
+

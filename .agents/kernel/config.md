@@ -36,6 +36,18 @@
   connections (the host stack carries no UDP).
 - OVERLAY_FS without optional features (data-disk.md; +116 KiB, 43 KiB
   gzip), the devices (devices.md), 9p (devices.md).
+- kwvirtio with DRM, DRM_VIRTIO_GPU and DRM_VIRTIO_GPU_KMS (devices.md),
+  without fbdev emulation, the panic screen or any other virtio transport
+  or driver: +660 KB lowered (7,876,477 to 8,536,718 bytes), +217 KB gzip
+  (2,574,915 to 2,791,683), +689 KB wasm64 (2026-11-21). Most of it is
+  the DRM core and the KMS helpers (drm_edid alone about 100 KB of
+  objects). What DRM brings for hardware displays is off, each through an
+  option a generic patch adds (81 KB lowered, 30 KB gzip together): I2C
+  (DRM_DDC), the HDMI infoframe library (DRM_HDMI_INFOFRAMES),
+  DRM_PANEL_BRIDGE and NET_DEVMEM. What is left needs changes in DRM core
+  (SYNC_FILE, 3.7 KB) or is always built (drm_bridge.o); the kernel links
+  without garbage collection, so unused helpers of a compiled object
+  stay. No new imports but the transport's nine.
 - EROFS_FS for a distro's read-only root image on kwblk: zstd, xattrs
   with POSIX ACLs and `security.*`, file-backed mounts; MISC_FILESYSTEMS
   is on for it, nothing else in that menu. +189 KB raw, +70 KB gzip (zstd

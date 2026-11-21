@@ -1,8 +1,9 @@
 # Guest GL through virgl on WebGL2
 
 The design, what was measured, how to test, and what is open. It is in
-unkernel: `createKernel({ gl: true })` in a browser (unkernel, below), and
-the page's Guest GL option, `?gl=1` (The page, below; web.md, Guest GL). All
+unkernel: `createKernel({ gl: true })` in a browser (unkernel, below), the
+page's Guest GL option, `?gl=1` (The page, below; web.md, Guest GL), and
+with `gpu: true` too a real `/dev/dri` with 3D (The DRM path, below). All
 work happens on the `webgl` branch (this worktree). Do not change `main`,
 and do not commit until asked.
 
@@ -13,10 +14,12 @@ kwemu. The guest runs stock Mesa with the `virgl` driver; the host runs
 virglrenderer compiled to wasm against one WebGL2 context.
 
 ```
-guest: app -> Mesa virgl (virpipe) -> /tmp/.virgl_test -> /usr/lib/kw/vtest-bridge
-       -> kwvsock, host CID 2, port 1019 ...
-host:  ... -> VsockHost -> StreamHost -> virglrenderer (wasm) -> WebGL2
-       (one context, OffscreenCanvas, on the thread that owns the VM)
+vtest: app -> Mesa virgl (virpipe) -> /tmp/.virgl_test -> /usr/lib/kw/vtest-bridge
+       -> kwvsock, host CID 2, port 1019 -> VsockHost -> StreamHost
+DRM:   app -> Mesa virtio_gpu (virgl) -> /dev/dri/renderD128 -> virtio_gpu
+       -> kwvirtio -> VirtioGpu + VirglGpuBackend -> GpuRenderer
+both:  -> virglrenderer (wasm) -> WebGL2 (one context, OffscreenCanvas,
+       on the thread that owns the VM)
 ```
 
 Decided, do not reopen without new facts:
@@ -24,11 +27,13 @@ Decided, do not reopen without new facts:
 - WebGL2, not WebGPU. Zink needs logic ops, transform feedback and
   non-solid fill, which WebGPU lacks; Venus needs host Vulkan 1.1 and
   guest-mappable device memory.
-- The vtest protocol first (a byte stream, no kernel driver). virtio-gpu in
-  the kernel comes last, if at all.
+- Two paths on one renderer: vtest (a byte stream, no kernel driver; GL
+  clients need `GALLIUM_DRIVER=virpipe`) and virtio-gpu (stock
+  `/dev/dri`, nothing set in the guest; The DRM path).
 - Browser only. Node has neither WebGL nor WebGPU.
-- No window system work here. Frames come back by readback (vtest transfer),
-  as in every test below. wland (a Wayland compositor for the page,
+- No window system work here. On the vtest path frames come back by
+  readback (vtest transfer); on the DRM path a KMS client's scanout is
+  presented from its texture. wland (a Wayland compositor for the page,
   `/workspace/github/pithings/wland`) is a later, separate integration and
   is not a prerequisite.
 
@@ -40,13 +45,15 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | Path | What |
 | --- | --- |
 | `gl/patches/virglrenderer/` | the one series on virglrenderer 1.3.0 (tag commit ca50e00), both builds; see Patches |
-| `gl/wasm/` | the wasm module: `build.sh` (emscripten pinned in `pins.sh`; also the `native` build), `kw_virgl.c`/`.h` (C API, GL context hooks, vtest I/O), `kw_gl.js` (GL entry points made from WebGL2), `gl-missing.txt` (the stubs), `epoxy/` (libepoxy stand-in), `post.js` (`Module.virgl`, the page's renderer); see WebGL2 |
-| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, busy waits (one answered ahead of its fence, one parked), two inline clients, `Module.virgl.Renderer` |
+| `gl/wasm/` | the wasm module: `build.sh` (emscripten pinned in `pins.sh`; also the `native` build), `kw_virgl.c`/`.h` (C API, GL context hooks, vtest I/O, the virtio-gpu entry `kw_vgpu_*`), `kw_gl.js` (GL entry points made from WebGL2), `gl-missing.txt` (the stubs), `epoxy/` (libepoxy stand-in), `post.js` (`Module.virgl`, the page's renderer, `Module.virgl.gpu`); see WebGL2 |
+| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, busy waits (one answered ahead of its fence, one parked), two inline clients, `Module.virgl.Renderer`, `Module.virgl.gpu` (capset, a packed transfer each way, present, a fence) |
 | `gl/bridge/` | `vtest-bridge.c` (vtest socket to WebSocket or byte stream, fd termination) and the page that hosts a renderer: the wasm module or the relay to a native server; `README.md` has the wire dialect and the renderer interface |
 | `test/gl/vtest-check.sh` | the check suite on this host; see Testing |
 | `test/gl/bridge-check.sh` | the same suite with every byte through the page in headless Chromium; `--wasm` against the wasm renderer |
 | `test/gl/kwgl-state.c` | the stale-state check run by `vtest-check.sh state` (surfaceless EGL clients taking turns) |
 | `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
+| `js/core/gl-gpu.ts` | virtio-gpu 3D: `VirglGpuBackend` (device side), `GpuRenderer` (`vm.gl.gpu`); see The DRM path |
+| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
 | `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, `?gl=1`); see The page |
@@ -96,7 +103,12 @@ In order, each with its reason in the commit message:
     buffer when the guest asks for the result: Mesa writes that into memory
     it shares with the host, which the inline dialect does not share, so
     the buffer kept saying DONE from the query's last use, and a read
-    before the new result was in returned the old one (Busy waits).
+    before the new result was in returned the old one (Busy waits);
+13. vtest shares the renderer: with `VTEST_EXTERNAL_IO` the resource ids
+    it hands out start at 0x40000000 (a virtio-gpu guest numbers its own
+    from 1, in its command streams), and `vtest_renderer_add_fence()` adds
+    an implicit fence for another user, as vtest's write_fence callback
+    takes every context 0 fence for one of its own (The DRM path).
 
 ## Single GL context
 
@@ -313,7 +325,9 @@ WebSocket carrying 1.2 MB a frame back, Xvfb). Two more pairs, default /
 
 ### Stats
 
-The module counts, over all clients since init (`kw_virgl_stats()`,
+The module counts, over all clients since init (virtio-gpu's commands
+too: SUBMIT_3D as a submit, TRANSFER_FROM_HOST_3D as a read,
+TRANSFER_TO_HOST_3D as a write; `kw_virgl_stats()`,
 `KW_VIRGL_STAT_*` in `kw_virgl.h`; `Renderer.totals()` adds the polls by
 message and by timer; the SDK's `vm.gl.stats.renderer`, `VirglTotals`):
 commands by kind with the time each took, GL calls included (submits,
@@ -442,6 +456,9 @@ GPU). One run each, on the shared host:
    The page's option: done (The page). Check: `node test/gl/page-check.mjs`.
    Next: frames to the page's display (X on kwfb, unverified; kwshm, or
    wland). Busy waits: done (Busy waits).
+6. **virtio-gpu 3D.** Done: The DRM path. Check: `node test/gl/unkernel-check.mjs --drm`.
+   Next: the page's option for it (the page offers no `gpu` yet; Display.tsx
+   already draws a GL scanout), wland on PRIME, a real GPU.
 
 ## unkernel
 
@@ -476,6 +493,149 @@ GPU). One run each, on the shared host:
   Verified on Node with the relay renderer (2026-11-21): eglinfo on virgl
   before the snapshot and after the restore, the same forwarder process.
 - Alpine's Mesa has no virgl driver: Debian only.
+
+## The DRM path
+
+A real `/dev/dri` now exists: the stock virtio_gpu driver runs over
+kwvirtio, a virtio transport whose registers are host imports
+(kernel/devices.md), against the SDK's device model
+(`js/core/virtio-gpu.ts`, `createKernel({ gpu })`, CLI `--gpu`). With
+`gl` too, in a browser, the device has 3D: stock Debian Mesa picks its
+`virtio_gpu` (virgl) driver on `renderD128` and `card0` with no
+environment variables, and renders through the same wasm renderer and
+WebGL2 context as the vtest path (js.md, virtio-gpu 3D, has the SDK side).
+The kernel side is the stage 1 driver with nothing added; the base's rc
+gives the DRM nodes udev's groups and modes (kernel/guest.md).
+
+- **Discovery**: libdrm's `drmGetDevice2()` takes the platform device
+  `kwvirtio.0` without an OF node (bus type platform, name from the
+  MODALIAS), and Mesa's loader, finding no PCI ids, takes the driver name
+  from DRM_IOCTL_VERSION: "device is not located on the PCI bus", "using
+  driver virtio_gpu". GBM, EGL on gbm and surfaceless all find it.
+- **Options**: `gl` is the renderer (and the vtest link), `gpu` the device;
+  both, where `gl` gets WebGL2: the device offers VIRTIO_GPU_F_VIRGL and
+  two capsets, read from that WebGL2 context. Not CONTEXT_INIT: with it
+  the driver makes a file's context only on DRM_IOCTL_VIRTGPU_CONTEXT_INIT
+  or first 3D use, and a PRIME import made before that is never attached
+  to it (the renderer then refuses transfers of that resource as an
+  illegal resource of that context); without it every resource a file
+  opens is attached. The renderer
+  is made before the kernel boots, as the driver probes the features and
+  asks for the capsets at boot (it waits up to 5 s a capset for the
+  answer, which comes once the module is up).
+- **Renderer front end** (`kw_virgl.c`, `kw_vgpu_*`): the virtio-gpu control
+  commands mapped to virglrenderer's API as QEMU's
+  `hw/display/virtio-gpu-virgl.c` maps them (context create with flags,
+  destroy, attach and detach resource, RESOURCE_CREATE_3D, unref,
+  TRANSFER_TO_HOST_3D and FROM_HOST_3D through `transfer_write_iov` and
+  `transfer_read_iov`, SUBMIT_3D), plus the capsets
+  (`get_cap_set`/`fill_caps`), a format table, fences, `resource_get_info`,
+  present and read. Context ids are the guest's plus 0x40000000; resource
+  ids are the guest's (they are in its command streams), and vtest's own
+  start at 0x40000000 (patch 13), so both paths run at once. 2D (dumb)
+  resources stay with the SDK's 2D model.
+- **Memory, copies**: the guest's pages are in the kernel's memory, the
+  renderer's in its own; no resource is shadowed. No resource gets an
+  iovec in the renderer (ATTACH_BACKING stays with the device side), and
+  the guest's capsets lose VIRGL_CAP_TRANSFER and VIRGL_CAP_COPY_TRANSFER
+  (and COPY_TRANSFER_BOTH_DIRECTIONS, MEMINFO, RESOURCE_LAYOUT), so Mesa
+  moves data with the transfer ioctls only: there are no transfers inside
+  the command stream (VIRGL_CCMD_TRANSFER3D, COPY_TRANSFER3D: those read
+  and write a resource's iovec, which is guest memory in QEMU and would be
+  a stale shadow here) and no staging resources. A transfer's bytes are
+  packed on the device side (each block row of the box, layer after layer;
+  a buffer's range) and the command rewritten to offset 0 and the packed
+  strides: an upload is one copy inline (guest pages into the module's
+  heap), two in worker mode (pages into a transferred buffer, it into the
+  heap); a readback is one copy out of the heap (plus the transfer in
+  worker mode) and a row-by-row scatter, so bytes between rows stay the
+  guest's. Query results (VIRGL_BIND_CUSTOM buffers) live in host memory
+  (vrend's `res->ptr`), which patch 12 marks pending when asked and
+  readbacks read.
+- **Fences** (`GpuRenderer`): a fenced command's answer is its fence
+  signal. Busy waits' reasoning holds (the guest shares no memory with the
+  GPU; what it reads comes in a TRANSFER_FROM_HOST_3D answer, read after
+  the work before it; queries read pending until written), so the answer
+  decides only timing: at once by default, except that after a frame was
+  presented (RESOURCE_FLUSH of the scanout) a fenced command waits until
+  that frame's work is done, so a KMS client runs at most about a frame
+  ahead of the GPU; readbacks at once. `gl.strictWaits`: each once its own
+  work is done (QEMU's). Fences are vtest's implicit ones (one sequence on
+  the one GL context; `vtest_renderer_add_fence`). Unfenced commands that
+  only answer OK are answered by the device at once and posted.
+- **Presentation**: a KMS client's framebuffer is a 3D resource; SET_SCANOUT
+  of it gives the display its mode with no pixels, RESOURCE_FLUSH blits its
+  texture into the renderer's OffscreenCanvas (sized to the scanout;
+  `kw_vgpu_present` gives vrend's single GL context up first, as its
+  blitter does, so the next command restores the client's state) and takes
+  it with `transferToImageBitmap()`; `vm.gl.gpu.drawFrame(ctx)` draws that
+  into the page's 2D canvas (Display.tsx does, per animation frame, in both
+  modes; the renderer is on the page's thread either way). No `readPixels`
+  on that path; `vm.frame()` reads the scanout back (screenshots). The
+  texture's row k is the picture's row k (from the top, as the guest lays
+  it out), or for a VIRGL_RESOURCE_Y_0_TOP resource its row height - 1 - k
+  (vrend inverts transfers of such a resource); the blit flips the first
+  kind.
+  Page flips are paced by virtio-gpu's emulated vblank (60 Hz).
+- **dmabuf**: PRIME export and import between openers of the device is the
+  stock driver's self-import (no vmap); `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`
+  gives the resource id, and `vm.gl.gpu.texture(id)` its `WebGLTexture` in
+  the renderer's context (js.md). For wland zero-copy what remains is the
+  wland side: a Wayland client's `zwp_linux_dmabuf` buffer in a guest
+  compositor (or a relay) mapped to its resource id, and the page's
+  compositor drawing that texture in the renderer's context (textures do
+  not cross WebGL contexts: a compositor on another context needs a copy,
+  e.g. an ImageBitmap as presentation makes).
+- Not done: blob resources and host-visible memory (no coherent buffer
+  maps), Venus, dumb buffers used by 3D contexts, the cursor plane (taken
+  and ignored), snapshots while 3D resources or contexts exist (refused),
+  SMP (not tried), the page (no `gpu` option there yet).
+- Guest notes: no `/dev/fd` in the guest, so bash's `<(...)` fails; kmscube
+  and glmark2-es2-drm stop at the first byte or EOF on stdin, so give them
+  a stdin that stays open (`mkfifo /tmp/h; exec 3<>/tmp/h; kmscube <&3`).
+  glmark2-es2-drm 2023.01 draws at the mode's size and never makes its
+  window when `-s` equals the mode or with `--fullscreen` (a size check in
+  its CanvasGeneric), and its first config is RGB565, which its
+  drmModeAddFB(24, 32) refuses: run it without `-s` and with
+  `--visual-config red=8:green=8:blue=8:alpha=0`. The kernel refuses
+  strides in a TRANSFER_TO_HOST of a resource that is not a blob (Mesa
+  sends none; the host takes the level's).
+
+### Measured (2026-11-21, `unkernel-check.mjs --drm`, headless Chromium 157)
+
+Debian 13 on the UP kernel with kwvirtio (`vendor/build/drm-base`), 1024
+MiB, display 640x480 (60 Hz), the prepared disk, WebGL2 on ANGLE/
+SwiftShader (software: a floor); one run each on a shared host.
+
+- No GL variables: `eglinfo -B -p gbm` and `-p surfaceless`: `virgl (ANGLE
+  (Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`, OpenGL ES 3.0 Mesa
+  25.0.7; libdrm's `drmdevice`: bus type platform, name `kwvirtio`, nodes
+  card0 and renderD128.
+- kmscube (600 frames): 59.9 to 60.0 fps, the vblank timer's rate; 601
+  presents, about 600 drawn into the page's canvas; three frames sampled
+  from the canvas (4096+ colours, the cube) equal the scanout read back in
+  the same task pixel for pixel, inline and in worker mode.
+- glmark2-es2 at 640x480, 5 s a scene, the DRM path (glmark2-es2-drm, which
+  swaps in mailbox mode: frames render as fast as they can, at most 60 a
+  second are flipped) against the vtest path (glmark2-es2 under Xvfb with
+  virpipe, each frame read back and put to Xvfb), FPS from the mean frame
+  time:
+
+  | Scene | DRM | vtest | DRM, `--off-screen` | vtest, `--off-screen` |
+  | --- | --- | --- | --- | --- |
+  | build | 541 | 121 | 781 | 488 |
+  | texture | 649 | 132 | 1333 | 646 |
+  | shading (phong) | 309 | 111 | 403 | 318 |
+
+  Off screen (nothing presented or read back) the DRM path is 1.3 to 2.1
+  times the vtest link: the same renderer, without vtest-bridge, kwvsock
+  and the inline transfers in the stream.
+- kwgl-state's 60 frames on the DRM path (surfaceless EGL on the render
+  node, its occlusion query included): all equal each client alone and
+  the same clients on the vtest path; 3.3 s against 3.0 s.
+- PRIME (`test/gpu/prime.c` as the default user): exporter and importer
+  name the same resource; `vm.gl.gpu.texture()` finds its 64x64 texture
+  with the importer's upload in it.
 
 ## The page
 
@@ -528,6 +688,9 @@ test/gl/stream-check.sh --guest state        # the same through the guest's buil
 node test/gl/debian-disk.mjs                 # the prepared disk, once (skipped when it exists)
 node test/gl/unkernel-check.mjs              # unkernel in headless Chromium, about 4 min
 node test/gl/unkernel-check.mjs --worker --skip c   # worker mode, without the benchmark
+node test/gl/unkernel-check.mjs --drm        # the DRM path (gl and gpu; a bundle with kwvirtio), about 2 min
+node test/gl/unkernel-check.mjs --drm --skip c,d --cmd 'modetest -c'   # a command of yours first (as root), its output printed
+node test/gl/unkernel-check.mjs --drm --gl-flags ""   # the browser's own WebGL2 (a host with a GPU) instead of SwiftShader
 node test/gl/page-check.mjs                  # the page's option (dev server, port 8091), about 1 min; needs the internet
 node test/gl/page-check.mjs --no-apt         # without Mesa: GL up and the guest's environment only
 ```
@@ -582,6 +745,7 @@ Results (2026-11-21, the series of Patches):
 | `stream-check.sh state`, `--guest state` | pass |
 | `stream-check.sh info state` | state times out (its clients wait 120 s for replies the relay never brings), also at the commit before unkernel; `state` alone passes. Not examined |
 | `unkernel-check.mjs` (inline; `--worker --skip c`) | all pass; Measured |
+| `unkernel-check.mjs --drm` (inline; `--worker --skip c`) | all pass; The DRM path, Measured |
 | `page-check.mjs` | all pass; The page |
 
 Workloads that need no window system of ours (so nothing waits on wland):
@@ -595,6 +759,11 @@ Workloads that need no window system of ours (so nothing waits on wland):
 | GL as compute (machine learning) | stops at GLES 3.0: no compute shaders, so no llama.cpp. A fragment-shader workload such as TensorFlow.js's WebGL backend is the only kind that could fit; unverified. |
 
 ## Open questions
+
+- The DRM path on a GPU: not measured. Each presented frame is a blit and
+  `transferToImageBitmap()` of the renderer's canvas, drawn into the
+  page's 2D canvas; whether the page's compositor copies it again, and the
+  fence rule's effect (`vm.gl.stats.gpu`: parks, parkedMs), are open.
 
 - Readback cost per frame over kwvsock, and when to move it to kwshm: at
   640x480 the guest gets as many frames as a host client through the

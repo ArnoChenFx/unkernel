@@ -105,6 +105,6 @@ if (body === null) {
 }
 const res = JSON.parse(body);
 console.log(JSON.stringify(res, (k, v) => (k === 'extensions' ? v.join(' ') : v), 2));
-console.log(res.ok ? `PASS: loaded, initialised on WebGL2, answered GET_CAPS2 and GET_CAPSET, answered a busy wait ahead and parked a second, served two inline clients, drove virgl.Renderer${res.stages.transfer ? '' : ' (the plain TRANSFER_PUT/GET probe failed)'}`
+console.log(res.ok ? `PASS: loaded, initialised on WebGL2, answered GET_CAPS2 and GET_CAPSET, answered a busy wait ahead and parked a second, served two inline clients, drove virgl.Renderer, drove virgl.gpu (virtio-gpu)${res.stages.transfer ? '' : ' (the plain TRANSFER_PUT/GET probe failed)'}`
   : `FAIL: ${res.error || 'see stages'}`);
 process.exit(res.ok ? 0 : 1);

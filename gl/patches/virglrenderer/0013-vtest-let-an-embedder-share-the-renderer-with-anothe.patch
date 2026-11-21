@@ -1,0 +1,100 @@
+From 90a59321ce3b5bee6f869ca4b86fd36b461152a0 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 19:25:02 +0000
+Subject: [PATCH] vtest: let an embedder share the renderer with another user
+
+An embedder (VTEST_EXTERNAL_IO) may serve something else on the same
+renderer next to vtest's clients, such as a virtio-gpu device. Two
+things collide then:
+
+- resource ids: a virtio-gpu guest numbers its resources from 1 and
+  names them in its command streams, and vtest hands out its own from 1
+  too. With VTEST_EXTERNAL_IO the ids vtest hands out start at
+  0x40000000; clients that name their own (protocol versions before 3)
+  keep their numbers.
+- fences: vtest's write_fence callback takes every context 0 fence for
+  one of its implicit fences, so another user's fences must count in
+  the same sequence. vtest_renderer_add_fence() adds one and returns its
+  number, which vtest_renderer_fences() reports as retired in turn; in
+  the single GL context mode every context's work is on one GL context,
+  so a fence retires once all the work issued before it is done.
+---
+ vtest/vtest.h          |  1 +
+ vtest/vtest_renderer.c | 28 +++++++++++++++++++++++++---
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/vtest/vtest.h b/vtest/vtest.h
+index 046d546..58b3981 100644
+--- a/vtest/vtest.h
++++ b/vtest/vtest.h
+@@ -115,6 +115,7 @@ int vtest_resource_export_fd(uint32_t length_dw);
+ 
+ void vtest_set_max_length(uint32_t length);
+ uint32_t vtest_renderer_fences(uint32_t *completed);
++uint32_t vtest_renderer_add_fence(void);
+ struct virgl_renderer_callbacks *vtest_renderer_callbacks(void);
+ struct iovec *vtest_resource_backing(struct vtest_context *ctx, uint32_t res_id);
+ 
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index 7b1468f..678ed45 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -245,10 +245,20 @@ static struct virgl_renderer_callbacks renderer_cbs = {
+ };
+ 
+ 
++/* An embedder (VTEST_EXTERNAL_IO) may share the renderer with another
++ * user, such as a virtio-gpu device whose guest numbers resources from 1:
++ * the ids vtest hands out start high, out of their way. Clients that name
++ * their own resources (protocol versions before 3) keep their numbers. */
++#ifdef VTEST_EXTERNAL_IO
++#define VTEST_FIRST_RESOURCE_ID 0x40000000
++#else
++#define VTEST_FIRST_RESOURCE_ID 1
++#endif
++
+ static struct vtest_renderer renderer = {
+    .max_length = UINT_MAX,
+    .next_context_id = 1,
+-   .next_resource_id = 1,
++   .next_resource_id = VTEST_FIRST_RESOURCE_ID,
+    .next_sync_id = 1,
+ };
+ 
+@@ -661,7 +671,7 @@ void vtest_cleanup_renderer(void)
+       renderer.current_context = NULL;
+    }
+ 
+-   if (renderer.next_resource_id > 1) {
++   if (renderer.next_resource_id > VTEST_FIRST_RESOURCE_ID) {
+       struct vtest_resource *res, *tmp;
+ 
+       LIST_FOR_EACH_ENTRY_SAFE(res, tmp, &renderer.free_resources, head) {
+@@ -669,7 +679,7 @@ void vtest_cleanup_renderer(void)
+       }
+       list_inithead(&renderer.free_resources);
+ 
+-      renderer.next_resource_id = 1;
++      renderer.next_resource_id = VTEST_FIRST_RESOURCE_ID;
+    }
+ 
+    if (renderer.next_sync_id > 1) {
+@@ -3112,3 +3122,15 @@ uint32_t vtest_renderer_fences(uint32_t *completed)
+    *completed = renderer.implicit_fence_completed;
+    return renderer.implicit_fence_submitted;
+ }
++
++/* Another implicit fence, after the GL work issued so far by anyone (every
++ * context shares the GL context in the single GL context mode, so it
++ * retires once that work is done): for an embedder's other users of the
++ * renderer, whose fences must count in the same sequence as the clients',
++ * as vtest's write_fence callback takes every context 0 fence for one of
++ * its own. Returns its number, which vtest_renderer_fences() reports. */
++uint32_t vtest_renderer_add_fence(void)
++{
++   vtest_create_implicit_fence(&renderer);
++   return renderer.implicit_fence_submitted;
++}
+-- 
+2.56.0
+

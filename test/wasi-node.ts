@@ -105,6 +105,16 @@ async function run(kernelPath: string, initrdPath: string, cmdline = "console=hv
 		wasm_driver_shm_attach: () => {},
 		wasm_driver_shm_detach: () => {},
 		wasm_driver_shm_reply: () => {},
+		// kwvirtio: no devices (0 for device 0), so nothing else is called.
+		wasm_driver_virtio_init: () => 0,
+		wasm_driver_virtio_features: () => 0n,
+		wasm_driver_virtio_set_features: () => -ENODEV,
+		wasm_driver_virtio_config: () => {},
+		wasm_driver_virtio_status: () => {},
+		wasm_driver_virtio_queue_max: () => 0,
+		wasm_driver_virtio_queue_set: () => -ENODEV,
+		wasm_driver_virtio_notify: () => {},
+		wasm_driver_virtio_interrupt: () => 0,
 		// kwemu's JIT tier (js/core/jit.ts): not offered here, so kwemu
 		// only interprets and never calls the other two.
 		kw_host_jit_caps: () => 0,

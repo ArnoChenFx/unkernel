@@ -71,7 +71,8 @@ kernel (SMP, below).
   counts, before anything is resumed), where the host copies the memory
   during the call; otherwise with the error and the task that did not park.
   The host answers 0, or -EBUSY if its own block, net, vsock or shm queues
-  are not empty or a disk cannot be sealed (js.md, Disks in snapshots). A
+  are not empty, virtio-gpu holds resources or commands, or a disk cannot
+  be sealed (js.md, Disks in snapshots). A
   disk's seal happens during this call, while nothing runs. For
   `snapshot({ commit })` the host suspends the call (JSPI) until the
   snapshot is stored (and, with `hold`, for as long as the host keeps it

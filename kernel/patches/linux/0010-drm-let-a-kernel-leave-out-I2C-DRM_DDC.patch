@@ -1,0 +1,70 @@
+From 7854fb7358dec836556fb424988613c088dcc78c Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 19:24:34 +0000
+Subject: [PATCH] drm: let a kernel leave out I2C (DRM_DDC)
+
+DRM selects I2C so that drm_edid.c can read EDIDs over DDC
+(drm_do_probe_ddc_edid(), the only I2C call in the DRM core). A kernel
+whose display drivers get the EDID otherwise, virtio-gpu reads it from
+the device, builds the I2C core and IRQ domains for nothing.
+
+Select I2C only if the new DRM_DDC, default y and visible under EXPERT,
+and give i2c.h a stub i2c_transfer() for !I2C that fails with -ENXIO,
+which drm_do_probe_ddc_edid() takes as an adapter that is not there.
+Drivers that use I2C themselves mostly select it already.
+---
+ drivers/gpu/drm/Kconfig | 13 ++++++++++++-
+ include/linux/i2c.h     |  6 ++++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index 323422861e8..f9c654822f3 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -10,7 +10,7 @@ menuconfig DRM
+ 	depends on (AGP || AGP=n) && !EMULATED_CMPXCHG && HAS_DMA
+ 	select DRM_PANEL_ORIENTATION_QUIRKS
+ 	select HDMI
+-	select I2C
++	select I2C if DRM_DDC
+ 	select DMA_SHARED_BUFFER
+ 	select SYNC_FILE
+ # gallium uses SYS_kcmp for os_same_file_description() to de-duplicate
+@@ -42,6 +42,17 @@ config DRM_MIPI_DSI
+ 	bool
+ 	depends on DRM
+ 
++config DRM_DDC
++	bool "Read EDIDs over I2C (DDC)" if EXPERT
++	depends on DRM
++	default y
++	help
++	  Display hardware reads a monitor's EDID over an I2C bus (DDC),
++	  and the DRM core selects I2C for it. Say N only for a kernel
++	  whose display drivers neither read EDIDs over I2C nor use I2C
++	  otherwise without selecting it, such as one with virtio-gpu
++	  alone, which gets the EDID from the device.
++
+ config DRM_KMS_HELPER
+ 	tristate
+ 	depends on DRM
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index 14ab4d3055a..48fad99ac59 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -189,6 +189,12 @@ s32 i2c_smbus_read_i2c_block_data_or_emulated(const struct i2c_client *client,
+ int i2c_get_device_id(const struct i2c_client *client,
+ 		      struct i2c_device_identity *id);
+ const struct i2c_device_id *i2c_client_get_device_id(const struct i2c_client *client);
++#else
++static inline int i2c_transfer(struct i2c_adapter *adap,
++			       struct i2c_msg *msgs, int num)
++{
++	return -ENXIO;
++}
+ #endif /* I2C */
+ 
+ /**
+-- 
+2.56.0
+

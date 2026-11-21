@@ -1,0 +1,39 @@
+From ebec70ab5a16b6cf7cb75cae184485a23751fd01 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 19:23:42 +0000
+Subject: [PATCH] drm/bridge: let DRM_PANEL_BRIDGE be turned off
+
+DRM_PANEL_BRIDGE is def_bool y, and it selects DRM_PANEL, so every DRM
+kernel builds the panel framework and the panel bridge, also one whose
+only display is virtual (virtio-gpu). The drivers that use the panel
+bridge select it, and drm_panel.h has stubs for !DRM_PANEL.
+
+Give it a prompt under EXPERT, default y.
+---
+ drivers/gpu/drm/bridge/Kconfig | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/Kconfig b/drivers/gpu/drm/bridge/Kconfig
+index 4a57d49b4c6..b8578246901 100644
+--- a/drivers/gpu/drm/bridge/Kconfig
++++ b/drivers/gpu/drm/bridge/Kconfig
+@@ -6,11 +6,14 @@ config DRM_BRIDGE
+ 	  Bridge registration and lookup framework.
+ 
+ config DRM_PANEL_BRIDGE
+-	def_bool y
++	bool "DRM bridge wrapper of DRM panels" if EXPERT
++	default y
+ 	depends on DRM_BRIDGE
+ 	select DRM_PANEL
+ 	help
+-	  DRM bridge wrapper of DRM panels
++	  DRM bridge wrapper of DRM panels. Drivers that need it select
++	  it; a kernel whose only displays are virtual (no panels) can
++	  leave it and the panel framework out.
+ 
+ config DRM_AUX_BRIDGE
+ 	tristate
+-- 
+2.56.0
+

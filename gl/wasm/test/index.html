@@ -13,7 +13,10 @@
   kw_virgl_poll from a later task, and two clients of the inline dialect (protocol version 3,
   transfer data in the stream, as gl/bridge speaks it) must get their own
   resource ids and move data through a texture; last, Module.virgl.Renderer
-  (the renderer shape of gl/bridge) must answer a parked busy wait by itself.
+  (the renderer shape of gl/bridge) must answer a parked busy wait by itself,
+  and virtio-gpu's entry (Module.virgl.gpu) must give a capset without the
+  transfers in the command stream, move packed data through a texture, and
+  present it to the canvas the right way up.
   The result goes into the page as
   JSON (<pre id=result>) and, when served by check.mjs, back to it by POST.
   ?module=URL loads another build of virgl.mjs.
@@ -336,6 +339,68 @@ async function main() {
       out.renderer.stats.parks !== 1)
     throw new Error(`v.Renderer: ${closed || 'unexpected reply ' + Array.from(w)}`);
   out.stages.renderer = true;
+
+  // virtio-gpu's entry (v.gpu, kw_vgpu_*): the capset without the
+  // transfers in the command stream; a context and a 4x4 B8G8R8X8 texture
+  // whose packed upload reads back the same; presented into the canvas's
+  // drawing buffer with its top row at the top (no readback on that path;
+  // here readPixels checks it); a fence that retires in a later task
+  stage('gpu');
+  const g = v.gpu;
+  const vcaps = g.capset(2);
+  if (!vcaps || vcaps.data.length !== caps.length * 4) throw new Error(`gpu: capset 2: ${vcaps && vcaps.data.length} bytes`);
+  const vw = new Uint32Array(vcaps.data.buffer, vcaps.data.byteOffset, vcaps.data.length / 4);
+  const CAP_TRANSFER = 1 << 17, CAP_COPY_TRANSFER = 1 << 26;
+  out.gpu = { capset: { version: vcaps.version, bytes: vcaps.data.length, capability_bits: '0x' + (vw[98] >>> 0).toString(16) } };
+  if (vw[98] & (CAP_TRANSFER | CAP_COPY_TRANSFER) || ((vw[98] | CAP_TRANSFER | CAP_COPY_TRANSFER) >>> 0) !== ((caps[98] | CAP_TRANSFER | CAP_COPY_TRANSFER) >>> 0))
+    throw new Error(`gpu: capability bits 0x${vw[98].toString(16)} against vtest's 0x${caps[98].toString(16)}`);
+  const vcmd = (type, ctx, words) => {
+    const b = new Uint32Array(6 + words.length);
+    b[0] = type; b[4] = ctx; b.set(words, 6);
+    return new Uint8Array(b.buffer);
+  };
+  let code = g.command(vcmd(0x200, 1, [5, 0, ...new Uint32Array(16)])); // CTX_CREATE, a 5-byte name of zeros
+  // RESOURCE_CREATE_3D 77: PIPE_TEXTURE_2D (2), B8G8R8X8 (2), RENDER_TARGET | SAMPLER_VIEW, 4x4x1, 1 layer, 0 levels, 0 samples, flags 0
+  code ||= g.command(vcmd(0x204, 1, [77, 2, 2, 2 | 8, 4, 4, 1, 1, 0, 0, 0]));
+  code ||= g.command(vcmd(0x202, 1, [77])); // CTX_ATTACH_RESOURCE
+  const px = new Uint8Array(64);
+  for (let i = 0; i < 16; i++) px.set([i * 16, 255 - i * 16, (i & 3) * 80, 255], i * 4); // B, G, R, X; row 0 first
+  // TRANSFER_TO_HOST_3D: box 0,0,0 4x4x1, offset 0 (u64), res 77, level 0, stride 16, layer_stride 64
+  code ||= g.command(vcmd(0x205, 1, [0, 0, 0, 4, 4, 1, 0, 0, 77, 0, 16, 64]), px);
+  const back3 = new Uint8Array(64);
+  code ||= g.command(vcmd(0x206, 1, [0, 0, 0, 4, 4, 1, 0, 0, 77, 0, 16, 64]), back3);
+  if (code) throw new Error(`gpu: command answered 0x${code.toString(16)}`);
+  out.gpu.roundTrip = back3.every((b, i) => (i & 3) === 3 || b === px[i]);
+  if (!out.gpu.roundTrip) throw new Error(`gpu: read back ${Array.from(back3.slice(0, 8))}, wrote ${Array.from(px.slice(0, 8))}`);
+  const info = g.info(77);
+  out.gpu.info = info && { width: info.width, height: info.height, format: info.format, yTop: info.yTop, texture: !!info.texture };
+  const rd = g.read(77, 0, 0, 4, 4, 4);
+  out.gpu.read = !!rd && rd.every((b, i) => (i & 3) === 3 || b === px[i]);
+  canvas.width = 4; canvas.height = 4;
+  if (g.present(77, 0, 0, 4, 4) !== 0) throw new Error('gpu: present failed');
+  const shown = new Uint8Array(64);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, shown);
+  // readPixels' row 0 is the bottom: the picture's last row
+  let bad = 0;
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+    const s = ((3 - y) * 4 + x) * 4, p = (y * 4 + x) * 4;
+    if (shown[s] !== px[p + 2] || shown[s + 1] !== px[p + 1] || shown[s + 2] !== px[p]) bad++;
+  }
+  out.gpu.presented = bad ? `${bad} of 16 pixels differ` : 'top row at the top, colours right';
+  if (bad) throw new Error(`gpu: presented picture: ${out.gpu.presented}; got ${Array.from(shown.slice(0, 8))}`);
+  if (!out.gpu.read) throw new Error('gpu: read() differs');
+  const seq = g.fence();
+  let polls = 0;
+  while (((g.fencesDone() - seq) | 0) < 0 && polls < 500) {
+    polls++;
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  out.gpu.fence = { seq, polls, retired: ((g.fencesDone() - seq) | 0) >= 0 };
+  if (!out.gpu.fence.retired) throw new Error('gpu: the fence did not retire');
+  g.command(vcmd(0x102, 0, [77])); // RESOURCE_UNREF
+  g.command(vcmd(0x201, 1, [])); // CTX_DESTROY
+  out.stages.gpu = true;
   delete out.running;
   out.ok = true;
 }

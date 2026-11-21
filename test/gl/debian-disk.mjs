@@ -13,8 +13,9 @@
 //   node test/gl/debian-disk.mjs [--out FILE] [--kernel unkernel.wasm] [--distro debian.erofs]
 //
 // Default out: $KW_BUILD/gl/debian-gl.img (vendor/build). The packages:
-// surfaceless EGL (eglinfo, libEGL and libGLESv2 for kwgl-state) and X11
-// (Xvfb, glmark2 for GLES 2 and GL).
+// surfaceless EGL (eglinfo, libEGL and libGLESv2 for kwgl-state), X11
+// (Xvfb, glmark2 for GLES 2 and GL) and KMS (kmscube, glmark2-es2-drm,
+// modetest).
 import { existsSync, mkdirSync, renameSync, rmSync, statSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,8 @@ import { createImageFromKwsparse, createKernel } from "../../js/node.ts";
 export const GL_PACKAGES = [
 	"mesa-utils", "libegl-mesa0", "libgles2",
 	"libgl1-mesa-dri", "libglx-mesa0", "xvfb", "xauth", "glmark2-es2-x11", "glmark2-x11",
+	// virtio-gpu (KMS and GBM clients on /dev/dri): unkernel-check.mjs --drm
+	"libgbm1", "kmscube", "glmark2-es2-drm", "libdrm-tests",
 ];
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -67,7 +70,7 @@ export DEBIAN_FRONTEND=noninteractive
 inst() { apt-get install -y -q --no-install-recommends ${GL_PACKAGES.join(" ")} </dev/null; }
 inst || { apt-get update -q && inst; }
 apt-get clean
-for c in eglinfo glxinfo Xvfb xvfb-run glmark2-es2 glmark2; do command -v $c >/dev/null || { echo "missing: $c"; exit 1; }; done
+for c in eglinfo glxinfo Xvfb xvfb-run glmark2-es2 glmark2 kmscube glmark2-es2-drm modetest; do command -v $c >/dev/null || { echo "missing: $c"; exit 1; }; done
 ls /usr/lib/aarch64-linux-gnu/dri/ | grep -c . >/dev/null
 sync`;
 let code = 1;

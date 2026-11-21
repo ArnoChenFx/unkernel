@@ -1,0 +1,79 @@
+From e733958c9315288a462964bf8349c4ee7f443f5e Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 19:24:55 +0000
+Subject: [PATCH] drm: let a kernel leave out the HDMI infoframe library
+ (DRM_HDMI_INFOFRAMES)
+
+DRM selects HDMI for two helpers in drm_edid.c,
+drm_hdmi_avi_infoframe_from_display_mode() and
+drm_hdmi_vendor_infoframe_from_display_mode(), which call
+hdmi_avi_infoframe_init() and hdmi_vendor_infoframe_init(). A kernel
+whose only display driver has no HDMI output (virtio-gpu) never calls
+them but still builds lib hdmi.o.
+
+Select HDMI only if the new DRM_HDMI_INFOFRAMES, default y and visible
+under EXPERT, and let both helpers return -EINVAL without HDMI, which
+also drops their calls into it. Drivers with HDMI outputs need it and
+should select HDMI themselves before they can be built without it.
+---
+ drivers/gpu/drm/Kconfig    | 14 +++++++++++++-
+ drivers/gpu/drm/drm_edid.c |  4 ++--
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+index f9c654822f3..2f18a09b029 100644
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -9,7 +9,7 @@ menuconfig DRM
+ 	tristate "Direct Rendering Manager (XFree86 4.1.0 and higher DRI support)"
+ 	depends on (AGP || AGP=n) && !EMULATED_CMPXCHG && HAS_DMA
+ 	select DRM_PANEL_ORIENTATION_QUIRKS
+-	select HDMI
++	select HDMI if DRM_HDMI_INFOFRAMES
+ 	select I2C if DRM_DDC
+ 	select DMA_SHARED_BUFFER
+ 	select SYNC_FILE
+@@ -53,6 +53,18 @@ config DRM_DDC
+ 	  otherwise without selecting it, such as one with virtio-gpu
+ 	  alone, which gets the EDID from the device.
+ 
++config DRM_HDMI_INFOFRAMES
++	bool "HDMI infoframe helpers" if EXPERT
++	depends on DRM
++	default y
++	help
++	  The DRM core selects the HDMI infoframe library (HDMI) for
++	  drm_hdmi_avi_infoframe_from_display_mode() and
++	  drm_hdmi_vendor_infoframe_from_display_mode(), which return
++	  -EINVAL without it. Say N only for a kernel whose display
++	  drivers have no HDMI outputs, such as one with virtio-gpu
++	  alone.
++
+ config DRM_KMS_HELPER
+ 	tristate
+ 	depends on DRM
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index 07970e5b5f6..719cbb5a9b9 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -7421,7 +7421,7 @@ drm_hdmi_avi_infoframe_from_display_mode(struct hdmi_avi_infoframe *frame,
+ 	enum hdmi_picture_aspect picture_aspect;
+ 	u8 vic, hdmi_vic;
+ 
+-	if (!frame || !mode)
++	if (!IS_ENABLED(CONFIG_HDMI) || !frame || !mode)
+ 		return -EINVAL;
+ 
+ 	hdmi_avi_infoframe_init(frame);
+@@ -7590,7 +7590,7 @@ drm_hdmi_vendor_infoframe_from_display_mode(struct hdmi_vendor_infoframe *frame,
+ 		connector->display_info.has_hdmi_infoframe : false;
+ 	int err;
+ 
+-	if (!frame || !mode)
++	if (!IS_ENABLED(CONFIG_HDMI) || !frame || !mode)
+ 		return -EINVAL;
+ 
+ 	if (!has_hdmi_infoframe)
+-- 
+2.56.0
+

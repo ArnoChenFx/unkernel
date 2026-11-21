@@ -10,10 +10,11 @@
 # which needs a host serving vsock port 1021 (the CLI's --wasi; prototype).
 # A distro registers its own formats after this (Alpine: qemu-user).
 # There is no udev, so this gives the console user's devices the groups
-# and modes udev's rules give them: the framebuffer to video, input
-# devices to input, sound to audio (0660), /dev/fuse to everyone (0666); by
-# group name, so on a root without that group (the base shell) the device
-# stays root's. The drivers make these devices at boot; none comes later.
+# and modes udev's rules give them: the framebuffer and DRM's card nodes
+# to video, input devices to input, sound to audio (0660), /dev/fuse and
+# DRM's render nodes to everyone (0666); by group name, so on a root
+# without that group (the base shell) the device stays root's. The drivers
+# make these devices at boot; none comes later.
 
 PATH=/run/kw-lower/bin
 m() { mountpoint -q "$2" || mount -t "$1" ${3:+-o "$3"} "$1" "$2"; }
@@ -35,8 +36,8 @@ dev() {
 	shift 2
 	for f; do [ -e "$f" ] && chgrp "$g" "$f" 2>/dev/null && chmod "$m" "$f"; done
 }
-dev video 660 /dev/fb[0-9]*
+dev video 660 /dev/fb[0-9]* /dev/dri/card*
 dev input 660 /dev/input/event* /dev/input/mice /dev/input/mouse* /dev/input/js*
 dev audio 660 /dev/dsp* /dev/audio* /dev/mixer* /dev/snd/*
-[ -e /dev/fuse ] && chmod 666 /dev/fuse
+for f in /dev/fuse /dev/dri/renderD*; do [ -e "$f" ] && chmod 666 "$f"; done
 exit 0

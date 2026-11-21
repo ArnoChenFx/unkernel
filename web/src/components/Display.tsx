@@ -15,7 +15,10 @@
 //   frame (the SDK's frame(); the guest is suspended whenever this runs). In
 //   worker mode frame() is the latest frame the worker sent (or put in the
 //   shared frame buffer): it is painted only when frameSeq says it is new,
-//   and each animation frame asks for the next;
+//   and each animation frame asks for the next. While a GL client has
+//   virtio-gpu's scanout (gl and gpu, not offered by the page yet), the
+//   picture is the renderer's latest frame (gl.gpu.drawFrame(): an
+//   ImageBitmap of its WebGL2 canvas, no readback), in both modes;
 // - mouse, absolute: while a program has the tablet (event2) open, e.g. X,
 //   the pointer over the canvas is sent as absolute positions (the canvas's
 //   on-screen rectangle is the whole picture), buttons and the wheel go to
@@ -213,12 +216,18 @@ function Picture({ opts, aw, ah, rot, width, height, mouse, tablet, touchMode }:
 		const c = ref.current!;
 		const image = new ImageData(width, height);
 		const ctx = c.getContext("2d")!;
-		let raf = 0, shown = -1;
+		let raf = 0, shown = -1, glForce = true;
 		const paint = () => {
 			raf = 0;
 			const vm = opts.vm();
 			if (!vm) return;
-			if (vm instanceof KernelInstance) {
+			// A GL client on virtio-gpu's scanout (gl and gpu): its latest frame
+			// comes from the renderer on this thread, drawn without a readback;
+			// null when no 3D resource is on the scanout.
+			const gl = vm.gl?.gpu?.drawFrame(ctx, glForce);
+			if (gl !== undefined && gl !== null) {
+				if (gl) glForce = false;
+			} else if (vm instanceof KernelInstance) {
 				if (vm.kernel.result) return;
 				if (!vm.frame(image.data)) return;
 				ctx.putImageData(image, 0, 0);

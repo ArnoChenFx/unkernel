@@ -3,18 +3,20 @@
 The kernel side of each host device. Host sides are in js.md, SMP paths
 in smp.md (Devices), imports and IRQ numbers in kernel.md.
 
-Display, input, sound, vsock and shm are lazy: each `_init` import returns
-< 0 when the host has no such device, and then nothing is registered.
+Display, input, sound, vsock, shm and kwvirtio are lazy: each `_init`
+import returns < 0 (kwvirtio: <= 0) when the host has no such device, and
+then nothing is registered.
 Display, input and sound allocate nothing until a program opens the
 device, and the host is told on open and close. None of these imports
 suspends. A new device adds only its own imports (diff the module's
 imports against a build without it). The CLI offers vsock by default and
-display, sound and shm on request (`--display`, `--sound`, `--shm`); the
-page offers all but shm.
+display, sound, shm and virtio-gpu on request (`--display`, `--sound`,
+`--shm`, `--gpu`); the page offers all but shm and virtio-gpu.
 
 Sizes (lowered kernel): display +37 KiB, input +49 KiB, sound +142 KiB
 (30 KiB of it OSS), vsock +45 KiB (+15.7 KB gzip), kwshm +6 KiB (+1.8 KB
-gzip) (2026-11-14); 9p +141 KiB (+52 KB gzip, 28 KiB of RAM; 2026-11-15).
+gzip) (2026-11-14); 9p +141 KiB (+52 KB gzip, 28 KiB of RAM; 2026-11-15);
+kwvirtio with DRM and virtio-gpu +660 KB (+217 KB gzip; config.md).
 
 ## Console (hvc_wasm)
 
@@ -198,6 +200,88 @@ the id to the host over any channel.
   covers everything. At power-off the kernel releases nothing; the host
   forgets every export.
 - kw_defconfig: KWSHM (depends on SHMEM and MEMFD_CREATE).
+
+## kwvirtio (virtio transport) and virtio-gpu (`/dev/dri`)
+
+`drivers/virtio/kwvirtio.c`, host `js/core/virtio.ts`: a virtio transport
+whose registers are host imports, so that stock virtio drivers run
+unmodified against device models in the SDK. Only virtio-gpu
+(`drivers/gpu/drm/virtio`, host `js/core/virtio-gpu.ts`) is enabled.
+
+- Imports (`wasm_driver_virtio_*`): `init(index)` (the device ID of the
+  host's device `index`, <= 0: none; devices are 0, 1, ... without holes,
+  at most 8), `features`, `set_features` (after `vring_transport_features`;
+  VIRTIO_F_VERSION_1 is required), `config(dev, offset, buf, len, write)`,
+  `status` (0 resets; the kernel keeps the status byte itself),
+  `queue_max`, `queue_set(dev, queue, num, desc, avail, used)` (num 0
+  takes it down), `notify(dev, queue)`, `interrupt(dev)` (reads and clears
+  the interrupt status: bit 0 used buffers, bit 1 config change). None
+  suspends; `notify` comes in atomic context.
+- Split rings from `vring_create_virtqueue()`, no indirect descriptors, no
+  event index, no ACCESS_PLATFORM. Without ACCESS_PLATFORM `virtio_ring`
+  and virtio-gpu do not use the DMA API for the rings and commands
+  (`vring_use_map_api()` and `virtio_gpu_use_dma_api()` are false), so every
+  address is physical, i.e. a kernel memory offset, and the host reads
+  and writes rings and buffers in place.
+- One IRQ for all devices: `WASM_IRQ_VIRTIO` (10), `IRQF_SHARED`; each
+  device's handler runs `virtio_config_changed()` and `vring_interrupt()`
+  on its queues.
+- Each device's parent is a platform device `kwvirtio.N` with a 32-bit DMA
+  mask. virtio-gpu makes the parent its DRM device, and
+  `drm_gem_shmem_get_pages_sgt()` maps a buffer's sg table with
+  `dma_map_sgtable()` on it, which dma-direct does one to one; virtio-gpu
+  passes `orig_nents` page addresses to the host anyway. libdrm (Debian
+  13's 2.4.124) takes the parent as it is: `drmGetDevice2()` reads
+  `device/subsystem` (platform) and, with no OF node, the `MODALIAS`
+  (`platform:kwvirtio`) for the device's name, and Mesa's loader, finding
+  no PCI ids, names the driver from DRM_IOCTL_VERSION (`virtio_gpu`), as
+  it logs: "device is not located on the PCI bus", "using driver
+  virtio_gpu". Nothing in the kernel was needed for that (2026-11-21).
+- SMP: the process-context calls go through `kw_host_call()`; a notify on
+  another CPU sets the queue's bit in the device's pending mask and raises
+  `WASM_IRQ_VIRTIO` on CPU 0, whose handler sends it before it reads the
+  interrupt status.
+
+virtio-gpu: `/dev/dri/card0` and `renderD128`, driver name `virtio_gpu`,
+one CRTC and connector, KMS with dumb buffers (GEM shmem objects in the
+guest, their pages handed to the host as the resource's backing), and 3D
+when the host offers VIRTIO_GPU_F_VIRGL (`createKernel({ gl, gpu })` in a
+browser: two capsets, VIRGL and VIRGL2, from the renderer's WebGL2
+context; gl.md, The DRM path). Without it Mesa falls back to software.
+There is no udev: the kw layer's rc gives `card*` to video (0660) and
+`renderD*` to everyone (0666), as udev's rules do (guest.md).
+
+- What the kernel side does not use: `vmap()` (VMALLOC_FLAT cannot map
+  scattered pages). The 2D paths pass backing as page lists and never
+  vmap; only `drm_gem_shmem_vmap()` callers would (fbdev emulation, the
+  panic screen, dma-buf importers that vmap), and DRM_FBDEV_EMULATION and
+  DRM_PANIC are off. PRIME between openers of the device (a client's
+  dmabuf imported by a compositor) is a self-import, which maps nothing
+  (`test/gpu/prime.c`; gl.md, The DRM path). virtio-gpu has no vblank
+  interrupt from the host: it emulates one with DRM's vblank timer
+  (`DRM_CRTC_VBLANK_TIMER_FUNCS`, at the mode's refresh, 60 Hz from the
+  EDID), so a page-flipping client runs at most at 60 frames a second
+  (kmscube: 59.97, 2026-11-21), and so do DIRTYFB updates. The timer runs
+  on for `drm.vblankoffdelay` (5 s) after its last use (`test/gpu/flip-check.mjs`
+  counts the host's idles), then an idle guest has no periodic timer.
+  No kthreads (its work items run on the system workqueue), so parking
+  needs nothing new.
+- A DIRTYFB transfers its rectangle only: the series backports
+  a9cc9905ddb7 ("drm/virtio: Recalculate ignore_damage_clips on every
+  update", 7.4), without which the flag sticks after the first commit that
+  changes the framebuffer.
+- Snapshots: the host refuses one (-EBUSY, "virtio-gpu resources", or
+  "virtio-gpu contexts" with 3D) while the device holds resources,
+  contexts or unanswered commands, which a KMS client
+  that has exited no longer does; otherwise it saves the transport state
+  (status, features, each queue's addresses and next available index) and
+  a restore picks it up, with nothing in the kernel (no restore notifier).
+- kw_defconfig: VIRTIO_MENU, KWVIRTIO, DRM, DRM_VIRTIO_GPU,
+  DRM_VIRTIO_GPU_KMS; not VIRTIO_MMIO, VIRTIO_BALLOON, VIRTIO_INPUT,
+  DRM_FBDEV_EMULATION, DRM_PANIC, DRM_DDC, DRM_HDMI_INFOFRAMES,
+  DRM_PANEL_BRIDGE, NET_DEVMEM.
+- Check: `node test/gpu/check.mjs` (a dumb-buffer client,
+  `test/gpu/kms-dumb.c`, against the host's frame; testing.md).
 
 ## 9p (host file systems)
 

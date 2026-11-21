@@ -18,6 +18,12 @@
 // not shared with other threads, so nothing else writes it meanwhile. There
 // is no flush or vsync; a frame read while a program is mid-draw is torn.
 // Neither import suspends.
+//
+// Another source may take the display over (setScanout): the virtio-gpu
+// scanout (virtio-gpu.ts), while a KMS client has a framebuffer on it. The
+// display then shows that picture (mode, pixels(), readRGBA()), and kwfb's
+// again when the scanout goes; both devices stay registered. The size
+// wanted (wantedSize()) is the same for both.
 
 /** DRM fourcc of XRGB8888 ("XR24"): 32-bit pixels, little endian B, G, R, X. */
 export const FOURCC_XRGB8888 = 0x34325258;
@@ -30,6 +36,19 @@ export interface DisplayMode {
 	stride: number;
 	/** DRM fourcc; only FOURCC_XRGB8888 so far. */
 	format: number;
+}
+
+/** A picture that takes the display over from kwfb (DisplayHost.setScanout). */
+export interface DisplaySource {
+	mode: DisplayMode;
+	/**
+	 * `mode.height` rows of `mode.stride` bytes (the last may be just
+	 * `width * 4`), XRGB8888; read at once. Null for a picture that is not
+	 * in this thread's memory: a virtio-gpu 3D resource, a GL texture where
+	 * the renderer runs (GlHost presents it; KernelHandle.frame() reads it
+	 * back there).
+	 */
+	pixels(): Uint8Array | null;
 }
 
 /** A copy of the frame, RGBA (the layout of canvas ImageData). */
@@ -91,10 +110,12 @@ export class DisplayHost {
 	#size: DisplayOption;
 	/** The size last offered to the kernel (wasm_driver_fb_mode). */
 	#offered: DisplaySize | null = null;
-	/** Address of the pixels in kernel memory; 0 while nothing has /dev/fb0 open. */
+	/** Address of kwfb's pixels in kernel memory; 0 while nothing has /dev/fb0 open. */
 	addr = 0;
-	/** The mode while attached, else null. */
-	mode: DisplayMode | null = null;
+	/** kwfb's mode while attached, else null. */
+	#fbMode: DisplayMode | null = null;
+	/** A source that has the display instead of kwfb (virtio-gpu), or null. */
+	#source: DisplaySource | null = null;
 	/** Did the kernel ask (wasm_driver_fb_init)? False for a kernel without kwfb. */
 	probed = false;
 	stats: DisplayStats = { attaches: 0, detaches: 0 };
@@ -119,6 +140,36 @@ export class DisplayHost {
 		return ((mm(mode.width) << 16) | mm(mode.height)) >>> 0;
 	}
 
+	/** The mode of what the display shows (the scanout's, else kwfb's while attached), else null. */
+	get mode(): DisplayMode | null {
+		return this.#source?.mode ?? this.#fbMode;
+	}
+
+	/** The size the host wants now (the option, or its function's answer; default 640x480). */
+	wantedSize(): DisplaySize {
+		let s = DEFAULT_DISPLAY_SIZE;
+		try {
+			const o = this.#size;
+			if (typeof o === "function") s = o();
+			else if (typeof o === "object") s = o;
+		} catch (e) {
+			this.#log(`[display] size callback failed: ${e}`);
+		}
+		return s;
+	}
+
+	/**
+	 * Let another source have the display (virtio-gpu's scanout), or give
+	 * it back to kwfb (null). onChange hears the mode that is shown now.
+	 */
+	setScanout(src: DisplaySource | null): void {
+		if (!src && !this.#source) return;
+		this.#source = src;
+		if (src) this.stats.attaches++;
+		else this.stats.detaches++;
+		try { this.#onChange?.(this.mode); } catch {}
+	}
+
 	imports(): Record<string, unknown> {
 		return {
 			wasm_driver_fb_init: (): bigint => {
@@ -127,14 +178,7 @@ export class DisplayHost {
 			},
 			// The size wanted at first open: width << 16 | height (the kernel fits it).
 			wasm_driver_fb_mode: (): number => {
-				let s = DEFAULT_DISPLAY_SIZE;
-				try {
-					const o = this.#size;
-					if (typeof o === "function") s = o();
-					else if (typeof o === "object") s = o;
-				} catch (e) {
-					this.#log(`[display] size callback failed: ${e}`);
-				}
+				const s = this.wantedSize();
 				this.#offered = s;
 				const w = Math.min(0xffff, Math.max(1, Math.round(s.width) || DEFAULT_DISPLAY_SIZE.width));
 				const h = Math.min(0xffff, Math.max(1, Math.round(s.height) || DEFAULT_DISPLAY_SIZE.height));
@@ -151,15 +195,16 @@ export class DisplayHost {
 						return 0;
 					}
 					this.addr = addr;
-					this.mode = mode;
+					this.#fbMode = mode;
 					this.stats.attaches++;
 				} else {
 					this.addr = 0;
-					this.mode = null;
+					this.#fbMode = null;
 					this.stats.detaches++;
 				}
-				try { this.#onChange?.(this.mode); } catch {}
-				return this.mode ? this.#physical(this.mode) : 0;
+				// While a scanout has the display, kwfb changes nothing that is shown.
+				if (!this.#source) try { this.#onChange?.(this.mode); } catch {}
+				return this.#fbMode ? this.#physical(this.#fbMode) : 0;
 			},
 		};
 	}
@@ -167,7 +212,8 @@ export class DisplayHost {
 	/** The state a snapshot keeps (the pixels are in the kernel's memory). */
 	saveState(): DisplaySnapshot {
 		const o = this.#offered;
-		return { addr: this.addr, mode: this.mode && { ...this.mode }, offered: o && { width: o.width, height: o.height, dpi: o.dpi } };
+		const m = this.#fbMode;
+		return { addr: this.addr, mode: m && { ...m }, offered: o && { width: o.width, height: o.height, dpi: o.dpi } };
 	}
 
 	/**
@@ -178,18 +224,20 @@ export class DisplayHost {
 		this.probed = true;
 		this.#offered = s.offered;
 		this.addr = s.mode ? s.addr : 0;
-		this.mode = s.mode && this.addr ? { ...s.mode } : null;
-		if (this.mode) try { this.#onChange?.(this.mode); } catch {}
+		this.#fbMode = s.mode && this.addr ? { ...s.mode } : null;
+		if (this.#fbMode) try { this.#onChange?.(this.#fbMode); } catch {}
 	}
 
 	/**
-	 * The guest's pixels in place (no copy): `mode.height` rows of
-	 * `mode.stride` bytes, XRGB8888. Null while detached. Valid only until
+	 * The pixels shown, in place (no copy): `mode.height` rows of
+	 * `mode.stride` bytes, XRGB8888 (kwfb's in the guest's memory, or the
+	 * scanout's host copy). Null while nothing is shown. Valid only until
 	 * the kernel runs again (the program may close the device and the
 	 * kernel reuse the memory), so read it at once and do not keep it.
 	 */
 	pixels(): Uint8Array | null {
-		const m = this.mode;
+		if (this.#source) return this.#source.pixels();
+		const m = this.#fbMode;
 		if (!m || !this.addr) return null;
 		return new Uint8Array(this.#memory().buffer, this.addr, m.stride * m.height);
 	}
@@ -201,16 +249,17 @@ export class DisplayHost {
 	 */
 	readRGBA(out?: Uint8ClampedArray): DisplayFrame | null {
 		const m = this.mode;
-		if (!m || !this.addr) return null;
+		const px = this.pixels();
+		if (!m || !px) return null;
 		const { width, height, stride } = m;
 		const data = out && out.length === width * height * 4 ? out : new Uint8ClampedArray(width * height * 4);
 		const dst = new Uint32Array(data.buffer, data.byteOffset, width * height);
-		const buf = this.#memory().buffer;
 		// Typed arrays use the platform byte order, which is little endian on
 		// every engine that runs this kernel: XRGB8888 reads as 0xXXRRGGBB,
-		// RGBA is written as 0xAABBGGRR.
+		// RGBA is written as 0xAABBGGRR. Rows start 4-byte aligned (kwfb's
+		// address and the host copy's offsets are multiples of 4).
 		for (let y = 0; y < height; y++) {
-			const src = new Uint32Array(buf, this.addr + y * stride, width);
+			const src = new Uint32Array(px.buffer, px.byteOffset + y * stride, width);
 			const o = y * width;
 			for (let x = 0; x < width; x++) {
 				const p = src[x]!;

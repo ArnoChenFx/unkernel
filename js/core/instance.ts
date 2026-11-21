@@ -15,11 +15,13 @@ import type { ProfileOptions, ProfileReport, SamplerHandle, SamplerInit } from "
 import type { SoundHost, SoundOption, SoundState, SoundStats } from "./sound.ts";
 import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
 import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
+import type { GpuBackend, VirtioGpuStats } from "./virtio-gpu.ts";
 import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess, type TtySessionSnapshot } from "./tty.ts";
 import { fetchOver } from "./http.ts";
 import { CommandTable, parseCommands, type CommandsOption, type HostCommand } from "./commands.ts";
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
-import { startGl, type GlHost, type GlOption } from "./gl.ts";
+import { prepareGpuGl, startGl, type GlHost, type GlOption } from "./gl.ts";
+import { inlineGpuLink, VirglGpuBackend } from "./gl-gpu.ts";
 import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
 import { NetStack, type NetBackend, type NetStats } from "./net.ts";
@@ -188,6 +190,21 @@ export interface CreateKernelOptions {
 	 */
 	shm?: boolean;
 	/**
+	 * A virtio-gpu device (kwvirtio, virtio-gpu.ts): the guest gets
+	 * /dev/dri/card0 and renderD128 (driver virtio_gpu), and while a client
+	 * has a framebuffer on its scanout, frame() and `display` show that
+	 * instead of /dev/fb0's pixels. With `gl` too, where WebGL2 is (a
+	 * browser), the device has 3D: the guest's Mesa renders through its
+	 * virtio_gpu (virgl) driver on gl's renderer, and a GL client's scanout
+	 * is presented from its texture (`gl.gpu.drawFrame()`; gl-gpu.ts).
+	 * Otherwise it is 2D: KMS with dumb buffers. Implies `display` (whose
+	 * size the scanout offers) when that is not given. Default false: no
+	 * virtio device.
+	 */
+	gpu?: boolean;
+	/** @internal The virtio-gpu device's 3D side in the kernel's worker (worker-serve.ts); createKernel makes its own from `gl`. */
+	gpuBackend?: GpuBackend;
+	/**
 	 * Host file systems to mount in the guest (mounts.ts): guest paths to a
 	 * file system (an Fs such as MemoryFs or nodeFs(), or a plain object
 	 * tree of files: strings, bytes, functions, subdirectory objects), or to
@@ -219,7 +236,8 @@ export interface CreateKernelOptions {
 	 * programs run with GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1
 	 * (Debian: Mesa from apt). true, or options. Needs vsock and WebGL2:
 	 * where there is none (Node) it is ignored with a log line, unless
-	 * `renderer` gives one. Default false.
+	 * `renderer` gives one. With `gpu` the same renderer gives the virtio-gpu
+	 * device 3D (see gpu). Default false.
 	 */
 	gl?: GlOption;
 	/** Initial console size (cols x rows); resize() changes it later. */
@@ -328,6 +346,8 @@ export interface InstanceStats extends KernelStats {
 	sound?: SoundStats;
 	vsock?: VsockStats;
 	shm?: ShmStats;
+	/** virtio-gpu (gpu option): commands, transfers, flushes. */
+	gpu?: VirtioGpuStats;
 }
 
 /** What the entry points supply. */
@@ -784,6 +804,7 @@ export class KernelInstance implements KernelHandle {
 			sound: k.sound.enabled ? { ...k.sound.stats } : undefined,
 			vsock: this.#vsock ? { ...this.#vsock.stats } : undefined,
 			shm: this.#shm?.stats,
+			gpu: k.gpu ? { ...k.gpu.stats } : undefined,
 		};
 	}
 
@@ -835,6 +856,8 @@ export class KernelInstance implements KernelHandle {
 	}
 
 	frame(out?: Uint8ClampedArray): DisplayFrame | null {
+		// A 3D resource on virtio-gpu's scanout: read back from the renderer.
+		if (this.#gl?.gpu?.scanout) return this.#gl.gpu.frame(out);
 		return this.kernel.display.enabled ? this.kernel.display.readRGBA(out) : null;
 	}
 
@@ -880,12 +903,14 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		throw new BootError("boot", `snapshot: it has host file systems (${savedMounts.mounts.map((m) => m.path).join(", ")}), which resume inline only (not in worker mode or with vsock.raw)`);
 	const mountsWhy = opts.restore && snapshotMountMismatch(savedMounts, mounts);
 	if (mountsWhy) throw new BootError("boot", `snapshot: ${mountsWhy}`);
+	// gl and gpu: the renderer first, as the device offers virgl when the driver probes (gl.ts).
+	const glStart = opts.gpu ? prepareGpuGl(opts.gl, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m))) : undefined;
 	if (opts.worker) {
 		checkWorkerOptions(platform, opts);
-		const vm = await createKernelInWorker(platform, opts, progress);
+		const vm = await createKernelInWorker(platform, opts, progress, glStart?.gpu);
 		vm.startMounts(mounts);
 		vm.startCommands(commands);
-		vm.attachGl(startGl(opts.gl, vm.vsock, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m))));
+		vm.attachGl(startGl(opts.gl, vm.vsock, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m)), glStart));
 		return vm;
 	}
 	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
@@ -950,10 +975,12 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		profile: opts.profile === true ? {} : opts.profile || undefined,
 		spawnSampler: platform.spawnSampler,
 		restore: opts.restore,
-		display: opts.display,
+		display: opts.display ?? (opts.gpu ? true : undefined),
 		onDisplay: opts.onDisplay,
 		onInput: opts.onInput,
 		sound: opts.sound,
+		gpu: !!opts.gpu,
+		gpuBackend: opts.gpuBackend ?? (glStart && new VirglGpuBackend(inlineGpuLink(glStart.gpu), log)),
 		vsock: !!vopt,
 		onVsockPacket: raw ? raw.onPacket : vsock && ((pkt) => vsock.receive(pkt)),
 		onVsockInit: raw ? raw.onInit : vsock && ((cid, rxMax) => vsock.deviceReady(cid, rxMax)),
@@ -1000,7 +1027,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	booting.catch(() => {});
 	instance.startMounts(rest);
 	instance.startCommands(commands);
-	instance.attachGl(startGl(opts.gl, vsock, platform.glModule?.(), log));
+	instance.attachGl(startGl(opts.gl, vsock, platform.glModule?.(), log, glStart));
 	if (signal) {
 		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
 		if (signal.aborted) onAbort();

@@ -90,4 +90,28 @@ enum {
 };
 const double *kw_virgl_stats(void);
 
+// virtio-gpu (kw_virgl.c has the contract): the guest's virtio_gpu DRM
+// driver on the same renderer, next to the vtest clients, after
+// kw_virgl_init. Its commands count in the stats above (SUBMIT_3D as a
+// submit, TRANSFER_FROM_HOST_3D as a read, TRANSFER_TO_HOST_3D as a write).
+
+// Run one control command (a copy, header first) with the transfer's
+// packed DATA: 0, or the virtio-gpu response type of the error.
+int kw_vgpu_command(const uint8_t *cmd, uint32_t len, uint8_t *data, uint32_t data_len);
+// A capset as the guest gets it: its size (0: none) or a negative errno.
+int kw_vgpu_capset(uint32_t id, uint8_t *out, uint32_t cap, uint32_t *max_version);
+// A virgl format's blocks: width | height << 8 | bytes << 16, or 0.
+uint32_t kw_vgpu_format(uint32_t format);
+// Another implicit fence after all GL work so far (its number), and the
+// last one retired.
+uint32_t kw_vgpu_fence(void);
+uint32_t kw_vgpu_fences_done(void);
+// A resource's texture, width, height, virgl format and Y_0_TOP; 0 or -ENOENT.
+int kw_vgpu_info(uint32_t res, uint32_t *out);
+// Blit a rectangle of a resource (row 0 at the top) to the context's
+// drawing buffer, sized w x h by the caller.
+int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+// Read a rectangle back (rows from the top, w * bpp bytes each).
+int kw_vgpu_read(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t bpp, uint8_t *out);
+
 #endif

@@ -22,6 +22,7 @@ import type { InputSnapshot } from "./input.ts";
 import type { ShmSnapshot } from "./shm.ts";
 import type { SoundSnapshot } from "./sound.ts";
 import type { TtySessionSnapshot } from "./tty.ts";
+import type { VirtioTransportSnapshot } from "./virtio.ts";
 import type { VsockSnapshot } from "./vsock.ts";
 
 /**
@@ -37,11 +38,17 @@ export interface DeviceSnapshots {
 	shm?: ShmSnapshot | null;
 	/** The MAC the guest's kwnet got. */
 	network?: { mac: number[] } | null;
+	/**
+	 * virtio-gpu (kwvirtio): the transport's state. A snapshot is refused
+	 * while the device holds resources or commands (virtio-gpu.ts), so the
+	 * model itself has nothing to keep.
+	 */
+	gpu?: { transport: VirtioTransportSnapshot[] } | null;
 }
 
 /** The devices of DeviceSnapshots that a restore must find configured, or not, as saved. */
-export type DeviceKind = "display" | "sound" | "vsock" | "shm" | "network";
-const DEVICE_KINDS: readonly DeviceKind[] = ["display", "sound", "vsock", "shm", "network"];
+export type DeviceKind = "display" | "sound" | "vsock" | "shm" | "network" | "gpu";
+const DEVICE_KINDS: readonly DeviceKind[] = ["display", "sound", "vsock", "shm", "network", "gpu"];
 
 /** A saved machine (Kernel.snapshot()). */
 export interface KernelSnapshot {

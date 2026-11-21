@@ -16,6 +16,7 @@ import type { DistroInfo } from "./distro.ts";
 import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundEvent, SoundFormat, SoundState } from "./sound.ts";
 import type { ShmCall, ShmCallResult, ShmInfo } from "./shm.ts";
+import type { GpuInit, GpuReply, GpuRequest } from "./gl-gpu.ts";
 import type { ExitKind } from "./kernel.ts";
 import type { BootProgress, InstanceStats } from "./instance.ts";
 import type { KernelSnapshot } from "./snapshot.ts";
@@ -63,6 +64,13 @@ export interface WorkerBootSpec {
 	vsock?: boolean;
 	/** kwshm: the worker's kernel offers it and runs the owner's "shm" calls (the copies happen there). */
 	shm?: boolean;
+	/**
+	 * virtio-gpu (gpu option): the device model runs in the worker, next to
+	 * the kernel; 2D frames come as the display's. "virgl": with 3D, whose
+	 * renderer is on the owner (gl-gpu.ts): the worker's VirglGpuBackend
+	 * sends "gpu" requests and gets "gpu-init" and "gpu-reply".
+	 */
+	gpu?: boolean | "virgl";
 	/**
 	 * The shared transport's control block (worker-shared.ts): console and
 	 * evdev input and frame requests go through it instead of "input",
@@ -136,6 +144,10 @@ export type ToWorker =
 	| { t: "vsock"; packets: Uint8Array[] }
 	/** A kwshm call (shm.ts) for the worker's ShmDevice; answered by "shm-result" with the same rid. */
 	| { t: "shm"; rid: number; call: ShmCall }
+	/** virtio-gpu 3D: the renderer's capsets and formats (or why there is none). */
+	| { t: "gpu-init"; init?: GpuInit; error?: string }
+	/** virtio-gpu 3D: the answer to a "gpu" request with that rid (a readback's bytes transferred). */
+	| { t: "gpu-reply"; rid: number; reply: GpuReply }
 	/**
 	 * Save the machine (KernelInstance.snapshot()); answered by
 	 * "snapshot-result" with the same id. With `commit` (SnapshotOptions)
@@ -189,6 +201,10 @@ export type FromWorker =
 	| { t: "sound-chunk"; seq: number; format: SoundFormat; data: Uint8Array }
 	/** vsock packets from the guest (transferred), in order; posted from inside the import once 64 KiB or 64 packets are waiting, else per microtask. */
 	| { t: "vsock"; packets: Uint8Array[] }
+	/** virtio-gpu 3D: a command for the owner's renderer (data transferred), answered by "gpu-reply" when it has a rid. */
+	| { t: "gpu"; req: GpuRequest; rid?: number }
+	/** virtio-gpu 3D: the driver reset the device. */
+	| { t: "gpu-reset" }
 	/** The kernel's kwvsock started (VsockDevice onInit). */
 	| { t: "vsock-ready"; guestCid: number; rxMax: number }
 	/** The answer to "shm": the result (read's bytes transferred), or the ShmError's code and message. */

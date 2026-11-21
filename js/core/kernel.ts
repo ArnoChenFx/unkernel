@@ -14,7 +14,8 @@
 // Imports: generic services (clocks, randomness, console, idle, yield, exit,
 // command line, initrd) are a WASI preview 1 subset (wasi.ts); task
 // switching, kwblk, kwnet, kwfb (display.ts), kwinput (input.ts), kwsnd
-// (sound.ts), kwvsock (vsock.ts), kwshm (shm.ts), the console window size, the host stack
+// (sound.ts), kwvsock (vsock.ts), kwshm (shm.ts), kwvirtio (virtio.ts: virtio-gpu,
+// virtio-gpu.ts), the console window size, the host stack
 // trace and kwemu's JIT tier (kw_host_jit_*, jit.ts) are module "unkernel".
 // Every
 // import except the suspending ones (wasm_switch_to, poll_oneoff,
@@ -41,6 +42,8 @@ import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJit
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
 import { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, awakeTimeout, copySnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { VirtioHost } from "./virtio.ts";
+import { VirtioGpu, type GpuBackend } from "./virtio-gpu.ts";
 import { VsockDevice } from "./vsock.ts";
 import { WasiHost, never } from "./wasi.ts";
 
@@ -60,6 +63,8 @@ const IRQ_VSOCK = 6;
 const IRQ_SHM = 7;
 /** Park every task and call wasm_snapshot_point (snapshot()). */
 const IRQ_SNAPSHOT = 8;
+/** kwvirtio: used buffers or a config change (virtio.ts). */
+const IRQ_VIRTIO = 10;
 const EBUSY = 16;
 const ENOSYS = 38;
 
@@ -177,6 +182,15 @@ export interface KernelConfig {
 	 * place. Default false: the kernel registers nothing.
 	 */
 	shm?: boolean;
+	/**
+	 * Offer a virtio-gpu device (kwvirtio, virtio-gpu.ts): the guest's
+	 * /dev/dri/card0 (driver virtio_gpu, 2D KMS), whose scanout the display
+	 * shows instead of kwfb's pixels while one is set. Its size is the
+	 * display option's. Default false: no virtio device.
+	 */
+	gpu?: boolean;
+	/** The device's 3D side (gl-gpu.ts VirglGpuBackend), with `gpu`; without one it is 2D. */
+	gpuBackend?: GpuBackend;
 	/**
 	 * Offer kwemu's JIT tier (hot guest code compiled to WebAssembly; see
 	 * jit.ts). Default true; false makes kwemu interpret everything. A
@@ -327,6 +341,10 @@ export class Kernel {
 	vsock: VsockDevice;
 	/** kwshm's host side (shm.ts): requests, page lists and copies; the API is ShmClient's. */
 	shm: ShmDevice;
+	/** kwvirtio's host side (virtio.ts): the transport and its queues. */
+	virtio: VirtioHost;
+	/** The virtio-gpu device model (gpu option), else undefined. */
+	gpu: VirtioGpu | undefined;
 	memory!: WebAssembly.Memory;
 	memory64 = false;
 	/** The module imports a shared memory (a kernel linked with --shared-memory). */
@@ -429,6 +447,13 @@ export class Kernel {
 			enabled: opts.shm, memory: () => this.memory, raise: () => this.raiseIrq(IRQ_SHM),
 			driver: WebAssembly.Module.imports(opts.module).some((i) => i.module === "unkernel" && i.name === "wasm_driver_shm_init"),
 		});
+		this.virtio = new VirtioHost({ memory: () => this.memory, raise: () => this.raiseIrq(IRQ_VIRTIO), log: this.log });
+		if (opts.gpu) {
+			const gpu = new VirtioGpu({ memory: () => this.memory, display: this.display, backend: opts.gpuBackend, log: this.log });
+			this.virtio.add(gpu);
+			gpu.configNotifier = () => this.virtio.configChanged(gpu);
+			this.gpu = gpu;
+		}
 		void this.exited.then(() => {
 			this.vsock.close();
 			this.shm.close();
@@ -834,8 +859,8 @@ export class Kernel {
 	}
 
 	/** Which devices this machine has, as a snapshot records them (DeviceSnapshots keys). */
-	devicesPresent(): Record<"display" | "sound" | "vsock" | "shm" | "network", boolean> {
-		return { display: this.display.enabled, sound: this.sound.enabled, vsock: this.vsock.enabled, shm: this.shm.enabled, network: !!this.opts.net };
+	devicesPresent(): Record<"display" | "sound" | "vsock" | "shm" | "network" | "gpu", boolean> {
+		return { display: this.display.enabled, sound: this.sound.enabled, vsock: this.vsock.enabled, shm: this.shm.enabled, network: !!this.opts.net, gpu: !!this.gpu };
 	}
 
 	/** The host side of each configured device, at the snapshot point (null: its driver had not started). */
@@ -847,6 +872,7 @@ export class Kernel {
 		if (this.vsock.enabled) d.vsock = this.vsock.probed ? this.vsock.saveState() : null;
 		if (this.shm.enabled) d.shm = this.shm.probed ? this.shm.saveState() : null;
 		if (this.opts.net) d.network = this.netMac ? { mac: [...this.netMac] } : null;
+		if (this.gpu) d.gpu = this.virtio.probed ? { transport: this.virtio.saveState() } : null;
 		return d;
 	}
 
@@ -861,6 +887,7 @@ export class Kernel {
 		if (d.sound) this.sound.restoreState(d.sound);
 		if (d.vsock) this.vsock.restoreState(d.vsock);
 		if (d.shm) this.shm.restoreState(d.shm);
+		if (d.gpu) this.virtio.restoreState(d.gpu.transport);
 		if (d.network && this.opts.net) {
 			this.netMac = Uint8Array.from(d.network.mac);
 			this.opts.net.attach?.(this);
@@ -883,7 +910,7 @@ export class Kernel {
 		}
 		const busy = [this.block.inflight || this.block.done.length ? "block requests" : "",
 			this.netRx.length ? "network frames" : "", this.vsock.blocker(),
-			this.shm.busy ? "shm requests" : ""].filter(Boolean);
+			this.shm.busy ? "shm requests" : "", this.virtio.blocker()].filter(Boolean);
 		if (busy.length) {
 			w.reject(new Error(`snapshot: ${busy.join(", ")} in flight`));
 			return -EBUSY;
@@ -1066,6 +1093,7 @@ export class Kernel {
 		Object.assign(unkernel, this.sound.imports());
 		Object.assign(unkernel, this.vsock.imports());
 		Object.assign(unkernel, this.shm.imports());
+		Object.assign(unkernel, this.virtio.imports());
 		Object.assign(unkernel, this.jit.imports());
 
 		const imports: Record<string, Record<string, unknown>> = {

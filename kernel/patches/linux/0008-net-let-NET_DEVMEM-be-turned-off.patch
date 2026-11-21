@@ -1,0 +1,41 @@
+From 48b88b64eacc873ef943a87f07baa68aebaae06f Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 19:23:30 +0000
+Subject: [PATCH] net: let NET_DEVMEM be turned off
+
+NET_DEVMEM is def_bool y whenever DMA_SHARED_BUFFER and PAGE_POOL are,
+so a kernel that has dma-buf only because DRM selects it also builds
+devmem TCP and the genalloc library it selects. devmem.h, netmem.h and
+mp_dmabuf_devmem.h already have stubs for !NET_DEVMEM.
+
+Give it a prompt under EXPERT, default y, so that such a kernel can
+leave it out.
+---
+ net/Kconfig | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/net/Kconfig b/net/Kconfig
+index e3847739355..84412519eb7 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -67,10 +67,16 @@ config SKB_EXTENSIONS
+ 	bool
+ 
+ config NET_DEVMEM
+-	def_bool y
++	bool "Device memory TCP" if EXPERT
++	default y
+ 	select GENERIC_ALLOCATOR
+ 	depends on DMA_SHARED_BUFFER
+ 	depends on PAGE_POOL
++	help
++	  Lets the network stack receive into and send from dma-buf
++	  memory (devmem TCP). It is on whenever dma-buf and page pools
++	  are; a kernel that has dma-buf for a display driver alone does
++	  not need it.
+ 
+ config NET_SHAPER
+ 	bool
+-- 
+2.56.0
+

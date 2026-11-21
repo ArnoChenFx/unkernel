@@ -41,7 +41,7 @@ const USAGE = `Usage: unkernel [kernel.wasm | --kernel kernel.wasm] [--distro al
        [--size COLSxROWS] [--stats] [--profile FILE [--profile-hz N] [--profile-insns N] [--profile-root DIR]]
        [--disk image.ext4[:ro]|URL[:ro]]... [--snapshot]
        [--data FILE [--data-template FILE.kwsparse.gz]]
-       [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]]
+       [--no-net | --net-wisp URL] [--net-mtu N] [--no-jit] [--display[=WxH[@DPI]]] [--gpu]
        [--sound | --sound-wav FILE] [--no-vsock] [--shm] [--worker[=shared|messages]] [--cpus N]
        [--mount HOSTDIR:GUESTPATH[:ro]]... [--forward HOSTPORT:GUESTPORT]... [--wasi]
        [--restore FILE]
@@ -151,6 +151,11 @@ program has the device open:
 (left, right, middle, or a code), {wheel=N} = wheel clicks (positive = up);
 for the tablet {abs=X,Y} = move to pixel X,Y of the current mode (or X%,Y% of
 the picture), {abtn=B:1|0} and {awheel=N} as above.
+
+--gpu gives the guest a virtio-gpu device (kwvirtio): /dev/dri/card0, driver
+virtio_gpu, KMS with dumb buffers (2D, no 3D). While a KMS client has a
+framebuffer on its scanout the display shows that instead of /dev/fb0's
+pixels; its size is --display's (implied, 640x480 by default).
 
 --sound-wav FILE gives the guest a sound card (kwsnd: ALSA hw:0,0, i.e.
 /dev/snd/pcmC0D0p, and OSS /dev/dsp; playback only) and writes what it plays
@@ -562,7 +567,8 @@ async function forward(sock: Socket, guestPort: number): Promise<void> {
 try {
 	const common = {
 		kernel: module, initrd, cmdline, memoryMiB, consoleSize, log, jit: !flag("no-jit"), cpus: smpCpus, onOutput: (bytes: Uint8Array) => process.stdout.write(bytes),
-		display: displaySize ?? flag("display"),
+		display: displaySize ?? (flag("display") || flag("gpu")),
+		gpu: flag("gpu"),
 		onDisplay: (m: DisplayMode | null) => log(m ? `[host] display: ${m.width}x${m.height}, stride ${m.stride}` : "[host] display: closed"),
 		onInput: (s: InputState) => log(`[host] evdev: keyboard ${s.keyboard ? "open" : "closed"}, mouse ${s.mouse ? "open" : "closed"}, tablet ${s.tablet ? "open" : "closed"}`),
 		sound: sound.option,
@@ -747,6 +753,7 @@ function finishNow(res: ExitResult): never {
 		process.stderr.write(`[host] ${path.basename(kernelPath)} (${moduleIsMemory64(module) ? "memory64" : "32-bit memory"}), compile ${tCompile.toFixed(0)} ms, ran ${(s.uptimeMs / 1000).toFixed(2)} s, ` +
 			`switches ${s.switches}, idles ${s.idles}, yields ${s.yields}\n`);
 		if (s.display) process.stderr.write(`[host] display: ${s.display.attaches} attaches (opens and mode changes), ${s.display.detaches} closes\n`);
+		if (s.gpu) process.stderr.write(`[host] gpu: ${s.gpu.commands} commands (${s.gpu.errors} errors), ${s.gpu.transfers} transfers (${(s.gpu.transferBytes / 1048576).toFixed(1)} MiB copied), ${s.gpu.flushes} flushes, ${s.gpu.cursor} cursor\n`);
 		if (s.evdev) process.stderr.write(`[host] evdev: ${s.evdev.delivered} events delivered, ${s.evdev.dropped} dropped\n`);
 		const jitLine = (who: string, j: JitStats) => process.stderr.write(!j.requested ? `[host] ${who}: not in this kernel\n` : !j.enabled ? `[host] ${who}: off\n`
 			: `[host] ${who}: ${j.compiled} compiled, ${j.live} live (max ${j.maxLive}), ${j.freed} freed, ${j.failed} failed, ` +

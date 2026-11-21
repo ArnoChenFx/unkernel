@@ -24,6 +24,7 @@ import { fetchOver } from "./http.ts";
 import { CommandTable, type HostCommand, type parseCommands } from "./commands.ts";
 import { MountTable, type FsSource, type Mount, type MountOptions, type parseMounts } from "./mounts.ts";
 import type { GlHost } from "./gl.ts";
+import type { GpuRenderer } from "./gl-gpu.ts";
 import { FrameClient, RemoteEvdev, SoundBridge } from "./worker-devices.ts";
 import { SharedOwner, newSharedControl, sharedMemoryAvailable, type KernelTransport } from "./worker-shared.ts";
 import type { CreateKernelOptions, InstanceStats, KernelHandle, Platform, BootProgress, VsockOption } from "./instance.ts";
@@ -143,6 +144,8 @@ export interface WorkerKernelOptions {
 	shared?: SharedArrayBuffer;
 	/** The console ring (console-ring.ts), also sent in the boot spec: read here. */
 	console?: SharedArrayBuffer;
+	/** virtio-gpu 3D: the renderer side here (gl-gpu.ts), serving the worker's "gpu" requests. */
+	gpu?: GpuRenderer;
 }
 
 /**
@@ -204,6 +207,7 @@ export class WorkerKernel implements KernelHandle {
 	#mounts: MountTable;
 	#commands: CommandTable;
 	#gl: GlHost | undefined;
+	#gpu: GpuRenderer | undefined;
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
@@ -266,6 +270,12 @@ export class WorkerKernel implements KernelHandle {
 		}
 		this.#mounts = new MountTable(this.#vsock, opts.log);
 		this.#commands = new CommandTable(this.#vsock, opts.log);
+		if (opts.gpu) {
+			const gpu = opts.gpu;
+			this.#gpu = gpu;
+			gpu.init.then((init) => post({ t: "gpu-init", init }),
+				(e: unknown) => post({ t: "gpu-init", error: (e as Error)?.message ?? String(e) }));
+		}
 		if (opts.shm) {
 			// Each call is a round trip: the worker runs it on its ShmDevice (where the kernel's
 			// memory is) when the kernel next suspends, and a read's bytes come back transferred.
@@ -375,6 +385,22 @@ export class WorkerKernel implements KernelHandle {
 			break;
 		case "vsock-ready":
 			this.#vsock?.deviceReady(m.guestCid, m.rxMax);
+			break;
+		case "gpu": {
+			const gpu = this.#gpu;
+			if (!gpu) break;
+			if (m.rid === undefined) {
+				gpu.post(m.req);
+				break;
+			}
+			const rid = m.rid;
+			void Promise.resolve(gpu.call(m.req)).then((reply) => {
+				if (!this.#result) this.#endpoint.post({ t: "gpu-reply", rid, reply }, reply.data ? [reply.data.buffer as ArrayBuffer] : undefined);
+			});
+			break;
+		}
+		case "gpu-reset":
+			this.#gpu?.reset();
 			break;
 		case "shm-result": {
 			const c = this.#shmCalls.get(m.rid);
@@ -575,6 +601,8 @@ export class WorkerKernel implements KernelHandle {
 	 * changed). Compare frameSeq to skip repainting an unchanged frame.
 	 */
 	frame(out?: Uint8ClampedArray): DisplayFrame | null {
+		// A 3D resource on virtio-gpu's scanout: read back from the renderer, which is here.
+		if (this.#gpu?.scanout) return this.#gpu.frame(out);
 		return this.#frames?.frame(out) ?? null;
 	}
 
@@ -590,6 +618,7 @@ export class WorkerKernel implements KernelHandle {
 
 	/** A fresh frame: a round trip to the worker (with messages at most about 20 ms while the guest is busy; shared, about a millisecond). */
 	readFrame(out?: Uint8ClampedArray): Promise<DisplayFrame | null> {
+		if (this.#gpu?.scanout) return Promise.resolve(this.#gpu.frame(out));
 		return this.#frames?.read(out) ?? Promise.resolve(null);
 	}
 
@@ -848,7 +877,7 @@ export class WorkerKernel implements KernelHandle {
  * on 2026-11-14 (.agents/js.md, Worker mode), compiling here started the
  * kernel about 20 ms sooner on Node.
  */
-export async function createKernelInWorker(platform: Platform, opts: CreateKernelOptions & { compileInWorker?: boolean; shared?: boolean; transferRestore?: boolean }, progress: (p: BootProgress) => void): Promise<WorkerKernel> {
+export async function createKernelInWorker(platform: Platform, opts: CreateKernelOptions & { compileInWorker?: boolean; shared?: boolean; transferRestore?: boolean }, progress: (p: BootProgress) => void, gpu?: GpuRenderer): Promise<WorkerKernel> {
 	const { signal } = opts;
 	const src = opts.kernel ?? platform.defaultKernel();
 	const compileHere = !opts.compileInWorker && !(src instanceof WebAssembly.Module);
@@ -862,8 +891,8 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 	const endpoint = platform.spawnWorker!();
 	const vm = new WorkerKernel(endpoint, {
 		onOutput: opts.onOutput, onProgress: progress, log, onDiskError: opts.onDiskError,
-		display: opts.display, onDisplay: opts.onDisplay, onInput: opts.onInput, sound: opts.sound, vsock: opts.vsock ?? true, shm: opts.shm, shared,
-		console: consoleRing,
+		display: opts.display ?? (opts.gpu ? true : undefined), onDisplay: opts.onDisplay, onInput: opts.onInput, sound: opts.sound, vsock: opts.vsock ?? true, shm: opts.shm, shared,
+		console: consoleRing, gpu,
 	});
 	let spec: WorkerBootSpec, transfer: ArrayBuffer[];
 	try {
@@ -900,6 +929,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 			sound: opts.sound ? { rate: typeof opts.sound === "object" ? opts.sound.rate : undefined, chunks: typeof opts.sound === "object" && !!opts.sound.onChunk } : false,
 			vsock: !!(opts.vsock ?? true),
 			shm: !!opts.shm,
+			gpu: gpu ? "virgl" : !!opts.gpu,
 			shared,
 			console: consoleRing,
 			restore,

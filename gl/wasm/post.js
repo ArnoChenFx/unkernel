@@ -25,6 +25,9 @@
 // init (v.stats(), kw_virgl.h, KW_VIRGL_STAT_*), and how many later tasks
 // polled parked clients, through a message or a timeout (messagePolls,
 // timerPolls).
+//
+// v.gpu is the virtio-gpu entry (kw_vgpu_*): command(), capset(), format(),
+// fence(), fencesDone(), info(), present(), read(); see below.
 
 Module['virgl'] = (() => {
   let scratch = 0, scratchSize = 0, initGL = null;
@@ -82,7 +85,72 @@ Module['virgl'] = (() => {
       const a = new Float64Array(HEAPU8.buffer, _kw_virgl_stats(), STATS.length);
       return Object.fromEntries(STATS.map((k, i) => [k, a[i]]));
     },
+    // virtio-gpu on the same renderer (kw_virgl.h, kw_vgpu_*; the SDK's
+    // gl-gpu.ts drives it), after init().
+    gpu: {
+      // A heap buffer of n bytes for a transfer's packed data, valid until
+      // the next call into the module: command() then copies nothing.
+      buffer(n) {
+        heapReserve(n);
+        return HEAPU8.subarray(gbuf, gbuf + n);
+      },
+      // Run a control command (Uint8Array, header first) with the
+      // transfer's packed data (a Uint8Array; for TRANSFER_FROM_HOST_3D
+      // filled on return): 0, or the virtio-gpu response type of the error.
+      command(cmd, data) {
+        const n = data ? data.length : 0;
+        const inHeap = n && data.buffer === HEAPU8.buffer && data.byteOffset === gbuf;
+        if (!inHeap) heapReserve(n);
+        const c = _malloc(cmd.length);
+        if (!c) return 0x1201; // ERR_OUT_OF_MEMORY
+        HEAPU8.set(cmd, c);
+        if (n && !inHeap) HEAPU8.set(data, gbuf);
+        const r = _kw_vgpu_command(c, cmd.length, gbuf, n);
+        _free(c);
+        if (n && !inHeap) data.set(HEAPU8.subarray(gbuf, gbuf + n));
+        return r;
+      },
+      // A capset as the guest gets it: { version, data } or null.
+      capset(id) {
+        heapReserve(65536);
+        const ver = _malloc(4);
+        const size = _kw_vgpu_capset(id, gbuf, 65536, ver);
+        const version = HEAPU32[ver >> 2];
+        _free(ver);
+        return size > 0 ? { version, data: HEAPU8.slice(gbuf, gbuf + size) } : null;
+      },
+      format: (f) => _kw_vgpu_format(f) >>> 0,
+      fence: () => _kw_vgpu_fence() >>> 0,
+      fencesDone: () => _kw_vgpu_fences_done() >>> 0,
+      // A resource's GL texture (the WebGLTexture of the renderer's context,
+      // null for a buffer), size, virgl format and whether row 0 is the top;
+      // null for no such resource.
+      info(res) {
+        const p = _malloc(20);
+        const r = _kw_vgpu_info(res, p);
+        const a = HEAPU32.slice(p >> 2, (p >> 2) + 5);
+        _free(p);
+        if (r < 0) return null;
+        return { texture: a[0] ? GL.textures[a[0]] ?? null : null, width: a[1], height: a[2], format: a[3], yTop: a[4] === 1 };
+      },
+      // Blit (x, y, w, h) of a resource to the context's drawing buffer, which the caller sized w x h.
+      present: (res, x, y, w, h) => _kw_vgpu_present(res, x, y, w, h),
+      // Read (x, y, w, h) back, rows from the top: a Uint8Array, or null.
+      read(res, x, y, w, h, bpp = 4) {
+        const n = w * h * bpp;
+        heapReserve(n);
+        return _kw_vgpu_read(res, x, y, w, h, bpp, gbuf) < 0 ? null : HEAPU8.slice(gbuf, gbuf + n);
+      },
+    },
   };
+  let gbuf = 0, gbufSize = 0;
+  function heapReserve(n) {
+    if (n <= gbufSize) return;
+    if (gbuf) _free(gbuf);
+    gbufSize = Math.max(n, 1 << 20);
+    gbuf = _malloc(gbufSize);
+    if (!gbuf) { gbufSize = 0; throw new Error('out of memory'); }
+  }
 
   v.Renderer = class {
     name = 'virgl-wasm';

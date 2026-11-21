@@ -7,7 +7,7 @@ break. Longer topics are in `.agents/kernel/`:
 | --- | --- |
 | [kernel/smp.md](kernel/smp.md) | the SMP build: model, moving tasks, IPIs, MM, waiting for another CPU, devices, costs |
 | [kernel/parking.md](kernel/parking.md) | parking every task, snapshots and restore, on UP and on SMP |
-| [kernel/devices.md](kernel/devices.md) | console, kwblk, kwnet, kwfb, kwinput, kwsnd, kwvsock, kwshm, 9p |
+| [kernel/devices.md](kernel/devices.md) | console, kwblk, kwnet, kwfb, kwinput, kwsnd, kwvsock, kwshm, kwvirtio and virtio-gpu, 9p |
 | [kernel/config.md](kernel/config.md) | `kw_defconfig` rules, what is on and off, measured options |
 | [kernel/tests.md](kernel/tests.md) | kwtest and abitest coverage, other checks, debugging |
 | [kernel/guest.md](kernel/guest.md) | the base initramfs and its shell, the kw layer, the Alpine and Debian images, guest tools and shims |
@@ -41,8 +41,9 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 
 - One patch per piece, in this order: generic changes (Joel's two, stock
   LLVM, `VMALLOC_FLAT`, 9p `metatimeout`, the kthread park points, the
-  random vmfork reseed); the arch; the ISA; each driver (kwblk, kwnet,
-  kwfb, kwinput, sysrq, kwsnd, kwvsock, kwshm); parking; kwvsock's reset
+  random vmfork reseed, the switches for NET_DEVMEM, DRM_PANEL_BRIDGE,
+  DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backport); the arch; the ISA; each driver (kwblk, kwnet,
+  kwfb, kwinput, sysrq, kwsnd, kwvsock, kwshm, kwvirtio); parking; kwvsock's reset
   after a restore; `kw_defconfig`; then the SMP series (the atomics and
   shared-memory build, the atomic tweaks, the generic mm, sched, kthread,
   workqueue and csd hooks, the arch and per-driver SMP patches, blocking
@@ -88,7 +89,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 | features: the table, `kw.isa=`, AT_HWCAP, cpuinfo | `arch/wasm/kernel/cpu.c`, `kw_isa_init()` from `tlb.c` |
 | IRQ numbers, IPI bits | `arch/wasm/include/asm/irq.h` |
 | guest pc sampling (`kw_prof`, its rings and file names) | `arch/wasm/kernel/prof.c`, `asm/kwprof.h` |
-| devices | `drivers/tty/hvc/hvc_wasm.c`, `drivers/block/kwblk.c`, `drivers/net/kwnet.c`, `drivers/video/fbdev/kwfb.c`, `drivers/input/kwinput.c`, `sound/drivers/kwsnd.c`, `net/vmw_vsock/kwvsock.c`, `drivers/misc/kwshm.c` |
+| devices | `drivers/tty/hvc/hvc_wasm.c`, `drivers/block/kwblk.c`, `drivers/net/kwnet.c`, `drivers/video/fbdev/kwfb.c`, `drivers/input/kwinput.c`, `sound/drivers/kwsnd.c`, `net/vmw_vsock/kwvsock.c`, `drivers/misc/kwshm.c`, `drivers/virtio/kwvirtio.c` |
 
 ## The kwemu contract (`include/kw_emu.h`)
 
@@ -261,7 +262,7 @@ instantiation fails; a standalone WASI runtime cannot run the kernel.
 restored snapshot's `__kw_resume()`, which the host answers with
 `kw_secondary_resume`) and `wasm_stack_drop` (SMP kernels only),
 `wasm_driver_console_size`, `wasm_dump_stacktrace`, the device imports (`wasm_driver_block_*`, `_net_*`, `_fb_*`, `_input_*`,
-`_sound_*`, `_vsock_*`, `_shm_*`; devices.md) and kwemu's
+`_sound_*`, `_vsock_*`, `_shm_*`, `_virtio_*`; devices.md) and kwemu's
 `kw_host_jit_caps`/`compile`/`free` (host `js/core/jit.ts`). **`env`**
 holds only `memory`, fixed size, chosen by the host.
 
@@ -283,7 +284,9 @@ Node's `node:wasi`.
   (requests queued), snapshot = 8 (a park cycle that ends in
   `wasm_snapshot_point`; host `Kernel.snapshot()`), profile = 9 (a time
   sample, prof.c; the host's sampler sets it in every CPU's word, without
-  a notify: kwemu.md, Measuring). Bits without a handler are cleared and
+  a notify: kwemu.md, Measuring), virtio = 10 (kwvirtio: used buffers or a
+  config change; on SMP also another CPU's queue notifications for CPU 0).
+  Bits without a handler are cleared and
   ignored. SMP adds a word per CPU and IPI bits 24-27
   (smp.md).
 - The timer is a one-shot deadline, checked against the host monotonic

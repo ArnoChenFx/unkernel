@@ -58,10 +58,10 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
   hostname (`/etc/hostname` unless empty or `localhost`, else
   `unkernel`), binfmt_misc and the WASI format (kwwasi), the console
-  user's devices as udev's rules give them (no udev: `/dev/fb*` to video,
-  `/dev/input/*` to input, `/dev/dsp*`, `/dev/snd/*` to audio, 0660, by
-  group name; `/dev/fuse` 0666; the drivers make them at boot, none
-  later).
+  user's devices as udev's rules give them (no udev: `/dev/fb*` and
+  `/dev/dri/card*` to video, `/dev/input/*` to input, `/dev/dsp*`,
+  `/dev/snd/*` to audio, 0660, by group name; `/dev/fuse` and
+  `/dev/dri/renderD*` 0666; the drivers make them at boot, none later).
 - The image's user: every distro image has `user` (uid and gid 1000,
   `/home/user` mode 700, `install_user` in guest/lib/stage.sh; bash on
   Debian, `/bin/sh` on Alpine) in audio, video, input and users, plus sudo

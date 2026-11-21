@@ -167,7 +167,7 @@ build_module() {
 	local m="$out/meson" o="$out/obj" f
 	local cflags=(-O2 -std=gnu11 -Wall -Wno-unused-parameter -fvisibility=hidden
 		-imacros "$m/config.h" -DHAVE_CONFIG_H=1 -DVTEST_EXTERNAL_IO=1
-		-I"$here/epoxy/include" -I"$here" -I"$m" -I"$m/src" -I"$src" -I"$src/src" -I"$src/vtest"
+		-I"$here/epoxy/include" -I"$here" -I"$m" -I"$m/src" -I"$m/src/gallium" -I"$src" -I"$src/src" -I"$src/vtest"
 		-I"$src/src/gallium/include" -I"$src/src/gallium/auxiliary" -I"$src/src/gallium/auxiliary/util"
 		-I"$src/src/mesa" -I"$src/src/mesa/compat" -I"$src/src/mesa/util" -I"$src/src/mesa/pipe"
 		-I"$src/src/drm" -I"$src/src/drm/drm-uapi"
@@ -194,8 +194,8 @@ build_module() {
 		-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
 		-sGL_EMULATE_GLES_VERSION_STRING_FORMAT=1 -sGL_EXTENSIONS_IN_PREFIXED_FORMAT=1 \
 		-sGL_SUPPORT_AUTOMATIC_ENABLE_EXTENSIONS=1 \
-		-sEXPORTED_FUNCTIONS=_kw_virgl_init,_kw_virgl_open,_kw_virgl_close,_kw_virgl_feed,_kw_virgl_poll,_kw_virgl_reply_ptr,_kw_virgl_reply_len,_kw_virgl_consume,_kw_virgl_state,_kw_virgl_stats,_malloc,_free \
-		-sEXPORTED_RUNTIME_METHODS=HEAPU8 \
+		-sEXPORTED_FUNCTIONS=_kw_virgl_init,_kw_virgl_open,_kw_virgl_close,_kw_virgl_feed,_kw_virgl_poll,_kw_virgl_reply_ptr,_kw_virgl_reply_len,_kw_virgl_consume,_kw_virgl_state,_kw_virgl_stats,_kw_vgpu_command,_kw_vgpu_capset,_kw_vgpu_format,_kw_vgpu_fence,_kw_vgpu_fences_done,_kw_vgpu_info,_kw_vgpu_present,_kw_vgpu_read,_malloc,_free \
+		-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32 \
 		'-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL' \
 		--js-library "$here/kw_gl.js" --post-js "$here/post.js" ${KW_LDFLAGS:-}
 	ls -l "$out/virgl.mjs" "$out/virgl.wasm"

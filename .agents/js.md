@@ -170,7 +170,7 @@ parts that are easy to get wrong.
   snapshot's, which also picks the bundle's SMP kernel, and a platform
   that gives fewer CPUs rejects in `Kernel.boot()`), the disks
   (`snapshotDiskMismatch()`) and the devices (`snapshotDeviceMismatch()`:
-  display, sound, vsock, shm and network each configured as when saved,
+  display, sound, vsock, shm, network and gpu each configured as when saved,
   the network with the same MAC, since the restored kernel has exactly the
   drivers it had); a mismatch rejects naming it, with no fallback. A UP
   snapshot on the SMP kernel or the reverse fails the fingerprint check.
@@ -237,6 +237,10 @@ parts that are easy to get wrong.
   - shm: the exports and their page runs (the kernel keeps the pages
     held), so `openId()` works again; exports the old host opened stay
     held in the kernel until closed by id.
+  - gpu: kwvirtio's transport state (status, features, each queue's ring
+    addresses and next available index); the device model has nothing to
+    keep, since a snapshot is refused while it holds resources (virtio and
+    virtio-gpu, below).
   - vsock: the guest CID and `rx_max`; the restore replays `onVsockInit`.
     Connections do not survive, except host file systems' (`mounts`,
     below): after a restore the kernel resets every connected socket the
@@ -283,8 +287,8 @@ parts that are easy to get wrong.
   mount, and a MemoryFs mount, across a restore.
 - Any host that instantiates the kernel itself must provide the three
   `unkernel.kw_host_jit_*` imports (caps returning 0 is enough), and the
-  display, input, sound, vsock and shm imports (kernel/devices.md; `_init`
-  returning -1 is enough, as `test/wasi-node.ts` does, which also answers
+  display, input, sound, vsock, shm and virtio imports (kernel/devices.md;
+  `_init` returning -1 is enough, `wasm_driver_virtio_init` 0, as `test/wasi-node.ts` does, which also answers
   `wasm_driver_vsock_keep` with 0). `Kernel.imports()`
   fills a missing import with a stub that throws when called, so an old
   host on a new kernel traps at that device's init.
@@ -836,8 +840,11 @@ parts that are easy to get wrong.
   forwarder fails or the link does not come within 30 s.
 - `vm.gl.stats` is `StreamHost.stats`, with the renderer's counters
   (`VtestRenderer.totals()`, `VirglTotals`: the wasm module's
-  `KW_VIRGL_STAT_*`; gl.md, Stats) as `renderer`. `gl.strictWaits` makes
-  the wasm renderer answer busy waits as vtest does (gl.md, Busy waits).
+  `KW_VIRGL_STAT_*`, which count virtio-gpu's commands too; gl.md, Stats)
+  as `renderer`, and with `gpu` virtio-gpu's (`gpu`, `GpuRendererStats`).
+  `gl.strictWaits` makes the wasm renderer answer busy waits as vtest does
+  and virtio-gpu's fences as QEMU does (gl.md, Busy waits). With `gpu`,
+  GlHost also serves virtio-gpu 3D (`vm.gl.gpu`; virtio-gpu 3D, below).
 - Where there is no OffscreenCanvas (Node) or no module (an entry without
   one; the page's `web/src/sdk.ts` passes its `glUrl`, web.md, Guest GL),
   `gl` is ignored with a `[host]` log line
@@ -1154,6 +1161,119 @@ parts that are easy to get wrong.
   and handles end with "exit".
 - Test: `test/api.test.ts` (inline and worker) with `guest/src/kwshm.c`.
   Skipped when the kernel has no kwshm.
+
+## virtio and virtio-gpu (`js/core/virtio.ts`, `virtio-gpu.ts`)
+
+- `VirtioHost` (`Kernel.virtio`) is kwvirtio's host side
+  (kernel/devices.md): the imports, each device's status, features,
+  interrupt status and queues, and `Virtqueue`, a split ring in kernel
+  memory (`pop()` a descriptor chain, `read()` its readable bytes as a copy,
+  `write()` into its writable buffers, `push()` it to the used ring, which
+  sets the interrupt status and raises IRQ 10 unless the driver set
+  `VIRTQ_AVAIL_F_NO_INTERRUPT`). A queue the driver reset or took down is
+  dead: `pop()` and `push()` do nothing, so a late completion never writes
+  freed memory. A malformed chain stops the device (DEVICE_NEEDS_RESET).
+  On a shared memory (SMP) the ring indices go through Atomics. A device
+  model is a `VirtioDeviceModel`; devices are numbered in the order of
+  `add()`.
+- `VirtioGpu` (`Kernel.gpu`, the `gpu` option, CLI `--gpu`): the 2D
+  model, one scanout; 3D through a `GpuBackend` (virtio-gpu 3D, below;
+  never on the CLI: Node has no WebGL2). Display info and the EDID (`makeEdid()`, CVT-RB timings, the
+  physical size from the display option's dpi) come from
+  `DisplayHost.wantedSize()`, the size kwfb is offered too. The `gpu`
+  option implies `display` (and so the evdev devices) when that is not
+  given.
+- Pixels: a resource's backing is the guest's pages, read in place. The
+  host keeps an XRGB8888 copy only of resources that have been scanned out:
+  SET_SCANOUT fills it from the backing, TRANSFER_TO_HOST_2D copies the
+  rectangle into it (converting the 8 formats virtio-gpu has), and
+  RESOURCE_FLUSH counts frames (`stats.flushes`, `onFlush`). So the frame
+  a reader gets never tears, and memory goes only to resources that were
+  shown (a 1280x720 scanout costs 3.5 MiB of host memory).
+- Coexistence with kwfb: `DisplayHost.setScanout()` lets the scanout take
+  the display over: while one is set, `mode`, `pixels()`, `readRGBA()`,
+  `frame()` and worker mode's frames show it, and `onDisplay` reports its
+  mode; when it goes (a client's framebuffer removed, SET_SCANOUT 0, a
+  reset), kwfb's picture is back. Both devices stay registered, so a
+  program can still open `/dev/fb0`, but it is not shown while a KMS
+  client has the scanout.
+- Commands are taken in order. 2D ones are answered during the notify
+  import, and the fence fields of a fenced request are copied into its
+  answer. Everything else (3D, contexts, capsets, blobs, and resource
+  commands for ids the 2D model did not create) goes to a `GpuBackend`
+  (`VirglGpuBackend`, below, with `gl`) or is answered ERR_UNSPEC. The
+  backend gets a copy of the command and a `GpuBackendContext` (the memory,
+  a resource's backing pages) and answers with bytes or a promise: an
+  unfenced command then holds the queue until it is answered, a fenced one
+  does not, and fenced answers go back in the order the commands came (the
+  driver signals every fence up to the one answered). A reset drops answers
+  still to come. A backend's resource on the scanout (SET_SCANOUT of an id
+  `backend.resource()` knows) gives the display its mode and no pixels
+  (`DisplaySource.pixels()` null; GlHost presents it), and SET_SCANOUT,
+  RESOURCE_FLUSH and RESOURCE_UNREF of it go to the backend too.
+- `blocker()`: "virtio-gpu resources", "virtio-gpu contexts" (3D) or
+  "virtio-gpu commands" refuse a snapshot; `displayChanged()` raises a config interrupt with
+  VIRTIO_GPU_EVENT_DISPLAY, after which the driver asks for the display
+  info again (nothing calls it yet).
+- Test: `node test/gpu/check.mjs` (testing.md).
+
+### virtio-gpu 3D (`js/core/gl-gpu.ts`)
+
+- The option rule: `gl` is the host renderer (one module, one WebGL2
+  context) and the vtest link; `gpu` is the virtio-gpu device; with both,
+  where `gl` gets the wasm module and WebGL2 (a browser), the device has
+  3D on that same renderer, and the vtest link stays. `gpu` alone, `gl` with
+  `renderer` (a vtest renderer), or no WebGL2 (Node): the 2D device, with a
+  `[host] gpu: 2D only: ...` line. The renderer is made before the kernel
+  boots (`prepareGpuGl()`), since the device offers VIRTIO_GPU_F_VIRGL
+  (not CONTEXT_INIT; gl.md, The DRM path) when the driver probes; its two
+  capsets (VIRGL, VIRGL2) are
+  answered once the renderer is up (the driver's probe waits, up to 5 s a
+  capset), read from the real WebGL2 context, without VIRGL_CAP_TRANSFER
+  and COPY_TRANSFER (gl.md, The DRM path).
+- Two halves: `VirglGpuBackend` (the device side, where the kernel runs:
+  this thread inline, the kernel's worker in worker mode) and `GpuRenderer`
+  (the renderer side, `vm.gl.gpu`, on the thread with the WebGL2 context),
+  joined by a `GpuLink`: `inlineGpuLink()` (direct calls, the gather writes
+  into the module's heap), or worker messages (`gpu` requests with a `rid`
+  when they want an answer, `gpu-reply`, `gpu-init` with the capsets and
+  the format table, `gpu-reset`; WorkerKernel serves them with the
+  GpuRenderer that createKernel made, spec `gpu: "virgl"`).
+- The device side keeps each 3D resource's backing pages (ATTACH_BACKING
+  never reaches the renderer) and layout (target, format, size), packs a
+  transfer's bytes (each block row of the box, layer after layer; a
+  buffer's range), using the renderer's format table, and rewrites the
+  command to offset 0 with the packed strides; a readback's packed bytes
+  are scattered back row by row, so bytes outside the box stay the
+  guest's. Commands that answer only OK and carry no fence are answered at
+  once and posted; fenced ones and readbacks wait for the renderer.
+- `GpuRenderer`: runs commands in order (queued until the module is up),
+  tracks the guest's contexts and resources (a device reset destroys them),
+  answers fences (`strictWaits`: when the GPU work is done; default: at
+  once, or after a presented frame once that frame is done; readbacks at
+  once), and presents: a RESOURCE_FLUSH of the scanout's resource sizes
+  the renderer's OffscreenCanvas to the scanout, blits the texture into its
+  drawing buffer (`kw_vgpu_present`) and keeps `transferToImageBitmap()`.
+  `drawFrame(ctx, force?)` draws that bitmap into a 2D context (true: drew
+  a new one; false: nothing new; null: no 3D resource on the scanout), and
+  the page's Display.tsx does so per animation frame before frame().
+  `frame()` reads the scanout back (KernelInstance.frame() and
+  WorkerKernel.frame()/readFrame() use it while a 3D resource is on the
+  scanout; for screenshots, not per frame). `onFrame` hears each present
+  and scanout change; `stats` (also `vm.gl.stats.gpu`) counts commands,
+  fenced answers, parks and time parked, presents, readbacks and errors.
+- `texture(resourceId)`: the resource's `WebGLTexture` in the renderer's
+  context (`gl`), its size, virgl format and `yTop` (the texture's row k
+  holds the picture's row k counted from the top, or with `yTop` its row
+  height - 1 - k), or null. For host code that
+  composes guest buffers: a guest client's dmabuf, through
+  DRM_IOCTL_VIRTGPU_RESOURCE_INFO, gives the resource id. Use it on that
+  thread and context; do not change its parameters or delete it (vrend
+  caches texture state); sample it through a sampler object.
+- Not shared with kwfb: dumb buffers stay 2D (the 2D model's host copies),
+  so a 3D context cannot use one (CTX_ATTACH_RESOURCE of a dumb buffer
+  fails). Blobs, UUIDs and host-visible memory are not offered.
+- Test: `node test/gl/unkernel-check.mjs --drm` (gl.md, The DRM path).
 
 ## Disks (`js/core/block.ts`)
 

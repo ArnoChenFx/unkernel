@@ -35,6 +35,7 @@ import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundChunk, SoundSink } from "./sound.ts";
 import { sharedNow } from "./worker-devices.ts";
 import { SharedServer, applyEvdev } from "./worker-shared.ts";
+import { VirglGpuBackend, type GpuInit, type GpuLink, type GpuReply, type GpuRequest } from "./gl-gpu.ts";
 import { SnapshotCommitError, awakeTimeout, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
 import { type FromWorker, type ToWorker, type WorkerBootSpec, type WorkerExit, type WorkerPort } from "./worker-protocol.ts";
 
@@ -115,6 +116,26 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 	let booting = false;
 	const abort = new AbortController();
 	const post = (msg: FromWorker, transfer?: ArrayBuffer[]) => port.post(msg, transfer);
+
+	// virtio-gpu 3D: the renderer runs on the owner (gl-gpu.ts); commands go
+	// there as "gpu" messages (posted from inside the notify import), its
+	// capsets come in "gpu-init" and answers in "gpu-reply".
+	let gpuInitDone!: (init: GpuInit) => void, gpuInitFail!: (e: Error) => void;
+	const gpuInit = new Promise<GpuInit>((res, rej) => ((gpuInitDone = res), (gpuInitFail = rej)));
+	gpuInit.catch(() => {});
+	const gpuReplies = new Map<number, (r: GpuReply) => void>();
+	let gpuRid = 0;
+	const gpuTransfer = (req: GpuRequest) => (req.data ? [req.data.buffer as ArrayBuffer] : undefined);
+	const gpuLink: GpuLink = {
+		init: gpuInit,
+		call: (req) => new Promise<GpuReply>((resolve) => {
+			const rid = ++gpuRid;
+			gpuReplies.set(rid, resolve);
+			post({ t: "gpu", req, rid }, gpuTransfer(req));
+		}),
+		post: (req) => post({ t: "gpu", req }, gpuTransfer(req)),
+		reset: () => post({ t: "gpu-reset" }),
+	};
 
 	// Console output in one message per burst (the kernel writes in small pieces).
 	let pending: Uint8Array[] = [];
@@ -280,6 +301,8 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				// The protocol (VsockHost) runs on the owner; this side passes the packets.
 				vsock: spec.vsock ? { raw: { onPacket: onVsockPacket, onInit: (guestCid, rxMax) => post({ t: "vsock-ready", guestCid, rxMax }) } } : false,
 				shm: !!spec.shm,
+				gpu: !!spec.gpu,
+				gpuBackend: spec.gpu === "virgl" ? new VirglGpuBackend(gpuLink, (msg) => post({ t: "log", msg })) : undefined,
 				onOutput,
 				log: (msg) => post({ t: "log", msg }),
 				onProgress: (p) => post({ t: "progress", p }),
@@ -354,6 +377,16 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 		case "input":
 			instance?.write(msg.data);
 			break;
+		case "gpu-init":
+			if (msg.init) gpuInitDone(msg.init);
+			else gpuInitFail(new Error(msg.error ?? "no renderer"));
+			break;
+		case "gpu-reply": {
+			const done = gpuReplies.get(msg.rid);
+			gpuReplies.delete(msg.rid);
+			done?.(msg.reply);
+			break;
+		}
 		case "resize":
 			instance?.resize(msg.cols, msg.rows);
 			break;

@@ -22,7 +22,30 @@
 //      comma-separated list of glmark2 -b values)
 //
 //   node test/gl/unkernel-check.mjs [--worker] [--size WxH] [--scenes LIST] [--skip a,b,c]
-//        [--state-ref FILE] [--out DIR] [--browser BIN] [--timeout S] [--no-build]
+//        [--state-ref FILE] [--out DIR] [--browser BIN] [--gl-flags FLAGS] [--timeout S] [--no-build]
+//
+// --drm checks the virtio-gpu path instead (drm-page.js): a kernel with
+// kwvirtio (--kernel, default $KW_BUILD/drm-base/unkernel.wasm) and
+// createKernel({ gl: true, gpu: true }), and in the guest, with no GL
+// environment variables:
+//
+//   a  eglinfo -B on the gbm and surfaceless platforms: the renderer must
+//      be virgl, through /dev/dri; libdrm's drmdevice (drmGetDevices2, as
+//      Mesa's loader enumerates) must list the card
+//   b  kmscube (GBM buffers page-flipped with KMS): its frames must reach
+//      the page's canvas (drawn from the renderer's texture, no readback)
+//      and equal the scanout read back in the same task, and not be flat
+//   c  glmark2-es2-drm against glmark2-es2 under Xvfb on virpipe (the vtest
+//      path), the same scenes (default build, texture, shading=phong, 5 s
+//      each) at the display's size (--size), on screen (DRM page flips are
+//      paced by virtio-gpu's 60 Hz vblank timer; vtest reads each frame
+//      back for Xvfb) and with --off-screen: FPS of each, reported
+//   d  kwgl-state on the DRM path: interleaved against each client alone,
+//      and against the same clients on the vtest path (the same renderer)
+//   e  test/gpu/prime.c as the default user: a resource exported as a dmabuf
+//      and imported by a second opener names the same host resource
+//      (DRM_IOCTL_VIRTGPU_RESOURCE_INFO), and the host finds its texture
+//      (GlHost.gpu.texture()) with the pattern the importer uploaded
 //
 // Builds first, each skipped when done: dist (pnpm build, unless
 // --no-build), the disk ($KW_BUILD/gl/debian-gl.img), kwgl-state for the
@@ -50,9 +73,12 @@ const timeout = Number(opt("--timeout", "3600")) * 1000;
 const browser = opt("--browser", process.env.CHROMIUM || "chromium-headless");
 const out = resolve(opt("--out", "") || mkdtempSync("/tmp/kwgl."));
 mkdirSync(out, { recursive: true });
+const drm = has("--drm");
+const kernelFile = resolve(opt("--kernel", join(build, "drm-base/unkernel.wasm")));
 const disk = join(build, "gl/debian-gl.img");
 const distro = join(build, "distro/debian.erofs");
 const stateBin = join(build, "gl/kwgl-state-aarch64");
+const primeBin = join(out, "prime");
 
 const step = (what, cmd, cmdArgs) => {
 	console.log(`== ${what}`);
@@ -73,6 +99,11 @@ if (!existsSync(join(root, "dist/web.mjs")) || !existsSync(join(root, "dist/virg
 }
 step("the prepared disk", process.execPath, [join(here, "debian-disk.mjs"), "--out", disk]);
 if (!existsSync(stateBin)) step("kwgl-state for the guest", join(here, "build-guest-state.sh"), [stateBin]);
+if (drm && !existsSync(kernelFile)) {
+	console.error(`no ${kernelFile} (a bundle with kwvirtio; --kernel)`);
+	process.exit(2);
+}
+if (drm) step("test/gpu/prime.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", primeBin, join(root, "test/gpu/prime.c")]);
 
 const types = { ".html": "text/html", ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm" };
 let resolveResult;
@@ -125,7 +156,9 @@ const server = createServer(async (req, res) => {
 	}
 	if (p === "/img/debian.erofs") return sendFile(req, res, distro, "application/octet-stream");
 	if (p === "/img/debian-gl.img") return sendFile(req, res, disk, "application/octet-stream");
+	if (p === "/img/unkernel.wasm" && drm) return sendFile(req, res, kernelFile, "application/wasm");
 	if (p === "/files/kwgl-state") return sendFile(req, res, stateBin, "application/octet-stream");
+	if (p === "/files/prime" && drm) return sendFile(req, res, primeBin, "application/octet-stream");
 	for (const [prefix, dir] of [["/dist/", join(root, "dist")], ["/test/", here]]) {
 		if (!p.startsWith(prefix)) continue;
 		const rel = normalize(p.slice(prefix.length));
@@ -138,13 +171,15 @@ const server = createServer(async (req, res) => {
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const query = new URLSearchParams();
 if (has("--worker")) query.set("worker", "1");
-for (const k of ["size", "scenes", "skip"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
-const url = `http://127.0.0.1:${server.address().port}/test/unkernel.html?${query}`;
+for (const k of ["size", "scenes", "skip", "cmd"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
+const url = `http://127.0.0.1:${server.address().port}/test/${drm ? "drm" : "unkernel"}.html?${query}`;
 console.log(`== ${url}\n   output in ${out}`);
 
 const t0 = Date.now();
+// The WebGL2 here: ANGLE on SwiftShader; --gl-flags replaces these (e.g. "--use-angle=vulkan" or "" on a host with a GPU).
+const glFlags = opt("--gl-flags", "--use-angle=swiftshader --enable-unsafe-swiftshader").split(" ").filter(Boolean);
 const chrome = spawn(browser, [
-	"--no-sandbox", "--headless", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
+	"--no-sandbox", "--headless", ...glFlags,
 	"--no-first-run", "--disable-gpu-sandbox", `--user-data-dir=${join(out, "chromium-profile")}`,
 	url,
 ], { stdio: ["ignore", "ignore", "pipe"] });
@@ -178,6 +213,11 @@ const report = (name, ok, detail) => {
 	console.log(`${ok ? "PASS" : "FAIL"} ${name}  ${detail}`);
 	if (!ok) fails++;
 };
+if (drm) {
+	judgeDrm(res);
+	console.log(`stats: ${JSON.stringify(res.gl)}; display ${JSON.stringify(res.display)}; ${((Date.now() - t0) / 1000).toFixed(0)} s in the browser; output in ${out}`);
+	process.exit(fails ? 1 : 0);
+}
 console.log(`renderer: ${res.renderer} (gl ready ${res.readyS} s after the page started; ${res.worker ? "worker" : "inline"} mode)`);
 
 const e = res.steps.eglinfo;
@@ -187,7 +227,9 @@ if (e) {
 	report("eglinfo", e.exitCode === 0 && /^virgl \(/.test(es), `GLES renderer "${es}", version "${ver}" (${(e.ms / 1000).toFixed(1)} s)`);
 }
 
-const lines = (s) => s.stdout.split("\n").filter((l) => /^[a-z.0-9]+ \d+ [0-9a-f]{16}$/.test(l) || /samples-passed/.test(l)).sort();
+function lines(s) {
+	return s.stdout.split("\n").filter((l) => /^[a-z.0-9]+ \d+ [0-9a-f]{16}$/.test(l) || /samples-passed/.test(l)).sort();
+}
 if (res.steps.state) {
 	const alone = lines(res.steps["state-alone"]), mixed = lines(res.steps.state);
 	const sums = alone.filter((l) => / [0-9a-f]{16}$/.test(l));
@@ -216,7 +258,62 @@ if (res.steps.state) {
 	report("state", ok, detail);
 }
 
-const fps = (s) => [...(s?.stdout ?? "").matchAll(/^\[(\S+)\] (.*?): FPS: (\d+) FrameTime: ([\d.]+) ms/gm)].map((m) => ({ scene: m[1], opts: m[2], fps: Number(m[3]), ms: Number(m[4]) }));
+/** The --drm steps (drm-page.js). */
+function judgeDrm(res) {
+	console.log(`renderer: ${res.renderer} (gl ready ${res.readyS} s after the page started)`);
+	if (res.steps.cmd) console.log(`--cmd (exit ${res.steps.cmd.exitCode}):\n${res.steps.cmd.stdout}${res.steps.cmd.stderr}`);
+	const dd = res.steps.drmdevice;
+	if (dd) report("drmdevice", dd.exitCode === 0 && /renderD128/.test(dd.stdout) && /platform/i.test(dd.stdout),
+		dd.stdout.split("\n").filter((l) => /bustype|platform|fullname|compatible|available_nodes|nodes\[|\/dev\/dri/i.test(l)).map((l) => l.trim()).slice(0, 12).join("; ") || dd.stdout.slice(0, 300));
+	for (const p of ["gbm", "surfaceless"]) {
+		const e = res.steps[`eglinfo-${p}`];
+		if (!e) continue;
+		const r = /OpenGL ES profile renderer: (.*)/.exec(e.stdout)?.[1] ?? "?";
+		const v = /OpenGL ES profile version: (.*)/.exec(e.stdout)?.[1] ?? "?";
+		report(`eglinfo -p ${p}`, e.exitCode === 0 && /^virgl \(/.test(r), `GLES renderer "${r}", version "${v}" (${(e.ms / 1000).toFixed(1)} s)`);
+	}
+	const k = res.steps.kmscube;
+	if (k) {
+		const frames = res.frames ?? [];
+		const fpsLine = /Rendered.*|[\d.]+ fps.*/i.exec(k.stdout)?.[0] ?? "";
+		const good = frames.filter((f) => f.drew && f.differFromReadback === 0 && f.colours > 16);
+		const moving = new Set(frames.map((f) => f.checksum)).size === frames.length;
+		report("kmscube", k.exitCode === 0 && frames.length >= 2 && good.length === frames.length && moving,
+			`${frames.map((f) => `frame ${f.seq} ${f.size}: canvas checksum ${f.checksum} (${f.colours} colours, centre ${f.center}, corner ${f.corner}), ${f.differFromReadback} pixels differ from the readback`).join("; ") || "no frames on the canvas"}; ` +
+			`${fpsLine || k.stdout.trim().split("\n").slice(-2).join(" | ")}; host: ${JSON.stringify(res.kmsStats)} (${(k.ms / 1000).toFixed(1)} s)`);
+	}
+	for (const suffix of ["", "-offscreen"]) {
+		const gd = res.steps[`glmark2-drm${suffix}`], gv = res.steps[`glmark2-vtest${suffix}`];
+		if (!gd && !gv) continue;
+		const d = fps(gd), v = fps(gv);
+		const f = (x) => (x ? `${(1000 / x.ms).toFixed(1)} FPS (${x.ms} ms)` : "?");
+		const rows = d.map((x, i) => `${x.scene} ${x.opts}: DRM ${f(x)}, vtest ${f(v[i])}`);
+		const renderers = [gd, gv].map((s) => /GL_RENDERER:\s*(.*)/.exec(s?.stdout ?? "")?.[1]?.trim() ?? "?");
+		report(`glmark2${suffix ? " off screen" : " on screen"}`, d.length > 0 && d.length === v.length && d.every((x) => x.fps > 0) && renderers.every((r) => /^virgl/.test(r)),
+			`${rows.join("; ") || "no FPS lines"} (renderers: ${renderers.join(" | ")})`);
+	}
+	const pr = res.steps.prime;
+	if (pr) {
+		const p = res.prime;
+		// 40 * 4 red, 8 * 4 green, 0xc0 blue (prime.c's pattern)
+		const ok = pr.exitCode === 0 && p?.texture && p.width === 64 && p.height === 64 && p.pixel?.join() === "160,32,192";
+		report("prime", ok, `${pr.stdout.trim().split("\n").join("; ")}; host: ${JSON.stringify(p)}`);
+	}
+	if (res.steps.state) {
+		const alone = lines(res.steps["state-alone"]), mixed = lines(res.steps.state), vt = lines(res.steps["state-vtest"]);
+		const sums = alone.filter((l) => / [0-9a-f]{16}$/.test(l));
+		const bad = mixed.filter((l, i) => l !== alone[i]).length + Math.max(0, alone.length - mixed.length);
+		const vbad = vt.filter((l, i) => l !== mixed[i]).length + Math.max(0, mixed.length - vt.length);
+		const samples = mixed.some((l) => /samples-passed=[^0]/.test(l));
+		report("state", sums.length === 60 && bad === 0 && alone.length === mixed.length && !samples && res.steps.state.exitCode === 0,
+			`${bad} of ${sums.length} frames differ from the clients alone; ${vbad} differ from the same clients on the vtest path; ` +
+			`${(res.steps.state.ms / 1000).toFixed(1)} s DRM, ${(res.steps["state-vtest"].ms / 1000).toFixed(1)} s vtest`);
+	}
+}
+
+function fps(s) {
+	return [...(s?.stdout ?? "").matchAll(/^\[(\S+)\] (.*?): FPS: (\d+) FrameTime: ([\d.]+) ms/gm)].map((m) => ({ scene: m[1], opts: m[2], fps: Number(m[3]), ms: Number(m[4]) }));
+}
 const gv = res.steps["glmark2-virgl"], gl = res.steps["glmark2-llvmpipe"];
 if (gv || gl) {
 	const v = fps(gv), l = fps(gl);

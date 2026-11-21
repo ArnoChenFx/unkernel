@@ -521,6 +521,18 @@ WebGL2 context of the page, and gets its frames back by readback: GL 2.1
 and GLES 3.0, surfaceless or under Xvfb. Node has no WebGL, so there `gl`
 is ignored with a log line.
 
+With `gpu: true` as well (and a kernel with kwvirtio), the guest gets a
+virtio-gpu device with 3D on the same renderer: stock Mesa finds
+`/dev/dri/renderD128` and `card0` (driver `virtio_gpu`) and renders through
+it with no variables set, and a KMS client's frames (kmscube,
+`glmark2-es2-drm`, a Wayland compositor) come from the renderer's texture:
+
+```js
+const vm = await createKernel({ distro, gl: true, gpu: true, display: { width: 1280, height: 720 } });
+// per animation frame: the scanout's latest frame, no readback (null: no GL client on it)
+if (vm.gl.gpu.drawFrame(ctx) === null) { /* show vm.frame() as above */ }
+```
+
 ### Run it in a worker
 
 ```js

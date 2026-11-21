@@ -337,6 +337,10 @@ if one is called there (js.md). So:
     kworker of CPU 0's pool).
   - kwfb: the mode and attach calls (open, release, mode change, under
     `info->lock`).
+  - kwvirtio: the config, status, feature and queue calls. A queue
+    notification (atomic) on another CPU sets the queue's bit in the
+    device's pending mask and raises `WASM_IRQ_VIRTIO` on CPU 0, whose
+    handler sends it.
   - kwinput: the open/close callbacks update the open mask inside the
     call, which serialises them.
   - kwsnd: open, prepare and close send their event through it. The timer

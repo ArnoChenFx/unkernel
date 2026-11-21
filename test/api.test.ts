@@ -2429,17 +2429,23 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			/^FAIL move: exec beside a busy thread on CPU 0: \d+ of \d+ new images started on another CPU \([0-9+]+; err 0, abnormal 0, bad 0\)$/.test(l) ||
 			/^FAIL smp: .* atomic add (\d+), cas (\d+), mutex (\d+) \(want \1, \2, \3\)$/.test(l));
 		await sh2("pkill -f 'n % 50'; pkill yes; sleep 0.5");
-		const smpRun = await sh2("kwtest smp 2>&1 | grep -v '^ok'", 240000);
-		assert.ok(/kwtest: \d+ failure\(s\)/.test(smpRun) && smpOk(smpRun), smpRun);
-		await sh2("(kwtest smp > /tmp/smp.log 2>&1; echo $? > /tmp/smp.rc) & sleep 1");
+		// A release bundle (KW_RELEASE=1, the release's package test) has no kwtest: only base-test.cpio does.
+		const hasKwtest = (await sh2("command -v kwtest >/dev/null && echo yes; true")).trim() === "yes";
+		if (hasKwtest) {
+			const smpRun = await sh2("kwtest smp 2>&1 | grep -v '^ok'", 240000);
+			assert.ok(/kwtest: \d+ failure\(s\)/.test(smpRun) && smpOk(smpRun), smpRun);
+			await sh2("(kwtest smp > /tmp/smp.log 2>&1; echo $? > /tmp/smp.rc) & sleep 1");
+		} else t.diagnostic("the bundle's initramfs has no kwtest: snapshotted again without its SMP checks");
 		const snap2 = await vm2.snapshot({ stop: true });
 		assert.equal(snap2.cpus, cpus);
 		const vm3 = await boot(t, { cpus, vsock: false, restore: snap2, log: () => {} });
 		const c = screen(vm3);
 		const sh3 = shell(vm3, c);
-		const rc = await done(sh3, "/tmp/smp.rc", (o) => /^\d+$/m.test(o));
-		const smpLog = await sh3("grep -v '^ok' /tmp/smp.log");
-		assert.ok(/kwtest: \d+ failure\(s\)/.test(smpLog) && (rc.trim() === "0" || smpOk(smpLog)), `kwtest smp across the snapshot (exit ${rc.trim()}): ${smpLog}`);
+		if (hasKwtest) {
+			const rc = await done(sh3, "/tmp/smp.rc", (o) => /^\d+$/m.test(o));
+			const smpLog = await sh3("grep -v '^ok' /tmp/smp.log");
+			assert.ok(/kwtest: \d+ failure\(s\)/.test(smpLog) && (rc.trim() === "0" || smpOk(smpLog)), `kwtest smp across the snapshot (exit ${rc.trim()}): ${smpLog}`);
+		}
 		// A park cycle after the restore (fields: requests R done D result X ...).
 		assert.equal((await sh3("set -- $(cat /proc/kwpark); w=$(($2 + 1)); echo 1 > /proc/kwpark; " +
 			"while set -- $(cat /proc/kwpark); [ $(($4 - w)) -lt 0 ]; do usleep 10000; done; echo $6", 30000)).trim(), "0", "a park cycle after the restore");

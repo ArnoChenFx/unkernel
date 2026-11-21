@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     // tests build a JIT-enabled harness and unit-test module regardless.
     const jit = b.option(bool, "kwemu-jit", "kwemu: wasm JIT tier, needs the unkernel.kw_host_jit_* host imports (default: false)") orelse false;
     const jit_threshold = b.option(u32, "kwemu-jit-threshold", "kwemu: retired instructions in a block before it is compiled (default: 131072)") orelse 1 << 17;
-    const jit_grow = b.option(u32, "kwemu-jit-grow", "kwemu: exits from a region towards a compiled block before it joins the region (default: 8192 per KiB of the region's module; 0 = never)") orelse 8192;
+    const jit_grow = b.option(u32, "kwemu-jit-grow", "kwemu: exits from a region towards a compiled block before it joins the region (default: 32768 per KiB of the region's module; 0 = never)") orelse 32768;
     // wasm atomics + bulk memory in the wasm64 objects, so that a kernel
     // linked with --shared-memory (wasm-ld refuses objects without both)
     // can include kwemu. With them (core.smp) exclusives and LSE atomics

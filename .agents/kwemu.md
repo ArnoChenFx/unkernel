@@ -31,7 +31,7 @@ memory64 only, undefined `__stack_pointer`), `zig-out/lib/kwemu-jit.o`,
 `kwemu-harness-jit.wasm`, and the A64 tools and guests.
 
 Build options: `-Dkwemu-jit` (off for plain `zig build`; kernel/build.sh
-turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (8192
+turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (32768
 exits per KiB of module, 0 = never), `-Dkwemu-stats` (counters, the
 `kw_debug_stats` export, CLI `--stats`; `kernel/build.sh stats`),
 `-Dkwemu-atomics` (a shared-memory kernel), `-Dlib-optimize`
@@ -195,7 +195,11 @@ to `run`. `cpu.jit.cur` names the member a region left from.
   both, `member_op` the low 16 bits of each member's op index.
 - **Membership.** When a block gets hot, `compile` takes it, the members
   of an open region of the same virtual page that has room (that region
-  is replaced), then breadth-first the decoded, valid, not-yet-compiled
+  is replaced), the blocks of that page that could be members and have
+  counted at least a quarter of the threshold (`pageWarm`, which probes
+  every pc of the page; without it most of them got hot later, one at a
+  time, and each compiled the region again to join it), then
+  breadth-first the decoded, valid, not-yet-compiled
   blocks reachable through side exits, branch targets and call return
   sites (the ISA's `targets`), on any page. A self-loop keeps a closed
   module of its own (as a plain wasm loop it is much faster than as a
@@ -270,7 +274,8 @@ its own thread, on one shared memory. The JIT is per CPU:
   never reachable from another; a task that moves finds a cold cache and
   compiles again. Sharing modules would need instantiating in every CPU's
   thread, a slot installed in every table before any CPU enters it, and a
-  free that waits until no CPU runs it.
+  free that waits until no CPU runs it; and V8 compiles the same bytes
+  again in each thread (a64/performance.md, Rejected designs).
 - **Interrupts.** Compiled code polls the `irqp` it is called with (taken
   from the CPU's own `irq_pending` at every call; nothing is baked into a
   module). With a shared memory (caps bit 3) the load is
@@ -385,7 +390,8 @@ host driver calls the exported `kw_debug_stats` at markers the guest
 prints (for example `@@S name` / `@@E name` around each command). Either
 finds the cpu through the stats-only export
 `kw_debug_cpu_of_jit_buf(ptr)`, where `ptr` is what `kw_host_jit_compile`
-receives; `icount` is at offset 32. Exit counters (`[kwemu-exits]` and
+receives; `icount` is at offset 32. `[kwemu-free]` counts the modules
+freed by reason (`jc.Why`, `Jx.free_why`). Exit counters (`[kwemu-exits]` and
 `[kwemu-jx]`, indices in `jc.Jx`): every entry ends as a hand-back, a
 side exit (`exit_side`, of which `exit_side_region` from region members),
 a direct or indirect terminator, or a stop (`exit_stop`: budget,

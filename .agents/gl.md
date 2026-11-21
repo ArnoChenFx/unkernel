@@ -600,7 +600,7 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   SMP only a short check: `page-check.mjs --cpus 0` (the page's default, 4
   CPUs, worker mode; 2026-11-21) ran `eglinfo -B -p gbm` on virgl and
   kmscube at 55 to 57 fps; the 2D device: `test/gpu/check.mjs --cpus 2`.
-- Guest notes: no `/dev/fd` in the guest, so bash's `<(...)` fails; kmscube
+- Guest notes: kmscube
   and glmark2-es2-drm stop at the first byte or EOF on stdin, so give them
   a stdin that stays open (`mkfifo /tmp/h; exec 3<>/tmp/h; kmscube <&3`).
   glmark2-es2-drm 2023.01 draws at the mode's size and never makes its

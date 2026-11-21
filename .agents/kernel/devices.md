@@ -262,7 +262,8 @@ There is no udev: the kw layer's rc gives `card*` to video (0660) and
   (`DRM_CRTC_VBLANK_TIMER_FUNCS`, at the mode's refresh, 60 Hz from the
   EDID), so a page-flipping client runs at most at 60 frames a second
   (kmscube: 59.97, 2026-11-21), and so do DIRTYFB updates. The timer runs
-  on for `drm.vblankoffdelay` (5 s) after its last use (`test/gpu/flip-check.mjs`
+  on for `drm.vblankoffdelay` after its last use (100 ms: the kw layer's rc lowers
+  the kernel's 5 s, kernel/guest.md) (`test/gpu/flip-check.mjs`
   counts the host's idles), then an idle guest has no periodic timer.
   No kthreads (its work items run on the system workqueue), so parking
   needs nothing new.

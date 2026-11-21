@@ -61,7 +61,9 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   user's devices as udev's rules give them (no udev: `/dev/fb*` and
   `/dev/dri/card*` to video, `/dev/input/*` to input, `/dev/dsp*`,
   `/dev/snd/*` to audio, 0660, by group name; `/dev/fuse` and
-  `/dev/dri/renderD*` 0666; the drivers make them at boot, none later).
+  `/dev/dri/renderD*` 0666; the drivers make them at boot, none later),
+  udev's links `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`,
+  and `drm.vblankoffdelay` 100 ms (kernel/devices.md, kwvirtio).
 - The image's user: every distro image has `user` (uid and gid 1000,
   `/home/user` mode 700, `install_user` in guest/lib/stage.sh; bash on
   Debian, `/bin/sh` on Alpine) in audio, video, input and users, plus sudo

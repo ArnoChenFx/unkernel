@@ -399,6 +399,9 @@ export class WorkerKernel implements KernelHandle {
 			});
 			break;
 		}
+		case "gpu-start":
+			this.#gpu?.start();
+			break;
 		case "gpu-reset":
 			this.#gpu?.reset();
 			break;

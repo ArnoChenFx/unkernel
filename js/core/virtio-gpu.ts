@@ -277,9 +277,18 @@ export class VirtioGpu implements VirtioDeviceModel {
 	}
 
 	blocker(): string {
-		if (this.#pending) return "virtio-gpu commands";
-		if (this.#resources.size) return "virtio-gpu resources";
-		return this.#backend?.blocker?.() ?? "";
+		return [this.#pending ? "virtio-gpu commands" : "", this.held()].filter(Boolean).join(", ");
+	}
+
+	/**
+	 * State that only the host holds and a snapshot cannot save, which lasts
+	 * while the program that made it runs ("virtio-gpu resources", the 2D
+	 * model's or the backend's, "virtio-gpu contexts"), or "" (commands in
+	 * flight are blocker()'s too, but pass).
+	 */
+	held(): string {
+		const back = this.#backend?.blocker?.() ?? "";
+		return this.#resources.size && !back.includes("virtio-gpu resources") ? ["virtio-gpu resources", back].filter(Boolean).join(", ") : back;
 	}
 
 	/** Resources the 2D model holds (for tests and stats). */

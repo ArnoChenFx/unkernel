@@ -48,17 +48,33 @@
 //                                      an unknown name boots the default and says so; none: no
 //                                      image, the base shell). Its changes to the root
 //                                      live in /data/distros/<name>/ on the data disk.
-//   ?gl=1                              guest GL (Debian only): the guest's Mesa renders through
-//                                      this browser's WebGL2 (virglrenderer compiled to wasm, on
-//                                      the page's thread; the SDK's createKernel({ gl }),
-//                                      .agents/gl.md). Adds kw.gl=1 to the command line, for
-//                                      which the guest's shells set GALLIUM_DRIVER=virpipe and
-//                                      LIBGL_ALWAYS_SOFTWARE=1 (kw-gl.sh). Mesa is not in the
-//                                      image: apt-get install it. virgl.mjs and virgl.wasm are
-//                                      fetched only then. Off with another distro, without
-//                                      WebGL2 on the page's thread, or in a build without the
-//                                      renderer (glBlocker()). Default off.
-//   ?glwait=strict                     with ?gl=1: the renderer answers the guest's busy waits
+//   ?gl=0 | ?gl=1                      guest GL (Debian only; default on where the display is,
+//                                      ?display=0 turns it off unless ?gl=1): the guest's Mesa
+//                                      renders through this browser's WebGL2 (virglrenderer
+//                                      compiled to wasm, on the page's thread; the SDK's
+//                                      createKernel({ gl }), .agents/gl.md). It also gives the
+//                                      guest a virtio-gpu device (createKernel({ gpu }): /dev/dri,
+//                                      where stock Mesa finds its virgl driver with no variables,
+//                                      and KMS clients show on the display), and adds kw.gl=1 to
+//                                      the command line, for which the guest's shells set
+//                                      GALLIUM_DRIVER=virpipe and LIBGL_ALWAYS_SOFTWARE=1 (the
+//                                      vtest link) only where there is no /dev/dri render node
+//                                      (kw-gl.sh). Mesa is not in the image: apt-get install it.
+//                                      virgl.mjs and virgl.wasm are fetched only on the guest's
+//                                      first GL use (a program asking the device for its
+//                                      capsets, or a vtest client), not at boot; before the boot
+//                                      the SDK only tries a WebGL2 context (a few ms) and offers
+//                                      3D on the device where it gets one. Off with another
+//                                      distro, without WebGL2 on the page's thread, or in a build
+//                                      without the renderer (glBlocker()).
+//   ?gpu=0                             with guest GL, this load only: no virtio-gpu device, so the
+//                                      guest's shells use the vtest link (guest GL as it was
+//                                      before the device, for comparison). Also none with
+//                                      ?display=0.
+//   ?glload=eager                      with guest GL, this load only: load the renderer before
+//                                      the boot (the SDK's gl.eager), as the page did before it
+//                                      loaded on first use.
+//   ?glwait=strict                     with guest GL: the renderer answers the guest's busy waits
 //                                      as vtest does, once WebGL tells that the fences have
 //                                      retired (the SDK's gl.strictWaits), for comparing frame
 //                                      times; the Guest GL row shows them. Default: at once where
@@ -249,16 +265,24 @@ export interface Config {
 	autosuspendParam: string;
 	/** Its default on this device: "now" on phones and tablets, else "0". */
 	autosuspendDefault: string;
-	/** Guest GL this load (?gl=1, on a distro of GL_DISTROS, where glBlocker() allows). */
+	/** Guest GL this load (the GL option, on a distro of GL_DISTROS, where glBlocker() allows). */
 	gl: boolean;
-	/** The GL option: ?gl=1. */
+	/** The GL option: ?gl=1, or by default where the display is (?gl=0 or ?display=0: off). */
 	glParam: boolean;
+	/** The GL option was set (?gl= in the URL or the saved settings), not the default. */
+	glAsked: boolean;
+	/** ?glload=eager: the SDK's gl.eager (the renderer loads before the boot). */
+	glEager: boolean;
+	/** This load's URL names ?gl= or ?gpu=: a suspended session must match them (else its own GL devices are kept for its resume, boot.ts). */
+	glFromUrl: boolean;
 	/** Why this page cannot offer guest GL (glBlocker()), or null. */
 	glBlocked: string | null;
 	/** Why this load runs without GL although ?gl=1 asks for it, or null. */
 	glWhy: string | null;
 	/** ?glwait=strict: the SDK's gl.strictWaits. */
 	glStrictWaits: boolean;
+	/** With guest GL, the virtio-gpu device (createKernel({ gpu })): unless ?gpu=0 or ?display=0. */
+	gpu: boolean;
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
@@ -270,6 +294,11 @@ export interface Config {
 
 /** The distros whose Mesa has the virgl driver (Alpine's has none). */
 export const GL_DISTROS: readonly string[] = ["debian"];
+
+/** The GL option's default: on where the display is (?display=0: off). */
+export function glDefault(display: boolean): boolean {
+	return display;
+}
 
 /**
  * Why this page cannot offer guest GL, or null: no GL renderer in the
@@ -387,7 +416,9 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	else if (distroAsked) distroWhy = `distro ${distroAsked} is not an image of this page (${[...names, "none"].join(", ")}): booting ${DEFAULT_DISTRO}`;
 	const distro = DISTROS_OFFERED.find((d) => d.name === distroParam) ?? null;
 	const autosuspend = parseAutoSuspend(params.get("autosuspend"), mobile);
-	const glParam = params.get("gl") === "1";
+	// Guest GL: on by default where the display is (the renderer loads on the guest's first GL use).
+	const glAsked = params.has("gl");
+	const glParam = glAsked ? params.get("gl") === "1" : glDefault(params.get("display") !== "0");
 	const glBlocked = glBlocker();
 	const glWhy = !glParam ? null : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
 	return {
@@ -436,9 +467,14 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		askLeave: params.get("askleave") !== "0",
 		gl: glParam && !glWhy,
 		glParam,
+		glAsked,
+		glEager: url.get("glload") === "eager",
+		glFromUrl: url.has("gl") || url.has("gpu"),
 		glBlocked,
 		glWhy,
-		glStrictWaits: params.get("glwait") === "strict",
+		// Not settings (SETTING_NAMES): this load's URL only.
+		glStrictWaits: url.get("glwait") === "strict",
+		gpu: glParam && !glWhy && url.get("gpu") !== "0" && params.get("display") !== "0",
 		mobile,
 		coarse,
 		mobileUA,

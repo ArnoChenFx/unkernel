@@ -20,7 +20,7 @@ import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, 
 import { fetchOver } from "./http.ts";
 import { CommandTable, parseCommands, type CommandsOption, type HostCommand } from "./commands.ts";
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
-import { prepareGpuGl, startGl, type GlHost, type GlOption } from "./gl.ts";
+import { prepareGl, startGl, type GlHost, type GlOption } from "./gl.ts";
 import { inlineGpuLink, VirglGpuBackend } from "./gl-gpu.ts";
 import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
@@ -230,8 +230,9 @@ export interface CreateKernelOptions {
 	 * Guest GL (gl.ts, .agents/gl.md): the guest's Mesa renders through
 	 * virglrenderer compiled to wasm on one WebGL2 context of this thread
 	 * (an OffscreenCanvas; frames come back to the guest by readback). The
-	 * module (virgl.mjs and virgl.wasm next to the web entry) is loaded only
-	 * then; the host listens on vsock port 1019 and starts the guest's
+	 * module (virgl.mjs and virgl.wasm next to the web entry) is fetched only
+	 * with `gl`, and only on the guest's first GL use (`gl.eager`: before the
+	 * boot); the host listens on vsock port 1019 and starts the guest's
 	 * forwarder (/usr/lib/kw/vtest-bridge) through kwtty, after which GL
 	 * programs run with GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1
 	 * (Debian: Mesa from apt). true, or options. Needs vsock and WebGL2:
@@ -903,14 +904,15 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		throw new BootError("boot", `snapshot: it has host file systems (${savedMounts.mounts.map((m) => m.path).join(", ")}), which resume inline only (not in worker mode or with vsock.raw)`);
 	const mountsWhy = opts.restore && snapshotMountMismatch(savedMounts, mounts);
 	if (mountsWhy) throw new BootError("boot", `snapshot: ${mountsWhy}`);
-	// gl and gpu: the renderer first, as the device offers virgl when the driver probes (gl.ts).
-	const glStart = opts.gpu ? prepareGpuGl(opts.gl, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m))) : undefined;
+	// gl (and gpu): before the boot, as the device offers virgl when the driver probes; the renderer
+	// itself loads on the guest's first GL use unless gl.eager (gl.ts).
+	const glPrep = prepareGl(opts.gl, !!opts.gpu, !!vopt && !raw, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m)), !!opts.restore);
 	if (opts.worker) {
 		checkWorkerOptions(platform, opts);
-		const vm = await createKernelInWorker(platform, opts, progress, glStart?.gpu);
+		const vm = await createKernelInWorker(platform, opts, progress, glPrep?.gpu);
 		vm.startMounts(mounts);
 		vm.startCommands(commands);
-		vm.attachGl(startGl(opts.gl, vm.vsock, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m)), glStart));
+		vm.attachGl(startGl(glPrep, vm.vsock, opts.log ?? ((m: string) => console.error(m))));
 		return vm;
 	}
 	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
@@ -980,7 +982,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		onInput: opts.onInput,
 		sound: opts.sound,
 		gpu: !!opts.gpu,
-		gpuBackend: opts.gpuBackend ?? (glStart && new VirglGpuBackend(inlineGpuLink(glStart.gpu), log)),
+		gpuBackend: opts.gpuBackend ?? (glPrep?.gpu && new VirglGpuBackend(inlineGpuLink(glPrep.gpu), log)),
 		vsock: !!vopt,
 		onVsockPacket: raw ? raw.onPacket : vsock && ((pkt) => vsock.receive(pkt)),
 		onVsockInit: raw ? raw.onInit : vsock && ((cid, rxMax) => vsock.deviceReady(cid, rxMax)),
@@ -1027,7 +1029,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	booting.catch(() => {});
 	instance.startMounts(rest);
 	instance.startCommands(commands);
-	instance.attachGl(startGl(opts.gl, vsock, platform.glModule?.(), log, glStart));
+	instance.attachGl(startGl(glPrep, vsock, log));
 	if (signal) {
 		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
 		if (signal.aborted) onAbort();

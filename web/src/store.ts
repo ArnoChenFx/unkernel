@@ -134,7 +134,7 @@ export interface Options {
 	autosuspend: string;
 	/** Ask before closing (?askleave=0: off). */
 	askleave: "on" | "off";
-	/** Guest GL (?gl=1), Debian only. */
+	/** Guest GL (?gl=), Debian only; on by default where the display is. */
 	gl: "on" | "off";
 }
 

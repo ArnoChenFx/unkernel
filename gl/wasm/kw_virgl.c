@@ -685,6 +685,13 @@ EMSCRIPTEN_KEEPALIVE int kw_virgl_state(int id)
 #include "virgl_hw.h"
 #include "util/u_format.h"
 
+// The device offers the capsets' sizes before the module is loaded (the
+// SDK's VIRGL_CAPSETS): a virglrenderer whose caps structs have grown must
+// change those numbers too (kw_virgl.h; the versions are checked when the
+// SDK loads the module).
+_Static_assert(sizeof(struct virgl_caps_v1) == KW_VGPU_CAPSET_VIRGL_SIZE, "struct virgl_caps_v1 changed: update KW_VGPU_CAPSET_VIRGL_SIZE and VIRGL_CAPSETS (js/core/gl-gpu.ts)");
+_Static_assert(sizeof(struct virgl_caps_v2) == KW_VGPU_CAPSET_VIRGL2_SIZE, "struct virgl_caps_v2 changed: update KW_VGPU_CAPSET_VIRGL2_SIZE and VIRGL_CAPSETS (js/core/gl-gpu.ts)");
+
 void vrend_renderer_single_enter_blitter(void);
 
 #define KW_VGPU_CTX_BASE 0x40000000u

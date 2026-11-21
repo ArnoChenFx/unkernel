@@ -9,7 +9,14 @@
 // has the scanout, frame() otherwise), runs the steps in the guest with no
 // GL environment variables and posts what they printed; the harness judges.
 // Query: size=WxH (the display), scenes= (glmark2 -b list), skip=a,b,c,d,e,
-// cmd= (a command run first, as root; for debugging).
+// cmd= (a command run first, as root; for debugging), eager (gl: { eager:
+// true }: the renderer loads before the boot; by default it loads on the
+// guest's first GL use), glmodule=URL (another virgl.mjs: the harness's
+// late one), glfail=module (a module URL that does not exist:
+// the renderer fails to load at first use), fail (step f: what the guest
+// sees without a renderer, and a dumb-buffer KMS client). The result has
+// the renderer's status (vm.gl.status) at boot, at gl.ready and at the end,
+// and when the page fetched virgl.mjs and virgl.wasm (resource timing).
 import { createKernel } from "/dist/web.mjs";
 
 const q = new URLSearchParams(location.search);
@@ -18,6 +25,8 @@ const size = q.get("size") || "640x480";
 const [W, H] = size.split("x").map(Number);
 const scenes = (q.get("scenes") || "build:duration=5,texture:duration=5,shading:shading=phong:duration=5").split(",");
 const t0 = performance.now();
+// Every request is kept (the disk's Range requests fill the default 250 entries early).
+performance.setResourceTimingBufferSize(1 << 20);
 const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
 
 const post = (path, body) => fetch(path, { method: "POST", body }).catch(() => {});
@@ -84,13 +93,21 @@ function summary(data) {
 	return { checksum: sum.toString(16), colours: colours.size };
 }
 
+/** When this page fetched the renderer's files (s after the page started), from resource timing. */
+const virglFetches = () => performance.getEntriesByType("resource").filter((e) => /virgl[^/]*\.(mjs|wasm)/.test(e.name))
+	.map((e) => ({ file: e.name.split("/").pop(), startS: Number((e.startTime / 1000).toFixed(2)), endS: Number((e.responseEnd / 1000).toFixed(2)), startMs: e.startTime }));
+
 async function main() {
 	const result = { size, scenes, steps: {}, frames: [] };
+	const glOpt = q.get("glfail") === "module" ? { module: new URL("/dist/no-such-virgl.mjs", location.href).href }
+		: q.get("glmodule") ? { module: new URL(q.get("glmodule"), location.href).href, ...(q.has("eager") ? { eager: true } : {}) }
+		: q.has("eager") ? { eager: true } : true;
+	result.glOption = glOpt;
 	const vm = await createKernel({
 		kernel: "/img/unkernel.wasm",
 		distro: "/img/debian.erofs",
 		disks: [{ kind: "http", url: "/img/debian-gl.img" }],
-		gl: true,
+		gl: glOpt,
 		gpu: true,
 		display: { width: W, height: H, dpi: 96 },
 		worker: q.has("worker"),
@@ -100,9 +117,25 @@ async function main() {
 	vm.onOutput((b) => (consoleBuf += new TextDecoder().decode(b)));
 	const shown = display(vm);
 	log(`booted (transport ${vm.transport})`);
-	result.renderer = await vm.gl.ready;
+	result.bootS = Number(secs());
+	result.bootMs = Math.round(performance.now() - t0);
+	result.statusAtBoot = vm.gl?.status;
+	result.fetchesAtBoot = virglFetches();
+	try {
+		result.renderer = await vm.gl.ready;
+	} catch (e) {
+		result.renderer = null;
+		result.readyError = String(e?.message || e);
+	}
 	result.readyS = Number(secs());
-	log(`gl ready: ${result.renderer}`);
+	result.readyMs = Math.round(performance.now() - t0);
+	// User space answering a command (the first exec through kwtty)
+	await vm.exec("true", []);
+	result.execMs = Math.round(performance.now() - t0);
+	result.statusAtReady = vm.gl?.status;
+	result.fetchesAtReady = virglFetches();
+	result.hasGpu3d = !!vm.gl?.gpu;
+	log(`gl ready: ${result.renderer ?? `rejected: ${result.readyError}`}; status ${JSON.stringify(result.statusAtReady)}; virgl fetches so far ${JSON.stringify(result.fetchesAtReady)}`);
 
 	const run = async (name, cmd, opts = {}) => {
 		log(`run ${name}: ${cmd}`);
@@ -115,8 +148,10 @@ async function main() {
 	};
 
 	// the test programs, in /tmp
-	for (const name of ["kwgl-state", "prime"]) {
-		const bin = new Uint8Array(await (await fetch(`/files/${name}`)).arrayBuffer());
+	for (const name of ["kwgl-state", "prime", "kms-dumb"]) {
+		const r = await fetch(`/files/${name}`);
+		if (!r.ok) continue;
+		const bin = new Uint8Array(await r.arrayBuffer());
 		await vm.exec("sh", ["-c", `cat >/tmp/${name} && chmod 755 /tmp/${name}`], { input: bin });
 	}
 
@@ -228,7 +263,18 @@ async function main() {
 		log(`prime: ${JSON.stringify(r)}, ${JSON.stringify(result.prime)}`);
 	}
 
-	result.gl = vm.gl.stats;
+	// (f) without a renderer (glfail=module, or no WebGL2): what Mesa does, and the 2D KMS path
+	if (q.has("fail")) {
+		await run("fail-eglinfo-gbm", "eglinfo -B -p gbm 2>&1 | head -40");
+		await run("fail-eglinfo-surfaceless", "eglinfo -B -p surfaceless 2>&1 | head -40");
+		await run("fail-kmscube", `${HOLD} timeout 120 kmscube -D /dev/dri/card0 -c 60 2>&1 <&3 | tail -15`);
+		await run("fail-kms-dumb", "/tmp/kms-dumb /dev/dri/card0 3 2>&1");
+		await run("fail-dmesg", "dmesg | grep -i -E 'virtio|drm|virgl' | sed 's/^\\[[ 0-9.]*\\] //' | sort | uniq -c | sort -rn | head -20");
+	}
+
+	result.status = vm.gl?.status;
+	result.fetches = virglFetches();
+	result.gl = vm.gl?.stats;
 	result.display = { painted: shown.st.painted, glPainted: shown.st.glPainted };
 	result.totalS = Number(secs());
 	await post("/result", JSON.stringify(result));

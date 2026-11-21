@@ -827,19 +827,32 @@ parts that are easy to get wrong.
 
 ## Guest GL (`js/core/gl.ts`, `gl-stream.ts`)
 
-- `createKernel({ gl })` (gl.md has the whole path): `startGl()` makes a
+- `createKernel({ gl })` (gl.md has the whole path): `prepareGl()`, before
+  the boot, makes the renderer's `GlLoader` (the platform's `virgl.mjs`,
+  web entry: `Platform.glModule`, `bundledGlUrl`; or `gl.module`) and, with
+  `gpu`, virtio-gpu's `GpuRenderer`; after the boot `startGl()` makes a
   `GlHost` (`vm.gl`) on the thread that owns the VM, in both modes, since
-  vsock is served there. It imports the platform's `virgl.mjs` (web entry:
-  `Platform.glModule`, `bundledGlUrl`; or `gl.module`), makes a WebGL2
-  context on a 1x1 OffscreenCanvas and the module's `virgl.Renderer`, then
-  listens on vsock port 1019 (`GL_PORT`) and serves each connection with
-  `StreamHost`, then runs the guest's forwarder (`GL_FORWARDER`,
-  `--daemon`) through kwtty as root. `gl.ready` resolves once the
-  forwarder's LOG line "ready: vtest clients on ..." arrives (the guest's
-  vtest socket exists then), and rejects (logged) when the renderer or the
-  forwarder fails or the link does not come within 30 s.
-- `vm.gl.stats` is `StreamHost.stats`, with the renderer's counters
-  (`VtestRenderer.totals()`, `VirglTotals`: the wasm module's
+  vsock is served there. It listens on vsock port 1019 (`GL_PORT`) and
+  serves each connection with `StreamHost`, then runs the guest's
+  forwarder (`GL_FORWARDER`, `--daemon`) through kwtty as root. The
+  renderer (the module, a WebGL2 context on a 1x1 OffscreenCanvas, the
+  module's `virgl.Renderer`) is loaded on the guest's first GL use: the
+  first vtest client (`LazyVtestRenderer`) or virtio-gpu's first capset or
+  3D command (gl.md, Loading on first use); before the boot only
+  `probeWebGl2()` makes a WebGL2 context and drops it, and without one the
+  loader is failed from the start (the device is 2D). `gl.eager` loads it
+  before the boot instead. `gl.ready` resolves once the forwarder's LOG
+  line "ready: vtest clients on ..." arrives (the guest's vtest socket
+  exists then; lazily, the renderer is not loaded yet), and rejects
+  (logged) when there can be no renderer (no WebGL2 context; with `eager`,
+  a load that failed), the forwarder fails or the link does not come
+  within 30 s. `vm.gl.status` (`GlRendererStatus`) says idle, loading,
+  ready or failed, when the load started, how long it took, the error, and
+  the WebGL2 implementation; `vm.gl.loaded` settles once the renderer is
+  up or failed (never while the guest uses no GL); `vm.gl.load()` starts
+  it.
+- `vm.gl.stats` is `StreamHost.stats`, with the renderer's counters once
+  it is loaded (`VtestRenderer.totals()`, `VirglTotals`: the wasm module's
   `KW_VIRGL_STAT_*`, which count virtio-gpu's commands too; gl.md, Stats)
   as `renderer`, and with `gpu` virtio-gpu's (`gpu`, `GpuRendererStats`).
   `gl.strictWaits` makes the wasm renderer answer busy waits as vtest does
@@ -859,8 +872,9 @@ parts that are easy to get wrong.
   and the new host's forwarder start exits 0 (one already runs).
 - The guest's environment is the caller's: with `kw.gl=1` on the command
   line the base's `/etc/profile.d/kw-gl.sh` sets `GALLIUM_DRIVER=virpipe
-  LIBGL_ALWAYS_SOFTWARE=1` for the guest's shells (the page adds it with
-  its GL option); `gl` alone does not add it.
+  LIBGL_ALWAYS_SOFTWARE=1` for the guest's shells where there is no DRM
+  render node (with `gpu` Mesa finds `/dev/dri` itself; the page adds
+  `kw.gl=1` with its GL option); `gl` alone does not add it.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 
@@ -1212,7 +1226,10 @@ parts that are easy to get wrong.
   (`DisplaySource.pixels()` null; GlHost presents it), and SET_SCANOUT,
   RESOURCE_FLUSH and RESOURCE_UNREF of it go to the backend too.
 - `blocker()`: "virtio-gpu resources", "virtio-gpu contexts" (3D) or
-  "virtio-gpu commands" refuse a snapshot; `displayChanged()` raises a config interrupt with
+  "virtio-gpu commands" refuse a snapshot; `held()` is the part that lasts
+  while a program runs (resources and contexts), which `Kernel.snapshot()`
+  refuses at once, before the guest parks (a task waiting on the device
+  might not park in time, and the reason would be lost); `displayChanged()` raises a config interrupt with
   VIRTIO_GPU_EVENT_DISPLAY, after which the driver asks for the display
   info again (nothing calls it yet).
 - Test: `node test/gpu/check.mjs` (testing.md).
@@ -1223,21 +1240,25 @@ parts that are easy to get wrong.
   context) and the vtest link; `gpu` is the virtio-gpu device; with both,
   where `gl` gets the wasm module and WebGL2 (a browser), the device has
   3D on that same renderer, and the vtest link stays. `gpu` alone, `gl` with
-  `renderer` (a vtest renderer), or no WebGL2 (Node): the 2D device, with a
-  `[host] gpu: 2D only: ...` line. The renderer is made before the kernel
-  boots (`prepareGpuGl()`), since the device offers VIRTIO_GPU_F_VIRGL
-  (not CONTEXT_INIT; gl.md, The DRM path) when the driver probes; its two
-  capsets (VIRGL, VIRGL2) are
-  answered once the renderer is up (the driver's probe waits, up to 5 s a
-  capset), read from the real WebGL2 context, without VIRGL_CAP_TRANSFER
-  and COPY_TRANSFER (gl.md, The DRM path).
+  `renderer` (a vtest renderer), or no WebGL2 (Node, or no WebGL2 context
+  when `probeWebGl2()` tries one before the boot): the 2D device, with a
+  `[host] gpu: 2D only: ...` line. The device offers VIRTIO_GPU_F_VIRGL
+  (not CONTEXT_INIT; gl.md, The DRM path) and the two capsets of
+  `VIRGL_CAPSETS` (VIRGL, VIRGL2: ids, versions and sizes are
+  virglrenderer's constants, so GET_CAPSET_INFO at probe needs no
+  renderer); their contents are answered once the renderer is up, which
+  the first GET_CAPSET or 3D command starts (`GpuLink.start()`; gl.md,
+  Loading on first use), read from the real WebGL2 context, without
+  VIRGL_CAP_TRANSFER and COPY_TRANSFER (gl.md, The DRM path). If it cannot
+  load, every 3D command is answered ERR_UNSPEC.
 - Two halves: `VirglGpuBackend` (the device side, where the kernel runs:
   this thread inline, the kernel's worker in worker mode) and `GpuRenderer`
   (the renderer side, `vm.gl.gpu`, on the thread with the WebGL2 context),
   joined by a `GpuLink`: `inlineGpuLink()` (direct calls, the gather writes
-  into the module's heap), or worker messages (`gpu` requests with a `rid`
-  when they want an answer, `gpu-reply`, `gpu-init` with the capsets and
-  the format table, `gpu-reset`; WorkerKernel serves them with the
+  into the module's heap), or worker messages (`gpu-start` on the first 3D
+  use, `gpu` requests with a `rid` when they want an answer, `gpu-reply`,
+  `gpu-init` with the capsets and the format table once the renderer is
+  up, `gpu-reset`; WorkerKernel serves them with the
   GpuRenderer that createKernel made, spec `gpu: "virgl"`).
 - The device side keeps each 3D resource's backing pages (ATTACH_BACKING
   never reaches the renderer) and layout (target, format, size), packs a
@@ -1246,8 +1267,14 @@ parts that are easy to get wrong.
   command to offset 0 with the packed strides; a readback's packed bytes
   are scattered back row by row, so bytes outside the box stay the
   guest's. Commands that answer only OK and carry no fence are answered at
-  once and posted; fenced ones and readbacks wait for the renderer.
-- `GpuRenderer`: runs commands in order (queued until the module is up),
+  once and posted; fenced ones and readbacks wait for the renderer. Before
+  the renderer is up, GET_CAPSET waits for its capsets and a 3D transfer
+  for its format table, and every send after a waiting one goes behind it
+  (resource bookkeeping stays synchronous, so SET_SCANOUT finds a 3D
+  resource made meanwhile).
+- `GpuRenderer`: loads the renderer on `start()` (or its first command;
+  at once with `gl.eager`) and checks the module's capsets against
+  `VIRGL_CAPSETS` (a mismatch is no 3D, logged); runs commands in order (queued until the module is up),
   tracks the guest's contexts and resources (a device reset destroys them),
   answers fences (`strictWaits`: when the GPU work is done; default: at
   once, or after a presented frame once that frame is done; readbacks at

@@ -227,8 +227,8 @@ deploying the page needs no kernel toolchain.
   `./virgl.wasm` next to itself, so neither may be renamed alone); the dev
   server answers `/_gl/virgl.mjs` and `/_gl/virgl.wasm` itself (`serveGl()`,
   `no-cache` with an ETag, untransformed: Vite would rewrite the module).
-  Either is fetched only by a load with GL on (the SDK imports the module
-  then).
+  Either is fetched only by a load with GL on, on the guest's first GL use
+  (the SDK imports the module then; Guest GL, below).
 - `web/src/sdk.ts` imports `js/core/index.ts`, `js/web/memory.ts` and
   `js/web/platform.ts`, not `js/web.ts`, whose own bundled kernel would
   become a second 10 MB asset. Its `kernelUrl` is a hashed Vite asset,
@@ -428,62 +428,114 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
 
 ## Guest GL
 
-The Guest GL option (`?gl=1`, the `#opt-gl` box in Options; default off)
-boots with the SDK's `createKernel({ gl: true })` (js.md, Guest GL;
-gl.md): the guest's Mesa renders through virglrenderer compiled to wasm on
-a WebGL2 context of the page's thread (in worker mode too: vsock is served
-there), and frames come back to the guest by readback.
+The Guest GL option (`?gl=`, the `#opt-gl` box in Options; on by default
+on Debian where the display is: `?gl=0` turns it off, `?display=0` too
+unless `?gl=1`; config.ts `glDefault()`, saved only where it differs)
+boots with the SDK's `createKernel({ gl: true, gpu: true })` (js.md, Guest
+GL, virtio-gpu 3D; gl.md, The DRM path): the guest's Mesa renders through
+virglrenderer compiled to wasm on a WebGL2 context of the page's thread (in
+worker mode too: vsock and the renderer are served there), through the
+virtio-gpu device's `/dev/dri` (stock Mesa, no variables; a KMS client's
+frames go to the display from the renderer's texture, `drawFrame()` in
+Display.tsx) or the vtest link (frames come back to the guest by readback).
+The renderer (`virgl.mjs`, `virgl.wasm`) is fetched and started only on
+the guest's first GL use (gl.md, Loading on first use), so a visitor who
+never runs a GL program fetches nothing of it; before the boot the SDK
+only tries a WebGL2 context (a few ms). `?glload=eager` (this load's URL
+only) loads it before the boot (`gl: { eager: true }`). `?gpu=0` (this
+load's URL only, like `?glwait=`; also `?display=0`) leaves the device
+out, so the guest has the vtest link alone, for comparison.
 
 - Only on Debian (`GL_DISTROS`, config.ts: Alpine's Mesa has no virgl
   driver) and only where `glBlocker()` passes: the page's build has the
   renderer (`glUrl`, above) and the page's thread has `OffscreenCanvas` and
   `WebGL2RenderingContext`. Otherwise the box is unticked and disabled with
   the reason in its note (it follows the Distro radios as chosen), its
-  saved value kept; a load with `?gl=1` that cannot have it boots without
-  and says why in the Environment tab's Guest GL row (`cfg.glWhy`).
+  saved value kept; a load that cannot have it boots without and says why
+  in the Environment tab's Guest GL row (`cfg.glWhy`: a warning where the
+  option was set, `cfg.glAsked`, information where it is the default,
+  as on Alpine).
 - With GL on the page appends `kw.gl=1` to the command line;
   `/etc/profile.d/kw-gl.sh` (the base's kw layer, kernel/guest.md) then
   exports `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` in every login
-  and interactive shell (the console, terminal windows, `bash -l`), so a
-  plain `eglinfo` or `glmark2-es2` uses virgl. Mesa is not in the image:
+  and interactive shell (the console, terminal windows, `bash -l`) where
+  there is no DRM render node (`?gpu=0`, or a kernel without kwvirtio), so
+  a plain `eglinfo` or `glmark2-es2` uses virgl either way; with the
+  device `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 cmd` runs one
+  program on the vtest link. Mesa is not in the image:
   `sudo apt-get install` it (deb.debian.org goes through the page's
   CORS mirror). Programs `vm.exec()` starts without a shell do not get the
   variables.
-- `showGl()` (boot.ts): the Guest GL row says "starting", then the WebGL2
-  renderer (the unmasked name, `WEBGL_debug_renderer_info`, as the SDK logs
-  it), with the forwarder links and GL clients (`vm.gl.stats`, every 2 s
+- `showGl()` (boot.ts): the Guest GL row says "starting", then, once the
+  forwarder is linked, "on, not loaded yet" (`vm.gl.status`) until the
+  guest's first GL use, "loading" while it loads, then the WebGL2 renderer
+  (the unmasked name, `WEBGL_debug_renderer_info`, as the SDK logs it) and
+  how long the load took and when (`vm.gl.loaded`, `status.loadMs`), with
+  the forwarder links and GL clients (`vm.gl.stats`, every 2 s
   while they change) in its note, and from the renderer's counters
   (`vm.gl.stats.renderer`) where a frame's time went in the renderer over
   the last 2 s with readbacks (`glFrameTimes()`: per readback, time parked
   in busy waits, reading back, issuing GL, uploading; how busy waits were
-  answered; gl.md, Stats). `?glwait=strict` passes `gl: { strictWaits:
+  answered; gl.md, Stats), and with the device its counters
+  (`vm.gl.stats.gpu`, `gpuFrames()`: presents a second and parks over the
+  last 2 s, then in all presents, commands, fenced commands parked and the
+  time parked, readbacks, errors). `?glwait=strict` passes `gl: { strictWaits:
   true }` (busy waits answered as vtest does) for comparing frame times,
   and the note says so. A software renderer (SwiftShader,
   llvmpipe, WARP...) is a warning row and a toast. The browser console
   gets `[unkernel] guest GL: WebGL2 renderer ...`, the Kernel log the
-  SDK's `[host] gl:` lines. A `vm.gl.ready` that rejects (no WebGL2
-  context, no forwarder in an older bundle) is a failed row and a toast,
-  not fatal.
-- A suspended session records GL with the device options (`gl` in
-  `SessionDevices`; absent in older records: off) and resumes only with the
-  same setting, since its kernel's command line has `kw.gl=1` or not. The
-  renderer's state is not saved: a resume ends the guest's GL clients, and
-  the forwarder relinks by itself (gl.md, unkernel).
-- Trying it (the display is kwfb with X on it: Display and input, above;
-  kernel/guest.md, X.Org on the framebuffer): `sudo apt-get install
-  mesa-utils libegl-mesa0 libgles2` and `eglinfo -B -p surfaceless`
-  (the GLES renderer must be `virgl (<the WebGL2 renderer>)`); for a
-  picture, `sudo apt-get install xserver-xorg-core
-  xserver-xorg-video-fbdev xserver-xorg-input-evdev glmark2-es2-x11
-  libgl1-mesa-dri libglx-mesa0`, `sudo Xorg :0 -nolisten tcp &`, then
-  `DISPLAY=:0 glmark2-es2`; for frame rates without the display,
+  SDK's `[host] gl:` lines. No WebGL2 context before the boot is an
+  "unavailable" row (information, or a warning and a toast where the
+  option was set): the device is 2D and GL programs use llvmpipe. A
+  renderer that fails at first use, or a `vm.gl.ready` that rejects
+  otherwise (no forwarder in an older bundle), is a failed row and a
+  toast, not fatal.
+- A suspended session records GL with the device options (`gl` and `gpu`
+  in `SessionDevices`; absent in older records: off), since its kernel's
+  command line has `kw.gl=1` or not and its devices differ. It is matched
+  with its own GL devices (`sessionDevicesFor()`) and resumed with them
+  (`adoptSessionGl()`: `cfg.gl` and `cfg.gpu` become the session's for
+  that boot, the row says "off: the resumed session was saved without
+  it"), unless this load's URL names `?gl=` or `?gpu=` (then they must
+  match) or the session had GL and this load cannot; a resume that fails
+  boots fresh with this load's own (`dropSessionGl()`). So a session saved
+  before GL was on by default resumes as it was, and a fresh boot uses the
+  options. The renderer being loaded or not changes nothing in a session
+  (gl.md, Loading on first use). The SDK refuses a snapshot while the
+  device holds resources or 3D contexts (a running GL program or KMS
+  client), before the guest parks, and Suspend then says that a program is
+  using the GPU and to quit it (`refusal()`, boot.ts; the same text in
+  the auto-suspend and Pause notes). The renderer's state is not saved: a
+  resume ends the guest's GL clients, and the forwarder relinks by itself
+  (gl.md, unkernel).
+- Trying it: `sudo apt-get install mesa-utils libegl-mesa0 libgles2` and
+  `eglinfo -B -p gbm` (with the device; `-p surfaceless` either way: the
+  GLES renderer must be `virgl (<the WebGL2 renderer>)`); KMS clients on
+  the display: `sudo apt-get install kmscube glmark2-es2-drm`, each with a
+  stdin that stays open (gl.md, The DRM path: `mkfifo /tmp/h; exec
+  3<>/tmp/h; kmscube <&3`, `glmark2-es2-drm --visual-config
+  red=8:green=8:blue=8:alpha=0 <&3`); X with glamor on the device: `sudo
+  apt-get install xserver-xorg-core xserver-xorg-input-evdev
+  libgl1-mesa-dri libglx-mesa0`, then the kw layer's
+  `/etc/X11/kw-kms.conf` (kernel/guest.md), `sudo
+  Xorg :0 -config kw-kms.conf -nolisten tcp &`, then `DISPLAY=:0
+  glxgears`. Without the device (`?gpu=0`) X runs on kwfb (kernel/guest.md,
+  X.Org on the framebuffer: `xserver-xorg-video-fbdev`, `sudo Xorg :0
+  -nolisten tcp &`) and GL clients on it go through the vtest link,
+  reading each frame back; for frame rates without the display,
   `sudo apt-get install xvfb xauth glmark2-es2-x11` and `xvfb-run -a -s
   "-screen 0 640x480x24" glmark2-es2`. Installed packages live in Debian's
   upper layer on the data disk (data-disk.md).
-- Checked 2026-11-21 with `test/gl/page-check.mjs` (testing.md): the dev
-  server, headless Chromium (Playwright's) on SwiftShader, `?gl=1`, worker
-  mode, one CPU, `?data=0`. Not checked: X on kwfb with virgl (a picture on
-  the page's display, its frame rate), packages kept across reloads on the
+- Checked 2026-11-21 with `test/gl/page-check.mjs --suspend` (testing.md):
+  the dev server, headless Chromium (Playwright's) on SwiftShader, the
+  default URL (GL on by default, no request for the renderer until the
+  first GL program; suspend and resume before GL use; Suspend refused
+  while kmscube runs; a session saved with `?gl=0` resumed with GL off),
+  worker mode, one CPU, `?data=0`, the device (gl.md, The page); and with
+  the default CPU count (`--cpus 0`: 4 CPUs here), eglinfo and kmscube on
+  the device. Not checked: X on
+  kwfb with virgl (`?gpu=0`; a picture on the page's display, its frame
+  rate), `?gpu=0` since the device came, packages kept across reloads on the
   data disk, a real GPU, Firefox and Safari, the built server's
   `/assets/virgl-*/` files in a browser.
 

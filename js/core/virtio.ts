@@ -242,6 +242,8 @@ export interface VirtioDeviceModel {
 	notify(q: Virtqueue): void;
 	/** Why a snapshot cannot be taken now (resources the host would lose), or "". */
 	blocker?(): string;
+	/** The part of blocker() that lasts while a guest program runs (not commands in flight), or "". */
+	held?(): string;
 }
 
 interface DeviceSlot {
@@ -425,6 +427,11 @@ export class VirtioHost {
 	/** Why a snapshot cannot be taken now, or "". */
 	blocker(): string {
 		return this.#devices.map((d) => d.model.blocker?.() ?? "").filter(Boolean).join(", ");
+	}
+
+	/** State only the host holds while a guest program runs (VirtioGpu.held()): a snapshot is refused before the guest parks. */
+	held(): string {
+		return this.#devices.map((d) => d.model.held?.() ?? "").filter(Boolean).join(", ");
 	}
 
 	/** Each device's transport state (the models keep nothing a snapshot needs while blocker() is ""). */

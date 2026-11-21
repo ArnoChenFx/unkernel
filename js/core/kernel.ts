@@ -827,6 +827,11 @@ export class Kernel {
 		if (commit !== undefined && typeof commit !== "function") return Promise.reject(new TypeError("snapshot: commit must be a function"));
 		if (hold !== undefined && (typeof hold !== "function" || !commit)) return Promise.reject(new TypeError("snapshot: hold must be a function, and needs commit"));
 		if (!this.exports?.kw_resume) return Promise.reject(new Error("snapshot: this kernel cannot resume one (no kw_resume)"));
+		// State only a device's host holds (virtio-gpu resources and 3D contexts) while a guest program
+		// runs: refused at once, as the snapshot point would, instead of after parking the guest (whose
+		// tasks waiting on that device may not park within the time given).
+		const held = this.virtio.held();
+		if (held) return Promise.reject(new Error(`snapshot: ${held} in flight (a program holds them)`));
 		for (const [i, d] of this.block.disks.entries()) {
 			const why = typeof d.snapshotSeal !== "function" ? "it does not support snapshots" : (() => {
 				try { d.snapshotState!(); return ""; } catch (e) { return (e as Error).message; }

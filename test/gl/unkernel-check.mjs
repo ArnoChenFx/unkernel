@@ -23,9 +23,10 @@
 //
 //   node test/gl/unkernel-check.mjs [--worker] [--size WxH] [--scenes LIST] [--skip a,b,c]
 //        [--state-ref FILE] [--out DIR] [--browser BIN] [--gl-flags FLAGS] [--timeout S] [--no-build]
+//   node test/gl/unkernel-check.mjs --drm [--eager | --fail [--glfail module]] ...
 //
 // --drm checks the virtio-gpu path instead (drm-page.js): a kernel with
-// kwvirtio (--kernel, default $KW_BUILD/drm-base/unkernel.wasm) and
+// kwvirtio (--kernel, default $KW_BUILD/bundle/unkernel.wasm) and
 // createKernel({ gl: true, gpu: true }), and in the guest, with no GL
 // environment variables:
 //
@@ -46,6 +47,22 @@
 //      and imported by a second opener names the same host resource
 //      (DRM_IOCTL_VIRTGPU_RESOURCE_INFO), and the host finds its texture
 //      (GlHost.gpu.texture()) with the pattern the importer uploaded
+//
+// and reports the renderer's status (vm.gl.status) and when the page
+// fetched virgl.mjs and virgl.wasm: by default the renderer loads on the
+// guest's first GL use, so neither is fetched by the time gl.ready
+// resolves (judged as "lazy"); --eager loads it before the boot
+// (createKernel({ gl: { eager: true } })). --fail checks the guest without
+// a renderer instead (step f; skips a to e unless --skip says otherwise):
+// with --glfail module the module URL does not exist, so the renderer
+// fails at the guest's first GL use (the device offered 3D); with
+// --gl-flags "--disable-webgl" (or another browser without WebGL2) the
+// probe before the boot finds no WebGL2 context and the device is 2D.
+// Either way it reports eglinfo on gbm and surfaceless, kmscube and the
+// kernel's messages, and judges test/gpu/kms-dumb.c (a dumb-buffer KMS
+// client, built here) and that GL programs did not get virgl.
+// --gl-delay S serves virgl.mjs S seconds late (a slow network), so the
+// first GL program's capset request waits that long for the renderer.
 //
 // Builds first, each skipped when done: dist (pnpm build, unless
 // --no-build), the disk ($KW_BUILD/gl/debian-gl.img), kwgl-state for the
@@ -74,11 +91,12 @@ const browser = opt("--browser", process.env.CHROMIUM || "chromium-headless");
 const out = resolve(opt("--out", "") || mkdtempSync("/tmp/kwgl."));
 mkdirSync(out, { recursive: true });
 const drm = has("--drm");
-const kernelFile = resolve(opt("--kernel", join(build, "drm-base/unkernel.wasm")));
+const kernelFile = resolve(opt("--kernel", join(build, "bundle/unkernel.wasm")));
 const disk = join(build, "gl/debian-gl.img");
 const distro = join(build, "distro/debian.erofs");
 const stateBin = join(build, "gl/kwgl-state-aarch64");
 const primeBin = join(out, "prime");
+const kmsDumbBin = join(out, "kms-dumb");
 
 const step = (what, cmd, cmdArgs) => {
 	console.log(`== ${what}`);
@@ -104,6 +122,7 @@ if (drm && !existsSync(kernelFile)) {
 	process.exit(2);
 }
 if (drm) step("test/gpu/prime.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", primeBin, join(root, "test/gpu/prime.c")]);
+if (drm && has("--fail")) step("test/gpu/kms-dumb.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", kmsDumbBin, join(root, "test/gpu/kms-dumb.c")]);
 
 const types = { ".html": "text/html", ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm" };
 let resolveResult;
@@ -159,6 +178,12 @@ const server = createServer(async (req, res) => {
 	if (p === "/img/unkernel.wasm" && drm) return sendFile(req, res, kernelFile, "application/wasm");
 	if (p === "/files/kwgl-state") return sendFile(req, res, stateBin, "application/octet-stream");
 	if (p === "/files/prime" && drm) return sendFile(req, res, primeBin, "application/octet-stream");
+	if (p === "/files/kms-dumb" && drm && existsSync(kmsDumbBin)) return sendFile(req, res, kmsDumbBin, "application/octet-stream");
+	// --gl-delay: the renderer's module, late (/slow/virgl.mjs; virgl.wasm next to it on time)
+	if (p === "/slow/virgl.mjs" || p === "/slow/virgl.wasm") {
+		if (p.endsWith(".mjs")) await new Promise((r) => setTimeout(r, Number(opt("--gl-delay", "0")) * 1000));
+		return sendFile(req, res, join(root, "dist", p.slice(6)), types[p.slice(p.lastIndexOf("."))]);
+	}
 	for (const [prefix, dir] of [["/dist/", join(root, "dist")], ["/test/", here]]) {
 		if (!p.startsWith(prefix)) continue;
 		const rel = normalize(p.slice(prefix.length));
@@ -171,7 +196,13 @@ const server = createServer(async (req, res) => {
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const query = new URLSearchParams();
 if (has("--worker")) query.set("worker", "1");
-for (const k of ["size", "scenes", "skip", "cmd"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
+for (const k of ["size", "scenes", "skip", "cmd", "glfail"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
+if (has("--eager")) query.set("eager", "1");
+if (opt("--gl-delay")) query.set("glmodule", "/slow/virgl.mjs");
+if (has("--fail")) {
+	query.set("fail", "1");
+	if (!opt("--skip")) query.set("skip", "a,b,c,d,e");
+}
 const url = `http://127.0.0.1:${server.address().port}/test/${drm ? "drm" : "unkernel"}.html?${query}`;
 console.log(`== ${url}\n   output in ${out}`);
 
@@ -260,7 +291,28 @@ if (res.steps.state) {
 
 /** The --drm steps (drm-page.js). */
 function judgeDrm(res) {
-	console.log(`renderer: ${res.renderer} (gl ready ${res.readyS} s after the page started)`);
+	console.log(`renderer: ${res.renderer ?? `none (gl.ready rejected: ${res.readyError})`} (booted ${res.bootS} s, gl ready ${res.readyS} s after the page started; option ${JSON.stringify(res.glOption)})`);
+	const st = res.status, first = res.fetches?.[0];
+	console.log(`renderer status: at boot ${res.statusAtBoot?.state}, at gl.ready ${res.statusAtReady?.state}, at the end ${st?.state}` +
+		`${st?.startedAt != null ? `; load started ${(st.startedAt / 1000).toFixed(2)} s after the page started, took ${(st.loadMs / 1000).toFixed(2)} s` : ""}` +
+		`${st?.error ? `; error: ${st.error}` : ""}; virgl fetches: at boot ${res.fetchesAtBoot?.length ?? "?"}, at gl.ready ${res.fetchesAtReady?.length ?? "?"}, in all ${JSON.stringify(res.fetches)}`);
+	if (res.glOption === true && !has("--fail"))
+		report("lazy", res.statusAtBoot?.state === "idle" && res.statusAtReady?.state === "idle" && !res.fetchesAtReady?.length && (!first || first.startMs >= st.startedAt),
+			`no renderer fetch before the guest's first GL use (first fetch ${first ? `${first.startS} s, the load started ${(st.startedAt / 1000).toFixed(2)} s` : "never"})`);
+	if (res.glOption?.eager) report("eager", res.statusAtReady?.state === "ready" && !!res.fetchesAtBoot?.length, `renderer ready at gl.ready, ${(st.loadMs / 1000).toFixed(2)} s to load, fetched at ${res.fetches?.map((f) => `${f.file} ${f.startS} s`).join(", ")}`);
+	if (res.steps["fail-kms-dumb"]) {
+		const kd = res.steps["fail-kms-dumb"];
+		report("fail: kms-dumb (2D KMS)", kd.exitCode === 0 && /kms-dumb: ready \d+x\d+/.test(kd.stdout), kd.stdout.trim().split("\n").slice(-3).join("; "));
+		for (const n of ["fail-eglinfo-gbm", "fail-eglinfo-surfaceless"]) {
+			const e = res.steps[n];
+			const r = /OpenGL ES profile renderer: (.*)/.exec(e.stdout)?.[1] ?? "?";
+			report(n.replace("fail-", "fail: "), !/^virgl/.test(r), `exit ${e.exitCode}, GLES renderer "${r}"`);
+			console.log(`--- ${n}:\n${e.stdout.trim()}`);
+		}
+		console.log(`--- fail-kmscube (exit ${res.steps["fail-kmscube"].exitCode}):\n${res.steps["fail-kmscube"].stdout.trim()}`);
+		console.log(`--- fail-dmesg:\n${res.steps["fail-dmesg"].stdout.trim()}`);
+		console.log(`3D on the device: ${res.hasGpu3d}`);
+	}
 	if (res.steps.cmd) console.log(`--cmd (exit ${res.steps.cmd.exitCode}):\n${res.steps.cmd.stdout}${res.steps.cmd.stderr}`);
 	const dd = res.steps.drmdevice;
 	if (dd) report("drmdevice", dd.exitCode === 0 && /renderD128/.test(dd.stdout) && /platform/i.test(dd.stdout),

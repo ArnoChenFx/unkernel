@@ -9,8 +9,9 @@
 // and is kept in localStorage. The
 // CPUs slider is disabled, with the reason, where the page cannot boot more
 // than one (config.ts smpBlocker()). Distro (?distro=) lists the page's images and none.
-// Guest GL (?gl=1) is disabled, unticked, with the reason, where the page cannot offer it
-// (config.ts glBlocker()) or the Distro chosen is not one of GL_DISTROS; its stored value stays.
+// Guest GL (?gl=, on by default where the display is) is disabled, unticked, with the reason,
+// where the page cannot offer it (config.ts glBlocker()) or the Distro chosen is not one of
+// GL_DISTROS; its stored value stays.
 // Suspend in the background (?autosuspend=, autosuspend.ts) offers off, at once, 30 s and 5 min,
 // plus a ?autosuspend= of other seconds; this device's default is marked.
 //
@@ -187,7 +188,8 @@ export function Options() {
 
 	// Guest GL: Debian only, and only where the page has the renderer and WebGL2.
 	const glOff = cfg.glBlocked ?? (GL_DISTROS.includes(o.distro) ? null : `${GL_DISTROS.join(", ")} only (its Mesa has the virgl driver)`);
-	const glNote = glOff ? `Off: ${glOff}` : cfg.glWhy ? `This boot runs without it: ${cfg.glWhy}` : "guest Mesa on this browser's WebGL2 (virgl)";
+	const glNote = glOff ? `Off: ${glOff}` : cfg.glWhy ? `This boot runs without it: ${cfg.glWhy}`
+		: "guest Mesa on this browser's WebGL2 (virgl), through /dev/dri (virtio-gpu); loaded on first use";
 
 	// Enter in a text field reboots, like the button.
 	const enter = (e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); ui.reboot(); } };

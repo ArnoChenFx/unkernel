@@ -16,7 +16,7 @@
 //   worker mode frame() is the latest frame the worker sent (or put in the
 //   shared frame buffer): it is painted only when frameSeq says it is new,
 //   and each animation frame asks for the next. While a GL client has
-//   virtio-gpu's scanout (gl and gpu, not offered by the page yet), the
+//   virtio-gpu's scanout (gl and gpu: the Guest GL option), the
 //   picture is the renderer's latest frame (gl.gpu.drawFrame(): an
 //   ImageBitmap of its WebGL2 canvas, no readback), in both modes;
 // - mouse, absolute: while a program has the tablet (event2) open, e.g. X,

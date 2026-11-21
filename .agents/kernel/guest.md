@@ -91,8 +91,9 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   (`/run/kw/bin`, then `~/.local/bin` first on PATH, the sbin directories
   where the distro leaves them out for users (Debian), `/usr/lib/kw/bin`
   last, below), `/etc/profile.d/kw-gl.sh` (with `kw.gl=1` on the command
-  line, which the page's GL option adds: `GALLIUM_DRIVER=virpipe
-  LIBGL_ALWAYS_SOFTWARE=1`, so Mesa renders through the host's WebGL2;
+  line, which the page's GL option adds, and no DRM render node:
+  `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1`, so Mesa renders
+  through the host's WebGL2 over vtest; with `/dev/dri` it sets nothing;
   gl.md), `/etc/profile.d/kw-term.sh
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
@@ -411,6 +412,9 @@ The files are in `guest/distro/alpine/rootfs/`.
   and `20-kw-input.conf` (the kw layer) name the fbdev
   driver and the evdev keyboard, mouse and tablet; `apk add xorg-server
   xf86-video-fbdev xf86-input-evdev` and `X :0` use them.
+  `/etc/X11/kw-kms.conf`, not read by default, names the modesetting
+  driver with glamor on `/dev/dri/card0` instead (gl.md, The DRM path):
+  `Xorg :0 -config kw-kms.conf`.
 - **Data disk**: the base mounts a `kwdata` disk at `/data` and keeps the
   root's changes in `/data/distros/alpine/` (data-disk.md).
 - **Known upstream crash, not ours**: `time nosuchcmd` prints status 127

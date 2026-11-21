@@ -68,7 +68,8 @@ export interface WorkerBootSpec {
 	 * virtio-gpu (gpu option): the device model runs in the worker, next to
 	 * the kernel; 2D frames come as the display's. "virgl": with 3D, whose
 	 * renderer is on the owner (gl-gpu.ts): the worker's VirglGpuBackend
-	 * sends "gpu" requests and gets "gpu-init" and "gpu-reply".
+	 * sends "gpu-start" (the guest's first 3D use) and "gpu" requests, and
+	 * gets "gpu-init" (once the renderer is up) and "gpu-reply".
 	 */
 	gpu?: boolean | "virgl";
 	/**
@@ -203,6 +204,8 @@ export type FromWorker =
 	| { t: "vsock"; packets: Uint8Array[] }
 	/** virtio-gpu 3D: a command for the owner's renderer (data transferred), answered by "gpu-reply" when it has a rid. */
 	| { t: "gpu"; req: GpuRequest; rid?: number }
+	/** virtio-gpu 3D: the guest's first 3D use: load the renderer if it is not loaded or loading ("gpu-init" follows). */
+	| { t: "gpu-start" }
 	/** virtio-gpu 3D: the driver reset the device. */
 	| { t: "gpu-reset" }
 	/** The kernel's kwvsock started (VsockDevice onInit). */

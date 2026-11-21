@@ -11,16 +11,21 @@
 //   host:  this thread's VsockHost -> StreamHost (gl-stream.ts) -> renderer
 //          (Module.virgl.Renderer of virgl.mjs, gl/wasm/post.js) -> WebGL2
 //
-// GlHost loads the module (only now: users without `gl` never fetch it),
-// makes the WebGL2 context on an OffscreenCanvas (1x1: every frame goes to
-// the renderer's own framebuffers and back by readback), listens on the
-// port once the renderer is up, and then starts the forwarder through kwtty
-// as root (`vtest-bridge bridge --link vsock:2:1019 --daemon`, which exits
-// at once when one already runs, as after a restore). The forwarder
-// reconnects every second while the link is down, so a restored guest finds
-// the new host by itself. Renderer state (the clients' GL contexts) is not
-// in a snapshot: a restore resets the link, which ends the guest's GL
-// clients.
+// GlHost serves vsock port 1019 and starts the guest's forwarder through
+// kwtty as root (`vtest-bridge bridge --link vsock:2:1019 --daemon`, which
+// exits at once when one already runs, as after a restore) right after the
+// boot. The renderer (GlLoader: the module, fetched only with `gl`, and a
+// WebGL2 context on an OffscreenCanvas, 1x1: every frame goes to the
+// renderer's own framebuffers and back by readback) is loaded on the
+// guest's first GL use: the first vtest client (an OPEN on the forwarder's
+// link; LazyVtestRenderer holds its bytes meanwhile) or virtio-gpu's first
+// GET_CAPSET or 3D command (gl-gpu.ts). So a guest that never runs a GL
+// program costs nothing but the forwarder. `gl.eager` loads it before the
+// kernel boots instead, and a failure then rejects `ready` up front. The
+// forwarder reconnects every second while the link is down, so a restored
+// guest finds the new host by itself. Renderer state (the clients' GL
+// contexts) is not in a snapshot: a restore resets the link, which ends the
+// guest's GL clients.
 //
 // Both modes: vsock is served on the thread that owns the VM (worker mode
 // too), so GL runs there, which must have OffscreenCanvas and WebGL2 (a
@@ -29,10 +34,13 @@
 //
 // With `gpu` too (createKernel({ gl, gpu })), the same module and WebGL2
 // context also serve the guest's virtio-gpu device in 3D (gl-gpu.ts): one
-// renderer for both paths, made before the kernel boots (prepareGpuGl), as
-// the device offers virgl when the driver probes. `gpu` without `gl`, or
-// where there is no WebGL2, is the 2D device. GlHost.gpu is that side: the
-// scanout's frames (drawFrame()) and resources' textures.
+// renderer for both paths. The device offers virgl and its capsets'
+// sizes when the driver probes, which needs no renderer (VIRGL_CAPSETS);
+// before boot only a WebGL2 context is tried and dropped (probeWebGl2(): a
+// few ms), so that a browser without one gets the 2D device rather than a
+// 3D one that fails at first use. `gpu` without `gl`, or where there is no
+// WebGL2, is the 2D device. GlHost.gpu is that side: the scanout's frames
+// (drawFrame()) and resources' textures.
 
 import { PtyError } from "./tty.ts";
 import { StreamHost, type StreamHostStats, type VirglTotals, type VtestRenderer } from "./gl-stream.ts";
@@ -68,6 +76,15 @@ export interface GlOptions {
 	 */
 	forwarder?: boolean;
 	/**
+	 * Load the renderer (fetch and compile the module, make its WebGL2
+	 * context) before the kernel boots, as the guest's first GL use would,
+	 * so that a failure shows up front (`ready` rejects). Default false: on
+	 * the guest's first GL use (a vtest client, or virtio-gpu's first capset
+	 * or 3D command), which then waits for it; `status` and `load()` tell
+	 * and start it.
+	 */
+	eager?: boolean;
+	/**
 	 * The wasm renderer answers every waiting busy wait as vtest does: once
 	 * the fences submitted before it have retired, which WebGL tells only
 	 * between tasks. Default false: it answers at once where that cannot
@@ -86,8 +103,8 @@ export type GlOption = boolean | GlOptions;
 
 /**
  * KernelHandle.gl.stats: bridges and clients, the renderer's counters
- * (`renderer`, VirglTotals; virtio-gpu's commands count there too) and,
- * with `gpu`, the virtio-gpu side's (`gpu`).
+ * (`renderer`, VirglTotals, once it is loaded; virtio-gpu's commands count
+ * there too) and, with `gpu`, the virtio-gpu side's (`gpu`).
  */
 export interface GlStats extends StreamHostStats {
 	gpu?: GpuRendererStats;
@@ -95,17 +112,50 @@ export interface GlStats extends StreamHostStats {
 
 export type { VirglTotals };
 
+/** Where the renderer is (KernelHandle.gl.status). */
+export interface GlRendererStatus {
+	/**
+	 * "idle": not loaded yet, it loads on the guest's first GL use; "loading";
+	 * "ready"; "failed": it cannot be had (`error` says why), and the guest's
+	 * GL programs get no renderer (with virtio-gpu, Mesa falls back to
+	 * software rendering).
+	 */
+	state: "idle" | "loading" | "ready" | "failed";
+	/** Loaded before the kernel booted (gl.eager), not on first use. */
+	eager: boolean;
+	/** performance.now() when the load started, or null. */
+	startedAt: number | null;
+	/** How long the load took (the module's fetch and compile, the WebGL2 context, the renderer's start), in ms, or null. */
+	loadMs: number | null;
+	/** Why it failed, or null. */
+	error: string | null;
+	/** Once ready: the renderer ("virglrenderer (wasm) on WebGL 2.0 ...") and the WebGL2 implementation (WEBGL_debug_renderer_info). */
+	what: string | null;
+	webgl: string | null;
+}
+
 /** The host side of guest GL (KernelHandle.gl). */
 export class GlHost {
 	/**
 	 * Resolves with the renderer's description once guest GL programs can
-	 * run: the renderer is up, and (unless `forwarder: false`, which
-	 * resolves once it listens) the guest's forwarder is linked and has made
-	 * its vtest socket. Rejects if that cannot happen (also logged).
+	 * run: the host listens and (unless `forwarder: false`) the guest's
+	 * forwarder is linked and has made its vtest socket. With the default
+	 * lazy loading the renderer itself is not loaded then (`status`,
+	 * `loaded`); with `eager` it is, and its description is in the string.
+	 * Rejects if that cannot happen (also logged).
 	 */
 	readonly ready: Promise<string>;
+	/**
+	 * Settles once the renderer is loaded ("<renderer>; <WebGL2
+	 * implementation>"), on the guest's first GL use, or at once with
+	 * `eager` or load(); rejects if it cannot be (logged). Never settles
+	 * while the guest uses no GL.
+	 */
+	readonly loaded: Promise<string>;
 	#vsock: Vsock | undefined;
 	#gpu: GpuRenderer | undefined;
+	#loader: GlLoader | undefined;
+	#custom: VtestRenderer | undefined;
 	#log: (msg: string) => void;
 	#host: StreamHost | undefined;
 	#listener: VsockListener | undefined;
@@ -114,11 +164,15 @@ export class GlHost {
 	#linked!: () => void;
 
 	/** @internal Use createKernel({ gl }). */
-	constructor(vsock: Vsock | undefined, opts: GlOptions, module: string | undefined, log: (msg: string) => void, start?: GpuGlStart) {
+	constructor(vsock: Vsock | undefined, prep: GlPrep, log: (msg: string) => void) {
 		this.#vsock = vsock;
-		this.#gpu = start?.gpu;
+		this.#gpu = prep.gpu;
+		this.#loader = prep.loader;
+		this.#custom = prep.opts.renderer;
 		this.#log = log;
-		this.ready = this.#start(opts, module, start);
+		this.loaded = this.#loader ? this.#loader.loaded.then((c) => describe(c)) : this.#custom ? Promise.resolve("custom renderer") : Promise.reject(new Error("no renderer"));
+		this.loaded.catch(() => {});
+		this.ready = this.#start(prep.opts);
 		this.ready.catch((e) => log(`[host] gl: ${(e as Error)?.message ?? e}; the guest gets no GL renderer`));
 	}
 
@@ -126,6 +180,18 @@ export class GlHost {
 	get stats(): GlStats {
 		const s: GlStats = this.#host?.stats ?? { streams: 0, clients: 0, opened: 0 };
 		return this.#gpu ? { ...s, gpu: { ...this.#gpu.stats } } : s;
+	}
+
+	/** Where the wasm renderer is: not loaded yet, loading, ready (with how long the load took), failed. */
+	get status(): GlRendererStatus {
+		if (this.#loader) return { ...this.#loader.status };
+		return { state: "ready", eager: true, startedAt: null, loadMs: null, error: null, what: "custom renderer (gl.renderer)", webgl: null };
+	}
+
+	/** Load the renderer now, as the guest's first GL use would (nothing if it is loaded or loading); resolves as `loaded`. */
+	load(): Promise<string> {
+		this.#loader?.load().catch(() => {});
+		return this.loaded;
 	}
 
 	/**
@@ -139,20 +205,29 @@ export class GlHost {
 		return this.#gpu;
 	}
 
-	async #start(opts: GlOptions, module: string | undefined, start: GpuGlStart | undefined): Promise<string> {
-		const core = opts.renderer ? undefined : await (start?.core ?? loadGlCore(module!, this.#log));
-		if (core && !this.#vsock) {
+	async #start(opts: GlOptions): Promise<string> {
+		const loader = this.#loader;
+		if (loader?.status.state === "failed") throw new Error(loader.status.error ?? "no renderer");
+		// Eager: up now, or the reason it is not (the loader may have started before the kernel booted).
+		const core = loader && (opts.eager ? await loader.load() : null);
+		if (!this.#vsock) {
 			// virtio-gpu alone (no vsock: no vtest link).
-			await this.#gpu?.init;
-			return `virglrenderer (wasm) on ${core.gl.getParameter(core.gl.VERSION)}; ${webglName(core.gl)}; virtio-gpu only`;
+			return core ? `${describe(core)}; virtio-gpu only` : "virglrenderer (wasm), loaded on first use; virtio-gpu only";
 		}
-		const renderer = opts.renderer ?? new core!.module.virgl.Renderer(core!.gl, { strictWaits: opts.strictWaits ?? false });
-		let what = await renderer.init();
-		if (core) what += `; ${webglName(core.gl)}`;
+		let renderer: VtestRenderer;
+		let what: string;
+		if (this.#custom) {
+			renderer = this.#custom;
+			what = await renderer.init();
+		} else {
+			renderer = new LazyVtestRenderer(loader!, opts.strictWaits ?? false);
+			what = core ? describe(core) : "virglrenderer (wasm), loaded on the guest's first GL use";
+			await renderer.init();
+		}
 		if (this.#gpu) what += "; virtio-gpu 3D";
 		if (this.#down) throw new Error("the kernel exited");
 		this.#host = new StreamHost(renderer);
-		this.#listener = this.#vsock!.listen(GL_PORT, (conn) => this.#serve(conn));
+		this.#listener = this.#vsock.listen(GL_PORT, (conn) => this.#serve(conn));
 		this.#log(`[host] gl: ${what}, on vsock port ${GL_PORT}`);
 		if (opts.forwarder ?? true) {
 			// The forwarder logs this over the link once it has its vtest socket.
@@ -218,6 +293,14 @@ interface GlCore extends GpuRendererCore {
 	module: VirglModule;
 }
 
+/** The renderer and the WebGL2 implementation, for the log and `loaded`. */
+function describe(c: GlCore): string {
+	return `virglrenderer (wasm) on ${c.gl.getParameter(c.gl.VERSION)}; ${webglName(c.gl)}`;
+}
+
+/** The WebGL2 context's attributes (the probe's and the renderer's). */
+const WEBGL_ATTRS: WebGLContextAttributes = { alpha: false, depth: false, stencil: false, antialias: false, powerPreference: "high-performance" };
+
 /**
  * Load the module and start its renderer on a WebGL2 context of an
  * OffscreenCanvas (1x1: vrend draws into its own framebuffers; virtio-gpu
@@ -228,41 +311,167 @@ async function loadGlCore(url: string, log: (msg: string) => void): Promise<GlCo
 	const mod = await import(/* @vite-ignore */ url) as { default: (o: object) => Promise<VirglModule> };
 	const say = (s: string) => log(`[gl] virgl: ${s}`);
 	const Module = await mod.default({ print: say, printErr: say });
-	const gl = new OffscreenCanvas(1, 1).getContext("webgl2", {
-		alpha: false, depth: false, stencil: false, antialias: false, powerPreference: "high-performance",
-	});
+	const gl = new OffscreenCanvas(1, 1).getContext("webgl2", WEBGL_ATTRS);
 	if (!gl) throw new Error("no WebGL2 context (OffscreenCanvas.getContext(\"webgl2\") gave none)");
 	gl.canvas.addEventListener("webglcontextlost", () => log("[host] gl: the WebGL2 context was lost; GL clients will fail"));
 	Module.virgl.init(gl);
 	return { module: Module, gl, gpu: Module.virgl.gpu };
 }
 
-/** @internal What prepareGpuGl() made before the kernel boots: the shared renderer and virtio-gpu's side of it. */
-export interface GpuGlStart {
-	core: Promise<GlCore>;
-	gpu: GpuRenderer;
+/**
+ * Whether this thread gives a WebGL2 context: "" if it does, else why not.
+ * The context is dropped at once (WEBGL_lose_context): a WebGL context
+ * that is merely made costs the GPU process a context, not the renderer.
+ */
+export function probeWebGl2(): string {
+	if (typeof OffscreenCanvas !== "function") return "no WebGL2 on this thread (no OffscreenCanvas)";
+	try {
+		const gl = new OffscreenCanvas(1, 1).getContext("webgl2", WEBGL_ATTRS);
+		if (!gl) return "no WebGL2 context (OffscreenCanvas.getContext(\"webgl2\") gave none: WebGL is off or the GPU is blocklisted)";
+		gl.getExtension("WEBGL_lose_context")?.loseContext();
+		return "";
+	} catch (e) {
+		return `no WebGL2 context (${(e as Error)?.message ?? e})`;
+	}
 }
 
 /**
- * @internal createKernel({ gl, gpu }): the renderer for virtio-gpu 3D, made
- * before the kernel boots (the device offers virgl when the driver probes,
- * and its capsets come from this WebGL2 context), or undefined with a log
- * line where there can be none (the device is then 2D).
+ * @internal The wasm renderer, loaded once, on the first load(): the
+ * guest's first GL use (a vtest client, virtio-gpu's first capset or 3D
+ * command), GlHost.load(), or before boot with `eager`.
  */
-export function prepareGpuGl(opt: GlOption | undefined, defaultModule: URL | undefined, log: (msg: string) => void): GpuGlStart | undefined {
-	if (!opt) return undefined;
-	const opts: GlOptions = opt === true ? {} : opt;
-	const module = opts.module ?? defaultModule;
-	const why = opts.renderer ? "gl.renderer is a vtest renderer, which virtio-gpu cannot use"
-		: typeof OffscreenCanvas !== "function" ? "no WebGL2 on this thread (no OffscreenCanvas)"
-		: !module ? "no renderer module (pass gl.module)" : "";
-	if (why) {
-		log(`[host] gpu: 2D only: ${why}`);
-		return undefined;
+export class GlLoader {
+	readonly status: GlRendererStatus;
+	readonly loaded: Promise<GlCore>;
+	#url: string;
+	#log: (msg: string) => void;
+	#settle!: { resolve: (c: GlCore) => void; reject: (e: Error) => void };
+	#started = false;
+
+	/** `failed`: it cannot be had at all (no WebGL2 context when probed), so load() rejects with that. */
+	constructor(url: string, log: (msg: string) => void, eager: boolean, failed?: string) {
+		this.#url = url;
+		this.#log = log;
+		this.status = { state: failed ? "failed" : "idle", eager, startedAt: null, loadMs: null, error: failed || null, what: null, webgl: null };
+		this.loaded = new Promise<GlCore>((resolve, reject) => (this.#settle = { resolve, reject }));
+		this.loaded.catch(() => {});
+		if (failed) {
+			this.#started = true;
+			this.#settle.reject(new Error(failed));
+		}
 	}
-	const core = loadGlCore(String(module), log);
-	core.catch(() => {});
-	return { core, gpu: new GpuRenderer(core, { strictWaits: opts.strictWaits, log }) };
+
+	load(): Promise<GlCore> {
+		if (this.#started) return this.loaded;
+		this.#started = true;
+		const st = this.status, t0 = performance.now();
+		st.state = "loading";
+		st.startedAt = t0;
+		if (!st.eager) this.#log("[host] gl: the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context)");
+		loadGlCore(this.#url, this.#log).then((c) => {
+			st.loadMs = performance.now() - t0;
+			st.state = "ready";
+			st.webgl = webglName(c.gl);
+			st.what = `virglrenderer (wasm) on ${c.gl.getParameter(c.gl.VERSION)}`;
+			this.#log(`[host] gl: renderer loaded in ${(st.loadMs / 1000).toFixed(2)} s: ${st.what}; ${st.webgl}`);
+			this.#settle.resolve(c);
+		}, (e: unknown) => {
+			st.loadMs = performance.now() - t0;
+			st.state = "failed";
+			st.error = (e as Error)?.message ?? String(e);
+			this.#log(`[host] gl: the renderer did not load: ${st.error}`);
+			this.#settle.reject(e instanceof Error ? e : new Error(st.error));
+		});
+		return this.loaded;
+	}
+}
+
+/**
+ * The vtest link's renderer, made from the loaded module on the first
+ * client (an OPEN on the forwarder's link), which starts the load. Until
+ * then clients are only noted, and their bytes wait (feed() returns a
+ * promise, so StreamHost reads no more from the link and vsock credit holds
+ * the forwarder). If the renderer cannot be had, each client is closed
+ * (the guest's Mesa sees its vtest socket end).
+ */
+class LazyVtestRenderer implements VtestRenderer {
+	onreply: (id: number, bytes: Uint8Array) => void = () => {};
+	onclose: (id: number, why: string) => void = () => {};
+	#loader: GlLoader;
+	#strict: boolean;
+	#real: VtestRenderer | null = null;
+	#failed: string | null = null;
+	#ready: Promise<VtestRenderer> | null = null;
+	#opened = new Set<number>();
+
+	constructor(loader: GlLoader, strictWaits: boolean) {
+		this.#loader = loader;
+		this.#strict = strictWaits;
+		// Loaded for virtio-gpu (or eagerly): made now too, so that totals() counts from then on.
+		loader.loaded.then(() => void this.#start().catch(() => {}), () => {});
+	}
+
+	async init(): Promise<string> {
+		return "virglrenderer (wasm), loaded on first use";
+	}
+
+	#start(): Promise<VtestRenderer> {
+		this.#ready ??= this.#loader.load().then(async (c) => {
+			const r = new c.module.virgl.Renderer(c.gl, { strictWaits: this.#strict });
+			await r.init();
+			r.onreply = (id, b) => this.onreply(id, b);
+			r.onclose = (id, why) => this.onclose(id, why);
+			this.#real = r;
+			for (const id of this.#opened) r.open(id);
+			this.#opened.clear();
+			return r;
+		}, (e: unknown) => {
+			this.#failed = (e as Error)?.message ?? String(e);
+			const ids = [...this.#opened];
+			this.#opened.clear();
+			for (const id of ids) this.onclose(id, `no renderer: ${this.#failed}`);
+			throw e;
+		});
+		return this.#ready;
+	}
+
+	open(id: number): void {
+		if (this.#real) return this.#real.open(id);
+		if (this.#failed) {
+			const why = this.#failed;
+			queueMicrotask(() => this.onclose(id, `no renderer: ${why}`));
+			return;
+		}
+		this.#opened.add(id);
+		this.#start().catch(() => {});
+	}
+
+	feed(id: number, bytes: Uint8Array): unknown {
+		if (this.#real) return this.#real.feed(id, bytes);
+		if (this.#failed || !this.#ready) return undefined;
+		// Busy until the renderer is up; then these bytes go first.
+		return this.#ready.then((r) => r.feed(id, bytes), () => {});
+	}
+
+	close(id: number): void {
+		if (this.#real) return this.#real.close(id);
+		this.#opened.delete(id);
+	}
+
+	stats(id: number): { parks: number; parkedMs: number } | undefined {
+		return this.#real?.stats?.(id);
+	}
+
+	totals(): VirglTotals | undefined {
+		return this.#real?.totals?.();
+	}
+}
+
+/** @internal What createKernel({ gl }) prepared before the kernel boots: the options, the renderer's loader, virtio-gpu's side. */
+export interface GlPrep {
+	opts: GlOptions;
+	loader?: GlLoader;
+	gpu?: GpuRenderer;
 }
 
 /** The WebGL2 implementation's name (WEBGL_debug_renderer_info), for the log. */
@@ -273,25 +482,62 @@ function webglName(gl: WebGL2RenderingContext): string {
 
 /**
  * @internal createKernel's `gl` (both modes, on the thread that owns the
- * VM): a GlHost, or undefined with a log line where GL cannot be had.
- * `defaultModule` is the platform's virgl.mjs (web entry only).
+ * VM), before the kernel boots: the renderer's loader (started now with
+ * `eager`; else only a WebGL2 context is tried, probeWebGl2()) and, with
+ * `gpu`, virtio-gpu's renderer side, or undefined with a log line where GL
+ * cannot be had. `defaultModule` is the platform's virgl.mjs (web entry
+ * only). `restoring`: a snapshot resumes, whose device offered 3D if it
+ * was made where this could load; then the probe is skipped, so the device
+ * offers 3D again (a failure shows at the guest's next 3D use).
  */
-export function startGl(opt: GlOption | undefined, vsock: Vsock | undefined, defaultModule: URL | undefined, log: (msg: string) => void, start?: GpuGlStart): GlHost | undefined {
+export function prepareGl(opt: GlOption | undefined, gpu: boolean, vsock: boolean, defaultModule: URL | undefined, log: (msg: string) => void, restoring = false): GlPrep | undefined {
 	if (!opt) return undefined;
 	const opts: GlOptions = opt === true ? {} : opt;
-	if (start) return new GlHost(vsock, opts, undefined, log, start);
-	if (!vsock) {
+	const module = opts.module ?? defaultModule;
+	if (opts.renderer) {
+		if (gpu) log("[host] gpu: 2D only: gl.renderer is a vtest renderer, which virtio-gpu cannot use");
+		if (!vsock) {
+			log("[host] gl: needs the vsock device (vsock: false was given, or vsock.raw); the guest gets no GL renderer");
+			return undefined;
+		}
+		return { opts };
+	}
+	const why = typeof OffscreenCanvas !== "function" ? "no WebGL2 on this thread (no OffscreenCanvas; Node has none)"
+		: !module ? "no renderer module (this entry bundles none; pass gl.module, the URL of virgl.mjs)" : "";
+	if (why) {
+		if (gpu) log(`[host] gpu: 2D only: ${why}`);
+		log(`[host] gl: ${why}, so it is ignored${typeof OffscreenCanvas !== "function" ? "; pass gl.renderer to use a renderer of your own" : ""}`);
+		return undefined;
+	}
+	if (!vsock && !gpu) {
 		log("[host] gl: needs the vsock device (vsock: false was given, or vsock.raw); the guest gets no GL renderer");
 		return undefined;
 	}
-	const module = opts.module ?? defaultModule;
-	if (!opts.renderer && typeof OffscreenCanvas !== "function") {
-		log("[host] gl: no WebGL2 on this thread (no OffscreenCanvas; Node has none), so it is ignored; pass gl.renderer to use a renderer of your own");
-		return undefined;
+	const eager = !!opts.eager;
+	let failed = "";
+	if (!eager && !restoring) {
+		const t0 = performance.now();
+		failed = probeWebGl2();
+		const ms = (performance.now() - t0).toFixed(1);
+		log(failed ? `[host] gl: ${failed} (probed in ${ms} ms): no renderer` : `[host] gl: WebGL2 is there (probed in ${ms} ms); the renderer loads on the guest's first GL use`);
 	}
-	if (!opts.renderer && !module) {
-		log("[host] gl: no renderer module (this entry bundles none; pass gl.module, the URL of virgl.mjs), so it is ignored");
-		return undefined;
+	const loader = new GlLoader(String(module), log, eager, failed || undefined);
+	if (eager) loader.load().catch(() => {});
+	if (!gpu) return { opts, loader };
+	if (failed) {
+		log(`[host] gpu: 2D only: ${failed}`);
+		return { opts, loader };
 	}
-	return new GlHost(vsock, opts, module === undefined ? undefined : String(module), log);
+	const renderer = new GpuRenderer(() => loader.load(), { strictWaits: opts.strictWaits, log });
+	if (eager) renderer.start();
+	return { opts, loader, gpu: renderer };
+}
+
+/**
+ * @internal createKernel's `gl` once the kernel runs: a GlHost, or
+ * undefined where prepareGl() found GL could not be had.
+ */
+export function startGl(prep: GlPrep | undefined, vsock: Vsock | undefined, log: (msg: string) => void): GlHost | undefined {
+	if (!prep) return undefined;
+	return new GlHost(vsock, prep, log);
 }

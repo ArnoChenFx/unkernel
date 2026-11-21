@@ -33,8 +33,8 @@ export interface VtestRenderer {
 	onclose: (id: number, why: string) => void;
 	/** How often and how long the client's busy waits were parked. */
 	stats?(id: number): { parks: number; parkedMs: number } | undefined;
-	/** Counters over all clients since init (the wasm renderer: VirglTotals). */
-	totals?(): VirglTotals;
+	/** Counters over all clients since init (the wasm renderer: VirglTotals), or undefined while there are none (a renderer not loaded yet). */
+	totals?(): VirglTotals | undefined;
 }
 
 /**

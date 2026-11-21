@@ -98,6 +98,15 @@ const double *kw_virgl_stats(void);
 // Run one control command (a copy, header first) with the transfer's
 // packed DATA: 0, or the virtio-gpu response type of the error.
 int kw_vgpu_command(const uint8_t *cmd, uint32_t len, uint8_t *data, uint32_t data_len);
+// The capsets the device offers before the renderer is up (the SDK's
+// VIRGL_CAPSETS, js/core/gl-gpu.ts, has the same numbers and checks the
+// module's capsets against them): VIRTGPU_DRM_CAPSET_VIRGL (1) and VIRGL2
+// (2), each with virglrenderer's max version and size (struct
+// virgl_caps_v1, v2; kw_virgl.c checks the sizes at compile time).
+#define KW_VGPU_CAPSET_VIRGL_VERSION 1
+#define KW_VGPU_CAPSET_VIRGL_SIZE 308
+#define KW_VGPU_CAPSET_VIRGL2_VERSION 2
+#define KW_VGPU_CAPSET_VIRGL2_SIZE 1408
 // A capset as the guest gets it: its size (0: none) or a negative errno.
 int kw_vgpu_capset(uint32_t id, uint8_t *out, uint32_t cap, uint32_t *max_version);
 // A virgl format's blocks: width | height << 8 | bytes << 16, or 0.

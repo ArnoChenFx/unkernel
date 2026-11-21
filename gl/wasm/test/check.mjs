@@ -5,8 +5,10 @@
 // virglrenderer build and exit 0 when the module loaded, the renderer started
 // on WebGL2, answered the capability queries, answered a waiting busy wait
 // ahead of its fence and parked and answered a second, and served two clients of the inline dialect (index.html says
-// what each stage does); 1 otherwise; 2 when it could not run (no build, no
-// browser, timeout). Prints the page's JSON result.
+// what each stage does), and virtio-gpu's capsets have the ids, versions and
+// sizes the SDK's device offers before the module is loaded (VIRGL_CAPSETS,
+// js/core/gl-gpu.ts, passed to the page); 1 otherwise; 2 when it could not
+// run (no build, no browser, timeout). Prints the page's JSON result.
 //
 //   node gl/wasm/test/check.mjs [--out DIR] [--browser BIN] [--timeout S] [--keep-log] [--glcheck]
 //
@@ -80,7 +82,10 @@ const server = createServer(async (req, res) => {
   res.end();
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const url = `http://127.0.0.1:${server.address().port}/test/index.html?report=1${args.includes('--glcheck') ? '&glcheck=1' : ''}`;
+// The capsets the SDK's device offers without the module (id:version:size,...).
+const { VIRGL_CAPSETS } = await import(join(root, 'js/core/gl-gpu.ts'));
+const capsets = VIRGL_CAPSETS.map((c) => `${c.id}:${c.version}:${c.size}`).join(',');
+const url = `http://127.0.0.1:${server.address().port}/test/index.html?report=1&capsets=${capsets}${args.includes('--glcheck') ? '&glcheck=1' : ''}`;
 
 // The flags of a WebGL2 that works headless here (ANGLE on SwiftShader).
 const chrome = spawn(browser, [

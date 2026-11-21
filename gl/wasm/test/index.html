@@ -15,7 +15,9 @@
   resource ids and move data through a texture; last, Module.virgl.Renderer
   (the renderer shape of gl/bridge) must answer a parked busy wait by itself,
   and virtio-gpu's entry (Module.virgl.gpu) must give a capset without the
-  transfers in the command stream, move packed data through a texture, and
+  transfers in the command stream (and, with ?capsets=id:version:size,...,
+  capsets of exactly those versions and sizes: what the SDK's device offers
+  before it loads the module, check.mjs passes them), move packed data through a texture, and
   present it to the canvas the right way up.
   The result goes into the page as
   JSON (<pre id=result>) and, when served by check.mjs, back to it by POST.
@@ -352,6 +354,15 @@ async function main() {
   const vw = new Uint32Array(vcaps.data.buffer, vcaps.data.byteOffset, vcaps.data.length / 4);
   const CAP_TRANSFER = 1 << 17, CAP_COPY_TRANSFER = 1 << 26;
   out.gpu = { capset: { version: vcaps.version, bytes: vcaps.data.length, capability_bits: '0x' + (vw[98] >>> 0).toString(16) } };
+  if (params.get('capsets')) {
+    out.gpu.offered = params.get('capsets');
+    for (const c of params.get('capsets').split(',')) {
+      const [id, version, size] = c.split(':').map(Number);
+      const got = g.capset(id);
+      if (!got || got.version !== version || got.data.length !== size)
+        throw new Error(`gpu: capset ${id} is ${got ? `version ${got.version}, ${got.data.length} bytes` : 'missing'}; the SDK offers version ${version}, ${size} bytes (VIRGL_CAPSETS)`);
+    }
+  }
   if (vw[98] & (CAP_TRANSFER | CAP_COPY_TRANSFER) || ((vw[98] | CAP_TRANSFER | CAP_COPY_TRANSFER) >>> 0) !== ((caps[98] | CAP_TRANSFER | CAP_COPY_TRANSFER) >>> 0))
     throw new Error(`gpu: capability bits 0x${vw[98].toString(16)} against vtest's 0x${caps[98].toString(16)}`);
   const vcmd = (type, ctx, words) => {

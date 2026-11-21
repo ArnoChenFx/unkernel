@@ -118,8 +118,9 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 	const post = (msg: FromWorker, transfer?: ArrayBuffer[]) => port.post(msg, transfer);
 
 	// virtio-gpu 3D: the renderer runs on the owner (gl-gpu.ts); commands go
-	// there as "gpu" messages (posted from inside the notify import), its
-	// capsets come in "gpu-init" and answers in "gpu-reply".
+	// there as "gpu" messages (posted from inside the notify import), the
+	// guest's first 3D use asks it to load with "gpu-start", its capsets come
+	// in "gpu-init" once it is up and answers in "gpu-reply".
 	let gpuInitDone!: (init: GpuInit) => void, gpuInitFail!: (e: Error) => void;
 	const gpuInit = new Promise<GpuInit>((res, rej) => ((gpuInitDone = res), (gpuInitFail = rej)));
 	gpuInit.catch(() => {});
@@ -134,6 +135,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 			post({ t: "gpu", req, rid }, gpuTransfer(req));
 		}),
 		post: (req) => post({ t: "gpu", req }, gpuTransfer(req)),
+		start: () => post({ t: "gpu-start" }),
 		reset: () => post({ t: "gpu-reset" }),
 	};
 

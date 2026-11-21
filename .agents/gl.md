@@ -2,8 +2,10 @@
 
 The design, what was measured, how to test, and what is open. It is in
 unkernel: `createKernel({ gl: true })` in a browser (unkernel, below), the
-page's Guest GL option, `?gl=1` (The page, below; web.md, Guest GL), and
-with `gpu: true` too a real `/dev/dri` with 3D (The DRM path, below). All
+page's Guest GL option, on by default on Debian (The page, below; web.md,
+Guest GL), and with `gpu: true` too a real `/dev/dri` with 3D (The DRM
+path, below). The renderer loads on the guest's first GL use (Loading on
+first use, below). All
 work happens on the `webgl` branch (this worktree). Do not change `main`,
 and do not commit until asked.
 
@@ -46,7 +48,7 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | --- | --- |
 | `gl/patches/virglrenderer/` | the one series on virglrenderer 1.3.0 (tag commit ca50e00), both builds; see Patches |
 | `gl/wasm/` | the wasm module: `build.sh` (emscripten pinned in `pins.sh`; also the `native` build), `kw_virgl.c`/`.h` (C API, GL context hooks, vtest I/O, the virtio-gpu entry `kw_vgpu_*`), `kw_gl.js` (GL entry points made from WebGL2), `gl-missing.txt` (the stubs), `epoxy/` (libepoxy stand-in), `post.js` (`Module.virgl`, the page's renderer, `Module.virgl.gpu`); see WebGL2 |
-| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, busy waits (one answered ahead of its fence, one parked), two inline clients, `Module.virgl.Renderer`, `Module.virgl.gpu` (capset, a packed transfer each way, present, a fence) |
+| `gl/wasm/test/check.mjs` | loads the module in headless Chromium: init on WebGL2, caps, busy waits (one answered ahead of its fence, one parked), two inline clients, `Module.virgl.Renderer`, `Module.virgl.gpu` (capset, the capsets' versions and sizes against the SDK's `VIRGL_CAPSETS`, a packed transfer each way, present, a fence) |
 | `gl/bridge/` | `vtest-bridge.c` (vtest socket to WebSocket or byte stream, fd termination) and the page that hosts a renderer: the wasm module or the relay to a native server; `README.md` has the wire dialect and the renderer interface |
 | `test/gl/vtest-check.sh` | the check suite on this host; see Testing |
 | `test/gl/bridge-check.sh` | the same suite with every byte through the page in headless Chromium; `--wasm` against the wasm renderer |
@@ -56,8 +58,8 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
-| `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, `?gl=1`); see The page |
-| `guest/base/rootfs/etc/profile.d/kw-gl.sh` | the guest's shells' `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` when the command line has `kw.gl=1` |
+| `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, the default URL); see The page |
+| `guest/base/rootfs/etc/profile.d/kw-gl.sh` | the guest's shells' `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` when the command line has `kw.gl=1` and there is no DRM render node |
 | `web/` (`config.ts`, `boot.ts` `showGl()`, `scripts/kernel.ts`, `vite.config.ts`) | the page's Guest GL option and how the page gets `virgl.*` (web.md, Guest GL) |
 | `test/gl/build-guest-state.sh` | `kwgl-state.c` for the Debian guest (aarch64 glibc, linked against stand-ins for libEGL and libGLESv2) |
 | `vendor/src/virglrenderer-wasm` (gitignored) | the source of both builds: branch `kw-wasm` = 1.3.0 + the series |
@@ -456,9 +458,9 @@ GPU). One run each, on the shared host:
    The page's option: done (The page). Check: `node test/gl/page-check.mjs`.
    Next: frames to the page's display (X on kwfb, unverified; kwshm, or
    wland). Busy waits: done (Busy waits).
-6. **virtio-gpu 3D.** Done: The DRM path. Check: `node test/gl/unkernel-check.mjs --drm`.
-   Next: the page's option for it (the page offers no `gpu` yet; Display.tsx
-   already draws a GL scanout), wland on PRIME, a real GPU.
+6. **virtio-gpu 3D.** Done: The DRM path, in the page by default (The
+   page), the renderer loaded on first use. Check: `node
+   test/gl/unkernel-check.mjs --drm`. Next: wland on PRIME, a real GPU.
 
 ## unkernel
 
@@ -466,20 +468,23 @@ GPU). One run each, on the shared host:
 
 - **Host** (`js/core/gl.ts`): on the thread that owns the VM, in both
   modes (vsock is served there: in worker mode the kernel's worker only
-  passes packets), the module is imported from `new URL("./virgl.mjs",
-  import.meta.url)` of the web entry (dist/virgl.mjs and virgl.wasm,
-  copied by `pnpm build`; never fetched without `gl`), the renderer is
-  `Module.virgl.Renderer` on a 1x1 OffscreenCanvas's WebGL2, and
-  `StreamHost` (`js/core/gl-stream.ts`) serves every connection to vsock
-  port 1019. Node: ignored with a log line (no OffscreenCanvas), unless
-  `gl.renderer` gives a renderer object (the relay works there).
+  passes packets), `StreamHost` (`js/core/gl-stream.ts`) serves every
+  connection to vsock port 1019 from the boot on, and the renderer
+  (`GlLoader`: the module imported from `new URL("./virgl.mjs",
+  import.meta.url)` of the web entry, dist/virgl.mjs and virgl.wasm copied
+  by `pnpm build`, never fetched without `gl`; `Module.virgl.Renderer` on a
+  1x1 OffscreenCanvas's WebGL2) is loaded on the guest's first GL use
+  (Loading on first use). Node: ignored with a log line (no
+  OffscreenCanvas), unless `gl.renderer` gives a renderer object (the
+  relay works there).
 - **Guest** (`/usr/lib/kw/vtest-bridge`, kernel/guest.md): the bridge
   built stream-only, in the base's kw layer (in the bundle, so it always
   matches the SDK that speaks its link; 67 KB of RAM-resident layer for
   every distro, Alpine included, which cannot use it). The SDK starts it
   through kwtty as root once the renderer is up (`bridge --link
   vsock:2:1019 --daemon`); it makes `/tmp/.virgl_test` mode 0666 when the
-  host sends READY, and `vm.gl.ready` resolves on its LOG line saying so.
+  host sends READY (at once: the renderer is not needed for that), and
+  `vm.gl.ready` resolves on its LOG line saying so.
 - **Mesa**: not in the image; `apt-get install mesa-utils libegl-mesa0
   libgles2` (surfaceless, about 45 MB download), plus `libgl1-mesa-dri
   libglx-mesa0 xvfb xauth glmark2-es2-x11 glmark2-x11` for X11 (all of it:
@@ -514,15 +519,17 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   driver virtio_gpu". GBM, EGL on gbm and surfaceless all find it.
 - **Options**: `gl` is the renderer (and the vtest link), `gpu` the device;
   both, where `gl` gets WebGL2: the device offers VIRTIO_GPU_F_VIRGL and
-  two capsets, read from that WebGL2 context. Not CONTEXT_INIT: with it
+  two capsets, whose contents are read from that WebGL2 context (their
+  ids, versions and sizes are constants; Loading on first use). Not CONTEXT_INIT: with it
   the driver makes a file's context only on DRM_IOCTL_VIRTGPU_CONTEXT_INIT
   or first 3D use, and a PRIME import made before that is never attached
   to it (the renderer then refuses transfers of that resource as an
   illegal resource of that context); without it every resource a file
-  opens is attached. The renderer
-  is made before the kernel boots, as the driver probes the features and
-  asks for the capsets at boot (it waits up to 5 s a capset for the
-  answer, which comes once the module is up).
+  opens is attached. The driver probes the features and asks for the
+  capsets' ids, versions and sizes (GET_CAPSET_INFO) at boot, which the
+  device answers without the renderer; a capset's contents (GET_CAPSET)
+  are asked by the first `DRM_IOCTL_VIRTGPU_GET_CAPS` (Mesa's screen
+  creation) and cached by the kernel per id and version.
 - **Renderer front end** (`kw_virgl.c`, `kw_vgpu_*`): the virtio-gpu control
   commands mapped to virglrenderer's API as QEMU's
   `hw/display/virtio-gpu-virgl.c` maps them (context create with flags,
@@ -588,8 +595,11 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   e.g. an ImageBitmap as presentation makes).
 - Not done: blob resources and host-visible memory (no coherent buffer
   maps), Venus, dumb buffers used by 3D contexts, the cursor plane (taken
-  and ignored), snapshots while 3D resources or contexts exist (refused),
-  SMP (not tried), the page (no `gpu` option there yet).
+  and ignored), snapshots while 3D resources or contexts exist (refused,
+  before the guest parks; the page says a program is using the GPU). On
+  SMP only a short check: `page-check.mjs --cpus 0` (the page's default, 4
+  CPUs, worker mode; 2026-11-21) ran `eglinfo -B -p gbm` on virgl and
+  kmscube at 55 to 57 fps; the 2D device: `test/gpu/check.mjs --cpus 2`.
 - Guest notes: no `/dev/fd` in the guest, so bash's `<(...)` fails; kmscube
   and glmark2-es2-drm stop at the first byte or EOF on stdin, so give them
   a stdin that stays open (`mkfifo /tmp/h; exec 3<>/tmp/h; kmscube <&3`).
@@ -603,7 +613,7 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
 
 ### Measured (2026-11-21, `unkernel-check.mjs --drm`, headless Chromium 157)
 
-Debian 13 on the UP kernel with kwvirtio (`vendor/build/drm-base`), 1024
+Debian 13 on the UP kernel with kwvirtio (the default bundle), 1024
 MiB, display 640x480 (60 Hz), the prepared disk, WebGL2 on ANGLE/
 SwiftShader (software: a floor); one run each on a shared host.
 
@@ -637,38 +647,130 @@ SwiftShader (software: a floor); one run each on a shared host.
   name the same resource; `vm.gl.gpu.texture()` finds its 64x64 texture
   with the importer's upload in it.
 
+## Loading on first use
+
+The renderer (module and WebGL2 context) is loaded on the guest's first GL
+use, not at boot (`GlLoader`, gl.ts): the first vtest client (an OPEN on
+the forwarder's link: `LazyVtestRenderer` notes it and holds its bytes,
+and StreamHost reads no more of the link meanwhile, so vsock credit holds
+the forwarder), or virtio-gpu's first GET_CAPSET or 3D command (context,
+3D resource, submit; `VirglGpuBackend` calls `GpuLink.start()`, in worker
+mode the message `gpu-start`). A 2D client never loads it (SET_SCANOUT 0
+and RESOURCE_FLUSH before any 3D use are answered without it). Commands
+wait meanwhile: GET_CAPSET for the capsets, a 3D transfer for the format
+table, and sends after a waiting one queue behind it. `gl.eager` loads it
+before the boot instead (the page's `?glload=eager`).
+
+- **Capset info without the module**: GET_CAPSET_INFO is answered from
+  `VIRGL_CAPSETS` (gl-gpu.ts): VIRGL (1) version 1, 308 bytes, VIRGL2 (2)
+  version 2, 1408 bytes, which are virglrenderer's constants
+  (`VREND_CAPSET_*_MAX_VERSION`, `sizeof(struct virgl_caps_v1/v2)`;
+  `virgl_renderer_get_cap_set()` "may be called before
+  virgl_renderer_init"). Kept in step three ways: `kw_virgl.h` has the
+  same numbers and `kw_virgl.c` `_Static_assert`s the sizes against
+  virglrenderer's structs (a virglrenderer whose caps grew fails to build);
+  `gl/wasm/test/check.mjs` checks the module's capsets against the SDK's
+  table; `GpuRenderer` checks them when it loads the module and refuses a
+  mismatch (no 3D, logged) rather than give a capset of another size than
+  the driver cached.
+- **Before the boot**: only a WebGL2 context is made and dropped
+  (`probeWebGl2()`, `WEBGL_lose_context`; 5 to 6 ms in headless Chromium on
+  SwiftShader), so that a browser without one gets the 2D device instead
+  of a 3D one that fails at first use; a restore skips it (the snapshot's
+  negotiated features decide).
+- **The kernel's wait**: the first GET_CAPS waits for the load. Upstream
+  waits 5 s and then gives -EBUSY, which Mesa takes for no caps (software
+  rendering), although the answer comes later and serves every later
+  client; kernel patch 0048 waits 30 s, killably. With `virgl.mjs` held 8 s
+  (`unkernel-check.mjs --drm --gl-delay 8`) the first `eglinfo -B -p gbm`
+  took 9.6 s and got virgl.
+- **Failure**: if the module or the WebGL2 context fails at first use,
+  every 3D command is answered ERR_UNSPEC (the kernel logs `response
+  0x1200 (command 0x...)`), GET_CAPSET included, which the driver caches as
+  a zeroed capset (it copies the reply's data whatever its type). Debian's
+  Mesa 25.0.7 then gets no virgl screen and EGL falls back by itself
+  (`libEGL warning: egl: failed to create dri2 screen` on surfaceless):
+  `eglinfo -B -p gbm` and `-p surfaceless` report llvmpipe (LLVM 19.1.7,
+  GLES 3.2), kmscube runs on llvmpipe with dumb buffers (17 to 18 fps),
+  and a dumb-buffer KMS client (`test/gpu/kms-dumb.c`) works; vtest
+  clients are closed (their socket ends). With no WebGL2 context at the
+  probe the device is 2D (`-virgl`, 0 cap sets) and Mesa uses kms_swrast
+  and llvmpipe from the start, without kernel errors. `ready` rejects then
+  (the page's row says why). Checked 2026-11-21, `unkernel-check.mjs --drm
+  --fail --glfail module` and `--fail --gl-flags "--disable-gpu
+  --disable-software-rasterizer"` (the flags that make headless
+  Chromium 157 give no WebGL2 context; `--disable-webgl` does not).
+- **Snapshots**: the device offers the same features and capsets whether
+  the renderer was loaded or not, so a session's device set does not
+  depend on it; a guest that never used GL resumes as before, and loads
+  the renderer on its next first use. A guest's kernel keeps the capset
+  contents it cached, read from the WebGL2 of the page that saved it.
+
+Measured (2026-11-21, `unkernel-check.mjs --drm --skip a,b,c,d,e`, inline
+mode, the module from 127.0.0.1, SwiftShader, 5 boots each, medians):
+`createKernel()` resolved after 98 ms lazily and 179 ms eagerly,
+`vm.gl.ready` (the guest's forwarder linked) after 512 / 604 ms, the
+first exec after 588 / 688 ms; the load itself took 105 to 231 ms (fetch,
+compile, WebGL2 context, renderer init) and 80 to 100 ms on first use.
+Over a network the fetch dominates: `virgl.wasm` is 155 KB brotli
+(184 KB gzip), `virgl.mjs` 30 KB gzip.
+
 ## The page
 
-`?gl=1` (Options: Guest GL; default off; web.md, Guest GL) boots with
-`gl: true` on Debian, where the page's build has the renderer and the
-page's thread has WebGL2; otherwise the option is disabled with the
-reason. The page builds with `virgl.mjs` and `virgl.wasm` from
+Guest GL (Options: Guest GL; on by default on Debian where the display
+is, `?gl=0` off; web.md, Guest GL) boots with `gl: true` and `gpu: true`,
+where the page's build has the renderer and the page's thread has WebGL2;
+otherwise the option is disabled with the reason. `?gpu=0` (this load
+only; also `?display=0`) leaves the device out: the vtest link alone, for
+comparison; `?glload=eager` loads the renderer before the boot. The page builds with `virgl.mjs` and `virgl.wasm` from
 `vendor/build/gl-wasm/` (with a local kernel), `KW_GL=<dir>`, or the
 release's assets of those names (release.yml attaches them); the dev
 server answers `/_gl/virgl.*`, a build emits both into
-`/assets/virgl-<hash>/`; only a load with GL on fetches them. With GL on
+`/assets/virgl-<hash>/`; only the guest's first GL use fetches them. With GL on
 the page adds `kw.gl=1` to the command line, for which the base's
 `/etc/profile.d/kw-gl.sh` exports `GALLIUM_DRIVER=virpipe
-LIBGL_ALWAYS_SOFTWARE=1` in the guest's shells, so plain `eglinfo` or
-`glmark2-es2` uses virgl. The Environment tab's Guest GL row names the
+LIBGL_ALWAYS_SOFTWARE=1` in the guest's shells only where there is no DRM
+render node, so plain `eglinfo` or `glmark2-es2` uses virgl: through
+`/dev/dri` with the device, through the vtest link without (with the
+device, `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 cmd` takes the
+vtest link for one program). KMS clients (kmscube, glmark2-es2-drm) show
+on the page's display (Display.tsx, `vm.gl.gpu.drawFrame()`). The Environment tab's Guest GL row says
+"on, not loaded yet" until the guest's first GL use, then names the
 WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
-is a warning and a toast) and `vm.gl.stats` with the per-readback
-breakdown of the renderer's counters (Stats); `?glwait=strict` answers busy
+is a warning and a toast) and how long the load took and `vm.gl.stats` with the per-readback
+breakdown of the renderer's counters (Stats) and the device's
+(`vm.gl.stats.gpu`: presents, parks, time parked, readbacks, errors); `?glwait=strict` answers busy
 waits as vtest does. The browser console has `[unkernel] guest GL: WebGL2
 renderer ...`.
 
-Checked 2026-11-21, `test/gl/page-check.mjs` (the dev server, Playwright's
-headless Chromium on SwiftShader, `?gl=1&data=0&cpus=1`, worker mode):
-`vm.gl.ready` 2.7 s after the page was opened; a login shell had the
-variables and `/tmp/.virgl_test`; `apt-get install mesa-utils
-libegl-mesa0 libgles2` over the page's network (deb.debian.org through the
-CORS mirror) took 46 s; then `eglinfo -B -p surfaceless`: `virgl (ANGLE
-(Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`, OpenGL ES 3.0 Mesa
-25.0.7. The built server sends `/assets/virgl-*/virgl.{mjs,wasm}` with
+Checked 2026-11-21, `test/gl/page-check.mjs --suspend` (the dev server,
+the default URL with `?data=0&cpus=1`, worker mode): GL on, `vm.gl.ready`
+1.1 s after the page was opened with the renderer not loaded, the row
+"on, not loaded yet" and no request for `virgl.*`; Suspend and a plain
+load resumed it, still not loaded, the forwarder linked again; after
+apt-get the first `eglinfo -B -p gbm` fetched both files (0.4 s after it
+started) and got virgl, the load took 0.10 s; Suspend while kmscube ran
+was refused with the page's message; a session suspended with `?gl=0`
+resumed on the default URL with GL off. Before it, `--xorg` (then with
+`?gl=1&data=0&cpus=1`, worker mode): `vm.gl.ready` 2.7 s after the page
+was opened; a login shell had no GL variables, `/dev/dri/card0` (video,
+0660) and `renderD128` (0666), and `/tmp/.virgl_test`; `apt-get install`
+of Mesa, kmscube and X.Org over the page's network (deb.debian.org
+through the CORS mirror) took 96 s; then `eglinfo -B -p gbm`: `virgl
+(ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`, OpenGL ES 3.0
+Mesa 25.0.7; kmscube (default user) at 55 to 58 fps, 121 presents in the
+Guest GL row; X.Org 21.1.16's modesetting driver on `/dev/dri/card0`
+("glamor X acceleration enabled on virgl (...)"), on it `glxinfo -B`
+(virgl, OpenGL 2.1 compat, GLES 3.0, direct rendering) and glxgears at 60
+FPS (page flips at the vblank rate, about 640 presents); X segfaults when
+it is ended (SIGTERM; not examined). Before the device the same check
+(now `--gpu0`) had the variables and `eglinfo -B -p surfaceless` on
+virgl; not rerun since. The built server sends `/assets/virgl-*/virgl.{mjs,wasm}` with
 JavaScript and wasm types, br-encoded, immutable (curl, not a browser).
-Not checked: a GL client on the page's display (X.Org's fbdev driver on
-kwfb, `sudo Xorg :0`, then `DISPLAY=:0 glmark2-es2`) and its frame rate
-(kwfb is read about 50 times a second, at most about 1M pixels), packages
+Not checked: with `?gpu=0`, a GL client on the page's display (X.Org's
+fbdev driver on kwfb, `sudo Xorg :0`, then `DISPLAY=:0 glmark2-es2`) and
+its frame rate (kwfb is read about 50 times a second, at most about 1M
+pixels); the device on several CPUs; packages
 kept across reloads on the data disk, a real GPU, Firefox and Safari.
 
 ## Testing
@@ -691,7 +793,14 @@ node test/gl/unkernel-check.mjs --worker --skip c   # worker mode, without the b
 node test/gl/unkernel-check.mjs --drm        # the DRM path (gl and gpu; a bundle with kwvirtio), about 2 min
 node test/gl/unkernel-check.mjs --drm --skip c,d --cmd 'modetest -c'   # a command of yours first (as root), its output printed
 node test/gl/unkernel-check.mjs --drm --gl-flags ""   # the browser's own WebGL2 (a host with a GPU) instead of SwiftShader
-node test/gl/page-check.mjs                  # the page's option (dev server, port 8091), about 1 min; needs the internet
+node test/gl/unkernel-check.mjs --drm --eager --skip c   # the renderer loaded before the boot (gl.eager)
+node test/gl/unkernel-check.mjs --drm --fail --glfail module   # the renderer fails at first use: what Mesa does, a dumb-buffer KMS client
+node test/gl/unkernel-check.mjs --drm --fail --gl-flags "--disable-gpu --disable-software-rasterizer"   # no WebGL2 context: the 2D device
+node test/gl/unkernel-check.mjs --drm --skip b,c,d,e --gl-delay 8   # virgl.mjs served 8 s late: the first GET_CAPS waits
+node test/gl/page-check.mjs                  # the page's option (dev server, port 8091, the default URL), about 1 min; needs the internet
+node test/gl/page-check.mjs --suspend        # plus suspend and resume before GL use, the refusal while kmscube runs, a session saved without GL
+node test/gl/page-check.mjs --gpu0           # the same with ?gpu=0 (the vtest link alone)
+node test/gl/page-check.mjs --xorg           # plus X.Org's modesetting driver with glamor on the device (reported)
 node test/gl/page-check.mjs --no-apt         # without Mesa: GL up and the guest's environment only
 ```
 
@@ -746,7 +855,8 @@ Results (2026-11-21, the series of Patches):
 | `stream-check.sh info state` | state times out (its clients wait 120 s for replies the relay never brings), also at the commit before unkernel; `state` alone passes. Not examined |
 | `unkernel-check.mjs` (inline; `--worker --skip c`) | all pass; Measured |
 | `unkernel-check.mjs --drm` (inline; `--worker --skip c`) | all pass; The DRM path, Measured |
-| `page-check.mjs` | all pass; The page |
+| `unkernel-check.mjs --drm --skip c`, lazy and `--eager`; `--fail` both ways; `--gl-delay 8` | all pass (2026-11-21); Loading on first use |
+| `page-check.mjs`, `--suspend` | all pass; The page |
 
 Workloads that need no window system of ours (so nothing waits on wland):
 
@@ -772,9 +882,10 @@ Workloads that need no window system of ours (so nothing waits on wland):
 - Frames on the page's display: whether X.Org's fbdev driver on kwfb
   presents virgl's frames as Xvfb does (the driver reads each frame back
   and puts it to X either way), and at what rate.
-- Not tried in unkernel: the SMP kernel (`cpus` > 1; vsock and so GL stay
-  on the owner's thread, as on one CPU), Firefox and Safari (WebGL2 and
-  OffscreenCanvas in a page's main thread exist there), and a GPU.
+- Not tried in unkernel: the vtest path and the state checks on the SMP
+  kernel (`cpus` > 1; vsock and so GL stay on the owner's thread, as on one
+  CPU; the DRM path only as The DRM path says), Firefox and Safari (WebGL2
+  and OffscreenCanvas in a page's main thread exist there), and a GPU.
 - Busy waits on a GPU: not measured. On SwiftShader the rules of Busy
   waits remove the per-frame park (4.5 ms, about half of it WebGL's lag
   in telling a fence retired); on a GPU the page's Guest GL row shows the

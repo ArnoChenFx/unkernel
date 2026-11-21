@@ -96,6 +96,8 @@ export interface SessionDevices {
 	data: boolean;
 	/** Guest GL (the GL option; its kw.gl=1 is in the saved kernel's command line); absent in sessions saved before: off. */
 	gl?: boolean;
+	/** The virtio-gpu device that comes with guest GL (?gpu=0: none); absent in sessions saved before: off. */
+	gpu?: boolean;
 }
 
 const reqP = <T>(r: IDBRequest<T>): Promise<T> =>
@@ -188,7 +190,7 @@ export function sessionMismatch(m: SessionMeta, kernelUrl: string | null, device
 		if (was && distro && was.name === distro.name) return `it was saved on another build of the ${was.name} image (${was.url}; now ${distro.url})`;
 		return `it was saved on ${was ? `the ${was.name} image` : "no distro image"}, this boot runs ${distro ? `the ${distro.name} image` : "none"} (Options, Distro)`;
 	}
-	const names: Record<keyof SessionDevices, string> = { display: "Display", sound: "Sound", net: "Network", data: "Data disk", gl: "Guest GL" };
+	const names: Record<keyof SessionDevices, string> = { display: "Display", sound: "Sound", net: "Network", data: "Data disk", gl: "Guest GL", gpu: "virtio-gpu (?gpu=0)" };
 	for (const k of Object.keys(names) as Array<keyof SessionDevices>)
 		if (!!m.devices[k] !== !!devices[k]) return `it was saved with ${names[k]} ${m.devices[k] ? "on" : "off"} (Options)`;
 	return null;

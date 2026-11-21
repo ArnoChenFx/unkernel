@@ -26,7 +26,7 @@ import { WTerm } from "@wterm/dom";
 import { prefetchApkIndexes } from "./apk.ts";
 import { createAudioOut } from "./audio.ts";
 import { AUTO_SUSPEND_HOLD_MS, AutoSuspend, AutoSuspendSkip, LEAVE_OFFER_MS, LEAVE_STAYED_MS, Pause, SuspendSaveError, allowLeave, autoSuspendLabel, pageLeaving, quietStart, resumeAskedFor, resumeChoice, resumedNote, sessionRoom, wantLeavePrompt, type SuspendFacts } from "./autosuspend.ts";
-import { CPUS_ONCE_KEY, INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
+import { CPUS_ONCE_KEY, GL_DISTROS, INLINE_ONCE_KEY, REPO, UP_ONCE_KEY } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, fmtSize, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { KW } from "./kw.ts";
@@ -43,8 +43,11 @@ import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from ".
 import {
 	BootError, ConsoleRouter, KernelInstance, SnapshotCommitError, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot, type SnapshotHoldDecision,
-	type VirglTotals,
+	type GlStats, type VirglTotals,
 } from "./sdk.ts";
+
+/** The virtio-gpu device's 3D counters (vm.gl.stats.gpu). */
+type GpuRendererStats = NonNullable<GlStats["gpu"]>;
 
 /** An error tagged with what failed (fetch, compile, memory, boot) and the boot stage it belongs to. */
 type StageError = Error & { kind?: string; stageId?: string };
@@ -651,7 +654,43 @@ export function start(): void {
 	}
 
 	// --- the suspended session (session.ts) ------------------------------------------
-	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data, gl: cfg.gl });
+	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data, gl: cfg.gl, gpu: cfg.gpu });
+	/**
+	 * The devices a suspended session is matched against: this load's, except
+	 * that guest GL and its virtio-gpu device follow the session's (it resumes
+	 * with its own; adoptSessionGl()) unless this load's URL names ?gl= or
+	 * ?gpu=, or the session had GL and this load cannot (no WebGL2, no
+	 * renderer, another distro: the distro is matched anyway). So a session
+	 * saved before GL was on by default (no gl, no gpu) still resumes, as it
+	 * was; a fresh boot uses the options.
+	 */
+	const sessionDevicesFor = (m: SessionMeta): SessionDevices => {
+		const d = sessionDevices();
+		if (cfg.glFromUrl) return d;
+		const gl = !!m.devices.gl, gpu = !!m.devices.gpu;
+		if (gl && (cfg.glBlocked || !GL_DISTROS.includes(cfg.guest))) return d;
+		return { ...d, gl, gpu };
+	};
+	/** This load's own GL devices, while a resume runs with the session's (a failed resume boots fresh with these). */
+	let glOwn: { gl: boolean; gpu: boolean; why: string | null } | null = null;
+	/** Resume `m` with its own guest GL devices (sessionDevicesFor()). */
+	const adoptSessionGl = (m: SessionMeta) => {
+		const d = sessionDevicesFor(m);
+		if (!!d.gl === cfg.gl && !!d.gpu === cfg.gpu) return;
+		glOwn = { gl: cfg.gl, gpu: cfg.gpu, why: cfg.glWhy };
+		cfg.gl = !!d.gl;
+		cfg.gpu = !!d.gpu;
+		cfg.glWhy = cfg.gl ? null : "the resumed session was saved without it; a fresh boot (Reboot) has it";
+		ui.hostLog(`[host] suspended session: resumed with guest GL ${cfg.gl ? `on${cfg.gpu ? "" : ", without virtio-gpu"}` : "off"}, as it was saved; a fresh boot uses the options`);
+	};
+	/** The resume failed: the fresh boot gets this load's own GL devices (its command line has them). */
+	const dropSessionGl = () => {
+		if (!glOwn) return;
+		cfg.gl = glOwn.gl;
+		cfg.gpu = glOwn.gpu;
+		cfg.glWhy = glOwn.why;
+		glOwn = null;
+	};
 	const ago = (t: number) => {
 		const m = Math.round((Date.now() - t) / 60000);
 		return m < 1 ? "just now" : m < 120 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
@@ -681,7 +720,7 @@ export function start(): void {
 		// A data disk that changed since can never resume it: forget it then.
 		const stale = inlineDisks ? snapshotDiskMismatch(meta.disks, inlineDisks)
 			: cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null;
-		const why = sessionMismatch(meta, kernelUrl, sessionDevices(), distroRef) ?? stale;
+		const why = sessionMismatch(meta, kernelUrl, sessionDevicesFor(meta), distroRef) ?? stale;
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
 			ui.hostLog(`[host] suspended session (${label}) not offered: ${why}`);
@@ -702,7 +741,9 @@ export function start(): void {
 			return null;
 		}
 		try {
-			return { snap: await loadSession(), meta };
+			const snap = await loadSession();
+			adoptSessionGl(meta);
+			return { snap, meta };
 		} catch (e) {
 			warn(`Could not read the suspended session: ${(e as Error)?.message ?? e}`);
 			await clearSession().catch(() => {});
@@ -727,6 +768,18 @@ export function start(): void {
 			ui.hostLog(`[host] preview: not opened again (${e.message})`);
 			ui.toast(`The preview's port ${p.port} did not answer after the resume: Ctrl-A p opens it again`);
 		});
+	}
+	/**
+	 * A snapshot the SDK refused, in words the user can act on where the
+	 * cause is known: a program holding the virtio-gpu device (guest GL: a GL
+	 * program's contexts and resources live in this page's WebGL2, which a
+	 * session cannot save; a KMS client's buffers), "virtio-gpu resources,
+	 * contexts or commands in flight" (js.md, virtio and virtio-gpu).
+	 */
+	function refusal(e: unknown): unknown {
+		const m = (e as Error)?.message ?? "";
+		if (!/virtio-gpu (resources|contexts|commands)/.test(m)) return e;
+		return new Error("a program is using the GPU (/dev/dri: a GL program, or a KMS client such as X, kmscube or glmark2), whose state lives in this page (its WebGL2 context and buffers) and cannot be saved in a session. Quit it and suspend again", { cause: e });
 	}
 	/** A record a given-up save left behind (its removal failed): this machine's, so a later suspend may replace it. */
 	let strandedSaved: number | null = null;
@@ -824,7 +877,7 @@ export function start(): void {
 			// Refused before the copy (a task did not park, I/O in flight), or not stored: it runs on.
 			suspending = null;
 			ui.setState("running", "Running");
-			if (!(e instanceof SnapshotCommitError)) throw e;
+			if (!(e instanceof SnapshotCommitError)) throw refusal(e);
 			const why = ((e.cause as Error | undefined)?.message ?? /not committed \((.*)\);/.exec(e.message)?.[1] ?? e.message).replace(/^snapshot: /, "");
 			ui.hostLog(`[host] suspend: the session was not saved (${why}) after ${fmtS(performance.now() - t0)}; the system runs on`);
 			throw new SuspendSaveError(`the session was not saved (${why}); the system runs on`);
@@ -1109,7 +1162,7 @@ export function start(): void {
 		const n = meta ? sessionCpus(meta) : cfg.cpus;
 		if (!meta || n === cfg.cpus) return false;
 		const label = `saved ${ago(meta.saved)}, ${fmtMiB(meta.bytes)}, ${cpusText(n)}`;
-		const why = sessionMismatch(meta, kernelFor(n), sessionDevices(), distroRef) ??
+		const why = sessionMismatch(meta, kernelFor(n), sessionDevicesFor(meta), distroRef) ??
 			(cfg.data && meta.devices.data && data?.lock && !data.lock.held ? "the data disk is open in another tab" : null);
 		if (why) {
 			ui.check("session", "Suspended session", "info", `${label}; not resumed`, why);
@@ -1180,16 +1233,21 @@ export function start(): void {
 	}
 
 	/**
-	 * Guest GL (?gl=1): the WebGL2 renderer the guest's Mesa draws on, in the
-	 * Environment tab's "Guest GL" row, the console and the Kernel log; a
-	 * software renderer (SwiftShader, llvmpipe, WARP) is a warning, since GL
-	 * is then no faster than the host's CPU. Then the bridges and clients
-	 * served (vm.gl.stats), every 2 s while they change, and where a frame's
-	 * time went in the renderer over the last 2 s with readbacks (glFrameTimes).
+	 * Guest GL (on by default on Debian; ?gl=0): the Environment tab's "Guest
+	 * GL" row. The renderer loads on the guest's first GL use (vm.gl.status,
+	 * vm.gl.loaded), so until then the row says it is not loaded (or why it
+	 * cannot be: no WebGL2 context when the SDK tried one before the boot);
+	 * once loaded, the WebGL2 renderer the guest's Mesa draws on and how long
+	 * the load took, also in the console and the Kernel log; a software
+	 * renderer (SwiftShader, llvmpipe, WARP) is a warning, since GL is then no
+	 * faster than the host's CPU. Then the bridges and clients served
+	 * (vm.gl.stats), every 2 s while they change, and where a frame's time
+	 * went in the renderer over the last 2 s with readbacks (glFrameTimes),
+	 * and the device's counters (gpuFrames).
 	 */
 	function showGl(vm: KernelHandle) {
 		if (!cfg.gl) {
-			if (cfg.glWhy) ui.check("gl", "Guest GL", "warn", "off", cfg.glWhy);
+			if (cfg.glWhy) ui.check("gl", "Guest GL", cfg.glAsked && !glOwn ? "warn" : "info", "off", cfg.glWhy);
 			return;
 		}
 		const gl = vm.gl;
@@ -1197,37 +1255,95 @@ export function start(): void {
 			ui.check("gl", "Guest GL", "fail", "unavailable", "the SDK started no GL renderer (the Kernel log says why)");
 			return;
 		}
-		ui.check("gl", "Guest GL", "info", "starting", "loading the renderer (virgl.mjs, virgl.wasm) and starting the guest's forwarder");
-		gl.ready.then((what) => {
-			// "<renderer>; <WebGL's unmasked renderer>" (js/core/gl.ts)
-			const webgl = what.slice(what.lastIndexOf("; ") + 2);
-			const soft = /SwiftShader|llvmpipe|softpipe|Software|Basic Render|WARP/i.test(webgl);
-			const note = `WebGL2: ${webgl}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${what.slice(0, what.lastIndexOf("; "))}. ` +
-				"Guest shells have GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1; Mesa: sudo apt-get install mesa-utils (eglinfo -B), glmark2-es2-x11 ...";
-			console.log(`[unkernel] guest GL: WebGL2 renderer ${webgl}${soft ? " (software rendering)" : ""}`);
-			ui.hostLog(`[host] guest GL ready: ${what}${soft ? " (software rendering)" : ""}`);
-			let shown = "", times = "", prev: VirglTotals | undefined, prevAt = performance.now();
-			const show = () => {
-				const st = gl.stats, at = performance.now();
-				if (st.renderer) {
-					times = glFrameTimes(st.renderer, prev, at - prevAt) ?? times;
-					prev = st.renderer;
-					prevAt = at;
-				}
-				const now = `${st.streams} forwarder link${st.streams === 1 ? "" : "s"}, ${st.clients} GL client${st.clients === 1 ? "" : "s"} now, ${st.opened} so far` +
-					`${cfg.glStrictWaits ? "; busy waits answered as vtest does (?glwait=strict)" : ""}${times ? `. ${times}` : ""}`;
-				if (now === shown) return;
-				shown = now;
-				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `${note} ${now}.`);
-			};
+		const how = cfg.gpu
+			? "virtio-gpu: Mesa uses /dev/dri with no variables (the vtest link: GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 cmd; ?gpu=0 for its shells); Mesa: sudo apt-get install mesa-utils (eglinfo -B -p gbm), kmscube, glmark2-es2-drm ..."
+			: "Guest shells have GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 (no virtio-gpu: ?gpu=0 or ?display=0); Mesa: sudo apt-get install mesa-utils (eglinfo -B), glmark2-es2-x11 ...";
+		const fallback = cfg.gpu ? "GL programs fall back to software rendering (llvmpipe), KMS with dumb buffers works" : "GL programs on the vtest link fail; without GALLIUM_DRIVER they use llvmpipe";
+		ui.check("gl", "Guest GL", "info", "starting", "starting the guest's forwarder; the renderer (virgl.mjs, virgl.wasm) loads on the guest's first GL use");
+		let webgl = "", soft = false, loadNote = "", linked = false, failed = false;
+		let shown = "", times = "", prev: VirglTotals | undefined, prevAt = performance.now();
+		let gpuTimes = "", gpuPrev: GpuRendererStats | undefined, gpuPrevAt = prevAt;
+		const show = () => {
+			if (failed) return;
+			const st = gl.stats, s = gl.status, at = performance.now();
+			if (st.renderer) {
+				times = glFrameTimes(st.renderer, prev, at - prevAt) ?? times;
+				prev = st.renderer;
+				prevAt = at;
+			}
+			if (st.gpu) {
+				gpuTimes = gpuFrames(st.gpu, gpuPrev, at - gpuPrevAt);
+				gpuPrev = st.gpu;
+				gpuPrevAt = at;
+			}
+			const now = `vtest: ${st.streams} forwarder link${st.streams === 1 ? "" : "s"}, ${st.clients} GL client${st.clients === 1 ? "" : "s"} now, ${st.opened} so far` +
+				`${cfg.glStrictWaits ? "; busy waits answered as vtest does (?glwait=strict)" : ""}${times ? `. ${times}` : ""}${gpuTimes ? `. ${gpuTimes}` : ""}`;
+			const key = `${s.state} ${now}`;
+			if (key === shown) return;
+			shown = key;
+			if (s.state === "ready")
+				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `WebGL2: ${webgl}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${s.what}${cfg.gpu ? ", virtio-gpu 3D" : ""}; ${loadNote}. ${how} ${now}.`);
+			else if (s.state === "loading")
+				ui.check("gl", "Guest GL", "info", "loading", `the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context) for ${fmtS(at - (s.startedAt ?? at))}. ${how}`);
+			else if (linked)
+				ui.check("gl", "Guest GL", "info", "on, not loaded yet", `the renderer (virglrenderer in wasm, virgl.mjs and virgl.wasm, about 480 KB) is fetched and started on this browser's WebGL2 on the guest's first GL use (a program opening /dev/dri for 3D, or a vtest client), which waits for it; nothing of it was loaded at boot. ${how} ${now}.`);
+		};
+		let timer: ReturnType<typeof setInterval> | undefined;
+		const tick = () => {
+			if (ended()) clearInterval(timer);
+			else show();
+		};
+		gl.ready.then(() => {
+			linked = true;
 			show();
-			if (soft) ui.toast(`Guest GL runs on a software WebGL renderer (${webgl}), not a GPU`);
-			const timer = setInterval(() => (ended() ? clearInterval(timer) : show()), 2000);
+			timer ??= setInterval(tick, 2000);
 		}, (e: unknown) => {
 			const why = (e as Error)?.message ?? String(e);
+			failed = true;
+			if (gl.status.state === "failed" && gl.status.startedAt === null) {
+				// Known before the boot (no WebGL2 context): the device is 2D, nothing was tried.
+				ui.check("gl", "Guest GL", cfg.glAsked ? "warn" : "info", "unavailable", `${why}. The guest has no GL renderer: ${cfg.gpu ? "its virtio-gpu device is 2D (KMS with dumb buffers), and " : ""}GL programs use software rendering (llvmpipe)`);
+				if (cfg.glAsked) ui.toast(`Guest GL is unavailable: ${why}`);
+				return;
+			}
 			ui.check("gl", "Guest GL", "fail", "failed", why);
 			ui.toast(`Guest GL failed: ${why}`);
 		});
+		gl.loaded.then((what) => {
+			const s = gl.status;
+			webgl = s.webgl ?? what.slice(what.lastIndexOf("; ") + 2);
+			soft = /SwiftShader|llvmpipe|softpipe|Software|Basic Render|WARP/i.test(webgl);
+			loadNote = s.loadMs === null ? "loaded" : s.eager
+				? `loaded before the boot in ${fmtS(s.loadMs)} (?glload=eager)`
+				: `loaded in ${fmtS(s.loadMs)} on the guest's first GL use, ${fmtS(s.startedAt ?? 0)} after the page opened`;
+			console.log(`[unkernel] guest GL: WebGL2 renderer ${webgl}${soft ? " (software rendering)" : ""}; ${loadNote}`);
+			ui.hostLog(`[host] guest GL: renderer ${what}${soft ? " (software rendering)" : ""}; ${loadNote}`);
+			if (soft) ui.toast(`Guest GL runs on a software WebGL renderer (${webgl}), not a GPU`);
+			show();
+			timer ??= setInterval(tick, 2000);
+		}, (e: unknown) => {
+			if (failed) return; // said above
+			failed = true;
+			const why = (e as Error)?.message ?? String(e);
+			ui.check("gl", "Guest GL", "fail", "renderer failed", `the renderer did not load on the guest's first GL use: ${why}; ${fallback}`);
+			ui.toast(`Guest GL: the renderer did not load (${why}); ${fallback}`, { ms: 8000 });
+		});
+	}
+
+	/**
+	 * The virtio-gpu device's 3D counters (vm.gl.stats.gpu; js.md, virtio-gpu
+	 * 3D): presented frames (RESOURCE_FLUSH of the scanout, which Display.tsx
+	 * draws from the renderer's texture), fenced commands that waited for the
+	 * GPU (parks: by default only behind a presented frame), readbacks and
+	 * refused commands, over the last MS and in all.
+	 */
+	function gpuFrames(g: GpuRendererStats, p: GpuRendererStats | undefined, ms: number): string {
+		const d = (k: keyof GpuRendererStats) => g[k] - (p?.[k] ?? 0);
+		const rate = p && ms > 0 && (d("presents") || d("commands"))
+			? `last ${(ms / 1000).toFixed(0)} s: ${(d("presents") * 1000 / ms).toFixed(1)} presents/s, ${d("parks")} parks, ${(d("parks") ? d("parkedMs") / d("parks") : 0).toFixed(2)} ms parked each; `
+			: "";
+		return `virtio-gpu: ${rate}${g.presents} presents, ${g.commands} commands (${g.fenced} fenced: ${g.parks} parked, ${g.parkedMs.toFixed(0)} ms in all), ` +
+			`${g.reads} readbacks, ${g.errors} errors`;
 	}
 
 	/**
@@ -1291,7 +1407,7 @@ export function start(): void {
 			const settle = setTimeout(unquiet, 2000);
 			session.then((m) => {
 				clearTimeout(settle);
-				if (quietResume && m && sessionCpus(m) === cfg.cpus && !sessionMismatch(m, kernelUrl, sessionDevices(), distroRef))
+				if (quietResume && m && sessionCpus(m) === cfg.cpus && !sessionMismatch(m, kernelUrl, sessionDevicesFor(m), distroRef))
 					ui.splash("Resuming", "Restoring the suspended session…");
 				else unquiet();
 			}, () => { clearTimeout(settle); unquiet(); });
@@ -1326,7 +1442,8 @@ export function start(): void {
 		ok(`Found the base initramfs (${fmtMiB(b.length)})`);
 		// The bundle's own command line unless ?append= gives one, with ?root= (kw.root=) after it.
 		if (!cfg.append && bundle.cmdline) cfg.cmdline = cfg.root ? `${bundle.cmdline} kw.root=${cfg.root}` : bundle.cmdline;
-		// Guest GL: the guest's shells point Mesa at virgl (kw-gl.sh in the base's kw layer).
+		// Guest GL: the guest's shells point Mesa at virgl, at the vtest link where there is no
+		// /dev/dri render node (kw-gl.sh in the base's kw layer).
 		if (cfg.gl) cfg.cmdline += " kw.gl=1";
 		if (distroOpening) {
 			try {
@@ -1406,8 +1523,15 @@ export function start(): void {
 			display: cfg.display ? display.size : false, onDisplay: display.onDisplay, onInput: display.onInput,
 			sound: cfg.sound ? createAudioOut({ log }) : false, // Web Audio, ?sound=0 (audio.ts)
 			vsock: true, // the terminal windows (windows.ts: kwtty sessions)
-			gl: cfg.gl && (cfg.glStrictWaits ? { strictWaits: true } : true), // guest GL on this thread's WebGL2 (?gl=1, Debian; showGl())
 		};
+		// Guest GL on this thread's WebGL2 (Debian, on by default; showGl()), read when the kernel is
+		// made: a resumed session keeps its own (adoptSessionGl()). The renderer loads on the guest's
+		// first GL use (?glload=eager: before the boot); with it virtio-gpu, the guest's /dev/dri, 3D on
+		// that renderer (?gpu=0: none).
+		const glDevices = () => ({
+			gl: cfg.gl && (cfg.glStrictWaits || cfg.glEager ? { ...(cfg.glStrictWaits ? { strictWaits: true } : {}), ...(cfg.glEager ? { eager: true } : {}) } : true),
+			gpu: cfg.gpu,
+		});
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);
 		if (!resume) unquiet(); // a fresh boot
@@ -1419,7 +1543,7 @@ export function start(): void {
 				// URL instead, absolute because the worker has no base of its own, and the
 				// worker downloads (from the HTTP cache) and compiles it.
 				const inWorker = (kernel: WebAssembly.Module | string) => createKernel({
-					...common, worker: true, kernel, compileInWorker: typeof kernel === "string",
+					...common, ...glDevices(), worker: true, kernel, compileInWorker: typeof kernel === "string",
 					cpus: smp ? cfg.cpus : undefined, // the worker starts the other CPUs (js/web/cpu.ts)
 					shared: cfg.shared ? undefined : false, // shared memory where the page is cross-origin isolated (?shared=0: never)
 					disks: dataDisks as DiskSpec[], onDiskError: (_i, e) => saveError(e),
@@ -1434,7 +1558,7 @@ export function start(): void {
 						return inWorker(new URL(kernelUrl, location.href).href);
 					})
 					: createKernel({
-						...common, kernel: module, disks: dataDisks as BlockDevice[], restore, distro: distroDisk ?? undefined,
+						...common, ...glDevices(), kernel: module, disks: dataDisks as BlockDevice[], restore, distro: distroDisk ?? undefined,
 						net: browserNet({ enabled: cfg.net, servers: cfg.wisp, routes: cfg.routes, log }), // Wisp (net.ts)
 					});
 			};
@@ -1459,6 +1583,7 @@ export function start(): void {
 					warn(`Could not resume the suspended session (${why}); booting fresh`);
 					ui.toast(`Could not resume: ${why}`);
 					ui.check("session", "Suspended session", "warn", "not resumed", why);
+					dropSessionGl();
 					vm = await create();
 				}
 				// Resumed or refused, it is used up: the running machine changes the disk. Resumed on several

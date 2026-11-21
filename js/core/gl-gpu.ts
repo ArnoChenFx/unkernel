@@ -38,8 +38,22 @@
 // device at once and posted to the renderer, which runs them in order
 // (errors there are logged). Fenced commands and readbacks wait for the
 // renderer's answer, which for a fenced one is the fence signal
-// (GpuRenderer, fences below). Capsets: the renderer's, read from its
-// WebGL2 context once at start (GpuInit), cached on the device side.
+// (GpuRenderer, fences below). Capsets: their ids, versions and sizes are
+// constants of virglrenderer (VIRGL_CAPSETS), so GET_CAPSET_INFO, which the
+// driver asks at probe, is answered without the renderer; their contents
+// come from its WebGL2 context once it is up (GpuInit), cached on the
+// device side.
+//
+// Loading: the renderer (the module and its WebGL2 context) may be loaded
+// on the first command that needs it (gl.ts, GlLoader; the default): the
+// device side starts it (GpuLink.start) on GET_CAPSET or the first 3D
+// command (context, 3D resource, submit), and nothing before that (a 2D
+// client's SET_SCANOUT 0 or RESOURCE_FLUSH never loads it). Commands wait
+// meanwhile: GET_CAPSET for the capsets, a 3D transfer for the format
+// table, and every command sent after a waiting one goes after it, so the
+// renderer sees them in order. If it cannot load, everything 3D is
+// answered ERR_UNSPEC (the driver then caches a zeroed capset; gl.md, The
+// DRM path, for what Mesa makes of that).
 
 import { FORMATS, GPU_CMD, GPU_RESP, VIRTIO_GPU_F_VIRGL, type GpuBackend, type GpuBackendContext } from "./virtio-gpu.ts";
 import type { VirtqBuffer } from "./virtio.ts";
@@ -49,6 +63,22 @@ const HDR = 24;
 const FLAG_FENCE = 1;
 /** PIPE_BUFFER, gallium's target of buffers. */
 const TARGET_BUFFER = 0;
+
+/**
+ * The capsets the device offers (num_capsets, GET_CAPSET_INFO), known
+ * without the renderer: virglrenderer's virgl_renderer_get_cap_set() gives
+ * constants (VREND_CAPSET_VIRGL_MAX_VERSION, VREND_CAPSET_VIRGL2_MAX_VERSION,
+ * sizeof(struct virgl_caps_v1), sizeof(struct virgl_caps_v2)) and may be
+ * called before the renderer exists. gl/wasm/kw_virgl.h has the same
+ * numbers (KW_VGPU_CAPSET*), which kw_virgl.c checks at compile time
+ * against virglrenderer's, and GpuRenderer checks the loaded module's
+ * capsets against these (a module from another virglrenderer then gives no
+ * 3D, with a log line, rather than capsets of the wrong size).
+ */
+export const VIRGL_CAPSETS: ReadonlyArray<{ readonly id: number; readonly version: number; readonly size: number }> = Object.freeze([
+	Object.freeze({ id: 1, version: 1, size: 308 }), // VIRTGPU_DRM_CAPSET_VIRGL: struct virgl_caps_v1
+	Object.freeze({ id: 2, version: 2, size: 1408 }), // VIRTGPU_DRM_CAPSET_VIRGL2: struct virgl_caps_v2
+]);
 
 /** What the renderer offers, from its WebGL2 context: the device side caches it. */
 export interface GpuInit {
@@ -75,8 +105,10 @@ export interface GpuReply {
 
 /** How the device side reaches the renderer. */
 export interface GpuLink {
-	/** The renderer's capsets and formats once it is up; rejects if there is none. */
+	/** The renderer's capsets and formats once it is up (after start()); rejects if there is none. */
 	readonly init: Promise<GpuInit>;
+	/** Load the renderer now if it is not loaded or loading (the guest's first 3D use). */
+	start(): void;
 	/** Run a command and answer (in order with posts). */
 	call(req: GpuRequest): GpuReply | Promise<GpuReply>;
 	/** Run a command; no answer. */
@@ -122,21 +154,25 @@ function resp(type: number, size = HDR): Uint8Array {
 
 /**
  * The device side of virtio-gpu 3D: a GpuBackend over a GpuLink. Offers
- * VIRTIO_GPU_F_VIRGL and two capsets (answered once the renderer is up: the
- * driver's probe waits for them, up to 5 s each). Not CONTEXT_INIT, which
- * only Venus and ring-indexed fences need: without it the driver makes a
- * file's context at its first 3D use and attaches every resource the file
- * opens to it, a PRIME import made before the first 3D ioctl included
- * (with CONTEXT_INIT such an import is left out of the context the file
- * makes later).
+ * VIRTIO_GPU_F_VIRGL and the capsets of VIRGL_CAPSETS (their contents
+ * answered once the renderer is up, which the first GET_CAPSET starts).
+ * Not CONTEXT_INIT, which only Venus and ring-indexed fences need: without
+ * it the driver makes a file's context at its first 3D use and attaches
+ * every resource the file opens to it, a PRIME import made before the first
+ * 3D ioctl included (with CONTEXT_INIT such an import is left out of the
+ * context the file makes later).
  */
 export class VirglGpuBackend implements GpuBackend {
 	readonly features = VIRTIO_GPU_F_VIRGL;
-	readonly capsetCount = 2;
+	readonly capsetCount = VIRGL_CAPSETS.length;
 	#link: GpuLink;
 	#log: (msg: string) => void;
 	#init: GpuInit | null = null;
 	#failed = false;
+	/** link.start() was called: the guest has used 3D. */
+	#started = false;
+	/** The last command sent to the renderer that had to wait for its init: later sends go after it. */
+	#tail: Promise<unknown> | null = null;
 	#resources = new Map<number, Resource3d>();
 	#contexts = new Set<number>();
 
@@ -145,7 +181,7 @@ export class VirglGpuBackend implements GpuBackend {
 		this.#log = log;
 		link.init.then((i) => (this.#init = i), (e: unknown) => {
 			this.#failed = true;
-			log(`[virtio-gpu] no 3D renderer: ${(e as Error)?.message ?? e}; capsets fail, so the guest's Mesa falls back to software`);
+			log(`[virtio-gpu] no 3D renderer: ${(e as Error)?.message ?? e}; capsets and 3D commands fail, so the guest's Mesa gets no virgl screen (it falls back to software rendering)`);
 		});
 	}
 
@@ -157,6 +193,7 @@ export class VirglGpuBackend implements GpuBackend {
 	reset(): void {
 		this.#resources.clear();
 		this.#contexts.clear();
+		this.#tail = null;
 		this.#link.reset();
 	}
 
@@ -164,6 +201,13 @@ export class VirglGpuBackend implements GpuBackend {
 		if (this.#resources.size) return "virtio-gpu resources";
 		if (this.#contexts.size) return "virtio-gpu contexts";
 		return "";
+	}
+
+	/** The guest uses 3D: load the renderer (once). */
+	#start(): void {
+		if (this.#started) return;
+		this.#started = true;
+		this.#link.start();
 	}
 
 	command(cmd: Uint8Array, ctx: GpuBackendContext): Uint8Array | null | Promise<Uint8Array | null> {
@@ -174,22 +218,23 @@ export class VirglGpuBackend implements GpuBackend {
 			if (cmd.length < HDR + n) throw new Error(`virtio-gpu command 0x${type.toString(16)}: ${cmd.length} bytes`);
 		};
 		switch (type) {
-			case GPU_CMD.GET_CAPSET_INFO:
+			case GPU_CMD.GET_CAPSET_INFO: {
 				need(4);
-				return this.#withInit((init) => {
-					const c = init.capsets[dv.getUint32(HDR, true)];
-					const out = resp(GPU_RESP.OK_CAPSET_INFO, HDR + 16);
-					const o = new DataView(out.buffer);
-					// An index past the renderer's capsets: id 0, which the driver skips.
-					if (c) {
-						o.setUint32(HDR, c.id, true);
-						o.setUint32(HDR + 4, c.version, true);
-						o.setUint32(HDR + 8, c.data.length, true);
-					}
-					return out;
-				});
+				// Constants (VIRGL_CAPSETS): the driver asks at probe, long before any 3D use.
+				const c = VIRGL_CAPSETS[dv.getUint32(HDR, true)];
+				const out = resp(GPU_RESP.OK_CAPSET_INFO, HDR + 16);
+				const o = new DataView(out.buffer);
+				// An index past them: id 0, which the driver skips.
+				if (c) {
+					o.setUint32(HDR, c.id, true);
+					o.setUint32(HDR + 4, c.version, true);
+					o.setUint32(HDR + 8, c.size, true);
+				}
+				return out;
+			}
 			case GPU_CMD.GET_CAPSET:
 				need(8);
+				this.#start();
 				return this.#withInit((init) => {
 					const c = init.capsets.find((x) => x.id === dv.getUint32(HDR, true));
 					if (!c) return resp(GPU_RESP.ERR_INVALID_PARAMETER);
@@ -205,6 +250,7 @@ export class VirglGpuBackend implements GpuBackend {
 					target: dv.getUint32(HDR + 4, true), format: dv.getUint32(HDR + 8, true),
 					width: dv.getUint32(HDR + 16, true), height: dv.getUint32(HDR + 20, true), backing: null, starts: [],
 				});
+				this.#start();
 				return this.#send({ cmd }, fenced);
 			}
 			case GPU_CMD.RESOURCE_UNREF: {
@@ -242,12 +288,19 @@ export class VirglGpuBackend implements GpuBackend {
 				return resp(GPU_RESP.OK_NODATA);
 			}
 			case GPU_CMD.TRANSFER_TO_HOST_3D:
-			case GPU_CMD.TRANSFER_FROM_HOST_3D:
+			case GPU_CMD.TRANSFER_FROM_HOST_3D: {
 				need(48);
-				return this.#transfer(cmd, dv, ctx, type === GPU_CMD.TRANSFER_TO_HOST_3D, fenced);
+				const res = this.#resources.get(dv.getUint32(HDR + 32, true));
+				if (!res) return resp(GPU_RESP.ERR_INVALID_RESOURCE_ID);
+				const toHost = type === GPU_CMD.TRANSFER_TO_HOST_3D;
+				// The packing needs the renderer's format table: wait for it, and keep later sends behind.
+				const run = () => this.#transferNow(cmd, dv, res, ctx, toHost, fenced);
+				return this.#tail || (!this.#init && !this.#failed) ? this.#after(run) : run();
+			}
 			case GPU_CMD.CTX_CREATE:
 				need(8);
 				this.#contexts.add(dv.getUint32(16, true));
+				this.#start();
 				return this.#send({ cmd }, fenced);
 			case GPU_CMD.CTX_DESTROY:
 				this.#contexts.delete(dv.getUint32(16, true));
@@ -255,8 +308,13 @@ export class VirglGpuBackend implements GpuBackend {
 			case GPU_CMD.CTX_ATTACH_RESOURCE:
 			case GPU_CMD.CTX_DETACH_RESOURCE:
 			case GPU_CMD.SUBMIT_3D:
+				this.#start();
+				return this.#send({ cmd }, fenced);
 			case GPU_CMD.SET_SCANOUT:
 			case GPU_CMD.RESOURCE_FLUSH:
+				// Before any 3D use the renderer has no scanout (a 2D client turning
+				// its scanout off): nothing to tell, and no reason to load it.
+				if (!this.#started) return resp(GPU_RESP.OK_NODATA);
 				return this.#send({ cmd }, fenced);
 			default:
 				// Blobs, UUIDs, 2D commands on a 3D resource: not offered.
@@ -272,8 +330,28 @@ export class VirglGpuBackend implements GpuBackend {
 		return this.#link.init.then(f, () => resp(GPU_RESP.ERR_UNSPEC));
 	}
 
+	/**
+	 * Run `f` (which sends to the renderer) once the renderer's init has come
+	 * and after every send that waited before it; sends that come meanwhile
+	 * queue behind it (#send), so the renderer gets them in order.
+	 */
+	#after<T>(f: () => T | Promise<T>): Promise<T> {
+		const before = this.#tail ?? this.#link.init.catch(() => {});
+		const p = before.then(() => f());
+		const tail = p.catch(() => {});
+		this.#tail = tail;
+		void tail.then(() => {
+			if (this.#tail === tail) this.#tail = null;
+		});
+		return p;
+	}
+
 	/** A command for the renderer: fenced ones wait for its answer, the others are answered OK now. */
 	#send(req: GpuRequest, fenced: boolean): Uint8Array | Promise<Uint8Array> {
+		return this.#tail ? this.#after(() => this.#sendNow(req, fenced)) : this.#sendNow(req, fenced);
+	}
+
+	#sendNow(req: GpuRequest, fenced: boolean): Uint8Array | Promise<Uint8Array> {
 		if (this.#failed) return resp(GPU_RESP.ERR_UNSPEC);
 		if (!fenced) {
 			this.#link.post(req);
@@ -300,9 +378,7 @@ export class VirglGpuBackend implements GpuBackend {
 		return { row, rows: nby, layers: d, srcStride, srcLayer, offset, len: row * nby * d };
 	}
 
-	#transfer(cmd: Uint8Array, dv: DataView, ctx: GpuBackendContext, toHost: boolean, fenced: boolean): Uint8Array | Promise<Uint8Array> {
-		const res = this.#resources.get(dv.getUint32(HDR + 32, true));
-		if (!res) return resp(GPU_RESP.ERR_INVALID_RESOURCE_ID);
+	#transferNow(cmd: Uint8Array, dv: DataView, res: Resource3d, ctx: GpuBackendContext, toHost: boolean, fenced: boolean): Uint8Array | Promise<Uint8Array> {
 		if (this.#failed) return resp(GPU_RESP.ERR_UNSPEC);
 		const p = this.#packing(res, dv);
 		if (!p) {
@@ -479,10 +555,14 @@ export interface GpuScanout {
  * on demand (screenshots).
  */
 export class GpuRenderer {
+	/** The capsets and the format table once the renderer is up (after start()); rejects if it cannot be. */
 	readonly init: Promise<GpuInit>;
 	stats: GpuRendererStats = { commands: 0, fenced: 0, parks: 0, parkedMs: 0, presents: 0, reads: 0, errors: 0 };
 	/** A new frame was presented, or the scanout changed. */
 	onFrame: (() => void) | undefined;
+	#load: () => Promise<GpuRendererCore>;
+	#started = false;
+	#settle!: { resolve: (c: GpuRendererCore) => void; reject: (e: unknown) => void };
 	#core: GpuRendererCore | null = null;
 	#queue: Array<{ req: GpuRequest; done?: (r: GpuReply | Promise<GpuReply>) => void }> | null = [];
 	#strict: boolean;
@@ -501,18 +581,30 @@ export class GpuRenderer {
 	#rounds = 0;
 	#wake: MessagePort | null = null;
 
-	constructor(core: Promise<GpuRendererCore>, opts: GpuRendererOptions = {}) {
+	/**
+	 * `load` gives the module's helpers and its WebGL2 context: called once,
+	 * on start() (the device side's first 3D use, or at once for a renderer
+	 * loaded before boot), or on the first command.
+	 */
+	constructor(load: () => Promise<GpuRendererCore>, opts: GpuRendererOptions = {}) {
+		this.#load = load;
 		this.#strict = !!opts.strictWaits;
 		this.#log = opts.log ?? (() => {});
+		const core = new Promise<GpuRendererCore>((resolve, reject) => (this.#settle = { resolve, reject }));
 		this.init = core.then((c) => {
-			this.#core = c;
 			const capsets: GpuInit["capsets"] = [];
-			for (const id of [1, 2]) {
+			for (const { id, version, size } of VIRGL_CAPSETS) {
 				const cs = c.gpu.capset(id);
-				if (cs) capsets.push({ id, version: cs.version, data: cs.data });
+				// The device offered these before the module was loaded (GET_CAPSET_INFO): the driver
+				// caches that size, so a capset of another size or version cannot be given.
+				if (!cs || cs.version !== version || cs.data.length !== size)
+					throw new Error(`the renderer's capset ${id} is ${cs ? `version ${cs.version}, ${cs.data.length} bytes` : "missing"}, not version ${version}, ${size} bytes as offered ` +
+						"(VIRGL_CAPSETS in js/core/gl-gpu.ts and KW_VGPU_CAPSET* in gl/wasm/kw_virgl.h must match the module's virglrenderer)");
+				capsets.push({ id, version, data: cs.data });
 			}
 			const formats = new Uint32Array(512);
 			for (let f = 0; f < formats.length; f++) formats[f] = c.gpu.format(f);
+			this.#core = c;
 			const q = this.#queue ?? [];
 			this.#queue = null;
 			for (const { req, done } of q) {
@@ -529,8 +621,27 @@ export class GpuRenderer {
 		});
 	}
 
+	/** Load the renderer now, if that has not started (the guest's first 3D use). */
+	start(): void {
+		if (this.#started) return;
+		this.#started = true;
+		let p: Promise<GpuRendererCore>;
+		try {
+			p = this.#load();
+		} catch (e) {
+			p = Promise.reject(e);
+		}
+		p.then(this.#settle.resolve, this.#settle.reject);
+	}
+
+	/** start() was called: the renderer is loaded, loading, or failed. */
+	get started(): boolean {
+		return this.#started;
+	}
+
 	/** Run a command and answer (after the commands before it). */
 	call(req: GpuRequest): GpuReply | Promise<GpuReply> {
+		this.start();
 		if (this.#queue) {
 			const q = this.#queue;
 			return new Promise((resolve) => q.push({ req, done: (r) => void Promise.resolve(r).then(resolve) }));
@@ -541,6 +652,7 @@ export class GpuRenderer {
 
 	/** Run a command, no answer. */
 	post(req: GpuRequest): void {
+		this.start();
 		if (this.#queue) this.#queue.push({ req });
 		else if (this.#core) void this.#run(req);
 	}
@@ -770,6 +882,7 @@ export class GpuRenderer {
 export function inlineGpuLink(r: GpuRenderer): GpuLink {
 	return {
 		init: r.init,
+		start: () => r.start(),
 		call: (req) => r.call(req),
 		post: (req) => r.post(req),
 		reset: () => r.reset(),

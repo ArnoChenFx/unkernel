@@ -270,9 +270,15 @@ There is no udev: the kw layer's rc gives `card*` to video (0660) and
   a9cc9905ddb7 ("drm/virtio: Recalculate ignore_damage_clips on every
   update", 7.4), without which the flag sticks after the first commit that
   changes the framebuffer.
-- Snapshots: the host refuses one (-EBUSY, "virtio-gpu resources", or
-  "virtio-gpu contexts" with 3D) while the device holds resources,
-  contexts or unanswered commands, which a KMS client
+- DRM_IOCTL_VIRTGPU_GET_CAPS waits up to 30 s for a capset the kernel has
+  not cached, killably (patch 0048, "drm/virtio: wait up to 30 s for a
+  capset"; upstream 5 s, then -EBUSY): the host loads its 3D renderer on
+  the first capset request, which may fetch it over the network (gl.md,
+  Loading on first use).
+- Snapshots: the host refuses one ("virtio-gpu resources", or
+  "virtio-gpu contexts" with 3D: at once, before the guest parks; -EBUSY at
+  the snapshot point for unanswered commands) while the device holds
+  resources, contexts or unanswered commands, which a KMS client
   that has exited no longer does; otherwise it saves the transport state
   (status, features, each queue's addresses and next available index) and
   a restore picks it up, with nothing in the kernel (no restore notifier).

@@ -137,16 +137,18 @@ The page takes a few URL parameters:
 | `?data=0` | No persistent disk, a fresh system every time |
 | `?worker=0` | Run the kernel on the page's thread (default: in a Web Worker where the page is cross-origin isolated) |
 | `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox, one on phones, in Safari and on iOS, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
-| `?gl=1` | Guest GL on Debian: the guest's Mesa renders through your browser's WebGL2 (see below) |
+| `?gl=0` | No guest GL (on by default on Debian: the guest's Mesa renders through your browser's WebGL2, see below) |
 
-With `?gl=1` (or Options, Guest GL) the guest's shells use Mesa's virgl
-driver, which draws through your browser's WebGL2; the status panel's
-Guest GL row names the GPU (a software renderer such as SwiftShader is
-flagged). Mesa is installed in the guest, not shipped:
+On Debian the guest gets a GPU (`/dev/dri`, Options, Guest GL): Mesa's
+virgl driver draws through your browser's WebGL2. The renderer behind it
+is downloaded only when a guest program first uses GL; the status panel's
+Guest GL row then names the GPU (a software renderer such as SwiftShader
+is flagged). Mesa is installed in the guest, not shipped:
 
 ```sh
-sudo apt-get install -y mesa-utils libegl-mesa0 libgles2
-eglinfo -B -p surfaceless         # OpenGL ES renderer: virgl (<your GPU>)
+sudo apt-get install -y mesa-utils libegl-mesa0 libgles2 kmscube
+eglinfo -B -p gbm                 # OpenGL ES renderer: virgl (<your GPU>)
+kmscube                           # on the display (Enter ends it)
 sudo apt-get install -y xvfb xauth glmark2-es2-x11
 xvfb-run -a -s "-screen 0 640x480x24" glmark2-es2   # frame rates
 ```
@@ -510,16 +512,18 @@ a fresh frame.
 
 ```js
 const vm = await createKernel({ distro: "/distros/debian.erofs", gl: true });
-await vm.gl.ready;                               // the renderer runs and the guest is linked to it
+await vm.gl.ready;                               // the guest is linked; the renderer loads on its first GL use
 await vm.exec("sudo", ["apt-get", "install", "-y", "mesa-utils", "libegl-mesa0", "libgles2"]);
 const r = await vm.exec("sh", ["-c", "GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 eglinfo -B -p surfaceless"]);
 ```
 
 The guest's Mesa (Debian; its `virpipe` driver) renders through
-virglrenderer compiled to wasm (`virgl.wasm`, loaded only with `gl`) on one
-WebGL2 context of the page, and gets its frames back by readback: GL 2.1
-and GLES 3.0, surfaceless or under Xvfb. Node has no WebGL, so there `gl`
-is ignored with a log line.
+virglrenderer compiled to wasm (`virgl.wasm`, fetched only with `gl`, and
+only on the guest's first GL use; `vm.gl.status` tells, `vm.gl.load()`
+starts it, and `gl: { eager: true }` loads it before the boot so that a
+failure shows up front) on one WebGL2 context of the page, and gets its
+frames back by readback: GL 2.1 and GLES 3.0, surfaceless or under Xvfb.
+Node has no WebGL, so there `gl` is ignored with a log line.
 
 With `gpu: true` as well (and a kernel with kwvirtio), the guest gets a
 virtio-gpu device with 3D on the same renderer: stock Mesa finds

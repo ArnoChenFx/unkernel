@@ -7,7 +7,7 @@
 // run: Copy diagnostics, the data disk buttons, the key bar, paste, font size.
 import { flushSync } from "react-dom";
 import { RESUME_AUTO, RESUME_BY_HAND, RESUME_FRESH, allowLeave, resumeAskedFor, resumeRequestKind, type ResumeRequest } from "./autosuspend.ts";
-import { DEFAULT_CMDLINE, DEFAULT_DISTRO, SETTING_NAMES, saveSettings, type Config } from "./config.ts";
+import { DEFAULT_CMDLINE, DEFAULT_DISTRO, SETTING_NAMES, glDefault, saveSettings, type Config } from "./config.ts";
 import { KW, type KWError } from "./kw.ts";
 import { initStore, type Ask, type PadLayout, type CheckResult, type Options, type State, type Tab, type UiState } from "./store.ts";
 
@@ -566,7 +566,8 @@ export function createUi(cfg: Config) {
 		// Auto-suspend: saved only where it differs from this device's default (config.ts).
 		set("autosuspend", o.autosuspend === cfg.autosuspendDefault ? null : o.autosuspend);
 		set("askleave", o.askleave === "off" ? "0" : null);
-		set("gl", o.gl === "on" ? "1" : null);
+		// Guest GL: saved only where it differs from its default (on where the display is; config.ts glDefault()).
+		set("gl", (o.gl === "on") === glDefault(o.display !== "off") ? null : o.gl === "on" ? "1" : "0");
 		return Object.fromEntries([...p].sort(([a], [b]) => a.localeCompare(b)));
 	}
 	/** The options differ from the settings this load booted with (the Reboot button says so). */

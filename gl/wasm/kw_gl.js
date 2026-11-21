@@ -35,6 +35,10 @@
 //                     base instance for instanced ones) and put back after.
 //   framebuffers      glFramebufferTexture3D(OES): framebufferTextureLayer.
 //   queries           glGetQueryObjectiv (WebGL2's getQueryParameter).
+//   renderer name     glGetString(GL_RENDERER): WebGL answers "WebKit WebGL";
+//                     the unmasked name (WEBGL_debug_renderer_info) when the
+//                     browser gives it, so the guest's "virgl (...)" names
+//                     the WebGL implementation.
 
 addToLibrary({
   $kwgl: {
@@ -182,6 +186,19 @@ addToLibrary({
   },
 
   // --- buffer types ---
+
+  kw_glGetString__deps: ['$kwgl', 'glGetString', '$stringToNewUTF8'],
+  kw_glGetString: (name) => {
+    if (name === 0x1F01) { // GL_RENDERER
+      if (kwgl.renderer === undefined) {
+        const info = kwgl.ext('WEBGL_debug_renderer_info');
+        const s = info && GLctx.getParameter(info.UNMASKED_RENDERER_WEBGL);
+        kwgl.renderer = s ? stringToNewUTF8(String(s)) : 0;
+      }
+      if (kwgl.renderer) return kwgl.renderer;
+    }
+    return _glGetString(name);
+  },
 
   kw_glBindBuffer__deps: ['$kwgl', 'glBindBuffer'],
   kw_glBindBuffer: (target, buffer) => {

@@ -5,7 +5,7 @@
 # link the guest's bridge uses over kwvsock (a unix socket here):
 #
 #   Mesa -> unix socket -> vtest-bridge bridge --link unix:... -> stream
-#        -> stream-relay.js (gl/bridge/stream.js, the relay renderer)
+#        -> stream-relay.js (js/core/gl-stream.ts, the relay renderer)
 #        -> WebSocket -> vtest-bridge helper -> unix socket -> virgl_test_server
 #
 #   test/gl/stream-check.sh [--server PATH] [--single] [--loose] [--keep]
@@ -106,7 +106,8 @@ report() { # name, unexpected lines
 routine='listening on\|page connected\|link connected\|ready: vtest clients\|: open$\|hung up\|closed after'
 report bridge-log "$(grep -v "$routine" "$work/bridge.log")"
 report helper-log "$(grep -v "$routine" "$work/helper.log")"
-report relay-log "$(grep -v 'stream-relay: renderer: relay\|listening on\|bridge connected' "$work/relay.log")"
+# (the bridge's own lines come over the link too, as "bridge: ...")
+report relay-log "$(grep -v 'stream-relay: renderer: relay\|bridge connected' "$work/relay.log" | grep -v "$routine")"
 report server-log "$(log_errors "$work/server.log")"
 [ $fails = 0 ] || keep=1
 exit $((fails > 0))

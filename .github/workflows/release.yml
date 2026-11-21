@@ -4,8 +4,9 @@
 # Release: build everything from source (patched wasm-ld, the UP and SMP
 # kernels, the data disk template, the base bundle unkernel.wasm with its
 # SMP patch, the distro images alpine.erofs and debian.erofs and their
-# index distros.json), smoke-test it, build and pack the npm package (the
-# base bundle, no distro image), and for a release publish it to npm
+# index distros.json) and the guest GL renderer (gl/wasm, virgl.wasm),
+# smoke-test it, build and pack the npm package (the base bundle and the
+# GL renderer, no distro image), and for a release publish it to npm
 # (trusted publishing, with provenance) and publish a GitHub release (a
 # normal one, marked latest, its notes a compare link from the previous
 # v* tag) with the npm tarball, unkernel.wasm, distros.json and the images
@@ -137,7 +138,7 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs patch
+            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs patch meson pkg-config
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -201,7 +202,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: vendor/downloads
-          key: downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh', 'guest/**/pins.sh') }}
+          key: downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh', 'guest/**/pins.sh', 'gl/wasm/pins.sh') }}
           restore-keys: downloads-
 
       # Exact key only: build.sh never re-applies the series on an existing
@@ -310,6 +311,14 @@ jobs:
             console.log(`ok: abi ${j.abi}, ${j.base}, ${j.distros.map((d) => `${d.file} ${d.image}`).join(", ")}`);
           '
 
+      # The guest GL renderer the package carries (dist/virgl.mjs and
+      # virgl.wasm): emscripten and virglrenderer, both pinned (gl/wasm/pins.sh;
+      # emscripten goes into the downloads cache).
+      - name: Build the GL renderer
+        run: |
+          gl/wasm/build.sh
+          ls -l vendor/build/gl-wasm/virgl.mjs vendor/build/gl-wasm/virgl.wasm
+
       - name: Save downloads
         if: steps.downloads.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -373,6 +382,7 @@ jobs:
           pnpm build
           ls -l dist/*.wasm
           cmp dist/unkernel.wasm vendor/build/bundle/unkernel.wasm
+          cmp dist/virgl.wasm vendor/build/gl-wasm/virgl.wasm
       # The api suite (~85 s) runs once, on the built package: the same code
       # as the sources, plus the packaging (its distro tests read
       # vendor/build/distro/alpine.erofs).

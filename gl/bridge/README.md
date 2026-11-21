@@ -13,17 +13,16 @@ relay renderer (the stand-in): page -> WebSocket -> vtest-bridge helper
                                     -> unix socket -> virgl_test_server
 the stream link (the guest's, over kwvsock):
 Mesa -> unix socket -> vtest-bridge bridge --link vsock:2:PORT -> byte stream
-     -> StreamHost (stream.js) -> renderer
+     -> StreamHost (js/core/gl-stream.ts) -> renderer
 ```
 
 | File | What |
 | --- | --- |
 | `vtest-bridge.c` | `bridge` mode: the vtest socket, fd termination, and the link to the far side: the page's WebSocket (and serves the page), or with `--link unix:PATH` or `vsock:CID:PORT` a byte stream it connects to; `helper` mode: the relay's far end against a real server |
-| `build-guest.sh` | the guest's build: static aarch64-linux-musl, stream link only (`-DVTEST_BRIDGE_STREAM_ONLY`: no WebSocket, no helper, libc only) |
+| `build-guest.sh` | the guest's build: static aarch64-linux-musl, stream link only (`-DVTEST_BRIDGE_STREAM_ONLY`: no WebSocket, no helper, libc only); the same build ships in the base's kw layer as `/usr/lib/kw/vtest-bridge` (`guest/base/build.sh`), which the SDK's `gl` option starts |
 | `index.html`, `main.js` | the page: connects back to the bridge, hosts one renderer: `?renderer=wasm` (the default; `./virgl.mjs` next to the page, or `?module=URL`) or `relay`; `?glcheck=1` logs every WebGL call that raises an error, `?glcount=1` the calls made most often |
 | `mux.js` | the WebSocket framing and a WebSocketStream wrapper |
 | `relay.js` | the stand-in renderer |
-| `stream.js` | the stream link's far end: `StreamHost.serve(readable, writable)` drives a renderer from a bridge's stream given as web streams (a vsock connection in the SDK) |
 
 `test/gl/bridge-check.sh` builds and starts all of it and runs
 `test/gl/vtest-check.sh --socket` through it, with `--wasm` against the wasm
@@ -31,7 +30,11 @@ renderer (the module from `vendor/build/gl-wasm` served next to the page),
 else against the relay. `test/gl/stream-check.sh`
 does the same through the stream link (a unix socket,
 `test/gl/stream-relay.js` with the relay renderer at its far end), with
-`--guest` through the guest's build under qemu-aarch64.
+`--guest` through the guest's build under qemu-aarch64. The stream link's
+far end is the SDK's `StreamHost` (`js/core/gl-stream.ts`:
+`StreamHost.serve(readable, writable)` drives a renderer from a bridge's
+stream given as web streams, a vsock connection in the SDK), and
+`test/gl/unkernel-check.mjs` runs the whole path in unkernel.
 
 ## No file descriptors: the inline dialect
 
@@ -134,7 +137,14 @@ u32 length (little-endian, 5 + payload) | u32 client id | u8 type | payload
 Types, ids, chunking and READY are as on the WebSocket: the far side sends
 READY (id 0) when its renderer is up, and only then does the bridge create
 its vtest socket (default `/tmp/.virgl_test`, Mesa's default
-`VTEST_SOCKET_NAME`). A length below 5 or above 512 MiB ends the link. The
+`VTEST_SOCKET_NAME`; mode 0666, so that any user's clients connect). The
+bridge sends its own log lines the other way as LOG messages (id 0), among
+them `ready: vtest clients on PATH` once the socket exists, which the SDK
+waits for. One bridge per vtest socket: it holds an abstract unix socket
+named after it, and another bridge for the same path exits (with
+`--daemon`, which forks into a session of its own with stdio on
+/dev/null once it holds that lock, with 0, so starting it twice is
+harmless). A length below 5 or above 512 MiB ends the link. The
 bridge connects again every second until it can, and again a second after
 the link closes, which takes its clients with it. Back pressure is the
 stream's own: the bridge stops reading Mesa clients while it has more than

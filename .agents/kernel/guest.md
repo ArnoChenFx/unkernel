@@ -52,6 +52,9 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   SDK shipped with the kernel. `glimmer` is not in the layer: every distro
   build compiles it into its image (`install_common`, guest/lib/stage.sh),
   so the base shell has none.
+- `/usr/lib/kw/vtest-bridge` (Guest tools, below): the guest GL forwarder,
+  in the layer for the same reason (its link protocol belongs to the SDK's
+  `gl` option).
 - `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
   hostname (`/etc/hostname` unless empty or `localhost`, else
   `unkernel`), binfmt_misc and the WASI format (kwwasi), the console
@@ -474,6 +477,14 @@ within what kwemu implements: check it with the coverage classifier
   NAME...` makes the links; the SDK runs it through kwtty.
 - `kwshm memfd SIZE [SEED]` and `kwshm export FILE` export a patterned
   memfd or a file and print its id.
+- `/usr/lib/kw/vtest-bridge bridge --link vsock:2:1019 --daemon`: the guest
+  GL forwarder, `gl/bridge/vtest-bridge.c` built stream-only
+  (`-DVTEST_BRIDGE_STREAM_ONLY`, 67 KB; gl.md, gl/bridge/README.md): Mesa's
+  vtest socket `/tmp/.virgl_test` (mode 0666, made once the host's renderer
+  is ready) to the host's renderer on vsock port 1019, reconnecting every
+  second. `--daemon` returns once it holds its lock (an abstract socket
+  named after the vtest socket), so a second start exits 0. The SDK's `gl`
+  option runs it through kwtty as root.
 - `glimmer` is a small game for the display, keyboard and mouse at any
   size, with synthesised sound effects when there is a sound card (22050 Hz
   stereo through the raw ALSA ioctls, about 46 ms queued; M or Tab mutes,

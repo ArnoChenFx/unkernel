@@ -37,12 +37,20 @@ parts that are easy to get wrong.
   `vendor/build/bundle/unkernel.wasm` (the base bundle) goes along as
   `dist/unkernel.wasm` (export `unkernel/unkernel.wasm`), and the build
   fails if the bundle is missing. `js/unkernel.wasm` is a symlink to that
-  bundle. No distro image is in the package (Distro images, below).
+  bundle. No distro image is in the package (Distro images, below). The
+  guest GL renderer, `vendor/build/gl-wasm/virgl.mjs` and `virgl.wasm`
+  (`gl/wasm/build.sh`; `UNKERNEL_GL=dir` takes another build), goes along
+  the same way as `dist/virgl.mjs` and `dist/virgl.wasm` (exports
+  `unkernel/virgl.mjs`, `unkernel/virgl.wasm`; `js/virgl.mjs` and
+  `js/virgl.wasm` are symlinks), and the build fails without it.
 - The build checks that `dist/web.mjs` reaches no Node built-in, that
   each entry (not a shared chunk) computes
   `new URL("./unkernel.wasm", import.meta.url)`, and that `dist/node.mjs`
   and `dist/cli.mjs` compute the package root (`new URL("..",
-  import.meta.url)`, for `fetchDistro()`) themselves.
+  import.meta.url)`, for `fetchDistro()`) themselves. `dist/web.mjs` (not a
+  chunk) computes `new URL("./virgl.mjs", import.meta.url)`, no entry
+  imports `virgl.mjs` statically (only `createKernel({ gl })` imports it,
+  by that URL), and `dist/virgl.mjs` finds `virgl.wasm` next to itself.
 - It inlines the kernel workers (Packaging, below) and the CPU workers
   (`js/node/cpu-entry.ts`, started by `js/node/cpu.ts`, and
   `js/web/web-cpu-entry.ts`, started by `js/web/cpu.ts`; CPU threads,
@@ -812,6 +820,31 @@ parts that are easy to get wrong.
   guest sends to exercise the kernel's retry path. Skipped when the kernel
   under test has no `wasm_driver_vsock_init` import;
   `UNKERNEL_TEST_KERNEL=path` runs the file against another bundle.
+
+## Guest GL (`js/core/gl.ts`, `gl-stream.ts`)
+
+- `createKernel({ gl })` (gl.md has the whole path): `startGl()` makes a
+  `GlHost` (`vm.gl`) on the thread that owns the VM, in both modes, since
+  vsock is served there. It imports the platform's `virgl.mjs` (web entry:
+  `Platform.glModule`, `bundledGlUrl`; or `gl.module`), makes a WebGL2
+  context on a 1x1 OffscreenCanvas and the module's `virgl.Renderer`, then
+  listens on vsock port 1019 (`GL_PORT`) and serves each connection with
+  `StreamHost`, then runs the guest's forwarder (`GL_FORWARDER`,
+  `--daemon`) through kwtty as root. `gl.ready` resolves once the
+  forwarder's LOG line "ready: vtest clients on ..." arrives (the guest's
+  vtest socket exists then), and rejects (logged) when the renderer or the
+  forwarder fails or the link does not come within 30 s.
+- Where there is no OffscreenCanvas (Node) or no module (the page's
+  `web/src/sdk.ts` passes none), `gl` is ignored with a `[host]` log line
+  and `vm.gl` is undefined; `gl.renderer` (any object of the renderer
+  shape, `VtestRenderer`) works anywhere, which is how a Node run can
+  serve the guest with the relay to a native server.
+- `StreamHost` (the far end of vtest-bridge's stream link; `test/gl/stream-relay.js`
+  uses it on Node) never holds up replies; it stops reading the link while
+  the renderer is busy, so vsock credit holds the guest's forwarder.
+  Renderer state is not in snapshots: a restore resets the link (the guest's
+  GL clients end), the forwarder in the restored guest reconnects by itself,
+  and the new host's forwarder start exits 0 (one already runs).
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 

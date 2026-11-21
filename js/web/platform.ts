@@ -10,7 +10,8 @@
 // or a worker of the caller's own; never on the page's main thread
 // (webCpuBlocker()).
 // The entry (web.ts, or the page's web/src/sdk.ts) passes the
-// default kernel's URL, so `new URL(..., import.meta.url)` stays in it.
+// default kernel's URL and the GL renderer's (web.ts only), so
+// `new URL(..., import.meta.url)` stays in it.
 
 import type { Platform } from "../core/instance.ts";
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "./memory.ts";
@@ -18,9 +19,11 @@ import { spawnWebCpu, webCpuBlocker } from "./cpu.ts";
 import { webDevices } from "./devices.ts";
 import { spawnWebWorker } from "./worker.ts";
 
-export function webPlatform(defaultKernel: URL): Platform {
+export function webPlatform(defaultKernel: URL, glModule?: URL): Platform {
 	return {
 		defaultKernel: () => defaultKernel,
+		// The `gl` option's renderer (virgl.mjs), imported only when asked for.
+		glModule: glModule && (() => glModule),
 		defaultMemoryMiB: () => autoMemoryMiB().mib,
 		defaultMemoryFallbackMiB: [...DEFAULT_MEMORY_FALLBACK_MIB],
 		spawnWorker: spawnWebWorker,

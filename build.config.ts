@@ -12,6 +12,12 @@
 //                                 no distro images (the Node entry and the CLI
 //                                 download them: js/node/distro-fetch.ts, which
 //                                 finds package.json with new URL("..", import.meta.url))
+//   vendor/build/gl-wasm/virgl.{mjs,wasm} -> dist/virgl.{mjs,wasm}
+//                                 the guest GL renderer (gl/wasm/build.sh; UNKERNEL_GL=dir
+//                                 takes another build): the web entry finds it with
+//                                 new URL("./virgl.mjs", import.meta.url) and imports it
+//                                 only for createKernel({ gl }); virgl.mjs finds virgl.wasm
+//                                 next to itself
 //   js/node/worker-entry.ts       the kernel worker (createKernel({ worker: true })) on
 //   js/web/web-worker-entry.ts    Node and in browsers, each bundled into one minified ES
 //                                 module and inlined as a string where js/node/worker.ts
@@ -35,6 +41,8 @@ import { pathToFileURL } from "node:url";
 import { defineBuildConfig } from "obuild/config";
 
 const WASM = process.env.UNKERNEL_BUNDLE || "vendor/build/bundle/unkernel.wasm";
+const GL_DIR = process.env.UNKERNEL_GL || "vendor/build/gl-wasm";
+const GL_FILES = ["virgl.mjs", "virgl.wasm"];
 
 /**
  * Worker entries and the module that starts each one with
@@ -164,6 +172,10 @@ export default defineBuildConfig({
 			const st = await stat(wasm).catch(() => null);
 			if (!st?.isFile())
 				throw new Error(`${WASM} is missing: build it first (kernel/build.sh all, or kernel/build.sh base once vmlinux32.wasm exists)`);
+			for (const f of GL_FILES) {
+				const gl = await stat(path.resolve(ctx.pkgDir, GL_DIR, f)).catch(() => null);
+				if (!gl?.isFile()) throw new Error(`${GL_DIR}/${f} is missing: build the guest GL renderer first (gl/wasm/build.sh)`);
+			}
 		},
 		async rolldownConfig(config, ctx) {
 			// dist/node.mjs, not dist/js/node.mjs.
@@ -189,6 +201,7 @@ export default defineBuildConfig({
 		async end(ctx) {
 			const dist = path.join(ctx.pkgDir, "dist");
 			await copyFile(path.resolve(ctx.pkgDir, WASM), path.join(dist, "unkernel.wasm"));
+			for (const f of GL_FILES) await copyFile(path.resolve(ctx.pkgDir, GL_DIR, f), path.join(dist, f));
 			// The files an entry loads (itself and its chunks) and its bare imports.
 			const reach = async (entry: string) => {
 				const files = new Map<string, string>(), bare: Array<[string, string]> = [];
@@ -238,15 +251,25 @@ export default defineBuildConfig({
 			const chunks = await readdir(path.join(dist, "_chunks")).catch(() => []);
 			for (const c of chunks.filter((f) => f.endsWith(".mjs"))) {
 				const code = await readFile(path.join(dist, "_chunks", c), "utf8");
-				if (code.includes(`new URL("./unkernel.wasm"`) || code.includes(`new URL("..", import.meta.url)`))
-					throw new Error(`dist/_chunks/${c} resolves unkernel.wasm or the package root itself (would resolve inside _chunks/)`);
+				if (code.includes(`new URL("./unkernel.wasm"`) || code.includes(`new URL("./virgl.mjs"`) || code.includes(`new URL("..", import.meta.url)`))
+					throw new Error(`dist/_chunks/${c} resolves unkernel.wasm, virgl.mjs or the package root itself (would resolve inside _chunks/)`);
 			}
+			// The GL renderer: located by the web entry itself, never loaded by an entry
+			// until createKernel({ gl }) asks for it (a dynamic import of that URL), and
+			// virgl.mjs finds virgl.wasm next to itself.
+			if (!web.files.get("web.mjs")!.includes(`new URL("./virgl.mjs", import.meta.url)`))
+				throw new Error("dist/web.mjs does not locate virgl.mjs next to itself");
+			for (const entry of ["node.mjs", "web.mjs", "cli.mjs"])
+				for (const [file] of (await reach(entry)).files)
+					if (GL_FILES.includes(path.basename(file))) throw new Error(`dist/${entry} imports ${file} statically; the GL renderer must load only for createKernel({ gl })`);
+			if (!(await readFile(path.join(dist, "virgl.mjs"), "utf8")).includes(`new URL("virgl.wasm",import.meta.url)`))
+				throw new Error("dist/virgl.mjs does not locate virgl.wasm next to itself (gl/wasm/build.sh: an ES module build)");
 			// Every entry links (a broken chunk split shows up as a missing export).
 			for (const entry of ["node.mjs", "web.mjs"]) {
 				const mod = await import(`${pathToFileURL(path.join(dist, entry)).href}?check=${Date.now()}`);
 				if (typeof mod.createKernel !== "function") throw new Error(`dist/${entry} has no createKernel export`);
 			}
-			console.log(`unkernel: dist/unkernel.wasm copied; web entry is free of Node imports; kernel, CPU and WASI program workers inlined; entries link; ${chunks.length} shared chunk(s)`);
+			console.log(`unkernel: dist/unkernel.wasm and the GL renderer (virgl.mjs, virgl.wasm) copied; web entry is free of Node imports; kernel, CPU and WASI program workers inlined; entries link; ${chunks.length} shared chunk(s)`);
 		},
 	},
 });

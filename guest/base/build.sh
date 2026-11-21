@@ -21,6 +21,9 @@
 #                           usr/lib/kw/ (rc, welcome, net, udhcpc, shutdown,
 #                           data-stop: the runtime a distro's init calls; shrc: the kw-*.sh profile files for
 #                           interactive shells that are not login shells;
+#                           vtest-bridge: gl/bridge/vtest-bridge.c, stream
+#                           link only, the guest GL forwarder that the SDK's
+#                           `gl` option starts;
 #                           shim and bin/: fx, claude, opencode, node,
 #                           npm, npx, bun, bunx, uv, uvx on first use),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh}, the X.Org
@@ -99,6 +102,8 @@ for t in kwvsock kwshm kwtty kw9p kwwasi kwcmd; do
 	"${cc_guest[@]}" -o "$layer/usr/bin/$t" "$guest/src/$t.c"
 	ln -s "/kw/layer/usr/bin/$t" "$stage/usr/bin/$t"   # for the base shell
 done
+# The guest GL forwarder (.agents/gl.md): vtest clients to the host's renderer over kwvsock.
+"${cc_guest[@]}" -DVTEST_BRIDGE_STREAM_ONLY -o "$layer/usr/lib/kw/vtest-bridge" "$root/gl/bridge/vtest-bridge.c"
 install_tree "$src/rootfs" "$layer"
 ln -s /kw/layer/usr/sbin/kw-overlay "$stage/usr/sbin/kw-overlay"
 ln -s /kw/layer/usr/lib/kw "$stage/usr/lib/kw"

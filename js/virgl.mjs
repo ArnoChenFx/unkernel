@@ -1,0 +1,1 @@
+../vendor/build/gl-wasm/virgl.mjs

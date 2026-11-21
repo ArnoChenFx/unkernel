@@ -9,14 +9,21 @@
 //       connected and ready) and carries every client over one WebSocket to
 //       the page, which connects to ws://127.0.0.1:N/. Plain GETs on the
 //       same port serve the page from DIR.
-//   vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH]
+//   vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH] [--daemon]
 //       The same with the far side on one connected byte stream in place of
 //       the WebSocket: the guest's end of kwvsock in unkernel, a unix socket
 //       for testing. It connects to the address (again every second while
 //       it cannot, or after the link closes) and sends each WebSocket
-//       message there after its length (README.md, Stream framing). The
-//       vtest socket defaults to /tmp/.virgl_test, Mesa's default
-//       VTEST_SOCKET_NAME.
+//       message there after its length (README.md, Stream framing), and
+//       its log lines as LOG messages. The vtest socket defaults to
+//       /tmp/.virgl_test, Mesa's default VTEST_SOCKET_NAME. --daemon: once
+//       it holds the socket's lock, it goes on in the background (a new
+//       session, stdio on /dev/null) and the command exits 0.
+//
+// One bridge per vtest socket: a bridge holds an abstract unix socket named
+// after its vtest socket while it runs, and another bridge for the same
+// socket exits (0 with --daemon, so starting it is idempotent; else 1).
+// The vtest socket is made mode 0666, so that any user's clients connect.
 //   vtest-bridge helper --server PATH [--port N] [--port-file F]
 //       Accepts the page's relay WebSocket and opens one connection to the
 //       vtest server at PATH per client.
@@ -47,6 +54,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +120,7 @@ static bool helper_mode;
 static const char *sock_path, *server_path, *www_dir = ".", *port_file, *link_addr;
 static int tcp_port;
 static int verbose;
+static bool daemonize;
 
 static double now(void)
 {
@@ -120,14 +129,23 @@ static double now(void)
 	return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+static void link_log(const char *s, size_t n);
+
+// A log line to stderr and, on the stream link, to the far side as LOG (a
+// daemon's stderr is /dev/null; the SDK logs what it gets).
 static void logf_(const char *fmt, ...)
 {
+	char line[1024];
 	va_list ap;
-	fprintf(stderr, "%s: ", helper_mode ? "helper" : "bridge");
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	fputc('\n', stderr);
+	if (n < 0)
+		return;
+	if ((size_t)n >= sizeof(line))
+		n = sizeof(line) - 1;
+	fprintf(stderr, "%s: %s\n", helper_mode ? "helper" : "bridge", line);
+	link_log(line, n);
 }
 
 static void die(const char *what)
@@ -244,6 +262,12 @@ static void link_send(uint8_t type, uint32_t id, const void *data, size_t len)
 #ifndef VTEST_BRIDGE_STREAM_ONLY
 	ws_frame(far, 2, h + 4, MUX_HDR, data, len);
 #endif
+}
+
+static void link_log(const char *s, size_t n)
+{
+	if (far && far->state == CONN_STREAM)
+		link_send(MUX_LOG, 0, s, n);
 }
 
 // ---- clients
@@ -780,6 +804,9 @@ static void start_unix(void)
 	listen_unix = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (listen_unix < 0 || bind(listen_unix, (void *)&sa, sizeof(sa)) < 0 || listen(listen_unix, 64) < 0)
 		die(sock_path);
+	// bind() made it with the umask; every user may connect (in the guest,
+	// any user's GL program, whoever started the bridge).
+	chmod(sock_path, 0666);
 	logf_("ready: vtest clients on %s", sock_path);
 }
 
@@ -1195,13 +1222,55 @@ static void on_signal(int sig)
 	stop = 1;
 }
 
+// The bridge's lock: an abstract unix socket named after the vtest socket,
+// held until it exits. 0, 1 if another bridge holds it, -1 on an error.
+static int instance_lock(void)
+{
+	struct sockaddr_un sa = { .sun_family = AF_UNIX };
+	int n = snprintf(sa.sun_path + 1, sizeof(sa.sun_path) - 1, "vtest-bridge:%s", sock_path);
+	if (n < 0)
+		return -1;
+	if ((size_t)n > sizeof(sa.sun_path) - 1)
+		n = sizeof(sa.sun_path) - 1;
+	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return -1;
+	if (bind(fd, (void *)&sa, offsetof(struct sockaddr_un, sun_path) + 1 + n) < 0) {
+		int e = errno;
+		close(fd);
+		errno = e;
+		return e == EADDRINUSE ? 1 : -1;
+	}
+	return 0; // fd stays open: the lock
+}
+
+// --daemon: the parent exits 0, the child goes on in a session of its own
+// with stdio on /dev/null (it logs over the link).
+static void go_background(void)
+{
+	pid_t pid = fork();
+	if (pid < 0)
+		die("fork");
+	if (pid > 0)
+		_exit(0);
+	setsid();
+	if (chdir("/") < 0)
+		die("chdir");
+	int fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+	if (fd >= 0) {
+		dup2(fd, 0), dup2(fd, 1), dup2(fd, 2);
+		if (fd > 2)
+			close(fd);
+	}
+}
+
 static void usage(void)
 {
 #ifdef VTEST_BRIDGE_STREAM_ONLY
-	fprintf(stderr, "usage: vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH] [-v]\n");
+	fprintf(stderr, "usage: vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH] [--daemon] [-v]\n");
 #else
 	fprintf(stderr, "usage: vtest-bridge bridge --socket PATH [--www DIR] [--port N] [--port-file F] [-v]\n"
-			"       vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH] [-v]\n"
+			"       vtest-bridge bridge --link unix:PATH|vsock:CID:PORT [--socket PATH] [--daemon] [-v]\n"
 			"       vtest-bridge helper --server PATH [--port N] [--port-file F] [-v]\n");
 #endif
 	exit(2);
@@ -1236,6 +1305,10 @@ int main(int argc, char **argv)
 			verbose++;
 			continue;
 		}
+		if (!strcmp(o, "--daemon")) {
+			daemonize = true;
+			continue;
+		}
 		if (!v)
 			usage();
 		if (!strcmp(o, "--socket"))
@@ -1266,6 +1339,21 @@ int main(int argc, char **argv)
 		fprintf(stderr, "vtest-bridge: --link takes unix:PATH (under 108 bytes) or vsock:CID:PORT\n");
 		exit(2);
 	}
+	if (daemonize && (helper_mode || !link_addr))
+		usage();
+	if (!helper_mode) {
+		int r = instance_lock();
+		if (r < 0) {
+			fprintf(stderr, "vtest-bridge: lock: %s\n", strerror(errno));
+			exit(1);
+		}
+		if (r > 0) {
+			fprintf(stderr, "vtest-bridge: a bridge already serves %s\n", sock_path);
+			exit(daemonize ? 0 : 1);
+		}
+	}
+	if (daemonize)
+		go_background();
 
 	signal(SIGPIPE, SIG_IGN);
 	struct sigaction sa = { .sa_handler = on_signal };

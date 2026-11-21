@@ -26,6 +26,7 @@ Run the row for what you changed, and no more.
 | SMP code (`CONFIG_SMP` paths, per-CPU data, IPIs, CPU parking, `js/core/cpu.ts`; kernel/smp.md) | `kernel/build.sh smp` (after `kernel`, so that the bundle carries the patch); kwtest with `--cpus 2` (the SMP kernel from the bundle) and once with `--kernel vendor/build/kernel-smp/vmlinux32.wasm --initrd base-test` (one CPU); `zig build test -Dkwemu-atomics=true` after a kwemu change |
 | Bundle and kernel patch (`bundle.mjs`, `kwdiff.mjs`, `kpatch.ts`, `kremap.ts`) | `KPATCH_UP=vendor/build/kernel/vmlinux32.wasm KPATCH_SMP=vendor/build/kernel-smp/vmlinux32.wasm pnpm test:kpatch` |
 | Page (`web/`) | `pnpm typecheck:web`; `node --test web/test/open.test.ts`; `pnpm build:web` |
+| Guest GL (`gl/`, `js/core/gl*.ts`, the forwarder; gl.md, Testing) | `node gl/wasm/test/check.mjs` (the module); `test/gl/stream-check.sh info state` (the stream link); `node test/gl/unkernel-check.mjs` (unkernel in headless Chromium; makes the prepared disk once) |
 
 The optional checks boot the same bundle as `pnpm test:api`, which already
 runs shell commands and `glimmer --test` inline and in worker mode (most of
@@ -135,8 +136,9 @@ the SMP patch), then the distro images (`kernel/build.sh distro`: the
 Debian image boots on that bundle to make apt's cache, and the step fails
 if it was left out) and `distros.json`, which it checks against
 `include/kw_emu.h`'s ABI and the images (sha256, size, ids; exactly
-alpine and debian, erofs). Network is needed only for the pinned
-downloads. Then it runs kwtest with and without the JIT and on 2 CPUs,
+alpine and debian, erofs), and the guest GL renderer the package carries
+(`gl/wasm/build.sh`: emscripten and virglrenderer, pinned). Network is
+needed only for the pinned downloads. Then it runs kwtest with and without the JIT and on 2 CPUs,
 and abitest on the UP kernel and on 2 CPUs (`--initrd base-test`, no
 distro), `pnpm typecheck` and `pnpm typecheck:web`, `pnpm test:kpatch`,
 the tty, http and 9p tests, `pnpm test:distro`, and kwtest and the api

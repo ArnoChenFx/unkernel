@@ -30,6 +30,8 @@
       "default": "./dist/web.mjs"
     },
     "./unkernel.wasm": "./dist/unkernel.wasm",
+    "./virgl.mjs": "./dist/virgl.mjs",
+    "./virgl.wasm": "./dist/virgl.wasm",
     "./package.json": "./package.json"
   },
   "types": "./dist/node.d.mts",

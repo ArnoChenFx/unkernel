@@ -1,9 +1,9 @@
-# Guest GL through virgl on WebGL2: handover
+# Guest GL through virgl on WebGL2
 
-For an agent starting this work. Nothing here is integrated into unkernel
-yet; this file is the plan, what was measured, and how to test. All work
-happens on the `webgl` branch (this worktree). Do not change `main`, and do
-not commit until asked.
+The design, what was measured, how to test, and what is open. It is in
+unkernel: `createKernel({ gl: true })` in a browser (unkernel, below). All
+work happens on the `webgl` branch (this worktree). Do not change `main`,
+and do not commit until asked.
 
 ## Goal
 
@@ -12,8 +12,10 @@ kwemu. The guest runs stock Mesa with the `virgl` driver; the host runs
 virglrenderer compiled to wasm against one WebGL2 context.
 
 ```
-guest: app -> Mesa virgl -> vtest protocol -> (socket) ...
-host:  ... -> virglrenderer (wasm) -> WebGL2 (one context, OffscreenCanvas)
+guest: app -> Mesa virgl (virpipe) -> /tmp/.virgl_test -> /usr/lib/kw/vtest-bridge
+       -> kwvsock, host CID 2, port 1019 ...
+host:  ... -> VsockHost -> StreamHost -> virglrenderer (wasm) -> WebGL2
+       (one context, OffscreenCanvas, on the thread that owns the VM)
 ```
 
 Decided, do not reopen without new facts:
@@ -43,8 +45,13 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | `test/gl/vtest-check.sh` | the check suite on this host; see Testing |
 | `test/gl/bridge-check.sh` | the same suite with every byte through the page in headless Chromium; `--wasm` against the wasm renderer |
 | `test/gl/kwgl-state.c` | the stale-state check run by `vtest-check.sh state` (surfaceless EGL clients taking turns) |
+| `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
+| `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
+| `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
+| `test/gl/build-guest-state.sh` | `kwgl-state.c` for the Debian guest (aarch64 glibc, linked against stand-ins for libEGL and libGLESv2) |
 | `vendor/src/virglrenderer-wasm` (gitignored) | the source of both builds: branch `kw-wasm` = 1.3.0 + the series |
 | `vendor/build/gl-wasm`, `vendor/build/gl-native` | `virgl.{mjs,wasm}`; `vtest/virgl_test_server` |
+| `vendor/build/gl/` | `debian-gl.img` (the prepared disk), `kwgl-state-aarch64`, `vtest-bridge` (`build-guest.sh`) |
 
 `vendor/` is not a record: commit on `kw-wasm` and re-export the series
 (`gl/wasm/build.sh` has the command). `build.sh` never re-applies an
@@ -158,6 +165,11 @@ is made up at three levels, the shim first:
     base vertex is not known.
   - `glFramebufferTexture3D(OES)` as `framebufferTextureLayer` (3D mipmaps
     through the blitter), `glGetQueryObjectiv`.
+  - **Renderer name**: `glGetString(GL_RENDERER)` answers the unmasked name
+    (`WEBGL_debug_renderer_info`) where WebGL says "WebKit WebGL", so the
+    guest's renderer string, `virgl (...)` (vrend forwards GL_RENDERER in
+    the caps, 63 bytes at most), names the WebGL implementation: here
+    `virgl (ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`.
 - `epoxy/gl.h`: aliases (`glGetQueryObjecti64v`, `glQueryCounter` and others
   to emscripten's EXT names).
 - vrend patches: the sized probe format (8), texture swizzles in the
@@ -267,6 +279,43 @@ eventfd. vtest forks one server process per client unless given
 `--no-fork`, also with `--multi-clients`; only `--no-fork` puts several
 clients on one renderer, as the page does.
 
+### unkernel (2026-11-21, `unkernel-check.mjs`, headless Chromium 157)
+
+The guest is Debian 13 on the UP kernel (inline; worker mode passes (a)
+and (b) the same), 1024 MiB, the prepared disk. The WebGL2 is ANGLE on
+SwiftShader (software: every virgl number is a floor for a page with a
+GPU). One run each, on the shared host:
+
+- `vm.gl.ready` 0.6 s after the page started (boot, module, forwarder
+  linked); `eglinfo -B -p surfaceless` on virgl 1.5 s: `virgl (ANGLE
+  (Google, Vulkan 1.3.0 (SwiftShader Device (Sub...)`, GLES 3.0 and GL 2.1
+  (Mesa 25.0.7).
+- `kwgl-state` (7 clients, 8 turns, 64x64): all 60 checksums of the
+  interleaved run equal each client's alone in the guest, and equal the
+  host's own run of the same clients through `bridge-check.sh --wasm
+  state` (x86 Mesa 26.2.7, the same renderer): the pixels are the
+  renderer's, whatever carried them. On llvmpipe in the guest 52 of 60
+  differ (rounding, as against the native renderer). 3.2 s on virgl, 32.4 s
+  on llvmpipe.
+- glmark2-es2 under Xvfb at 640x480, 10 s a scene, the same command with
+  and without `GALLIUM_DRIVER=virpipe` (FPS from glmark2's mean frame time):
+
+  | Scene | virgl (WebGL2 on SwiftShader) | llvmpipe (in the guest, under kwemu) | Ratio |
+  | --- | --- | --- | --- |
+  | build | 93.2 | 4.30 | 22x |
+  | texture | 98.8 | 4.08 | 24x |
+  | shading (phong) | 91.9 | 0.82 | 112x |
+  | jellyfish | 69.8 | 0.32 | 218x |
+  | desktop | 38.2 | 0.16 | 239x |
+
+  virgl here is as fast as Mesa on this host through the bridge's
+  WebSocket to the same renderer (Measured, above: build 90, texture 107,
+  jellyfish 84, desktop 37, also 640x480, 2 s a scene): the browser's
+  renderer bounds it, not the emulated guest or kwvsock. Each frame comes back to the guest
+  by readback and goes to Xvfb by XPutImage, for virgl and llvmpipe alike.
+- The prepared disk: 290 MiB used of a 4 GiB sparse image; made in 55 s
+  (boot, apt over the direct network, power-off).
+
 ## Work packages
 
 1. **Single context, hardened (native).** Done: Single GL context. Check:
@@ -278,12 +327,44 @@ clients on one renderer, as the page does.
    (below) would find the rest.
 4. **Bridge and browser harness.** Done: `gl/bridge`, `bridge-check.sh`
    (relay or `--wasm`).
-5. **unkernel.** Carry the vtest socket from the guest over kwvsock (the
-   bridge's stream link and its guest build, `gl/bridge/README.md`) to the
-   renderer in the page; confirm that the Debian image's Mesa has the virgl
-   driver with vtest (`GALLIUM_DRIVER=virpipe`); decide where the renderer
-   runs (it needs an OffscreenCanvas; the kernel runs in a worker). Frames
-   by readback at first; kwshm can carry them later.
+5. **unkernel.** Done: unkernel, below. Check: `node test/gl/unkernel-check.mjs`.
+   Next: frames to the page (kwshm, or wland), the page's own `gl`
+   option (web/: it needs the module served and `glModule` passed), and
+   the busy wait (Open questions).
+
+## unkernel
+
+`createKernel({ gl: true })` (js.md, Guest GL; README.md):
+
+- **Host** (`js/core/gl.ts`): on the thread that owns the VM, in both
+  modes (vsock is served there: in worker mode the kernel's worker only
+  passes packets), the module is imported from `new URL("./virgl.mjs",
+  import.meta.url)` of the web entry (dist/virgl.mjs and virgl.wasm,
+  copied by `pnpm build`; never fetched without `gl`), the renderer is
+  `Module.virgl.Renderer` on a 1x1 OffscreenCanvas's WebGL2, and
+  `StreamHost` (`js/core/gl-stream.ts`) serves every connection to vsock
+  port 1019. Node: ignored with a log line (no OffscreenCanvas), unless
+  `gl.renderer` gives a renderer object (the relay works there).
+- **Guest** (`/usr/lib/kw/vtest-bridge`, kernel/guest.md): the bridge
+  built stream-only, in the base's kw layer (in the bundle, so it always
+  matches the SDK that speaks its link; 67 KB of RAM-resident layer for
+  every distro, Alpine included, which cannot use it). The SDK starts it
+  through kwtty as root once the renderer is up (`bridge --link
+  vsock:2:1019 --daemon`); it makes `/tmp/.virgl_test` mode 0666 when the
+  host sends READY, and `vm.gl.ready` resolves on its LOG line saying so.
+- **Mesa**: not in the image; `apt-get install mesa-utils libegl-mesa0
+  libgles2` (surfaceless, about 45 MB download), plus `libgl1-mesa-dri
+  libglx-mesa0 xvfb xauth glmark2-es2-x11 glmark2-x11` for X11 (all of it:
+  72 packages, 60 MB download, 238 MB installed). Debian trixie's Mesa
+  25.0.7 has virpipe. Clients run with `GALLIUM_DRIVER=virpipe
+  LIBGL_ALWAYS_SOFTWARE=1`, surfaceless or under Xvfb; without
+  `GALLIUM_DRIVER` the same programs run on llvmpipe in the guest.
+- **Snapshots**: renderer state is not saved. A restore resets the link
+  (GL clients in the guest end); the restored guest's forwarder
+  reconnects within a second and the new host's start of it exits 0.
+  Verified on Node with the relay renderer (2026-11-21): eglinfo on virgl
+  before the snapshot and after the restore, the same forwarder process.
+- Alpine's Mesa has no virgl driver: Debian only.
 
 ## Testing
 
@@ -296,7 +377,31 @@ test/gl/bridge-check.sh --single             # the suite through the page to the
 test/gl/vtest-check.sh --single              # the native server alone, about 2 min
 test/gl/vtest-check.sh --fork                # a server process per client
 test/gl/vtest-check.sh --server "$(command -v virgl_test_server)" info es2
+test/gl/stream-check.sh state                # the stream link (unix socket) to the relay
+test/gl/stream-check.sh --guest state        # the same through the guest's build under qemu-aarch64
+node test/gl/debian-disk.mjs                 # the prepared disk, once (skipped when it exists)
+node test/gl/unkernel-check.mjs              # unkernel in headless Chromium, about 4 min
+node test/gl/unkernel-check.mjs --worker --skip c   # worker mode, without the benchmark
 ```
+
+`unkernel-check.mjs` builds what it needs and skips what exists: `pnpm
+build` (the page imports `/dist/web.mjs`; `--no-build` skips it), the
+prepared disk `vendor/build/gl/debian-gl.img` (`debian-disk.mjs`: boots
+Debian on Node with the direct network, apt-installs the packages of
+unkernel above as root, powers off cleanly; delete it after a new Debian
+image, since its upper layer belongs to the image it was made on), and
+`kwgl-state` for the guest (`build-guest-state.sh`). It serves the Debian
+image and the disk read-only with Range requests (the guest's writes stay
+in the page's memory), and the page boots with `gl: true` and runs: (a)
+`eglinfo -B -p surfaceless` on virpipe (the renderer must be `virgl
+(...)`); (b) `kwgl-state` interleaved against each client alone, as
+`vtest-check.sh state` judges it, and with `--state-ref FILE` (the
+`state.txt` that `bridge-check.sh --wasm --keep state` keeps) against the
+host's own run, plus the same clients on llvmpipe (reported, not judged);
+its frames are written as PPM; (c) glmark2-es2 under Xvfb, the same scenes
+at the same size on virgl and on llvmpipe (`--size`, `--scenes`). The
+steps' output, the page's log and the guest's console go to `--out`
+(default a new `/tmp/kwgl.*`).
 
 Tests: `info` (versions), `es2` and `gl` (glmark2, 16 scenes each; the
 `.png` has a frame of each scene), `sdl` (neverball), `weston` (GL
@@ -326,6 +431,9 @@ Results (2026-11-21, the series of Patches):
 | `vtest-check.sh --single` | all pass, log clean |
 | `vtest-check.sh` (multi-context, one process) | all pass, log clean |
 | `vtest-check.sh --fork`, `--single --fork` | all pass; in some runs a client killed mid-command leaves a `VTEST_CLIENT_ERROR_COMMAND_DISPATCH` line |
+| `stream-check.sh state`, `--guest state` | pass |
+| `stream-check.sh info state` | state times out (its clients wait 120 s for replies the relay never brings), also at the commit before unkernel; `state` alone passes. Not examined |
+| `unkernel-check.mjs` (inline; `--worker --skip c`) | all pass; Measured |
 
 Workloads that need no window system of ours (so nothing waits on wland):
 
@@ -339,8 +447,16 @@ Workloads that need no window system of ours (so nothing waits on wland):
 
 ## Open questions
 
-- Which worker hosts the renderer, and how its replies reach kwvsock.
-- Readback cost per frame over kwvsock, and when to move it to kwshm.
+- Readback cost per frame over kwvsock, and when to move it to kwshm: at
+  640x480 the guest gets as many frames as a host client through the
+  bridge (unkernel, Measured), so kwvsock is not the limit on SwiftShader;
+  not measured with a GPU-backed WebGL2, where it may be.
+- The page (web/) does not offer `gl` yet: it would need virgl.mjs served
+  with the page's assets and `glModule` passed to `webPlatform()`, and a
+  way to get Mesa (apt over Wisp works there; routes for deb.debian.org).
+- Not tried in unkernel: the SMP kernel (`cpus` > 1; vsock and so GL stay
+  on the owner's thread, as on one CPU), Firefox and Safari (WebGL2 and
+  OffscreenCanvas in a page's main thread exist there), and a GPU.
 - The busy wait costs about 5 ms a frame (fence latency across tasks).
   Through the inline dialect a readback's data travels with its
   `TRANSFER_GET2` reply, which `glReadPixels` fills synchronously, so a

@@ -23,6 +23,7 @@ import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, 
 import { fetchOver } from "./http.ts";
 import { CommandTable, type HostCommand, type parseCommands } from "./commands.ts";
 import { MountTable, type FsSource, type Mount, type MountOptions, type parseMounts } from "./mounts.ts";
+import type { GlHost } from "./gl.ts";
 import { FrameClient, RemoteEvdev, SoundBridge } from "./worker-devices.ts";
 import { SharedOwner, newSharedControl, sharedMemoryAvailable, type KernelTransport } from "./worker-shared.ts";
 import type { CreateKernelOptions, InstanceStats, KernelHandle, Platform, BootProgress, VsockOption } from "./instance.ts";
@@ -202,6 +203,7 @@ export class WorkerKernel implements KernelHandle {
 	#vsockOut: Uint8Array[] = [];
 	#mounts: MountTable;
 	#commands: CommandTable;
+	#gl: GlHost | undefined;
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
@@ -450,6 +452,7 @@ export class WorkerKernel implements KernelHandle {
 		this.#evdev?.close();
 		this.#frames?.close();
 		this.#shared?.close();
+		this.#gl?.shutdown();
 		this.#commands.shutdown();
 		this.#mounts.shutdown();
 		this.#vsock?.shutdown();
@@ -670,6 +673,17 @@ export class WorkerKernel implements KernelHandle {
 	/** @internal createKernel's `commands`, once the kernel runs. */
 	startCommands(list: ReturnType<typeof parseCommands>): void {
 		this.#commands.addAll(list);
+	}
+
+	/** @internal createKernel's `gl`, once the kernel runs: served on this thread, as vsock is. */
+	attachGl(gl: GlHost | undefined): void {
+		this.#gl = gl;
+		if (gl && this.#result) gl.shutdown();
+	}
+
+	/** With the gl option: the GL renderer's host side (gl.ts), on this thread as inline. */
+	get gl(): GlHost | undefined {
+		return this.#gl;
 	}
 
 	/**

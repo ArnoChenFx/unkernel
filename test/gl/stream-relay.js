@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The far end of vtest-bridge's stream link on this host, for
 // stream-check.sh: accepts bridges on a unix socket and serves each with
-// gl/bridge/stream.js (as the page will serve the guest's vsock connection)
-// and the relay renderer (gl/bridge/relay.js), which carries every client
+// the SDK's StreamHost (js/core/gl-stream.ts, which serves the guest's vsock
+// connection for the `gl` option) and the relay renderer (gl/bridge/relay.js), which carries every client
 // over a WebSocket to `vtest-bridge helper` and on to virgl_test_server.
 //
 //   node test/gl/stream-relay.js --listen PATH --relay ws://127.0.0.1:PORT/
@@ -11,7 +11,7 @@ import { unlinkSync } from "node:fs";
 import net from "node:net";
 import { Duplex } from "node:stream";
 import { RelayRenderer } from "../../gl/bridge/relay.js";
-import { StreamHost } from "../../gl/bridge/stream.js";
+import { StreamHost } from "../../js/core/gl-stream.ts";
 
 const args = process.argv.slice(2);
 const opt = (name) => {

@@ -493,6 +493,21 @@ mouse or tablet. `onInput` tells you when a program opens the keyboard
 and mouse; until then, send keys to the console. `readFrame()` waits for
 a fresh frame.
 
+### GL in the guest (browsers)
+
+```js
+const vm = await createKernel({ distro: "/distros/debian.erofs", gl: true });
+await vm.gl.ready;                               // the renderer runs and the guest is linked to it
+await vm.exec("sudo", ["apt-get", "install", "-y", "mesa-utils", "libegl-mesa0", "libgles2"]);
+const r = await vm.exec("sh", ["-c", "GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 eglinfo -B -p surfaceless"]);
+```
+
+The guest's Mesa (Debian; its `virpipe` driver) renders through
+virglrenderer compiled to wasm (`virgl.wasm`, loaded only with `gl`) on one
+WebGL2 context of the page, and gets its frames back by readback: GL 2.1
+and GLES 3.0, surfaceless or under Xvfb. Node has no WebGL, so there `gl`
+is ignored with a log line.
+
 ### Run it in a worker
 
 ```js

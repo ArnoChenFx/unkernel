@@ -153,7 +153,9 @@ lives in virtio_transport.c, so kwvsock has its own).
 - kw_defconfig: VSOCKETS, VSOCKETS_DIAG (`ss --vsock`), KWVSOCK, not
   VSOCKETS_LOOPBACK.
 - Guest tools (guest.md): `kwvsock`, `kwtty` (terminal sessions, programs
-  on pipes and TCP relays for the host, port 1022), `kw9p`.
+  on pipes and TCP relays for the host, port 1022), `kw9p`, and the guest
+  GL forwarder `/usr/lib/kw/vtest-bridge` (connects to host port 1019;
+  gl.md).
 
 ## kwshm (shared memory)
 

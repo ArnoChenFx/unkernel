@@ -14,6 +14,7 @@
 //   term.onData((d) => vm.write(d));
 //
 // Needs JSPI (WebAssembly.Suspending/promising); checkSupport() tells.
+// `gl: true` gives the guest GL through WebGL2 (virgl.mjs, loaded only then).
 
 import { createKernelOn, type CreateKernelOptions, type KernelHandle, type KernelInstance, type WorkerOption } from "./core/instance.ts";
 import type { WorkerKernel } from "./core/worker-host.ts";
@@ -34,7 +35,14 @@ export { serveWasiPrograms } from "./web/wasi.ts";
  */
 export const bundledKernelUrl: URL = new URL("./unkernel.wasm", import.meta.url);
 
-const platform = webPlatform(bundledKernelUrl);
+/**
+ * The guest GL renderer (createKernel({ gl: true })): virglrenderer compiled
+ * to wasm, an emscripten module with virgl.wasm next to it, both next to
+ * this module. Imported only when `gl` asks for it.
+ */
+export const bundledGlUrl: URL = new URL("./virgl.mjs", import.meta.url);
+
+const platform = webPlatform(bundledKernelUrl, bundledGlUrl);
 
 /**
  * Load, compile and boot a kernel (default: the bundled one, which boots

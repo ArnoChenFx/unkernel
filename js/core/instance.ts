@@ -19,6 +19,7 @@ import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, 
 import { fetchOver } from "./http.ts";
 import { CommandTable, parseCommands, type CommandsOption, type HostCommand } from "./commands.ts";
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
+import { startGl, type GlHost, type GlOption } from "./gl.ts";
 import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
 import { NetStack, type NetBackend, type NetStats } from "./net.ts";
@@ -208,6 +209,19 @@ export interface CreateKernelOptions {
 	 * `restore`, the snapshot's links are replaced by these.
 	 */
 	commands?: CommandsOption;
+	/**
+	 * Guest GL (gl.ts, .agents/gl.md): the guest's Mesa renders through
+	 * virglrenderer compiled to wasm on one WebGL2 context of this thread
+	 * (an OffscreenCanvas; frames come back to the guest by readback). The
+	 * module (virgl.mjs and virgl.wasm next to the web entry) is loaded only
+	 * then; the host listens on vsock port 1019 and starts the guest's
+	 * forwarder (/usr/lib/kw/vtest-bridge) through kwtty, after which GL
+	 * programs run with GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1
+	 * (Debian: Mesa from apt). true, or options. Needs vsock and WebGL2:
+	 * where there is none (Node) it is ignored with a log line, unless
+	 * `renderer` gives one. Default false.
+	 */
+	gl?: GlOption;
 	/** Initial console size (cols x rows); resize() changes it later. */
 	consoleSize?: { cols: number; rows: number };
 	/** Console output, from the first byte. */
@@ -337,6 +351,8 @@ export interface Platform {
 	distroSpec?: (src: string | URL) => DiskSpec;
 	/** Start the profiler's time sampler thread (profile.ts); without it there are no time samples. */
 	spawnSampler?: (init: SamplerInit) => SamplerHandle;
+	/** The wasm GL renderer's module (virgl.mjs, the `gl` option); without it `gl` needs a module or a renderer. */
+	glModule?: () => URL;
 }
 
 /**
@@ -465,6 +481,8 @@ export interface KernelHandle {
 	 * "messages" or "shared" (worker mode; see WorkerOption.shared).
 	 */
 	readonly transport: KernelTransport;
+	/** With the gl option, where it could start: the renderer's host side (ready, stats); it runs on this thread in both modes. */
+	readonly gl: GlHost | undefined;
 }
 
 function isBackend(n: NetDevice | NetBackend): n is NetBackend {
@@ -495,6 +513,7 @@ export class KernelInstance implements KernelHandle {
 	#shm: ShmClient<InlineShmFile> | undefined;
 	#mounts = new MountTable(undefined, () => {});
 	#commands = new CommandTable(undefined, () => {});
+	#gl: GlHost | undefined;
 
 	/** @internal Use createKernel(). */
 	constructor(kernel: Kernel, module: WebAssembly.Module, cmdline: string, net: NetDevice | undefined, compileMs: number) {
@@ -506,6 +525,7 @@ export class KernelInstance implements KernelHandle {
 		this.#out = new ConsoleOutput(() => !!kernel.result);
 		if (kernel.shm.enabled) this.#shm = inlineShm(kernel.shm);
 		this.exited = kernel.exited.then((res) => {
+			this.#gl?.shutdown();
 			this.#commands.shutdown();
 			this.#mounts.shutdown();
 			this.#vsock?.shutdown();
@@ -552,6 +572,17 @@ export class KernelInstance implements KernelHandle {
 	/** @internal createKernel's `commands`, once the kernel runs. */
 	startCommands(list: ReturnType<typeof parseCommands>): void {
 		this.#commands.addAll(list);
+	}
+
+	/** @internal createKernel's `gl`, once the kernel runs. */
+	attachGl(gl: GlHost | undefined): void {
+		this.#gl = gl;
+		if (gl && this.kernel.result) gl.shutdown();
+	}
+
+	/** With the gl option: the GL renderer's host side (gl.ts), or undefined. */
+	get gl(): GlHost | undefined {
+		return this.#gl;
 	}
 
 	/** createKernel's `mounts` and `commands` first (see KernelHandle.spawn()). */
@@ -854,6 +885,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		const vm = await createKernelInWorker(platform, opts, progress);
 		vm.startMounts(mounts);
 		vm.startCommands(commands);
+		vm.attachGl(startGl(opts.gl, vm.vsock, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m))));
 		return vm;
 	}
 	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
@@ -968,6 +1000,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	booting.catch(() => {});
 	instance.startMounts(rest);
 	instance.startCommands(commands);
+	instance.attachGl(startGl(opts.gl, vsock, platform.glModule?.(), log));
 	if (signal) {
 		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
 		if (signal.aborted) onAbort();

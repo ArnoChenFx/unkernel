@@ -48,6 +48,10 @@
 #define glEndTransformFeedback kw_glEndTransformFeedback
 #define glPauseTransformFeedback kw_glPauseTransformFeedback
 
+/* GL_RENDERER: the WebGL implementation's own name (kw_gl.js), which vrend
+ * forwards to the guest ("virgl (...)") in place of "WebKit WebGL". */
+#define glGetString kw_glGetString
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -66,6 +70,7 @@ void kw_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count
                             const void *indices);
 void kw_glEndTransformFeedback(void);
 void kw_glPauseTransformFeedback(void);
+const GLubyte *kw_glGetString(GLenum name);
 
 bool epoxy_has_gl_extension(const char *extension);
 bool epoxy_is_desktop_gl(void);

@@ -22,8 +22,8 @@ const std = @import("std");
 const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
-pub const abi_version: u32 = 2;
-pub const cpu_size: usize = 8 << 20;
+pub const abi_version: u32 = 3;
+pub const cpu_size: usize = 9 << 20;
 
 pub const Event = extern struct {
     kind: u32 = 0,
@@ -106,7 +106,7 @@ const ppn_mask: u64 = (1 << 44) - 1;
 /// collide must not evict each other forever).
 const nsets = 16384;
 const nblocks = 2 * nsets;
-/// Op arena (16 bytes per op, 6 MiB). With 128K ops, node's startup
+/// Op arena (16 bytes per op, 7 MiB). With 128K ops, node's startup
 /// filled it every ~2M instructions (about 270 resets per `npx --version`,
 /// each freeing every compiled block); 384K ops cut npx by ~7%.
 /// Two parts: the nursery [0, Priv.nursery), where blocks are decoded, and
@@ -114,8 +114,11 @@ const nblocks = 2 * nsets;
 /// compiled (`tenure`). A full nursery is reset without touching compiled
 /// code (`resetNursery`); the tenured part is a ring whose oldest blocks
 /// make room (their code is dropped).
-const nops = 384 * 1024;
-pub const ten_default = 64 * 1024;
+const nops = 448 * 1024;
+/// The tenured ring's size in ops (the nursery has the rest, 320K): it holds
+/// the compiled set of one run of a Bun-based program, and a smaller
+/// nursery made npm slower (a64/performance.md, Tenured ring).
+pub const ten_default = 128 * 1024;
 /// Tenured ops are numbered on from Priv.nursery for good (Block.op; the
 /// ring position is that number modulo the ring's size, `opIndex`), so a
 /// number names one copy and a module's member check (jitcore.zig,

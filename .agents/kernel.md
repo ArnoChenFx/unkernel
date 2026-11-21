@@ -53,7 +53,8 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   `kw_emu.h`); and last the guest pc sampling (prof.c).
 - A fix or an extension of a piece is a `git commit --fixup` of its patch,
   autosquashed; an arm64 fix, or a kwemu ABI change that changes the
-  header or what the kernel advertises, is a fixup of the last patch. A
+  header or what the kernel advertises, is a fixup of `wasm: run arm64
+  user space`. A
   new piece (a driver, a generic change) is a new patch placed with its
   kind, with a kernel-style subject (`wasm: ...`); its config options go in
   the `kw_defconfig` patch. Each patch need not build on its own; the
@@ -96,7 +97,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and
 a patch re-export.
 
-- `KW_ABI_VERSION` is 2. `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 3. `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it in both copies on any change to
   the layout or the semantics; the header describes the current contract
   only. A new `KW_ISA_*` bit is an ABI change; implementing an extension
@@ -114,7 +115,7 @@ a patch re-export.
   belongs to a new module instance, so kwemu forgets its JIT slots without
   `kw_host_jit_free`, asks `kw_host_jit_caps` again and drops all decoded
   code.
-- `KW_CPU_SIZE` is 8 MiB, reserved statically (`kw_cpu_storage`), so it
+- `KW_CPU_SIZE` is 9 MiB, reserved statically (`kw_cpu_storage`), so it
   comes out of guest RAM; about 28 KiB of it is spare with the JIT
   (kwemu.md, Numbers, Sizes). Zig checks its layouts against the header at compile
   time through translate-c.

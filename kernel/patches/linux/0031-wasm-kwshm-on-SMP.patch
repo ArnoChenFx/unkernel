@@ -1,4 +1,4 @@
-From abe47e08ff3d50faa7e2290c4622a8f0d0e078fd Mon Sep 17 00:00:00 2001
+From b87a1a84f3d2a027b05a40519c07a6157abed4d7 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 20:16:03 +0000
 Subject: [PATCH] wasm: kwshm on SMP
@@ -39,7 +39,7 @@ index 139f3e96491..9238a99bc2e 100644
  
  /* Bits set by the host in wasm_host_irqs (see irq.h). */
 diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
-index e48cf0a45bb..dd3ea4d9238 100644
+index ec63ba2d518..54f963f3471 100644
 --- a/arch/wasm/kernel/smp.c
 +++ b/arch/wasm/kernel/smp.c
 @@ -24,6 +24,7 @@

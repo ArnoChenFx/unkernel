@@ -79,7 +79,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 2
+#define KW_ABI_VERSION 3
 
 /*
  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -138,7 +138,7 @@ struct kw_event {
  * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned): TLBs,
  * the decoded-block cache and its op arena, JIT bookkeeping.
  */
-#define KW_CPU_SIZE (8 * 1024 * 1024)
+#define KW_CPU_SIZE (9 * 1024 * 1024)
 
 /*
  * Only the leading fields are public. The rest of the KW_CPU_SIZE bytes

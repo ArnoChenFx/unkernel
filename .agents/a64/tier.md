@@ -16,7 +16,8 @@ through `Cpu.opIndex(b.op)` (tenured ops are numbered, not indexed).
 
 ## Blocks
 
-Up to 64 instructions inside one page in execution order. B.cond,
+Up to 64 instructions (`max_block`; shorter blocks: a64/performance.md,
+Rejected designs) inside one page in execution order. B.cond,
 CBZ/CBNZ and TBZ/TBNZ are side exits; B and BL to the same page are
 followed (`b_f`, `bl_f`: the op stays, so the instruction count stays
 exact, and BL's link is in the op). A block ends at BR/BLR/RET, a branch
@@ -186,7 +187,10 @@ countdowns and compiled code across resets:
   and evicted region members failed their checked entry 1.16M times.
 - The tenured part is a ring: a plain area that freed every module when
   full made short apk commands 10-15% slower (about 450 modules freed per
-  command).
+  command). It holds 128K ops, enough for the compiled set of one run of
+  claude or bun, so a later process of the same non-PIE binary runs that
+  code again instead of recompiling it (a64/performance.md, Tenured
+  ring).
 
 **Marking decoded code.** Every decode marks its 64-byte chunks in the
 code-page filter (`markCode`). The write TLB (1024 entries) is scanned

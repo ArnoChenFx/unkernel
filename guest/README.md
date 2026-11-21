@@ -39,7 +39,7 @@ refreshed by `kernel/build.sh base`, `kernel`, `smp`, `lower` and
 release publishes it with the images and the bundle:
 
 ```json
-{ "abi": 2, "base": "base-<hash>",
+{ "abi": 3, "base": "base-<hash>",
   "distros": [{ "name": "alpine", "file": "alpine.erofs", "size": 4317184, "sha256": "<hex>", "image": "alpine-3.24.4-<hash>" }] }
 ```
 

@@ -1,4 +1,4 @@
-From a3a8b2a449ecf55191e6a6804873a000f8e07b8c Mon Sep 17 00:00:00 2001
+From 3f21619d8d7a396909be9cc02dd0eaeaa137e461 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Fri, 20 Nov 2026 08:27:30 +0000
 Subject: [PATCH] wasm: parking and snapshots on SMP
@@ -1248,7 +1248,7 @@ index 05622e66df2..2a860cf0e7e 100644
  	schedule_tail(prev);
  
 diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
-index dd3ea4d9238..35151bdc801 100644
+index 54f963f3471..c9a2da16649 100644
 --- a/arch/wasm/kernel/smp.c
 +++ b/arch/wasm/kernel/smp.c
 @@ -27,6 +27,7 @@

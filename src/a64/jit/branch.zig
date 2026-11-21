@@ -270,7 +270,7 @@ test "a64 jit branch: bl" {
         }
     }.g, .{});
 }
-test "a64 jit branch: goto (blocks cut at 64 instructions)" {
+test "a64 jit branch: goto (blocks cut at max_block instructions)" {
     try kt.kind(.goto, struct {
         fn g(r: std.Random, out: []u32, pc: u64) usize {
             _ = pc;
@@ -523,10 +523,10 @@ const CondB = struct {
 
 /// Run conditional branch `c` from `regs` (taken or not: `taken`) in every
 /// shape the JIT emits: a side exit, a self-loop's terminator, a terminator
-/// that is a block's 64th instruction (the select), a side exit and a
-/// 64th-instruction terminator in a region on one page (A: movz; br x20 ->
-/// B, which branches back to A when taken, else on to C: svc), each
-/// against the reference and the expected outcome.
+/// that is a block's last instruction (`max_block`; the select), a side
+/// exit and a last-instruction terminator in a region on one page (A: movz;
+/// br x20 -> B, which branches back to A when taken, else on to C: svc),
+/// each against the reference and the expected outcome.
 fn forms(p: *Pair, c: CondB, regs0: Regs, is_taken: bool) !void {
     var regs = regs0;
     regs.pc = 0x10000;
@@ -540,14 +540,15 @@ fn forms(p: *Pair, c: CondB, regs0: Regs, is_taken: bool) !void {
     // 1: a self-loop: L: movz x1, #3; cond L; movz x0, #1; svc.
     p.load(&.{ movz(1, 3), c.at(0x10004, 0x10000), movz(0, 1), svc }, &.{});
     try tt.expectEqual(@as(u32, if (is_taken) mach.EV_BUDGET else mach.EV_SYSCALL), try p.go(regs, 101));
-    // 2: 63 movz, then the branch as the block's 64th instruction (a
-    // terminator that is no loop) to 0x10200: taken -> x0 = 2.
-    for (0..63) |k| w[k] = movz(1, @intCast(k));
-    w[63] = c.at(0x10000 + 63 * 4, 0x10200);
-    w[64] = movz(0, 1);
-    w[65] = svc;
+    // 2: max_block - 1 movz, then the branch as the block's last
+    // instruction (a terminator that is no loop) to 0x10200: taken -> x0 = 2.
+    const last = tier.max_block - 1;
+    for (0..last) |k| w[k] = movz(1, @intCast(k));
+    w[last] = c.at(0x10000 + last * 4, 0x10200);
+    w[last + 1] = movz(0, 1);
+    w[last + 2] = svc;
     var page: [0x90]u32 = @splat(svc);
-    @memcpy(page[0..66], w[0..66]);
+    @memcpy(page[0 .. last + 3], w[0 .. last + 3]);
     page[0x80] = movz(0, 2);
     p.load(&page, &.{});
     try tt.expectEqual(@as(u32, mach.EV_SYSCALL), try p.go(regs, 1000));
@@ -562,13 +563,13 @@ fn forms(p: *Pair, c: CondB, regs0: Regs, is_taken: bool) !void {
     p.load(&page, &.{});
     try tt.expectEqual(@as(u32, if (is_taken) mach.EV_BUDGET else mach.EV_SYSCALL), try p.go(regs, 301));
     if (is_taken and jc.enabled) try tt.expect(regionFormed(&p.m[0]));
-    // 4: the same with B = 63 movz, then the branch to A as its 64th
-    // instruction (a terminator in a region, through memberTail).
+    // 4: the same with B = max_block - 1 movz, then the branch to A as its
+    // last instruction (a terminator in a region, through memberTail).
     var big: [0x90]u32 = @splat(svc);
     big[0] = movz(1, 1);
     big[1] = encBr(20);
-    for (0..63) |k| big[0x40 + k] = movz(2, @intCast(k));
-    big[0x40 + 63] = c.at(0x10100 + 63 * 4, 0x10000);
+    for (0..last) |k| big[0x40 + k] = movz(2, @intCast(k));
+    big[0x40 + last] = c.at(0x10100 + last * 4, 0x10000);
     p.load(&big, &.{});
     try tt.expectEqual(@as(u32, if (is_taken) mach.EV_BUDGET else mach.EV_SYSCALL), try p.go(regs, 1001));
     if (is_taken and jc.enabled) try tt.expect(regionFormed(&p.m[0]));

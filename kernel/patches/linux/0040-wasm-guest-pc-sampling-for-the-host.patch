@@ -1,4 +1,4 @@
-From 0fb2367ed3df11b639b286e37e2c495a4d04f446 Mon Sep 17 00:00:00 2001
+From f84a8eb87230960b8e780519bd1e6e79a1af5dd4 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Fri, 20 Nov 2026 16:38:40 +0000
 Subject: [PATCH] wasm: guest pc sampling for the host

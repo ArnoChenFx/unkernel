@@ -398,11 +398,12 @@ exactly that meaning.
   aliased registers.
 - branch.zig's own tests: every B.cond against every NZCV value, CBZ/CBNZ
   and TBZ/TBNZ on edge values and every bit, each as side exit, self-loop
-  terminator, 64th-instruction terminator and inside a region; every
-  budget from 1 to 99 over a self-loop, a two-page call loop and a BR
-  loop; an interrupt during a compile stops loops at the exact count; a
-  second `kw_cpu` storing SVC over a compiled loop and executing IC IVAU
-  makes the loop leave at its next back edge or checked entry.
+  terminator, terminator as a block's last instruction (`max_block`) and
+  inside a region; every budget from 1 to 99 over a self-loop, a two-page
+  call loop and a BR loop; an interrupt during a compile stops loops at
+  the exact count; a second `kw_cpu` storing SVC over a compiled loop and
+  executing IC IVAU makes the loop leave at its next back edge or checked
+  entry.
 - **The JIT fuzz**: the block fuzz (a64/tier.md) in the wasm64 unit tests,
   with a random threshold (eager or 1..200), region size and growth
   threshold, and a flush during every other compile. 2026-11-18: 3000

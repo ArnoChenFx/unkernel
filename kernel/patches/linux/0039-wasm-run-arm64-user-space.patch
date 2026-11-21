@@ -1,4 +1,4 @@
-From 2579750793811d84c78b3aa23f975fe9a03ef4ba Mon Sep 17 00:00:00 2001
+From 52af977c778074ebcc7cd6d8b9e62712e3f39567 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -51,7 +51,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/include/asm/elf.h              |  42 ++-
  arch/wasm/include/asm/futex.h            |   6 +-
  arch/wasm/include/asm/hwcap.h            |  15 +-
- arch/wasm/include/asm/kw_emu.h           | 250 +++++++------
+ arch/wasm/include/asm/kw_emu.h           | 252 +++++++------
  arch/wasm/include/asm/processor.h        |  11 +-
  arch/wasm/include/asm/ptrace.h           |  25 +-
  arch/wasm/include/asm/syscall.h          |  42 +--
@@ -87,7 +87,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/mm/fault.c                     |   6 +-
  arch/wasm/mm/sigpage.c                   |   7 +-
  arch/wasm/mm/tlb.c                       |  11 -
- 42 files changed, 1595 insertions(+), 1060 deletions(-)
+ 42 files changed, 1596 insertions(+), 1061 deletions(-)
  delete mode 100644 arch/wasm/include/uapi/asm/elf.h
  create mode 100644 arch/wasm/include/uapi/asm/fcntl.h
  delete mode 100644 arch/wasm/include/uapi/asm/hwprobe.h
@@ -292,7 +292,7 @@ index e116408e5c1..4fc957f3bba 100644
  
  #endif /* _ASM_WASM_HWCAP_H */
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 3308c54e1fe..29c410e441e 100644
+index 3308c54e1fe..f717e59b25f 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
 @@ -1,21 +1,28 @@
@@ -412,7 +412,7 @@ index 3308c54e1fe..29c410e441e 100644
  #endif
  
 -#define KW_ABI_VERSION 8
-+#define KW_ABI_VERSION 2
++#define KW_ABI_VERSION 3
  
 +/*
 + * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -476,7 +476,8 @@ index 3308c54e1fe..29c410e441e 100644
 + * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned): TLBs,
 + * the decoded-block cache and its op arena, JIT bookkeeping.
   */
- #define KW_CPU_SIZE (8 * 1024 * 1024)
+-#define KW_CPU_SIZE (8 * 1024 * 1024)
++#define KW_CPU_SIZE (9 * 1024 * 1024)
  
  /*
   * Only the leading fields are public. The rest of the KW_CPU_SIZE bytes

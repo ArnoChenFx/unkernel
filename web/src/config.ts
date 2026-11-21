@@ -266,7 +266,7 @@ export function smpBlocker(): string | null {
  * this. Profiled with /profile.html (2026-11-19, a 14-thread desktop,
  * Chrome): 4 CPUs ran 4-wide work 2.5x and 8-wide 3.5x as fast as one; 8
  * CPUs only gained on 8-wide work (4-5x), 14 no more, for 3-7% on
- * single-threaded work, 40 ms more boot per CPU past 4 and 8 MiB each.
+ * single-threaded work, 40 ms more boot per CPU past 4 and 9 MiB each.
  * Firefox and phones are not measured yet: two and one. WebKit
  * (webkitEngine()) suggests none: in desktop Safari 27.2 (same machine,
  * 2026-11-19) parallel work got slower with every CPU added (8 CPUs: 0.25-0.4x

@@ -52,7 +52,8 @@ block is shaped is the ISA's (a64/tier.md).
   the access's last byte, so page-straddling accesses take the slow path
   for free (still about 15 wasm instructions per access). Read and write
   TLBs are direct-mapped, 1024 entries each (32 KiB). Against 256 (riscv64
-  guest, 2026-11-15): apk, sort, gzip and an ash loop 1.5-3% faster.
+  guest, 2026-11-15): apk, sort, gzip and an ash loop 1.5-3% faster; 4096
+  gained nothing (Rejected designs).
 - **Ops.** The op arena is an array of 16-byte slots (`kwemu.Slot`) the
   ISA views as its own op type (`Cpu.opArena`). One guest instruction is
   one op, so an op index is a count of retired instructions; what the ISA
@@ -100,21 +101,24 @@ block is shaped is the ISA's (a64/tier.md).
   An interpreted self-loop that an interrupt ends still counts its passes
   towards the compile threshold (`loopDone`): under a stream of IPIs a hot
   loop otherwise never got compiled.
-- **Cache.** 32K block slots, 384K op slots (6 MiB of the 8 MiB
+- **Cache.** 32K block slots, 448K op slots (7 MiB of the 9 MiB
   `KW_CPU_SIZE`). The op arena has a nursery (320K slots) where blocks
-  are decoded and a tenured ring (64K) where a block's ops are copied when
-  it is compiled. When the nursery fills, only its ops are discarded:
-  blocks keep their table entry with pc, host and compile countdown
-  (`op_gone`), a re-decode of the same pc and host goes on counting, and
-  compiled code keeps running. The ring makes room by dropping its oldest
-  blocks and their code. Tenured ops are numbered on for good (ring
-  position = number modulo size), so a module's member check never
+  are decoded and a tenured ring (128K, `ten_default`) where a block's ops
+  are copied when it is compiled. When the nursery fills, only its ops
+  are discarded: blocks keep their table entry with pc, host and compile
+  countdown (`op_gone`), a re-decode of the same pc and host goes on
+  counting, and compiled code keeps running. The ring makes room by
+  dropping its oldest blocks and their code; 128K ops hold what one run
+  of claude or bun compiles, which the next process then reuses
+  (a64/performance.md, Tenured ring). Tenured ops are numbered on for
+  good (ring position = number modulo size), so a module's member check never
   mistakes a later copy for the one it was emitted from. The table
   replaces the way with less countdown progress (compiled counts as most);
   the survivor loses half its progress. Only kw_cpu_init, kw_set_isa and
   kw_host_reset drop everything. Why so: a64/tier.md, The op arena. The
   block table cannot grow past 64K entries (region members are u16 block
-  indexes); a bigger `KW_CPU_SIZE` was no faster (a64/performance.md).
+  indexes); a nursery beyond 320K was no faster (a64/performance.md,
+  Tenured ring).
 - **FP** (`fpu.zig`). All five rounding modes and flags exact. RNE uses
   host-float fast paths with exact inexact detection. f64 FMA uses Boldo
   & Melquiond's emulated FMA (Dekker product, TwoSum, round to odd),
@@ -124,10 +128,9 @@ block is shaped is the ISA's (a64/tier.md).
 - **Dispatch** is one central `while (true) switch` over the op kinds (A64:
   `opexec.runOps`), a loop over a single `br_table`. Keep it that way: a
   threaded `switch` (`continue :sw`) gives every handler its own
-  `br_table`, a 7x larger run loop and much slower cold code. V8 pays most
-  for mispredicts and code size on code that does not repeat: 16 hot
-  functions run at 3.3 ns per instruction, 256 to 4K distinct functions in
-  random order at 6.7-8.7 ns.
+  `br_table`, a 7x larger run loop and much slower cold code (Rejected
+  designs). Per guest instruction the loop costs the same on hot and on
+  cold code (a64/performance.md, Where the time goes).
 
 ## JIT tier
 
@@ -372,10 +375,12 @@ block interpreted that long instead of the ~0.25 ms compiling takes.
 
 ## Measuring
 
-There are no perf events, and strace and gdb hang in the guest (no
-regsets). `kernel/build.sh stats` builds a `-Dkwemu-stats` bundle; the
-CLI's `--stats` prints its counters for the whole run at exit
-(`JitHost.kwemuStats()`, `stats().kwemu`). For a window inside a run, a
+The guest has no perf events, and strace and gdb hang in it (no
+regsets); host-side `perf` works (a64/performance.md, Measuring).
+`kernel/build.sh stats` builds a `-Dkwemu-stats` bundle of the UP kernel
+only, so counters come from one CPU and time samples (which need two or
+more) from the regular bundle; the CLI's `--stats` prints its counters
+for the whole run at exit (`JitHost.kwemuStats()`, `stats().kwemu`). For a window inside a run, a
 host driver calls the exported `kw_debug_stats` at markers the guest
 prints (for example `@@S name` / `@@E name` around each command). Either
 finds the cpu through the stats-only export
@@ -506,6 +511,8 @@ retry without a new reason.
 | SMP: making the host's first call of a new module trap instead of the `cpu == 0` test | a wasm trap costs 33-43 µs in a CPU's thread, against one compare per entry |
 | SMP: compiling asynchronously (`WebAssembly.compile`, a helper worker) | a finished Module reaches a CPU's thread only through its event loop, at the 20 ms yields; V8's first-call compile stays on the CPU anyway |
 | SMP: returning to the kernel between `new Module`, `new Instance` and the first call | the first-call compile alone is most of it and cannot be split |
+| Data TLBs of 4096 entries each (2026-11-20, A64, the profile disk of a64/performance.md, 6 boots) | `claude --help` first runs 0.0%, later -2.5%, npm -0.5% and +2.9%, bun cpu.js -0.8% and -1.0%: noise, for 4x the TLB memory |
+| No halving of the surviving way's progress in `jc.victim` (2026-11-20, same) | 4-23% slower: `claude --help` +4.2% / +8.2% (first / later runs), npm +5.9% / +23.2%, bun cpu.js +6.1% / +8.4%; compiles per later claude run 453 to 855 |
 
 ## Next steps
 

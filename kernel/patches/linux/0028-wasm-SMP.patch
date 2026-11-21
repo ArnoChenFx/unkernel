@@ -1,4 +1,4 @@
-From fbd259dd5a8acc1e7b1c12d64fc236240a06de82 Mon Sep 17 00:00:00 2001
+From efc2d5733c751ba7acb4ee5142f7afa2935ebe63 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:07:10 +0000
 Subject: [PATCH] wasm: SMP
@@ -1617,7 +1617,7 @@ index 3eceaadeb6e..5df45d42d6e 100644
  	struct siginfo info;
 diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
 new file mode 100644
-index 00000000000..e48cf0a45bb
+index 00000000000..ec63ba2d518
 --- /dev/null
 +++ b/arch/wasm/kernel/smp.c
 @@ -0,0 +1,174 @@
@@ -1659,7 +1659,7 @@ index 00000000000..e48cf0a45bb
 +	int n = min_t(int, wasm_cpu_count(), nr_cpu_ids), cpu;
 +
 +	for (cpu = 1; cpu < n; cpu++) {
-+		/* kwemu's state (KW_CPU_SIZE, 8 MiB) for each further CPU. */
++		/* kwemu's state (KW_CPU_SIZE, 9 MiB) for each further CPU. */
 +		kw_cpus[cpu] = memblock_alloc_raw(KW_CPU_SIZE, SMP_CACHE_BYTES);
 +		if (!kw_cpus[cpu]) {
 +			pr_warn("smp: no memory for CPU%d's kwemu state\n", cpu);

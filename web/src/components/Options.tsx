@@ -162,7 +162,7 @@ export function Options() {
 		});
 	const cpuWarn = webkitEngine()
 		? "To try: in Safari and on iOS, several CPUs ran slower than one (/profile.html)."
-		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 8 MiB of guest memory, and as much in a suspended session.`;
+		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 9 MiB of guest memory, and as much in a suspended session.`;
 	// More than one CPU runs each in a Web Worker (config.ts: worker), so Worker thread is ticked and locked.
 	const smp = o.cpus !== "1" && !cfg.smpBlocked;
 	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`

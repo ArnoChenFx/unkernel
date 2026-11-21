@@ -131,12 +131,18 @@ Open:
 
 ## Roadmap
 
-1. **JIT**: bigger regions (most remaining exits leave full ones), exits
-   into self-loop modules, cold code, `run`'s entry path and region
-   prologues, NZCV materialisation. Details in a64/performance.md (Next levers)
-   and kwemu.md (Next steps). The op arena keeps countdowns and compiled
-   code across resets (kwemu.md, Interpreter machinery; a64/tier.md,
-   The op arena).
+1. **JIT and interpreter** (a64/performance.md, Next levers; kwemu.md,
+   Next steps). Node, Bun and Claude Code, in order: measure V8's
+   worker-thread cycles and the decode share again; more tenured capacity
+   or a second-chance ring (mixed sequences still evict compiled code;
+   each 64K ops cost 1 MiB of guest RAM per CPU) only if long sessions
+   show the same; per-CPU code caches on
+   SMP; a cheaper decoder only if decode stays above about 8% of npm's
+   time; Binaryen `-O2` after the lowering, timed on a quiet machine. Apk
+   and shell: bigger regions (most remaining exits leave full ones), exits
+   into self-loop modules, `run`'s entry path and region prologues, NZCV
+   materialisation. Not worth revisiting: the compile threshold and heat
+   policy, the block-table size, the interpreter's dispatch.
 2. **A64 features**: ARMv8.0-A with AES, PMULL, SHA1, SHA2, CRC32, LSE,
    SHA512 and SHA3 is in (a64/isa.md, What is implemented). Not implemented: SVE/SME, SM3
    and SM4, FP16 arithmetic, RNDR, later-architecture encodings (the

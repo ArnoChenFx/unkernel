@@ -6,7 +6,7 @@ Linux ELF (ARMv8.0-A with FP, AdvSIMD and the crypto, CRC32 and LSE
 extensions; a64/isa.md), run by kwemu, a software CPU in Zig linked
 into the kernel: the AArch64 front end (src/a64: a reference interpreter, a
 decoded-op tier and a wasm JIT) on an ISA-neutral MMU, block cache and JIT
-core (src/emu). Its contract with the kernel is `include/kw_emu.h` (ABI 2).
+core (src/emu). Its contract with the kernel is `include/kw_emu.h` (ABI 3).
 The kernel bundle (`unkernel.wasm`) carries a small base initramfs that
 boots a distro image (Alpine or Debian, read-only erofs, attached as a disk)
 under an overlay root, or the base shell without one. README.md is the overview,

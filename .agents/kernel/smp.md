@@ -17,7 +17,7 @@ The host side: js.md, CPU threads.
   `current_thread_info()->cpu`.
 - The host offers `wasm_cpu_count()` CPUs. `kw_smp_init_cpus()`
   (setup_arch) makes them possible and present, capped by `nr_cpus=`, and
-  takes kwemu's 8 MiB state for each from memblock (CPU 0's is static).
+  takes kwemu's 9 MiB state for each from memblock (CPU 0's is static).
 - `__cpu_up()` calls `wasm_cpu_start(cpu, idle)`: the host starts a thread
   with a new instance, which enters the export `kw_secondary_entry(idle)`
   (entry.S), then `kw_secondary_start()` (smp.c). `__cpu_up()` waits up to

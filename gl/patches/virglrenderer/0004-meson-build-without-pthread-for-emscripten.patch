@@ -1,0 +1,32 @@
+From 39c4ddb813432b466531057b88c1361488741454 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 12:47:17 +0000
+Subject: [PATCH] meson: build without -pthread for emscripten
+
+---
+ meson.build | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/meson.build b/meson.build
+index 69c1bb8..0dba846 100644
+--- a/meson.build
++++ b/meson.build
+@@ -84,7 +84,14 @@ with_host_darwin = host_machine.system() == 'darwin'
+ 
+ not_found = dependency('', required: false)
+ gbm_dep = not_found
+-thread_dep = dependency('threads')
++if host_machine.system() == 'emscripten'
++   # No threads: meson's threads dependency would add -pthread (shared
++   # memory, workers). Code that calls pthread_* links against the
++   # single-threaded stubs in emscripten's libc.
++   thread_dep = declare_dependency()
++else
++   thread_dep = dependency('threads')
++endif
+ epoxy_dep = dependency('epoxy', version: '>= 1.5.4')
+ m_dep = cc.find_library('m', required : false)
+ dl_dep = not_found
+-- 
+2.56.0
+

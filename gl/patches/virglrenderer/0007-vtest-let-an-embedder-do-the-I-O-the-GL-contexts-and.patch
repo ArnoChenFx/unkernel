@@ -1,0 +1,148 @@
+From 73e78d41cda039e2d5d839c3d3594489225bf383 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 12:50:29 +0000
+Subject: [PATCH] vtest: let an embedder do the I/O, the GL contexts and the
+ busy waits
+
+For an embedder without sockets, fds or threads (a browser): with
+VTEST_EXTERNAL_IO it defines vtest_block_write and vtest_send_fd (the fd
+argument names one of its clients) and the backing store of a resource
+is plain memory, whose contents the embedder may carry in its stream
+(vtest_resource_backing finds it). vtest_renderer_callbacks gives it the
+renderer callbacks, to fill in its GL context hooks before
+vtest_init_renderer (no EGL or GLX winsys), and vtest_renderer_fences
+gives it the implicit fence counters, for an embedder that cannot block
+in the wait loop of VCMD_RESOURCE_BUSY_WAIT and answers it later.
+---
+ vtest/vtest.h          |  3 +++
+ vtest/vtest_renderer.c | 55 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/vtest/vtest.h b/vtest/vtest.h
+index b2708a2..046d546 100644
+--- a/vtest/vtest.h
++++ b/vtest/vtest.h
+@@ -114,6 +114,9 @@ int vtest_drm_sync_transfer(uint32_t length_dw);
+ int vtest_resource_export_fd(uint32_t length_dw);
+ 
+ void vtest_set_max_length(uint32_t length);
++uint32_t vtest_renderer_fences(uint32_t *completed);
++struct virgl_renderer_callbacks *vtest_renderer_callbacks(void);
++struct iovec *vtest_resource_backing(struct vtest_context *ctx, uint32_t res_id);
+ 
+ #endif
+ 
+diff --git a/vtest/vtest_renderer.c b/vtest/vtest_renderer.c
+index ba4feb1..7b1468f 100644
+--- a/vtest/vtest_renderer.c
++++ b/vtest/vtest_renderer.c
+@@ -283,7 +283,11 @@ static void vtest_unref_resource(struct vtest_resource *res)
+    virgl_renderer_resource_unref(res->res_id);
+ 
+    if (res->iov.iov_base)
++#ifdef VTEST_EXTERNAL_IO
++      free(res->iov.iov_base);
++#else
+       munmap(res->iov.iov_base, res->iov.iov_len);
++#endif
+ 
+    list_add(&res->head, &renderer.free_resources);
+ }
+@@ -373,6 +377,11 @@ sync_destroy_func(void *value)
+    vtest_unref_sync(sync);
+ }
+ 
++#ifdef VTEST_EXTERNAL_IO
++/* The embedder owns the output: fd names one of its clients, and the reply
++ * bytes are queued there (gl/wasm/kw_virgl.c in unkernel). */
++int vtest_block_write(int fd, void *buf, int size);
++#else
+ static int vtest_block_write(int fd, void *buf, int size)
+ {
+    char *ptr = buf;
+@@ -392,6 +401,7 @@ static int vtest_block_write(int fd, void *buf, int size)
+ 
+    return size;
+ }
++#endif
+ 
+ int vtest_block_read(struct vtest_input *input, void *buf, int size)
+ {
+@@ -436,6 +446,11 @@ int vtest_block_read(struct vtest_input *input, void *buf, int size)
+    return size;
+ }
+ 
++#ifdef VTEST_EXTERNAL_IO
++/* The embedder passes fds, or carries the backing store's contents in its
++ * stream instead (then the backing store is plain memory, below). */
++int vtest_send_fd(int socket_fd, int fd);
++#else
+ static int vtest_send_fd(int socket_fd, int fd)
+ {
+     struct iovec iovec;
+@@ -469,6 +484,7 @@ static int vtest_send_fd(int socket_fd, int fd)
+ 
+     return 0;
+ }
++#endif
+ 
+ static int
+ vtest_receive_fd(int socket_fd)
+@@ -1233,11 +1249,19 @@ static int vtest_create_resource_setup_shm(struct vtest_resource *res,
+    if (fd < 0)
+       return report_failed_call("vtest_new_shm", fd);
+ 
++#ifdef VTEST_EXTERNAL_IO
++   ptr = calloc(1, size);
++   if (!ptr) {
++      close(fd);
++      return -1;
++   }
++#else
+    ptr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+       close(fd);
+       return -1;
+    }
++#endif
+ 
+    res->iov.iov_base = ptr;
+    res->iov.iov_len = size;
+@@ -3057,3 +3081,34 @@ void vtest_set_max_length(uint32_t length)
+ {
+    renderer.max_length = length;
+ }
++
++/* The callbacks vtest_init_renderer passes to virgl_renderer_init: an
++ * embedder that provides its own GL contexts (no VIRGL_RENDERER_USE_EGL)
++ * sets create_gl_context, destroy_gl_context and make_current first. */
++struct virgl_renderer_callbacks *vtest_renderer_callbacks(void)
++{
++   return &renderer_cbs;
++}
++
++/* A resource's backing store (protocol version 2 and later), for an
++ * embedder that carries its contents in the stream: NULL if there is none. */
++struct iovec *vtest_resource_backing(struct vtest_context *ctx, uint32_t res_id)
++{
++   struct vtest_resource *res = util_hash_table_get(ctx->resource_table,
++                                                    intptr_to_pointer(res_id));
++   return res && res->iov.iov_base ? &res->iov : NULL;
++}
++
++/* The implicit fences (one a VCMD_SUBMIT_CMD, retired in order), after
++ * polling them: the last one submitted, and in *completed the last one
++ * retired. An embedder that cannot block in a waiting
++ * VCMD_RESOURCE_BUSY_WAIT (no thread, no poll fd) notes the first when the
++ * wait arrives and answers it once *completed has caught up, polling from
++ * later tasks in between, instead of waiting until no client has work in
++ * flight, which with several clients may never happen. */
++uint32_t vtest_renderer_fences(uint32_t *completed)
++{
++   virgl_renderer_poll();
++   *completed = renderer.implicit_fence_completed;
++   return renderer.implicit_fence_submitted;
++}
+-- 
+2.56.0
+

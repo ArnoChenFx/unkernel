@@ -1,0 +1,78 @@
+From 081166aa318f444232ebbd31674557c834f399d4 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 12:49:53 +0000
+Subject: [PATCH] mesa/util: build on emscripten
+
+Treat emscripten as a Unix without /proc: detect it in detect_os.h,
+take the sysconf paths in os_misc.c and name no thread in u_thread.h
+(the build is single-threaded).
+---
+ src/mesa/util/detect_os.h | 8 ++++++++
+ src/mesa/util/os_misc.c   | 4 ++--
+ src/mesa/util/u_thread.h  | 2 ++
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/mesa/util/detect_os.h b/src/mesa/util/detect_os.h
+index 994a1ef..c391930 100644
+--- a/src/mesa/util/detect_os.h
++++ b/src/mesa/util/detect_os.h
+@@ -81,6 +81,11 @@
+ #define DETECT_OS_UNIX 1
+ #endif
+ 
++#if defined(__EMSCRIPTEN__)
++#define DETECT_OS_EMSCRIPTEN 1
++#define DETECT_OS_UNIX 1
++#endif
++
+ 
+ /*
+  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
+@@ -100,6 +105,9 @@
+ #ifndef DETECT_OS_DRAGONFLY
+ #define DETECT_OS_DRAGONFLY 0
+ #endif
++#ifndef DETECT_OS_EMSCRIPTEN
++#define DETECT_OS_EMSCRIPTEN 0
++#endif
+ #ifndef DETECT_OS_FREEBSD
+ #define DETECT_OS_FREEBSD 0
+ #endif
+diff --git a/src/mesa/util/os_misc.c b/src/mesa/util/os_misc.c
+index ca9bf7d..2e7b3f2 100644
+--- a/src/mesa/util/os_misc.c
++++ b/src/mesa/util/os_misc.c
+@@ -57,7 +57,7 @@
+ #  include <unistd.h>
+ #  include <log/log.h>
+ #  include <cutils/properties.h>
+-#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD
++#elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_EMSCRIPTEN
+ #  include <unistd.h>
+ #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
+ #  include <sys/resource.h>
+@@ -222,7 +222,7 @@ os_get_option(const char *name)
+ bool
+ os_get_total_physical_memory(uint64_t *size)
+ {
+-#if DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD
++#if DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_EMSCRIPTEN
+    const long phys_pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+ 
+diff --git a/src/mesa/util/u_thread.h b/src/mesa/util/u_thread.h
+index 366c8e9..41d9327 100644
+--- a/src/mesa/util/u_thread.h
++++ b/src/mesa/util/u_thread.h
+@@ -146,6 +146,8 @@ static inline void u_thread_setname( const char *name )
+    pthread_setname_np(name);
+ #elif DETECT_OS_HAIKU
+    rename_thread(find_thread(NULL), name);
++#elif DETECT_OS_EMSCRIPTEN
++   /* single-threaded: no thread to name */
+ #else
+ #warning Not sure how to call pthread_setname_np
+ #endif
+-- 
+2.56.0
+

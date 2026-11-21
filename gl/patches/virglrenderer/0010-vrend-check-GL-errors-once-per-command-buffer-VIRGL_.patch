@@ -1,0 +1,126 @@
+From 1614564f0e6582400005aa7fe3dab5e4e9dbae24 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 14:35:44 +0000
+Subject: [PATCH] vrend: check GL errors once per command buffer
+ (VIRGL_RENDERER_COARSE_GL_ERRORS)
+
+The decoder calls glGetError after every command of a command buffer.
+In WebGL that is a synchronous round trip to the GPU process, about three
+of them per draw: glmark2's ideas scene ran at 6 frames per second with
+them and at 41 with none (ANGLE on SwiftShader). With the flag the
+decoder checks once, after the last command: every command of a buffer
+belongs to the same context, which an error is still charged to.
+---
+ src/virglrenderer.c        | 2 ++
+ src/virglrenderer.h        | 7 +++++++
+ src/vrend/vrend_decode.c   | 5 ++++-
+ src/vrend/vrend_renderer.c | 8 ++++++++
+ src/vrend/vrend_renderer.h | 3 +++
+ 5 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 6229da1..3c9fcf8 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -921,6 +921,8 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
+          renderer_flags |= VREND_USE_GBM_LAYOUT;
+       if (flags & VIRGL_RENDERER_SINGLE_GL_CONTEXT)
+          renderer_flags |= VREND_USE_SINGLE_CONTEXT;
++      if (flags & VIRGL_RENDERER_COARSE_GL_ERRORS)
++         renderer_flags |= VREND_USE_COARSE_GL_ERRORS;
+ 
+       ret = vrend_renderer_init(&vrend_cbs, renderer_flags);
+       if (ret) {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index dc029d5..2d5bb26 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -176,6 +176,13 @@ struct virgl_renderer_callbacks {
+  */
+ #define VIRGL_RENDERER_SINGLE_GL_CONTEXT (1 << 15)
+ 
++/*
++ * Check host GL errors once per command buffer instead of after each
++ * command, for hosts where glGetError is a round trip (WebGL). An error is
++ * still charged to the context that caused it, but not to a command.
++ */
++#define VIRGL_RENDERER_COARSE_GL_ERRORS (1 << 16)
++
+ VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
+ VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
+ 
+diff --git a/src/vrend/vrend_decode.c b/src/vrend/vrend_decode.c
+index 7774a25..b8e2cbc 100644
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -2071,6 +2071,8 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+    const uint32_t *typed_buf = (const uint32_t *)buffer;
+    const uint32_t buf_total = (uint32_t)(size / sizeof(uint32_t));
+    uint32_t buf_offset = 0;
++   /* only after the last command: every command here is this context's */
++   const bool coarse_errors = vrend_renderer_coarse_gl_errors();
+ 
+    while (buf_offset < buf_total) {
+       const uint32_t cur_offset = buf_offset;
+@@ -2096,7 +2098,8 @@ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+       TRACE_SCOPE_SLOW(vrend_get_comand_name(cmd));
+ 
+       ret = decode_table[cmd](gdctx->grctx, buf, len);
+-      if (!vrend_check_no_error(gdctx->grctx) && !ret)
++      if ((!coarse_errors || buf_offset >= buf_total) &&
++          !vrend_check_no_error(gdctx->grctx) && !ret)
+          ret = EINVAL;
+       if (ret) {
+          virgl_error("context %d failed to dispatch %s: %d\n",
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index bd8eff8..decc3e3 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -419,6 +419,7 @@ struct global_renderer_state {
+    /* no GL_TEXTURE_SWIZZLE_* (WebGL 2): the shaders apply sampler view
+     * swizzles */
+    bool lower_tex_swizzle : 1;
++   bool coarse_gl_errors : 1;
+ };
+ 
+ struct sysval_uniform_block {
+@@ -7673,6 +7674,11 @@ static bool vrend_probe_texture_swizzle(void)
+    return err == GL_NO_ERROR;
+ }
+ 
++bool vrend_renderer_coarse_gl_errors(void)
++{
++   return vrend_state.coarse_gl_errors;
++}
++
+ bool vrend_renderer_lower_tex_swizzle(void)
+ {
+    return vrend_state.lower_tex_swizzle;
+@@ -7745,6 +7751,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+       virgl_info("gl_version %d - compat profile\n", gl_ver);
+    }
+ 
++   vrend_state.coarse_gl_errors = flags & VREND_USE_COARSE_GL_ERRORS;
++
+    if (flags & VREND_USE_SINGLE_CONTEXT) {
+       /* only the GLES host's state is re-emitted on a switch */
+       if (gles)
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 2361a44..49e99c0 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -199,8 +199,11 @@ struct vrend_if_cbs {
+ #define VREND_USE_GLES (1 << 6)
+ #define VREND_USE_GBM_LAYOUT (1 << 7)
+ #define VREND_USE_SINGLE_CONTEXT (1 << 8)
++#define VREND_USE_COARSE_GL_ERRORS (1 << 9)
+ 
+ bool vrend_check_no_error(struct vrend_context *ctx);
++/* GL errors are checked once per command buffer (VREND_USE_COARSE_GL_ERRORS) */
++bool vrend_renderer_coarse_gl_errors(void);
+ 
+ const struct virgl_resource_pipe_callbacks *
+ vrend_renderer_get_pipe_callbacks(void);
+-- 
+2.56.0
+

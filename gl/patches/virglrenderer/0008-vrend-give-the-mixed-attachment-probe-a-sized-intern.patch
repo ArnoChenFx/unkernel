@@ -1,0 +1,31 @@
+From a1b3fffba8ea6fbf74f626e1b4ee6698b0ad155b Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 12:58:24 +0000
+Subject: [PATCH] vrend: give the mixed-attachment probe a sized internal
+ format
+
+GLES 3.0 has no unsized GL_RED internal format (only EXT_texture_rg
+adds one to GLES 2.0), and WebGL2 rejects it with GL_INVALID_VALUE. The
+error was left pending by vrend_renderer_fill_caps and charged to the
+next context that checked for errors, which then refused every command.
+GL_R8 is valid on GL 3.0+ and GLES 3.0.
+---
+ src/vrend/vrend_formats.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index 670b3a4..e920197 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -689,7 +689,7 @@ bool vrend_check_framebuffer_mixed_color_attachements(void)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_id[0], 0);
+ 
+    glBindTexture(GL_TEXTURE_2D, tex_id[1]);
+-   glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, 32, 32, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
++   glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 32, 32, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, tex_id[1], 0);
+ 
+ 
+-- 
+2.56.0
+

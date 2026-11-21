@@ -1,0 +1,369 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (C) 2026 Pooya Parsa <pooya@pi0.io> -->
+<!--
+  Check of the wasm virglrenderer module (gl/wasm/build.sh): load it,
+  start the renderer on a WebGL2 context and query its capabilities through
+  the vtest protocol as Mesa's vtest winsys does (CREATE_RENDERER, protocol
+  version handshake, GET_CAPS2, GET_CAPSET), feeding the bytes in odd-sized
+  chunks. A second, informational stage creates a texture and moves data
+  through it (TRANSFER_PUT, TRANSFER_GET). Then a waiting busy wait behind
+  a fence must park the client and be answered by kw_virgl_poll from a
+  later task, and two clients of the inline dialect (protocol version 3,
+  transfer data in the stream, as gl/bridge speaks it) must get their own
+  resource ids and move data through a texture; last, Module.virgl.Renderer
+  (the renderer shape of gl/bridge) must answer a parked busy wait by itself.
+  The result goes into the page as
+  JSON (<pre id=result>) and, when served by check.mjs, back to it by POST.
+  ?module=URL loads another build of virgl.mjs.
+-->
+<meta charset="utf-8">
+<title>virgl wasm check</title>
+<canvas id="c" width="64" height="64"></canvas>
+<pre id="result">running</pre>
+<script>
+  // a script that does not even start (a syntax error) still reports
+  addEventListener('error', (e) => {
+    document.getElementById('result').textContent = 'error: ' + e.message;
+    if (new URLSearchParams(location.search).has('report'))
+      fetch('/result', { method: 'POST', body: JSON.stringify({ ok: false, stages: {}, error: `${e.message} (${e.filename}:${e.lineno})` }) });
+  });
+</script>
+<script type="module">
+const out = { ok: false, stages: {}, log: [] };
+const log = (s) => { out.log.push(String(s)); };
+// the stage now running, to check.mjs (it prints the last one on a timeout)
+const stage = (name) => {
+  out.running = name;
+  if (params.has('report')) fetch('/stage', { method: 'POST', body: name }).catch(() => {});
+};
+const params = new URLSearchParams(location.search);
+const moduleUrl = params.get('module') || '../out/virgl.mjs';
+
+// vtest protocol constants (vtest/vtest_protocol.h)
+const VCMD = {
+  GET_CAPS: 1, RESOURCE_CREATE: 2, RESOURCE_UNREF: 3, TRANSFER_GET: 4, TRANSFER_PUT: 5,
+  SUBMIT_CMD: 6, RESOURCE_BUSY_WAIT: 7, CREATE_RENDERER: 8, GET_CAPS2: 9,
+  PING_PROTOCOL_VERSION: 10, PROTOCOL_VERSION: 11, RESOURCE_CREATE2: 12,
+  TRANSFER_GET2: 13, TRANSFER_PUT2: 14, GET_PARAM: 15, GET_CAPSET: 16, CONTEXT_INIT: 17,
+};
+const PIPE_TEXTURE_2D = 2, VIRGL_FORMAT_R8G8B8A8_UNORM = 67, BIND_SAMPLER_VIEW = 1 << 3, BIND_RENDER_TARGET = 1 << 1;
+const cmd = (id, payload = []) => new Uint32Array([payload.length, id, ...payload]);
+const bytesOf = (u32) => new Uint8Array(u32.buffer, u32.byteOffset, u32.byteLength);
+
+function finish() {
+  document.getElementById('result').textContent = JSON.stringify(out, null, 2);
+  if (params.has('report')) {
+    fetch('/result', { method: 'POST', body: JSON.stringify(out) }).catch(() => {});
+  }
+}
+
+// A reader over a client's reply bytes.
+class Replies {
+  constructor(v, client) { this.v = v; this.client = client; this.buf = new Uint8Array(0); }
+  pull() {
+    const more = this.v.take(this.client);
+    if (more.length) {
+      const b = new Uint8Array(this.buf.length + more.length);
+      b.set(this.buf); b.set(more, this.buf.length);
+      this.buf = b;
+    }
+  }
+  bytes(n) {
+    this.pull();
+    if (this.buf.length < n) throw new Error(`reply short: wanted ${n} bytes, have ${this.buf.length}`);
+    const r = this.buf.slice(0, n);
+    this.buf = this.buf.slice(n);
+    return r;
+  }
+  u32(n) { return new Uint32Array(this.bytes(4 * n).buffer); }
+  header(id) {
+    const [len, got] = this.u32(2);
+    if (got !== id) throw new Error(`reply id ${got}, expected ${id}`);
+    return len;
+  }
+  get left() { this.pull(); return this.buf.length; }
+}
+
+// Feed BYTES in chunks of 1, 2, 3, ... bytes: commands split anywhere.
+function feedChunked(v, client, bytes) {
+  let r = 0;
+  for (let i = 0, n = 1; i < bytes.length; i += n, n = n % 7 + 1) {
+    r = v.feed(client, bytes.subarray(i, i + n));
+    if (r < 0) throw new Error(`kw_virgl_feed: ${r}`);
+  }
+  return r;
+}
+
+async function main() {
+  // WebGL2
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false,
+    preserveDrawingBuffer: false, powerPreference: 'high-performance' });
+  if (!gl) throw new Error('no WebGL2');
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  out.webgl = {
+    version: gl.getParameter(gl.VERSION),
+    glsl: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
+    renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+    extensions: gl.getSupportedExtensions(),
+  };
+  out.stages.webgl = true;
+
+  // the module
+  stage('load');
+  const t0 = performance.now();
+  const { default: createVirgl } = await import(moduleUrl);
+  const Module = await createVirgl({ print: log, printErr: log });
+  out.loadMs = Math.round(performance.now() - t0);
+  out.stages.load = true;
+  const v = Module.virgl;
+
+  // the renderer (?glcheck=1: on a wrapper that logs each GL call that
+  // raises an error, for debugging; getError still reports it)
+  const t1 = performance.now();
+  stage('init');
+  const glUsed = params.has('glcheck') ? checkedGL(gl) : gl;
+  v.init(glUsed);
+  out.initMs = Math.round(performance.now() - t1);
+  out.stages.init = true;
+
+  // a client, as Mesa's vtest winsys connects
+  stage('caps');
+  const c = v.open();
+  const rep = new Replies(v, c);
+  const name = new TextEncoder().encode('kwcheck\0');
+  const create = new Uint8Array(8 + name.length);
+  create.set(bytesOf(new Uint32Array([name.length, VCMD.CREATE_RENDERER])));
+  create.set(name, 8);
+  const hello = [
+    create,
+    bytesOf(cmd(VCMD.PING_PROTOCOL_VERSION)),
+    bytesOf(cmd(VCMD.RESOURCE_BUSY_WAIT, [0, 0])),
+    bytesOf(cmd(VCMD.PROTOCOL_VERSION, [4])),
+    bytesOf(cmd(VCMD.GET_CAPS2)),
+    bytesOf(cmd(VCMD.GET_CAPSET, [2, 1])),  // capset VIRGL2, version 1 (what GET_CAPS2 sends)
+  ];
+  const all = new Uint8Array(hello.reduce((n, b) => n + b.length, 0));
+  hello.reduce((o, b) => (all.set(b, o), o + b.length), 0);
+  const r = feedChunked(v, c, all);
+  if (r !== v.OK) throw new Error(`feed: ${r}`);
+
+  rep.header(VCMD.PING_PROTOCOL_VERSION);
+  rep.header(VCMD.RESOURCE_BUSY_WAIT);
+  rep.u32(1);
+  rep.header(VCMD.PROTOCOL_VERSION);
+  out.protocolVersion = rep.u32(1)[0];
+
+  // GET_CAPS2: the reply's id is the capset (2), its length the caps' size
+  // in bytes plus one (vtest_send_caps2; Mesa reads it so)
+  const capsLen = rep.header(2) - 1;
+  const caps = rep.u32(capsLen / 4);
+  const f32 = new Float32Array(caps.buffer);
+  // struct virgl_caps_v2 (src/virgl_hw.h), offsets in dwords
+  out.caps = {
+    bytes: capsLen,
+    max_version: caps[0],
+    glsl_level: caps[66],
+    max_texture_array_layers: caps[67],
+    max_streamout_buffers: caps[68],
+    max_dual_source_render_targets: caps[69],
+    max_render_targets: caps[70],
+    max_samples: caps[71],
+    prim_mask: '0x' + caps[72].toString(16),
+    max_tbo_size: caps[73],
+    max_uniform_blocks: caps[74],
+    max_viewports: caps[75],
+    max_aliased_point_size: f32[78],
+    max_vertex_outputs: caps[88],
+    max_vertex_attribs: caps[89],
+    capability_bits: '0x' + caps[98].toString(16),
+    max_texture_2d_size: caps[121],
+    max_texture_3d_size: caps[122],
+    max_texture_cube_size: caps[123],
+    capabilities: bitNames(caps[98], CAP_NAMES),
+    capability_bits_v2: '0x' + caps[172].toString(16),
+    capabilities_v2: bitNames(caps[172], CAP_V2_NAMES),
+    host_feature_check_version: caps[139],
+    sampler_formats: caps.slice(1, 17).reduce((n, w) => n + popcount(w), 0),
+    render_formats: caps.slice(17, 33).reduce((n, w) => n + popcount(w), 0),
+  };
+  // GET_CAPSET: a flag, then the caps; the length is in dwords
+  const setLen = rep.header(VCMD.GET_CAPSET);
+  const valid = rep.u32(1)[0];
+  const set = rep.u32(setLen - 1);
+  out.capset = { valid, bytes: 4 * (setLen - 1), same_as_caps2: set.length === caps.length && set.every((w, i) => w === caps[i]) };
+  if (rep.left) throw new Error(`${rep.left} reply bytes left over`);
+  if (out.protocolVersion !== 0) throw new Error(`protocol version ${out.protocolVersion}, expected 0`);
+  if (!(caps[0] >= 1 && caps[66] >= 130 && caps[121] >= 2048)) throw new Error('implausible caps');
+  if (!valid || !out.capset.same_as_caps2) throw new Error('GET_CAPSET 2 not answered as GET_CAPS2');
+  out.stages.caps = true;
+
+  // informational: a 4x4 RGBA8 texture, data in and out (protocol version 0
+  // transfers: the data rides in the stream)
+  stage('transfer');
+  const logStart = out.log.length;
+  try {
+    feedChunked(v, c, bytesOf(cmd(VCMD.RESOURCE_CREATE,
+      [1, PIPE_TEXTURE_2D, VIRGL_FORMAT_R8G8B8A8_UNORM, BIND_SAMPLER_VIEW | BIND_RENDER_TARGET, 4, 4, 1, 1, 0, 0])));
+    if (v.state(c) < 0) throw new Error(`RESOURCE_CREATE: ${v.state(c)}`);
+    const pixels = new Uint8Array(64).map((_, i) => (i * 37 + 11) & 255);
+    const put = new Uint8Array(8 + 44 + 64);
+    // handle, level, stride, layer_stride, x, y, z, w, h, d, data_size
+    put.set(bytesOf(new Uint32Array([11, VCMD.TRANSFER_PUT, 1, 0, 16, 64, 0, 0, 0, 4, 4, 1, 64])));
+    put.set(pixels, 52);
+    feedChunked(v, c, put);
+    if (v.state(c) < 0) throw new Error(`TRANSFER_PUT: ${v.state(c)}`);
+    feedChunked(v, c, bytesOf(cmd(VCMD.TRANSFER_GET, [1, 0, 16, 64, 0, 0, 0, 4, 4, 1, 64])));
+    if (v.state(c) < 0) throw new Error(`TRANSFER_GET: ${v.state(c)}`);
+    const back = rep.bytes(64);
+    out.transfer = { roundTrip: back.every((b, i) => b === pixels[i]),
+      first: Array.from(back.slice(0, 8)), expected: Array.from(pixels.slice(0, 8)) };
+    // a failed transfer still sends data_size bytes (unwritten): look at the log too
+    const failed = out.log.slice(logStart).filter((l) => /failed|error/i.test(l) && !l.startsWith('GL error'));
+    if (failed.length) out.transfer.errors = failed;
+    out.stages.transfer = out.transfer.roundTrip && !failed.length;
+  } catch (e) {
+    out.transfer = { error: String(e) };
+    out.stages.transfer = false;
+  }
+
+  // a waiting busy wait behind a fence: SUBMIT_CMD (one VIRGL_CCMD_NOP) makes
+  // an implicit fence; RESOURCE_BUSY_WAIT with VCMD_BUSY_WAIT_FLAG_WAIT parks
+  // the client until kw_virgl_poll, from later tasks, sees the fence signal
+  // (WebGL sync objects change only between tasks)
+  stage('busyWait');
+  const t2 = performance.now();
+  let fed = v.feed(c, bytesOf(new Uint32Array([1, VCMD.SUBMIT_CMD, 0, 2, VCMD.RESOURCE_BUSY_WAIT, 0, 1])));
+  if (fed < 0) throw new Error(`busy wait: feed ${fed}`);
+  out.busyWait = { parked: fed === v.PARKED, polls: 0 };
+  while (v.state(c) === v.PARKED) {
+    if (++out.busyWait.polls > 1000) throw new Error('busy wait never answered');
+    await new Promise((r) => setTimeout(r, 1));
+    v.poll();
+  }
+  if (v.state(c) < 0) throw new Error(`busy wait: state ${v.state(c)}`);
+  rep.header(VCMD.RESOURCE_BUSY_WAIT);
+  out.busyWait.busy = rep.u32(1)[0];
+  out.busyWait.ms = Math.round(performance.now() - t2);
+  if (out.busyWait.busy !== 0) throw new Error('busy wait answered busy');
+  out.stages.busyWait = true;
+  v.close(c);
+
+  // the inline dialect (KW_VIRGL_INLINE, as gl/bridge speaks it): protocol
+  // version 3 without fds, renderer-chosen resource ids, transfer data in
+  // the stream; two clients at once
+  stage('inline');
+  const a = v.open(v.INLINE), b = v.open(v.INLINE);
+  const ra = new Replies(v, a), rb = new Replies(v, b);
+  const inl = out.inline = {};
+  for (const [cl, r] of [[a, ra], [b, rb]]) {
+    const parts = [create, bytesOf(cmd(VCMD.PROTOCOL_VERSION, [4])), bytesOf(cmd(VCMD.GET_PARAM, [1])),
+      bytesOf(cmd(VCMD.CONTEXT_INIT, [2])),
+      bytesOf(cmd(VCMD.RESOURCE_CREATE2, [0, PIPE_TEXTURE_2D, VIRGL_FORMAT_R8G8B8A8_UNORM,
+        BIND_SAMPLER_VIEW | BIND_RENDER_TARGET, 4, 4, 1, 1, 0, 0, 64]))];
+    for (const p of parts) if (feedChunked(v, cl, p) < 0) throw new Error(`inline: state ${v.state(cl)}`);
+    r.header(VCMD.PROTOCOL_VERSION);
+    const ver = r.u32(1)[0];
+    r.header(VCMD.GET_PARAM);
+    const param = Array.from(r.u32(2));
+    r.header(VCMD.RESOURCE_CREATE2);
+    const res = r.u32(1)[0];
+    (inl.clients ||= []).push({ version: ver, maxTimelineCount: param, resource: res });
+  }
+  const [ia, ib] = inl.clients;
+  if (ia.version !== 3 || ib.version !== 3) throw new Error('inline: protocol version is not 3');
+  if (ia.resource === ib.resource) throw new Error('inline: two clients got the same resource id');
+  const pixels2 = new Uint8Array(64).map((_, i) => (i * 53 + 7) & 255);
+  const put2 = new Uint8Array(8 + 40 + 64);
+  // handle, level, x, y, z, w, h, d, data_size, offset
+  put2.set(bytesOf(new Uint32Array([10 + 16, VCMD.TRANSFER_PUT2, ia.resource, 0, 0, 0, 0, 4, 4, 1, 64, 0])));
+  put2.set(pixels2, 48);
+  const get2 = bytesOf(cmd(VCMD.TRANSFER_GET2, [ia.resource, 0, 0, 0, 0, 4, 4, 1, 64, 0]));
+  feedChunked(v, a, put2);
+  // overwrite the backing in between: what comes back must come from the texture
+  const zero = new Uint8Array(8 + 40 + 64);
+  zero.set(bytesOf(new Uint32Array([10 + 16, VCMD.TRANSFER_PUT2, ia.resource, 0, 0, 0, 0, 0, 0, 0, 64, 0])));
+  feedChunked(v, a, zero);  // an empty box: only the backing changes
+  if (feedChunked(v, a, get2) < 0) throw new Error(`inline transfer: state ${v.state(a)}`);
+  const n = ra.header(VCMD.TRANSFER_GET2);
+  const back2 = ra.bytes(4 * n);
+  inl.roundTrip = n === 16 && back2.every((x, i) => x === pixels2[i]);
+  if (ra.left || rb.left) throw new Error('inline: reply bytes left over');
+  if (!inl.roundTrip) throw new Error(`inline transfer: got ${Array.from(back2.slice(0, 8))}, expected ${Array.from(pixels2.slice(0, 8))}`);
+  out.stages.inline = true;
+  v.close(a);
+  v.close(b);
+
+  // the same through v.Renderer (the renderer shape of gl/bridge), which
+  // polls a parked client by itself
+  stage('renderer');
+  const ren = new v.Renderer(glUsed);
+  out.renderer = { init: await ren.init() };
+  const got = [];
+  let closed = null;
+  const done = new Promise((resolve) => {
+    ren.onreply = (id, bytes) => { got.push(...bytes); if (got.length >= 24) resolve(); };
+    ren.onclose = (id, why) => { closed = why; resolve(); };
+  });
+  ren.open(7);
+  ren.feed(7, create);
+  ren.feed(7, bytesOf(cmd(VCMD.PROTOCOL_VERSION, [4])));
+  ren.feed(7, bytesOf(new Uint32Array([1, VCMD.SUBMIT_CMD, 0, 2, VCMD.RESOURCE_BUSY_WAIT, 0, 1])));
+  await Promise.race([done, new Promise((res) => setTimeout(res, 5000))]);
+  ren.close(7);
+  const w = new Uint32Array(new Uint8Array(got).buffer);
+  out.renderer.reply = Array.from(w);
+  // [1, PROTOCOL_VERSION, 3], [1, RESOURCE_BUSY_WAIT, 0]
+  if (closed || w.length !== 6 || w[1] !== VCMD.PROTOCOL_VERSION || w[2] !== 3 ||
+      w[4] !== VCMD.RESOURCE_BUSY_WAIT || w[5] !== 0)
+    throw new Error(`v.Renderer: ${closed || 'unexpected reply ' + Array.from(w)}`);
+  out.stages.renderer = true;
+  delete out.running;
+  out.ok = true;
+}
+
+function checkedGL(gl) {
+  let pending = 0;
+  const fmt = (a) => (typeof a === 'number' ? (a > 255 ? '0x' + a.toString(16) : a)
+    : a && a.constructor ? a.constructor.name : String(a));
+  return new Proxy(gl, {
+    get(t, p) {
+      const val = t[p];
+      if (typeof val !== 'function') return val;
+      if (p === 'getError') return () => { const e = pending || t.getError(); pending = 0; return e; };
+      return (...a) => {
+        const r = val.apply(t, a);
+        const e = t.getError();
+        if (e) {
+          log(`GL error 0x${e.toString(16)} from ${String(p)}(${a.map(fmt).join(', ')})`);
+          pending ||= e;
+        }
+        return r;
+      };
+    },
+  });
+}
+
+// VIRGL_CAP_* and VIRGL_CAP_V2_* (src/virgl_hw.h), by bit
+const CAP_NAMES = ['TGSI_INVARIANT', 'TEXTURE_VIEW', 'SET_MIN_SAMPLES', 'COPY_IMAGE', 'TGSI_PRECISE',
+  'TXQS', 'MEMORY_BARRIER', 'COMPUTE_SHADER', 'FB_NO_ATTACH', 'ROBUST_BUFFER_ACCESS', 'TGSI_FBFETCH',
+  'SHADER_CLOCK', 'TEXTURE_BARRIER', 'TGSI_COMPONENTS', 'GUEST_MAY_INIT_LOG', 'SRGB_WRITE_CONTROL',
+  'QBO', 'TRANSFER', 'FBO_MIXED_COLOR_FORMATS', 'HOST_IS_GLES', 'BIND_COMMAND_ARGS',
+  'MULTI_DRAW_INDIRECT', 'INDIRECT_PARAMS', 'TRANSFORM_FEEDBACK3', '3D_ASTC', 'INDIRECT_INPUT_ADDR',
+  'COPY_TRANSFER', 'CLIP_HALFZ', 'APP_TWEAK_SUPPORT', 'BGRA_SRGB_IS_EMULATED', 'CLEAR_TEXTURE',
+  'ARB_BUFFER_STORAGE'];
+const CAP_V2_NAMES = ['BLEND_EQUATION', 'UNTYPED_RESOURCE', 'VIDEO_MEMORY', 'MEMINFO', 'STRING_MARKER',
+  'DIFFERENT_GPU', 'IMPLICIT_MSAA', 'COPY_TRANSFER_BOTH_DIRECTIONS', 'SCANOUT_USES_GBM', 'SSO',
+  'TEXTURE_SHADOW_LOD', 'VS_VERTEX_LAYER', 'VS_VIEWPORT_INDEX', 'PIPELINE_STATISTICS_QUERY',
+  'DRAW_PARAMETERS', 'GROUP_VOTE', 'MIRROR_CLAMP_TO_EDGE', 'MIRROR_CLAMP', 'RESOURCE_LAYOUT'];
+function bitNames(w, names) {
+  const r = [];
+  for (let i = 0; i < 32; i++) if (w & (1 << i)) r.push(names[i] || `bit${i}`);
+  return r.join(' ');
+}
+
+function popcount(w) { let n = 0; while (w) { n += w & 1; w >>>= 1; } return n; }
+
+main().catch((e) => { out.error = String(e && e.stack || e); }).finally(finish);
+</script>

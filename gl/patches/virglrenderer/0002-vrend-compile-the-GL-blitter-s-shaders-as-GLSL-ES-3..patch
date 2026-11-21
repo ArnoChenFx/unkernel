@@ -1,0 +1,43 @@
+From 93bdc926984ddce0e2628995aa86739980928bbf Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 13:55:13 +0000
+Subject: [PATCH] vrend: compile the GL blitter's shaders as GLSL ES 3.00 on a
+ GLES 3.0 host
+
+A GLES 3.0 host (WebGL2) has no GLSL ES 3.10; without this every blit
+that takes the GL path fails there. Only the multisample blits need
+3.10, and such a host cannot sample multisample textures.
+---
+ src/vrend/vrend_blitter.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index cd20cd1..cc29f55 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -125,9 +125,21 @@ prog_key_to_uint64( struct blit_prog_key prog_key )
+ 
+ static GLint blit_shader_build_and_check(GLenum shader_type, const char *buf)
+ {
++   static const char es31[] = "#version 310 es\n";
+    GLint param;
+    GLint id = glCreateShader(shader_type);
+-   glShaderSource(id, 1, (const char **)&buf, NULL);
++   const char *src[2] = { buf, NULL };
++   GLsizei n = 1;
++
++   /* A GLES 3.0 host (WebGL 2) has no GLSL ES 3.10. Only the multisample
++    * blits need it, and such a host cannot sample multisample textures. */
++   if (!epoxy_is_desktop_gl() && epoxy_gl_version() < 31 &&
++       !strncmp(buf, es31, sizeof(es31) - 1)) {
++      src[0] = "#version 300 es\n";
++      src[1] = buf + sizeof(es31) - 1;
++      n = 2;
++   }
++   glShaderSource(id, n, src, NULL);
+    glCompileShader(id);
+ 
+    glGetShaderiv(id, GL_COMPILE_STATUS, &param);
+-- 
+2.56.0
+

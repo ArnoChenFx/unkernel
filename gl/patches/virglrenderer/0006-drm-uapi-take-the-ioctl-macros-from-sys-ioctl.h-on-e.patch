@@ -1,0 +1,29 @@
+From 5e48ff7bbcbcd3f3f524a9a0e25f6482484d55c6 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 12:49:53 +0000
+Subject: [PATCH] drm-uapi: take the ioctl macros from sys/ioctl.h on
+ emscripten
+
+---
+ src/drm/drm-uapi/drm.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/drm/drm-uapi/drm.h b/src/drm/drm-uapi/drm.h
+index c5bd3e9..29ead02 100644
+--- a/src/drm/drm-uapi/drm.h
++++ b/src/drm/drm-uapi/drm.h
+@@ -44,7 +44,11 @@ typedef unsigned int drm_handle_t;
+ #else /* One of the BSDs */
+ 
+ #include <stdint.h>
++#ifdef __EMSCRIPTEN__
++#include <sys/ioctl.h>
++#else
+ #include <sys/ioccom.h>
++#endif
+ #include <sys/types.h>
+ typedef int8_t   __s8;
+ typedef uint8_t  __u8;
+-- 
+2.56.0
+

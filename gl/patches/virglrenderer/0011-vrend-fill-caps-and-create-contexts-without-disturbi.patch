@@ -1,0 +1,58 @@
+From b0c92fb702d5c6916c4e481e95b8cd6bf2ee2900 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 15:36:09 +0000
+Subject: [PATCH] vrend: fill caps and create contexts without disturbing the
+ current client
+
+On a server that all clients share, vrend_renderer_fill_caps ran its
+framebuffer probes on whichever client's GL context was current and left
+framebuffer 0 bound, and vrend_create_context made the new context current
+while the previous client stayed recorded as current. Either way the
+client that drew last went on drawing without its framebuffer. Fill the
+caps on context 0, and forget the current context when one is created.
+---
+ src/vrend/vrend_renderer.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index decc3e3..5ba8064 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -8169,6 +8169,16 @@ struct vrend_context *vrend_create_context(int id, uint32_t nlen, const char *de
+    vrend_renderer_create_sub_ctx(grctx, 0);
+    vrend_renderer_set_sub_ctx(grctx, 0);
+ 
++   /* vrend_renderer_create_sub_ctx made the new GL context current behind
++    * the back of vrend_hw_switch_context. Forget which context is current, or
++    * the next switch to the one that was current before would be skipped and
++    * its commands would run on this context's GL context (several clients on
++    * one renderer: vtest --no-fork creates a context when a new client sends
++    * its first command, between two submits of another client).
++    */
++   vrend_state.current_ctx = NULL;
++   vrend_state.current_hw_ctx = NULL;
++
+    int glver = get_glsl_version();
+    if (glver < 0) {
+       virgl_error("Unable to query GL version\n");
+@@ -13339,6 +13349,17 @@ void vrend_renderer_fill_caps(uint32_t set, uint32_t version,
+       return;
+    }
+ 
++   /* The probes below (vrend_renderer_query_multisample_caps,
++    * vrend_check_framebuffer_mixed_color_attachements) bind framebuffers and
++    * textures of their own and leave GL_FRAMEBUFFER at 0. A client may ask for
++    * the caps while another client's context is current (vtest --no-fork, a
++    * new client connecting), and that context's framebuffer binding would be
++    * lost, so run them in context 0. The next command of any context makes
++    * its own context current again.
++    */
++   if (vrend_state.ctx0)
++      vrend_renderer_force_ctx_0();
++
+    /* We don't want to deal with stale error states that the caller might not
+     * have cleaned up propperly, so read the error state until we are okay.
+     */
+-- 
+2.56.0
+

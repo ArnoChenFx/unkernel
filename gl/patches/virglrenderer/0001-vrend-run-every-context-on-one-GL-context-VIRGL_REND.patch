@@ -1,0 +1,871 @@
+From 360da089f824d9d8670803f0279a6eded3f70818 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 13:55:13 +0000
+Subject: [PATCH] vrend: run every context on one GL context
+ (VIRGL_RENDERER_SINGLE_GL_CONTEXT)
+
+For hosts without share groups (WebGL): every renderer context, sub
+context and the GL blitter run on the GL context that
+vrend_renderer_init creates, and the renderer re-emits GL state when it
+switches between sub contexts (vrend_single_acquire); queries open across
+a switch are split and their parts added up. vtest: --single-gl-context
+or VTEST_SINGLE_GL_CONTEXT. GLES hosts only; the sync thread is ignored.
+---
+ src/virglrenderer.c        |   2 +
+ src/virglrenderer.h        |   7 +
+ src/vrend/vrend_blitter.c  |  28 ++-
+ src/vrend/vrend_renderer.c | 425 +++++++++++++++++++++++++++++++++++--
+ src/vrend/vrend_renderer.h |   5 +
+ vtest/vtest_server.c       |  11 +
+ 6 files changed, 459 insertions(+), 19 deletions(-)
+
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 79717fc..6229da1 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -919,6 +919,8 @@ int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks
+          renderer_flags |= VREND_USE_GLES;
+       if (flags & VIRGL_RENDERER_VENUS)
+          renderer_flags |= VREND_USE_GBM_LAYOUT;
++      if (flags & VIRGL_RENDERER_SINGLE_GL_CONTEXT)
++         renderer_flags |= VREND_USE_SINGLE_CONTEXT;
+ 
+       ret = vrend_renderer_init(&vrend_cbs, renderer_flags);
+       if (ret) {
+diff --git a/src/virglrenderer.h b/src/virglrenderer.h
+index 0bcafef..dc029d5 100644
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -169,6 +169,13 @@ struct virgl_renderer_callbacks {
+ /* Blob allocations must be done by guest from dedicated heap (Host visible memory). */
+ #define VIRGL_RENDERER_USE_GUEST_VRAM (1 << 14)
+ 
++/*
++ * Run every virgl context on one GL context, for hosts without share groups
++ * (WebGL). The renderer re-emits GL state when it switches between contexts.
++ * Needs a GLES host; the sync thread (VIRGL_RENDERER_THREAD_SYNC) is ignored.
++ */
++#define VIRGL_RENDERER_SINGLE_GL_CONTEXT (1 << 15)
++
+ VIRGL_EXPORT int virgl_renderer_init(void *cookie, int flags, struct virgl_renderer_callbacks *cb);
+ VIRGL_EXPORT void virgl_renderer_poll(void); /* force fences */
+ 
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index f829115..cd20cd1 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -458,7 +458,14 @@ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
+    struct virgl_gl_ctx_param ctx_params;
+    int i;
+    if (blit_ctx->initialised) {
+-      vrend_sync_make_current(blit_ctx->gl_context);
++      if (vrend_renderer_single_gl_context()) {
++         /* The blitter shares the one GL context: leave the client's state
++          * and set up what the blitter's own context would hold. */
++         vrend_renderer_single_enter_blitter();
++         glBindVertexArray(blit_ctx->vaoid);
++         glBindBuffer(GL_ARRAY_BUFFER, blit_ctx->vbo_id);
++      } else
++         vrend_sync_make_current(blit_ctx->gl_context);
+       return;
+    }
+ 
+@@ -467,7 +474,10 @@ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
+    blit_ctx->use_gles = epoxy_is_desktop_gl() == 0;
+    ctx_params.shared = true;
+    ctx_params.compat_ctx = false;
+-   for (uint32_t i = 0; i < ARRAY_SIZE(gl_versions); i++) {
++   blit_ctx->gl_context = vrend_renderer_single_gl_context();
++   if (blit_ctx->gl_context)
++      vrend_renderer_single_enter_blitter();
++   for (uint32_t i = 0; !blit_ctx->gl_context && i < ARRAY_SIZE(gl_versions); i++) {
+       ctx_params.major_ver = gl_versions[i].major;
+       ctx_params.minor_ver = gl_versions[i].minor;
+ 
+@@ -481,7 +491,8 @@ static void vrend_renderer_init_blit_ctx(struct vrend_blitter_ctx *blit_ctx)
+       abort();
+    }
+ 
+-   vrend_sync_make_current(blit_ctx->gl_context);
++   if (!vrend_renderer_single_gl_context())
++      vrend_sync_make_current(blit_ctx->gl_context);
+    glGenVertexArrays(1, &blit_ctx->vaoid);
+    glGenFramebuffers(1, &blit_ctx->fb_id);
+ 
+@@ -916,7 +927,16 @@ void vrend_blitter_fini(void)
+    vrend_blit_ctx.initialised = false;
+    if (vrend_blit_ctx.blit_programs)
+       _mesa_hash_table_u64_destroy(vrend_blit_ctx.blit_programs, delete_program_cb);
+-   vrend_clicbs->destroy_gl_context(vrend_blit_ctx.gl_context);
++   if (vrend_renderer_single_gl_context()) {
++      /* the GL context outlives the blitter: free what its own would have */
++      if (vrend_blit_ctx.gl_context) {
++         glDeleteVertexArrays(1, &vrend_blit_ctx.vaoid);
++         glDeleteFramebuffers(1, &vrend_blit_ctx.fb_id);
++         glDeleteBuffers(1, &vrend_blit_ctx.vbo_id);
++         glDeleteShader(vrend_blit_ctx.vs);
++      }
++   } else
++      vrend_clicbs->destroy_gl_context(vrend_blit_ctx.gl_context);
+    memset(&vrend_blit_ctx, 0, sizeof(vrend_blit_ctx));
+ }
+ 
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4bf88e0..4c53dbe 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -123,6 +123,14 @@ struct vrend_query {
+    int sub_ctx_id;
+    struct vrend_resource *res;
+    bool fake_samples_passed;
++
++   /* Single GL context mode: a query that is active while another context
++    * takes the GL context is ended there and continued in a new GL query
++    * object; the result combines the ended ones (done_ids) with id. */
++   struct list_head active;
++   GLuint *done_ids;
++   uint32_t num_done;
++   uint32_t max_done;
+ };
+ 
+ struct global_error_state {
+@@ -349,6 +357,11 @@ struct global_renderer_state {
+    struct vrend_context *current_ctx;
+    struct vrend_context *current_hw_ctx;
+ 
++   /* Single GL context mode: the one GL context, and the sub context whose
++    * state it holds (NULL: none, e.g. after the blitter used it). */
++   virgl_gl_context single_gl_context;
++   struct vrend_sub_context *gl_owner;
++
+    struct list_head waiting_query_list;
+    struct list_head fence_list;
+    struct list_head fence_wait_list;
+@@ -810,6 +823,15 @@ struct vrend_sub_context {
+    uint32_t sysvalue_data_cookie;
+    uint32_t current_program_id;
+    uint32_t current_pipeline_id;
++
++   /* GL state that is emitted once and would otherwise live only in this
++    * sub context's own GL context; re-emitted in single GL context mode. */
++   struct list_head active_queries;
++   struct pipe_rasterizer_state emitted_rs;
++   bool rs_bound;
++   bool blend_bound;
++   GLbitfield sample_mask;
++   GLfloat min_sample_shading;
+ };
+ 
+ struct vrend_untyped_resource {
+@@ -879,6 +901,12 @@ static void vrend_update_viewport_state(struct vrend_sub_context *sub_ctx);
+ static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx);
+ static void vrend_destroy_query_object(void *obj_ptr);
+ static void vrend_finish_context_switch(struct vrend_context *ctx);
++static void vrend_single_acquire(struct vrend_sub_context *sub);
++static void vrend_single_release(void);
++static void vrend_make_current_sub(struct vrend_sub_context *sub);
++static void vrend_query_split(struct vrend_query *q);
++static void vrend_query_gl_begin(struct vrend_query *q);
++static void vrend_query_gl_end(struct vrend_query *q);
+ static void vrend_patch_blend_state(struct vrend_sub_context *sub_ctx);
+ static void vrend_update_frontface_state(struct vrend_sub_context *ctx);
+ static void vrend_destroy_program(struct vrend_linked_shader_program *ent);
+@@ -6584,6 +6612,7 @@ void vrend_object_bind_blend(struct vrend_context *ctx,
+    if (handle == 0) {
+       memset(&ctx->sub->blend_state, 0, sizeof(ctx->sub->blend_state));
+       glDisable(GL_BLEND);
++      ctx->sub->blend_bound = false;
+       return;
+    }
+    state = vrend_object_lookup(ctx->sub->object_hash, handle, VIRGL_OBJECT_BLEND);
+@@ -6594,6 +6623,7 @@ void vrend_object_bind_blend(struct vrend_context *ctx,
+ 
+    ctx->sub->shader_dirty = true;
+    ctx->sub->blend_state = *state;
++   ctx->sub->blend_bound = true;
+ 
+    ctx->sub->blend_state_dirty = true;
+ }
+@@ -7024,6 +7054,8 @@ void vrend_object_bind_rasterizer(struct vrend_context *ctx,
+    ctx->sub->rs_state = *state;
+    ctx->sub->shader_dirty = true;
+    vrend_hw_emit_rs(ctx);
++   ctx->sub->emitted_rs = *state;
++   ctx->sub->rs_bound = true;
+ }
+ 
+ void vrend_bind_sampler_states(struct vrend_context *ctx,
+@@ -7656,6 +7688,14 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+       virgl_info("gl_version %d - compat profile\n", gl_ver);
+    }
+ 
++   if (flags & VREND_USE_SINGLE_CONTEXT) {
++      /* only the GLES host's state is re-emitted on a switch */
++      if (gles)
++         vrend_state.single_gl_context = gl_context;
++      else
++         virgl_warn("single GL context mode needs a GLES host, using one GL context per context\n");
++   }
++
+    vrend_state.use_integer = use_integer();
+ 
+    init_features(gles ? 0 : gl_ver,
+@@ -7718,7 +7758,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+       glEnable(GL_DEBUG_OUTPUT);
+    }
+ 
+-   vrend_clicbs->destroy_gl_context(gl_context);
++   if (!vrend_state.single_gl_context)
++      vrend_clicbs->destroy_gl_context(gl_context);
+    list_inithead(&vrend_state.fence_list);
+    list_inithead(&vrend_state.fence_wait_list);
+    list_inithead(&vrend_state.waiting_query_list);
+@@ -7733,7 +7774,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+    }
+ 
+    vrend_state.eventfd = -1;
+-   if (flags & VREND_USE_THREAD_SYNC) {
++   /* the sync thread would make the one GL context current a second time */
++   if ((flags & VREND_USE_THREAD_SYNC) && !vrend_state.single_gl_context) {
+       if (flags & VREND_USE_ASYNC_FENCE_CB)
+          vrend_state.use_async_fence_cb = true;
+       vrend_renderer_use_threaded_sync();
+@@ -7797,12 +7839,18 @@ vrend_renderer_fini(void)
+    vrend_state.current_ctx = NULL;
+    vrend_state.current_hw_ctx = NULL;
+ 
++   if (vrend_state.single_gl_context) {
++      vrend_clicbs->destroy_gl_context(vrend_state.single_gl_context);
++      vrend_state.single_gl_context = NULL;
++      vrend_state.gl_owner = NULL;
++   }
++
+    vrend_state.finishing = false;
+ }
+ 
+ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
+ {
+-   vrend_clicbs->make_current(sub->gl_context);
++   vrend_make_current_sub(sub);
+ 
+    if (has_feature(feat_images)) {
+       for (int shader_type = PIPE_SHADER_VERTEX;
+@@ -7864,8 +7912,18 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
+    if (sub->current_so)
+       glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+ 
+-   list_for_each_entry_safe(struct vrend_streamout_object, obj, &sub->streamout_list, head)
++   list_for_each_entry_safe(struct vrend_streamout_object, obj, &sub->streamout_list, head) {
++      /* an active transform feedback cannot be deleted, and no context
++       * destruction ends it in single GL context mode */
++      if (vrend_state.single_gl_context && obj->xfb_state != XFB_STATE_OFF &&
++          obj->xfb_state != XFB_STATE_STARTED_NEED_BEGIN &&
++          has_feature(feat_transform_feedback2)) {
++         glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, obj->id);
++         glEndTransformFeedback();
++         glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
++      }
+       vrend_destroy_streamout_object(obj);
++   }
+ 
+    vrend_shader_state_reference(&sub->shaders[PIPE_SHADER_VERTEX], NULL);
+    vrend_shader_state_reference(&sub->shaders[PIPE_SHADER_FRAGMENT], NULL);
+@@ -7909,8 +7967,19 @@ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
+    vrend_set_num_vbo_sub(sub, 0);
+    vrend_resource_reference((struct vrend_resource **)&sub->ib.buffer, NULL);
+ 
++   /* queries still open would stay open on the one GL context */
++   list_for_each_entry_safe(struct vrend_query, q, &sub->active_queries, active) {
++      vrend_query_gl_end(q);
++      list_delinit(&q->active);
++   }
++
+    vrend_object_fini_ctx_table(sub->object_hash);
+-   vrend_clicbs->destroy_gl_context(sub->gl_context);
++   if (vrend_state.single_gl_context) {
++      /* the GL context lives on: nothing may point at this sub context */
++      if (vrend_state.gl_owner == sub)
++         vrend_state.gl_owner = NULL;
++   } else
++      vrend_clicbs->destroy_gl_context(sub->gl_context);
+ 
+    list_del(&sub->head);
+    FREE(sub);
+@@ -7933,7 +8002,7 @@ void vrend_destroy_context(struct vrend_context *ctx)
+       vrend_state.current_hw_ctx = NULL;
+    }
+ 
+-   vrend_clicbs->make_current(ctx->sub->gl_context);
++   vrend_make_current_sub(ctx->sub);
+    /* reset references on framebuffers */
+    vrend_set_framebuffer_state(ctx, 0, NULL, 0);
+ 
+@@ -10292,8 +10361,9 @@ void vrend_set_clip_state(struct vrend_context *ctx, struct pipe_clip_state *ucp
+    }
+ }
+ 
+-void vrend_set_sample_mask(UNUSED struct vrend_context *ctx, unsigned sample_mask)
++void vrend_set_sample_mask(struct vrend_context *ctx, unsigned sample_mask)
+ {
++   ctx->sub->sample_mask = sample_mask;
+    if (has_feature(feat_sample_mask))
+       glSampleMaski(0, sample_mask);
+ }
+@@ -10306,6 +10376,7 @@ void vrend_set_min_samples(struct vrend_context *ctx, unsigned min_samples)
+       min_sample_shading /= MAX2(1, ctx->sub->surf[0]->texture->base.nr_samples);
+    }
+ 
++   ctx->sub->min_sample_shading = min_sample_shading;
+    if (has_feature(feat_sample_shading))
+       glMinSampleShading(min_sample_shading);
+ }
+@@ -11181,7 +11252,10 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
+ 
+       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use GL fallback\n");
+       vrend_renderer_blit_gl(ctx, src_res, dst_res, &blit_info);
+-      vrend_sync_make_current(ctx->sub->gl_context);
++      if (vrend_state.single_gl_context)
++         vrend_single_acquire(ctx->sub);
++      else
++         vrend_sync_make_current(ctx->sub->gl_context);
+    }
+ 
+    if (blit_info.src_view != src_res->gl_id)
+@@ -11434,7 +11508,10 @@ void vrend_renderer_check_fences(void)
+       }
+       mtx_unlock(&vrend_state.fence_mutex);
+    } else {
+-      vrend_renderer_force_ctx_0();
++      /* any context will do for the sync objects; with a single GL context
++       * it is current already, and a switch would re-emit state for nothing */
++      if (!vrend_state.single_gl_context)
++         vrend_renderer_force_ctx_0();
+ 
+       list_for_each_entry_safe(struct vrend_fence, fence, &vrend_state.fence_list, fences) {
+          if (do_wait(fence, /* can_block */ false)) {
+@@ -11510,6 +11587,23 @@ static bool vrend_check_query(struct vrend_query *query)
+    if (ret == false)
+       return false;
+ 
++   /* a query split in single GL context mode: add up its parts */
++   for (uint32_t i = 0; i < query->num_done; i++) {
++      uint64_t part;
++      if (!vrend_get_one_query_result(query->done_ids[i], state.result_size == 8, &part))
++         return false;
++      switch (query->gltype) {
++      case GL_ANY_SAMPLES_PASSED:
++      case GL_ANY_SAMPLES_PASSED_CONSERVATIVE:
++      case GL_TRANSFORM_FEEDBACK_OVERFLOW_ARB:
++      case GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW_ARB:
++         state.result = state.result || part;
++         break;
++      default:
++         state.result += part;
++      }
++   }
++
+    /* We got a boolean, but the client wanted the actual number of samples
+     * blow the number up so that the client doesn't think it was just one pixel
+     * and discards an object that might be bigger */
+@@ -11548,6 +11642,233 @@ static struct vrend_sub_context *vrend_renderer_find_sub_ctx(struct vrend_contex
+    return NULL;
+ }
+ 
++/*
++ * Single GL context mode (VREND_USE_SINGLE_CONTEXT).
++ *
++ * Every sub context's gl_context is the same GL context, so a switch between
++ * sub contexts no longer swaps GL state. vrend_state.gl_owner names the sub
++ * context whose state the GL context holds. Taking the GL context for
++ * another one (vrend_single_acquire) puts the GL state in that sub context's
++ * view: the old owner's open queries and render condition are ended, the GL
++ * state that any context or the blitter may change is reset to the GL
++ * defaults, and what the new owner had emitted is emitted again, or marked
++ * dirty where the next draw or clear emits it anyway. State that every user
++ * binds before use (program, buffer bindings, pixel store, front face,
++ * primitive restart) is left alone.
++ */
++
++static void vrend_single_reset_gl_state(void)
++{
++   glDisable(GL_BLEND);
++   glBlendEquation(GL_FUNC_ADD);
++   glBlendFunc(GL_ONE, GL_ZERO);
++   glBlendColor(0.0f, 0.0f, 0.0f, 0.0f);
++   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++   glEnable(GL_DITHER);
++   glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
++
++   glDisable(GL_DEPTH_TEST);
++   glDepthFunc(GL_LESS);
++   glDepthMask(GL_TRUE);
++   glDisable(GL_STENCIL_TEST);
++   glStencilFunc(GL_ALWAYS, 0, ~0u);
++   glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
++   glStencilMask(~0u);
++
++   glDisable(GL_SCISSOR_TEST);
++   glDisable(GL_CULL_FACE);
++   glCullFace(GL_BACK);
++   glFrontFace(GL_CCW);
++   glDisable(GL_POLYGON_OFFSET_FILL);
++   glPolygonOffset(0.0f, 0.0f);
++   glDisable(GL_RASTERIZER_DISCARD);
++   glLineWidth(1.0f);
++
++   if (has_feature(feat_depth_clamp))
++      glDisable(GL_DEPTH_CLAMP);
++   if (has_feature(feat_clip_control))
++      glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
++   if (has_feature(feat_srgb_write_control))
++      glDisable(GL_FRAMEBUFFER_SRGB_EXT);
++   if (has_feature(feat_multisample) && has_feature(feat_sample_mask)) {
++      glDisable(GL_SAMPLE_MASK);
++      glSampleMaski(0, ~0u);
++   }
++   if (has_feature(feat_multisample) && has_feature(feat_sample_shading)) {
++      glDisable(GL_SAMPLE_SHADING);
++      glMinSampleShading(0.0f);
++   }
++
++   glUseProgram(0);
++   if (has_feature(feat_separate_shader_objects))
++      glBindProgramPipeline(0);
++   if (has_feature(feat_transform_feedback2))
++      glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
++}
++
++static void vrend_single_render_condition(struct vrend_sub_context *sub, bool on)
++{
++   if (!sub->cond_render_q_id)
++      return;
++   if (has_feature(feat_gl_conditional_render)) {
++      if (on)
++         glBeginConditionalRender(sub->cond_render_q_id, sub->cond_render_gl_mode);
++      else
++         glEndConditionalRender();
++   } else if (has_feature(feat_nv_conditional_render)) {
++      if (on)
++         glBeginConditionalRenderNV(sub->cond_render_q_id, sub->cond_render_gl_mode);
++      else
++         glEndConditionalRenderNV();
++   }
++}
++
++/* The owner gives up the GL context: end what would count or condition
++ * another context's commands. */
++static void vrend_single_release(void)
++{
++   struct vrend_sub_context *sub = vrend_state.gl_owner;
++
++   if (!sub)
++      return;
++   vrend_state.gl_owner = NULL;
++
++   list_for_each_entry(struct vrend_query, q, &sub->active_queries, active)
++      vrend_query_split(q);
++   vrend_single_render_condition(sub, false);
++
++   /* paused after every draw already; a running one would capture others' */
++   if (sub->current_so && sub->current_so->xfb_state == XFB_STATE_STARTED &&
++       has_feature(feat_transform_feedback2)) {
++      glPauseTransformFeedback();
++      sub->current_so->xfb_state = XFB_STATE_PAUSED;
++   }
++
++   /* the defaults below do not know which planes were on */
++   for (int i = 0; i < 8; i++)
++      if (sub->hw_rs_state.clip_plane_enable & (1 << i))
++         glDisable(GL_CLIP_PLANE0 + i);
++}
++
++static void vrend_single_restore(struct vrend_sub_context *sub)
++{
++   struct vrend_context *ctx = sub->parent;
++   uint32_t all_vps = has_feature(feat_viewport_array) ? (1u << PIPE_MAX_VIEWPORTS) - 1 : 1;
++
++   glBindFramebuffer(GL_FRAMEBUFFER, sub->fb_id);
++   glBindVertexArray(sub->vaoid);
++   if (has_feature(feat_transform_feedback2))
++      glBindTransformFeedback(GL_TRANSFORM_FEEDBACK,
++                              sub->current_so ? sub->current_so->id : 0);
++
++   /* texture units, samplers and uniform buffers: rebind at the next draw */
++   for (int i = 0; i < PIPE_SHADER_TYPES; i++) {
++      sub->views[i].dirty_mask = ~0u;
++      sub->const_bufs_dirty[i] = ~0u;
++   }
++   glActiveTexture(GL_TEXTURE0 + vrend_state.max_texture_units - 1);
++
++   /* rasterizer: emit what was last emitted, with the shadows of the state
++    * it compares against set to force it */
++   if (sub->rs_bound) {
++      struct pipe_rasterizer_state cur = sub->rs_state;
++      struct vrend_sub_context *cur_sub = ctx->sub;
++      const struct pipe_rasterizer_state *rs = &sub->emitted_rs;
++
++      sub->hw_rs_state.rasterizer_discard = !rs->rasterizer_discard;
++      sub->hw_rs_state.flatshade = !rs->flatshade;
++      sub->hw_rs_state.flatshade_first = !rs->flatshade_first;
++      if (has_feature(feat_clip_control))
++         sub->hw_rs_state.clip_halfz = !rs->clip_halfz;
++      sub->hw_rs_state.clip_plane_enable = rs->clip_plane_enable ? ~rs->clip_plane_enable : 0;
++      sub->rs_state = *rs;
++      ctx->sub = sub;
++      vrend_hw_emit_rs(ctx);
++      ctx->sub = cur_sub;
++      sub->rs_state = cur;
++   }
++
++   /* depth and stencil: the enables now, as the shadows say; the stencil
++    * functions and masks at the next draw or clear */
++   if (sub->depth_test_enabled) {
++      glEnable(GL_DEPTH_TEST);
++      glDepthFunc(GL_NEVER + sub->dsa_state.depth.func);
++      glDepthMask(sub->dsa_state.depth.writemask ? GL_TRUE : GL_FALSE);
++   }
++   if (sub->stencil_test_enabled)
++      glEnable(GL_STENCIL_TEST);
++   sub->stencil_state_dirty = true;
++
++   /* blend: the colour mask as the shadow has it, the rest at the next draw */
++   if (sub->hw_blend_state.independent_blend_enable && has_feature(feat_indep_blend)) {
++      for (int i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
++         uint32_t m = sub->hw_blend_state.rt[i].colormask;
++         glColorMaskIndexedEXT(i, m & PIPE_MASK_R ? GL_TRUE : GL_FALSE,
++                               m & PIPE_MASK_G ? GL_TRUE : GL_FALSE,
++                               m & PIPE_MASK_B ? GL_TRUE : GL_FALSE,
++                               m & PIPE_MASK_A ? GL_TRUE : GL_FALSE);
++      }
++   } else {
++      uint32_t m = sub->hw_blend_state.rt[0].colormask;
++      glColorMask(m & PIPE_MASK_R ? GL_TRUE : GL_FALSE, m & PIPE_MASK_G ? GL_TRUE : GL_FALSE,
++                  m & PIPE_MASK_B ? GL_TRUE : GL_FALSE, m & PIPE_MASK_A ? GL_TRUE : GL_FALSE);
++   }
++   glBlendColor(sub->blend_color.color[0], sub->blend_color.color[1],
++                sub->blend_color.color[2], sub->blend_color.color[3]);
++   if (sub->blend_bound)
++      sub->blend_state_dirty = true;
++
++   /* viewports, depth ranges and scissor rectangles */
++   sub->viewport_state_dirty |= all_vps;
++   sub->scissor_state_dirty |= all_vps;
++   vrend_update_viewport_state(sub);
++   vrend_update_scissor_state(sub);
++
++   if (has_feature(feat_srgb_write_control) && sub->framebuffer_srgb_enabled)
++      glEnable(GL_FRAMEBUFFER_SRGB_EXT);
++   if (has_feature(feat_multisample) && has_feature(feat_sample_mask))
++      glSampleMaski(0, sub->sample_mask);
++   if (has_feature(feat_multisample) && has_feature(feat_sample_shading))
++      glMinSampleShading(sub->min_sample_shading);
++
++   list_for_each_entry(struct vrend_query, q, &sub->active_queries, active)
++      vrend_query_gl_begin(q);
++   vrend_single_render_condition(sub, true);
++}
++
++static void vrend_single_acquire(struct vrend_sub_context *sub)
++{
++   if (vrend_state.gl_owner == sub)
++      return;
++   vrend_single_release();
++   vrend_single_reset_gl_state();
++   vrend_single_restore(sub);
++   vrend_state.gl_owner = sub;
++}
++
++static void vrend_make_current_sub(struct vrend_sub_context *sub)
++{
++   vrend_clicbs->make_current(sub->gl_context);
++   if (vrend_state.single_gl_context)
++      vrend_single_acquire(sub);
++}
++
++virgl_gl_context vrend_renderer_single_gl_context(void)
++{
++   return vrend_state.single_gl_context;
++}
++
++/* The blitter takes the GL context: no sub context owns it until the next
++ * acquire, and the blitter finds what its own GL context would hold. */
++void vrend_renderer_single_enter_blitter(void)
++{
++   vrend_single_release();
++   vrend_single_reset_gl_state();
++   glActiveTexture(GL_TEXTURE0);
++   if (has_feature(feat_samplers))
++      glBindSampler(0, 0);
++}
++
+ static bool vrend_hw_switch_context_with_sub(struct vrend_context *ctx, int sub_ctx_id)
+ {
+    if (!ctx)
+@@ -11555,6 +11876,8 @@ static bool vrend_hw_switch_context_with_sub(struct vrend_context *ctx, int sub_
+ 
+    if (ctx == vrend_state.current_ctx && sub_ctx_id == ctx->sub->sub_ctx_id &&
+        ctx->ctx_switch_pending == false) {
++      if (vrend_state.single_gl_context)
++         vrend_single_acquire(ctx->sub);
+       return true;
+    }
+ 
+@@ -11601,8 +11924,11 @@ bool vrend_hw_switch_context(struct vrend_context *ctx, bool now)
+    if (!ctx)
+       return false;
+ 
+-   if (ctx == vrend_state.current_ctx && ctx->ctx_switch_pending == false)
++   if (ctx == vrend_state.current_ctx && ctx->ctx_switch_pending == false) {
++      if (vrend_state.single_gl_context && now)
++         vrend_single_acquire(ctx->sub);
+       return true;
++   }
+ 
+    if (ctx->ctx_id != 0 && ctx->in_error) {
+       return false;
+@@ -11622,12 +11948,15 @@ static void vrend_finish_context_switch(struct vrend_context *ctx)
+       return;
+    ctx->ctx_switch_pending = false;
+ 
+-   if (vrend_state.current_hw_ctx == ctx)
++   if (vrend_state.current_hw_ctx == ctx) {
++      if (vrend_state.single_gl_context)
++         vrend_single_acquire(ctx->sub);
+       return;
++   }
+ 
+    vrend_state.current_hw_ctx = ctx;
+ 
+-   vrend_clicbs->make_current(ctx->sub->gl_context);
++   vrend_make_current_sub(ctx->sub);
+ }
+ 
+ void
+@@ -11688,6 +12017,7 @@ int vrend_create_query(struct vrend_context *ctx, uint32_t handle,
+    int err = 0;
+ 
+    list_inithead(&q->waiting_queries);
++   list_inithead(&q->active);
+    q->type = query_type;
+    q->index = query_index;
+    q->ctx = ctx;
+@@ -11774,10 +12104,55 @@ int vrend_create_query(struct vrend_context *ctx, uint32_t handle,
+    return err;
+ }
+ 
++static void vrend_query_drop_done(struct vrend_query *q)
++{
++   if (q->num_done)
++      glDeleteQueries(q->num_done, q->done_ids);
++   q->num_done = 0;
++}
++
++static void vrend_query_gl_begin(struct vrend_query *q)
++{
++   if (q->index > 0)
++      glBeginQueryIndexed(q->gltype, q->index, q->id);
++   else
++      glBeginQuery(q->gltype, q->id);
++}
++
++static void vrend_query_gl_end(struct vrend_query *q)
++{
++   if (q->index > 0)
++      glEndQueryIndexed(q->gltype, q->index);
++   else
++      glEndQuery(q->gltype);
++}
++
++/* Single GL context mode: end an active query's GL query and continue it in
++ * a new one, so that another context's commands are not counted in it. */
++static void vrend_query_split(struct vrend_query *q)
++{
++   if (q->num_done == q->max_done) {
++      uint32_t max = q->max_done ? q->max_done * 2 : 4;
++      GLuint *ids = realloc(q->done_ids, max * sizeof(*ids));
++      if (!ids) {
++         virgl_error("query %u: out of memory, counting other contexts in it\n", q->id);
++         return;
++      }
++      q->done_ids = ids;
++      q->max_done = max;
++   }
++   vrend_query_gl_end(q);
++   q->done_ids[q->num_done++] = q->id;
++   glGenQueries(1, &q->id);
++}
++
+ static void vrend_destroy_query(struct vrend_query *query)
+ {
+    vrend_resource_reference(&query->res, NULL);
+    list_del(&query->waiting_queries);
++   list_delinit(&query->active);
++   vrend_query_drop_done(query);
++   free(query->done_ids);
+    glDeleteQueries(1, &query->id);
+    free(query);
+ }
+@@ -11804,6 +12179,12 @@ int vrend_begin_query(struct vrend_context *ctx, uint32_t handle)
+    if (q->gltype == GL_TIMESTAMP)
+       return 0;
+ 
++   if (vrend_state.single_gl_context) {
++      vrend_query_drop_done(q);
++      list_delinit(&q->active);
++      list_addtail(&q->active, &ctx->sub->active_queries);
++   }
++
+    if (q->index > 0)
+       glBeginQueryIndexed(q->gltype, q->index, q->id);
+    else
+@@ -11821,6 +12202,8 @@ int vrend_end_query(struct vrend_context *ctx, uint32_t handle)
+    if (q->index > 0 && !has_feature(feat_transform_feedback3))
+       return EINVAL;
+ 
++   list_delinit(&q->active);
++
+    if (vrend_is_timer_query(q->gltype)) {
+       if (q->gltype == GL_TIMESTAMP && !has_feature(feat_timer_query)) {
+          report_gles_warn(ctx, GLES_WARN_TIMESTAMP);
+@@ -13168,7 +13551,12 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+    ctx_params.major_ver = vrend_state.gl_major_ver;
+    ctx_params.minor_ver = vrend_state.gl_minor_ver;
+    ctx_params.compat_ctx = !vrend_state.use_core_profile && !vrend_state.use_gles;
+-   sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
++   if (vrend_state.single_gl_context) {
++      sub->gl_context = vrend_state.single_gl_context;
++      /* the objects created below would land in the owner's bindings */
++      vrend_single_release();
++   } else
++      sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
+    sub->parent = ctx;
+    vrend_clicbs->make_current(sub->gl_context);
+ 
+@@ -13209,12 +13597,19 @@ void vrend_renderer_create_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+ 
+    sub->sysvalue_data.winsys_adjust_y = 1.f;
+ 
++   list_inithead(&sub->active_queries);
++   sub->sample_mask = ~0u;
++
+    ctx->sub = sub;
+    list_add(&sub->head, &ctx->sub_ctxs);
+    if (sub_ctx_id == 0)
+       ctx->sub0 = sub;
+ 
+    vrend_set_tweak_from_env(&ctx->sub->tweaks);
++
++   /* like the fresh GL context it would have had */
++   if (vrend_state.single_gl_context)
++      vrend_single_acquire(sub);
+ }
+ 
+ unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx, enum virgl_debug_flags flag)
+@@ -13243,7 +13638,7 @@ void vrend_renderer_destroy_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+             ctx->sub = ctx->sub0;
+          }
+          vrend_destroy_sub_context(sub);
+-         vrend_clicbs->make_current(ctx->sub->gl_context);
++         vrend_make_current_sub(ctx->sub);
+          break;
+       }
+    }
+@@ -13254,7 +13649,7 @@ void vrend_renderer_set_sub_ctx(struct vrend_context *ctx, int sub_ctx_id)
+    struct vrend_sub_context *sub = vrend_renderer_find_sub_ctx(ctx, sub_ctx_id);
+    if (sub && ctx->sub != sub) {
+       ctx->sub = sub;
+-      vrend_clicbs->make_current(sub->gl_context);
++      vrend_make_current_sub(sub);
+    }
+ }
+ 
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index adb1213..2c08b1b 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -198,6 +198,7 @@ struct vrend_if_cbs {
+ #define VREND_USE_COMPAT_CONTEXT (1 << 5)
+ #define VREND_USE_GLES (1 << 6)
+ #define VREND_USE_GBM_LAYOUT (1 << 7)
++#define VREND_USE_SINGLE_CONTEXT (1 << 8)
+ 
+ bool vrend_check_no_error(struct vrend_context *ctx);
+ 
+@@ -617,6 +618,10 @@ int vrend_renderer_export_query(struct pipe_resource *pres,
+ 
+ void vrend_sync_make_current(virgl_gl_context);
+ 
++/* single GL context mode (VREND_USE_SINGLE_CONTEXT) */
++virgl_gl_context vrend_renderer_single_gl_context(void);
++void vrend_renderer_single_enter_blitter(void);
++
+ int
+ vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
+                                     const struct vrend_renderer_resource_create_args *args);
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 64a29e1..090a37d 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -97,6 +97,7 @@ struct vtest_server
+    bool no_virgl;
+    bool use_compat_profile;
+    bool drm;
++   bool single_gl_context;
+ 
+    int ctx_flags;
+ 
+@@ -176,6 +177,7 @@ while (__AFL_LOOP(1000)) {
+ #define OPT_NO_VIRGL 'g'
+ #define OPT_COMPAT_PROFILE 'c'
+ #define OPT_DRM 'd'
++#define OPT_SINGLE_GL_CONTEXT 'o'
+ 
+ static void vtest_server_parse_args(int argc, char **argv)
+ {
+@@ -193,6 +195,7 @@ static void vtest_server_parse_args(int argc, char **argv)
+       {"socket-path",         required_argument, NULL, OPT_SOCKET_PATH},
+       {"no-virgl",            no_argument, NULL, OPT_NO_VIRGL},
+       {"compat",              no_argument, NULL, OPT_COMPAT_PROFILE},
++      {"single-gl-context",   no_argument, NULL, OPT_SINGLE_GL_CONTEXT},
+       {"drm",                 no_argument, NULL, OPT_DRM},
+       {0, 0, 0, 0}
+    };
+@@ -235,6 +238,9 @@ static void vtest_server_parse_args(int argc, char **argv)
+       case OPT_COMPAT_PROFILE:
+          server.use_compat_profile = true;
+          break;
++      case OPT_SINGLE_GL_CONTEXT:
++         server.single_gl_context = true;
++         break;
+ #ifdef ENABLE_VENUS
+       case OPT_VENUS:
+          server.venus = true;
+@@ -251,6 +257,7 @@ static void vtest_server_parse_args(int argc, char **argv)
+       default:
+          printf("Usage: %s [--no-fork] [--no-loop-or-fork] [--multi-clients] "
+                 "[--use-glx] [--use-egl-surfaceless] [--use-gles] [--no-virgl]"
++                "[--single-gl-context] "
+                 "[--rendernode <dev>] [--socket-path <path>] "
+ #ifdef ENABLE_VENUS
+                 " [--venus]"
+@@ -294,6 +301,9 @@ static void vtest_server_parse_args(int argc, char **argv)
+          }
+          server.ctx_flags |= VIRGL_RENDERER_COMPAT_PROFILE;
+       }
++
++      if (server.single_gl_context)
++         server.ctx_flags |= VIRGL_RENDERER_SINGLE_GL_CONTEXT;
+    } else {
+       server.ctx_flags = VIRGL_RENDERER_NO_VIRGL;
+    }
+@@ -314,6 +324,7 @@ static void vtest_server_getenv(void)
+    server.use_gles = getenv("VTEST_USE_GLES") != NULL;
+    server.render_device = getenv("VTEST_RENDERNODE");
+    server.use_compat_profile = getenv("VTEST_USE_COMPATIBILITY_PROFILE");
++   server.single_gl_context = getenv("VTEST_SINGLE_GL_CONTEXT") != NULL;
+ }
+ 
+ static void handler(int sig, siginfo_t *si, void *unused)
+-- 
+2.56.0
+

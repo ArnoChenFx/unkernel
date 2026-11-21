@@ -1,0 +1,330 @@
+From eee8fdde8e7fc776f1ec45c55e24fc5147d66588 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 14:19:56 +0000
+Subject: [PATCH] vrend: apply sampler view swizzles in the shaders on a host
+ without texture swizzles
+
+WebGL 2 is GLES 3.0 without GL_TEXTURE_SWIZZLE_*, which vrend sets for
+every sampler view (RGBX, alpha and luminance formats, BGRA emulation and
+the guest's own swizzles), and which fails there with GL_INVALID_ENUM.
+vrend_renderer_init probes for it on a GLES host; without it the shader
+key carries each sampler view's swizzle, as it already did for texture
+buffers, and translate_tex applies it to the result of every texture
+function but gather and shadow lookups (a selection, then a mask and
+constants for 0 and 1, in place of the write mask). The GL blitter takes
+the source format's swizzle into its fragment shader instead of the
+texture parameters.
+---
+ src/vrend/vrend_blitter.c  | 23 ++++++++++---
+ src/vrend/vrend_renderer.c | 66 +++++++++++++++++++++++++++++++++++--
+ src/vrend/vrend_renderer.h |  3 ++
+ src/vrend/vrend_shader.c   | 67 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 152 insertions(+), 7 deletions(-)
+
+diff --git a/src/vrend/vrend_blitter.c b/src/vrend/vrend_blitter.c
+index cc29f55..e8cf423 100644
+--- a/src/vrend/vrend_blitter.c
++++ b/src/vrend/vrend_blitter.c
+@@ -174,6 +174,7 @@ static bool blit_shader_link_and_check(GLuint prog_id)
+ }
+ 
+ static void create_dest_swizzle_snippet(const enum pipe_swizzle swizzle[4],
++                                        const enum pipe_swizzle *src_swizzle,
+                                         char snippet[DEST_SWIZZLE_SNIPPET_SIZE])
+ {
+    static const uint8_t invalid_swizzle = 0xff;
+@@ -195,9 +196,17 @@ static void create_dest_swizzle_snippet(const enum pipe_swizzle swizzle[4],
+           /* Use 0.0f for unused color values, 1.0f for an unused alpha value */
+          res = snprintf(&snippet[si], DEST_SWIZZLE_SNIPPET_SIZE - si,
+                         i < 3 ? "0.0f, " : "1.0f");
++      } else if (src_swizzle && src_swizzle[inverse[i]] > PIPE_SWIZZLE_W) {
++         /* the source format's swizzle, which a host without texture
++          * swizzles cannot set on the texture */
++         res = snprintf(&snippet[si], DEST_SWIZZLE_SNIPPET_SIZE - si, "%s%s",
++                        src_swizzle[inverse[i]] == PIPE_SWIZZLE_1 ? "1.0f" : "0.0f",
++                        i < 3 ? ", " : "");
+       } else {
+          res = snprintf(&snippet[si], DEST_SWIZZLE_SNIPPET_SIZE - si,
+-                        "texel.%c%s", "rgba"[inverse[i]], i < 3 ? ", " : "");
++                        "texel.%c%s",
++                        "rgba"[src_swizzle ? src_swizzle[inverse[i]] : inverse[i]],
++                        i < 3 ? ", " : "");
+       }
+       si += res > 0 ? res : 0;
+    }
+@@ -288,6 +297,7 @@ static GLuint blit_build_frag_tex_col(struct vrend_blitter_ctx *blit_ctx,
+                                       enum tgsi_texture_type tgsi_tex_target,
+                                       enum tgsi_return_type tgsi_ret,
+                                       const enum pipe_swizzle swizzle[4],
++                                      const enum pipe_swizzle *src_swizzle,
+                                       int nr_samples,
+                                       uint32_t flags)
+ {
+@@ -315,7 +325,7 @@ static GLuint blit_build_frag_tex_col(struct vrend_blitter_ctx *blit_ctx,
+    blit_get_swizzle(tgsi_tex_target, swizzle_flags, &swizzle_and_type);
+ 
+    if (swizzle)
+-      create_dest_swizzle_snippet(swizzle, dest_swizzle_snippet);
++      create_dest_swizzle_snippet(swizzle, src_swizzle, dest_swizzle_snippet);
+ 
+    bool needs_manual_srgb_decode = has_bit(flags, BLIT_MANUAL_SRGB_DECODE);
+    bool needs_manual_srgb_encode = has_bit(flags, BLIT_MANUAL_SRGB_ENCODE);
+@@ -452,8 +462,12 @@ static GLuint blit_get_frag_tex_col(struct vrend_blitter_ctx *blit_ctx,
+       enum tgsi_return_type tgsi_ret = tgsi_ret_for_format(src_entry->format);
+       int msaa_samples = nr_samples > 1 ? (tgsi_ret == TGSI_RETURN_TYPE_UNORM ? nr_samples : 1) : 0;
+ 
++      /* the program key has the source format, so its swizzle too */
++      const enum pipe_swizzle *src_swizzle =
++         vrend_renderer_lower_tex_swizzle() &&
++         (src_entry->flags & VIRGL_TEXTURE_NEED_SWIZZLE) ? src_entry->swizzle : NULL;
+       GLuint fs_id = blit_build_frag_tex_col(blit_ctx, tgsi_tex, tgsi_ret,
+-                                             swizzle, msaa_samples, flags);
++                                             swizzle, src_swizzle, msaa_samples, flags);
+       glAttachShader(prog_id, fs_id);
+       if(!blit_shader_link_and_check(prog_id))
+          return 0;
+@@ -761,7 +775,8 @@ static void vrend_set_tex_param(struct vrend_resource *src_res,
+    const struct vrend_format_table *src_entry =
+       vrend_get_format_table_entry(info->src.format);
+ 
+-   if (src_entry->flags & VIRGL_TEXTURE_NEED_SWIZZLE) {
++   if ((src_entry->flags & VIRGL_TEXTURE_NEED_SWIZZLE) &&
++       !vrend_renderer_lower_tex_swizzle()) {
+       glTexParameteri(src_res->target, GL_TEXTURE_SWIZZLE_R,
+                       to_gl_swizzle(src_entry->swizzle[0]));
+       glTexParameteri(src_res->target, GL_TEXTURE_SWIZZLE_G,
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4c53dbe..bd8eff8 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -416,6 +416,9 @@ struct global_renderer_state {
+ #endif
+    bool d3d_share_texture : 1;
+    bool gbm_layout_feat : 1;
++   /* no GL_TEXTURE_SWIZZLE_* (WebGL 2): the shaders apply sampler view
++    * swizzles */
++   bool lower_tex_swizzle : 1;
+ };
+ 
+ struct sysval_uniform_block {
+@@ -2671,6 +2674,18 @@ int vrend_create_sampler_state(struct vrend_context *ctx,
+    return 0;
+ }
+ 
++static inline enum pipe_swizzle from_gl_swizzle(GLint swizzle)
++{
++   switch (swizzle) {
++   case GL_RED: return PIPE_SWIZZLE_X;
++   case GL_GREEN: return PIPE_SWIZZLE_Y;
++   case GL_BLUE: return PIPE_SWIZZLE_Z;
++   case GL_ALPHA: return PIPE_SWIZZLE_W;
++   case GL_ZERO: return PIPE_SWIZZLE_0;
++   default: return PIPE_SWIZZLE_1;
++   }
++}
++
+ static inline GLenum to_gl_swizzle(enum pipe_swizzle swizzle)
+ {
+    switch (swizzle) {
+@@ -2895,7 +2910,9 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
+            }
+         }
+ 
+-        if (vrend_state.use_gles) {
++        if (vrend_state.lower_tex_swizzle) {
++           /* the shaders apply view->gl_swizzle */
++        } else if (vrend_state.use_gles) {
+            for (unsigned int i = 0; i < 4; ++i) {
+               glTexParameteri(view->target, GL_TEXTURE_SWIZZLE_R + i, view->gl_swizzle[i]);
+            }
+@@ -3718,6 +3735,9 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
+       }
+ 
+       shader_view->dirty_mask |= (1u << index);
++      /* the swizzle is in the shader key */
++      if (vrend_state.lower_tex_swizzle)
++         ctx->sub->shader_dirty = true;
+ 
+       if (!has_bit(view->texture->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+          if (view->texture->gl_id == view->gl_id) {
+@@ -3748,7 +3768,8 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
+                glTexParameteri(view->texture->target, GL_TEXTURE_MAX_LEVEL, view->u.tex.last_level);
+                tex->cur_max = view->u.tex.last_level;
+             }
+-            if (memcmp(tex->cur_swizzle, view->gl_swizzle, 4 * sizeof(GLint))) {
++            if (!vrend_state.lower_tex_swizzle &&
++                memcmp(tex->cur_swizzle, view->gl_swizzle, 4 * sizeof(GLint))) {
+                if (vrend_state.use_gles) {
+                   for (unsigned int i = 0; i < 4; ++i) {
+                      if (tex->cur_swizzle[i] != view->gl_swizzle[i]) {
+@@ -4361,6 +4382,19 @@ static inline void vrend_fill_shader_key(struct vrend_sub_context *sub_ctx,
+                                   swizzle[2] << 6 |
+                                   swizzle[3] << 9;
+          }
++      } else if (vrend_state.lower_tex_swizzle) {
++         /* the swizzle the texture parameters would have applied */
++         uint16_t packed = 0;
++         bool identity = true;
++         for (int c = 0; c < 4; c++) {
++            enum pipe_swizzle swz = from_gl_swizzle(view->gl_swizzle[c]);
++            identity &= swz == (enum pipe_swizzle)c;
++            packed |= swz << (3 * c);
++         }
++         if (!identity) {
++            vrend_shader_sampler_views_mask_set(key->sampler_views_lower_swizzle_mask, i);
++            key->tex_swizzle[i] = packed;
++         }
+       }
+    }
+ }
+@@ -5286,7 +5320,8 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+              * the texture is queries by using sampler*Shadow then these swizzles must
+              * not be applied, therefore, reset the swizzled to the default */
+             static const GLint swizzle[] = {GL_RED,GL_GREEN,GL_BLUE,GL_ALPHA};
+-            if (memcmp(tex->cur_swizzle, swizzle, 4 * sizeof(GLint))) {
++            if (!vrend_state.lower_tex_swizzle &&
++                memcmp(tex->cur_swizzle, swizzle, 4 * sizeof(GLint))) {
+                if (vrend_state.use_gles) {
+                   for (unsigned int i = 0; i < 4; ++i) {
+                      glTexParameteri(tview->texture->target, GL_TEXTURE_SWIZZLE_R + i, swizzle[i]);
+@@ -7621,6 +7656,28 @@ static bool vrend_use_gbm_layout_feature(UNUSED uint32_t flags)
+ #endif
+ }
+ 
++/* WebGL 2 is GLES 3.0 without GL_TEXTURE_SWIZZLE_*. */
++static bool vrend_probe_texture_swizzle(void)
++{
++   GLuint tex;
++   GLenum err;
++
++   while (glGetError() != GL_NO_ERROR)
++      ;
++   glGenTextures(1, &tex);
++   glBindTexture(GL_TEXTURE_2D, tex);
++   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_GREEN);
++   err = glGetError();
++   glBindTexture(GL_TEXTURE_2D, 0);
++   glDeleteTextures(1, &tex);
++   return err == GL_NO_ERROR;
++}
++
++bool vrend_renderer_lower_tex_swizzle(void)
++{
++   return vrend_state.lower_tex_swizzle;
++}
++
+ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+ {
+    bool gles;
+@@ -7741,6 +7798,9 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+    vrend_build_format_list_common();
+ 
+    if (vrend_state.use_gles) {
++      vrend_state.lower_tex_swizzle = !vrend_probe_texture_swizzle();
++      if (vrend_state.lower_tex_swizzle)
++         virgl_info("host has no texture swizzles: the shaders apply them\n");
+       vrend_build_format_list_gles();
+    } else {
+       vrend_build_format_list_gl();
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 2c08b1b..2361a44 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -622,6 +622,9 @@ void vrend_sync_make_current(virgl_gl_context);
+ virgl_gl_context vrend_renderer_single_gl_context(void);
+ void vrend_renderer_single_enter_blitter(void);
+ 
++/* the host has no texture swizzles (WebGL 2): shaders apply them */
++bool vrend_renderer_lower_tex_swizzle(void);
++
+ int
+ vrend_renderer_pipe_resource_create(struct vrend_context *ctx, uint32_t blob_id,
+                                     const struct vrend_renderer_resource_create_args *args);
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 6a26fdf..2b4a07d 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -3123,6 +3123,60 @@ emit_lodq(struct dump_ctx *ctx,
+ }
+ 
+ // TODO Consider exposing non-const ctx-> members as args to make *ctx const
++/* A host without texture swizzles (WebGL 2): the sampler view's swizzle
++ * (PACKED, 3 bits a component) applied to the result of a texture
++ * function, as the suffix that replaces WRITEMASK, which every form of the
++ * texture instructions writes right after that result. */
++static const char *lower_texture_swizzle(char buf[static 160], const char *writemask,
++                                         uint16_t packed, enum tgsi_return_type ret)
++{
++   const char *comps = writemask[0] ? writemask + 1 : "xyzw";
++   int n = strlen(comps), len;
++   char sel[5] = "";
++   bool consts = false;
++   const char *type, *one, *zero;
++
++   for (int i = 0; i < n; i++) {
++      int c = comps[i] == 'w' ? 3 : comps[i] - 'x';
++      int swz = (packed >> (3 * c)) & 7;
++      sel[i] = swz <= PIPE_SWIZZLE_W ? "xyzw"[swz] : 'x';
++      consts |= swz > PIPE_SWIZZLE_W;
++   }
++   sel[n] = 0;
++   len = snprintf(buf, 160, ".%s", sel);
++   if (!consts)
++      return buf;
++
++   switch (ret) {
++   case TGSI_RETURN_TYPE_SINT:
++      type = n > 1 ? "ivec" : "int";
++      one = "1"; zero = "0";
++      break;
++   case TGSI_RETURN_TYPE_UINT:
++      type = n > 1 ? "uvec" : "uint";
++      one = "1u"; zero = "0u";
++      break;
++   default:
++      type = n > 1 ? "vec" : "float";
++      one = "1.0"; zero = "0.0";
++   }
++   /* .sel * mask + constants: the mask keeps the selected components */
++   for (int pass = 0; pass < 2; pass++) {
++      len += snprintf(buf + len, 160 - len, pass ? " + %s" : " * %s", type);
++      if (n > 1)
++         len += snprintf(buf + len, 160 - len, "%d", n);
++      len += snprintf(buf + len, 160 - len, "(");
++      for (int i = 0; i < n; i++) {
++         int c = comps[i] == 'w' ? 3 : comps[i] - 'x';
++         int swz = (packed >> (3 * c)) & 7;
++         bool v = pass ? swz == PIPE_SWIZZLE_1 : swz <= PIPE_SWIZZLE_W;
++         len += snprintf(buf + len, 160 - len, "%s%s", i ? ", " : "", v ? one : zero);
++      }
++      len += snprintf(buf + len, 160 - len, ")");
++   }
++   return buf;
++}
++
+ static void translate_tex(struct dump_ctx *ctx,
+                           const struct tgsi_full_instruction *inst,
+                           const struct source_info *sinfo,
+@@ -3151,6 +3205,19 @@ static void translate_tex(struct dump_ctx *ctx,
+ 
+    is_shad = samplertype_is_shadow(inst->Texture.Texture);
+ 
++   /* A shadow sampler ignores the swizzle (vrend resets it for those);
++    * texture buffers apply it below; gather takes one component, which the
++    * swizzle would choose. */
++   char lowered_writemask[160];
++   if (inst->Texture.Texture != TGSI_TEXTURE_BUFFER && !is_shad &&
++       inst->Instruction.Opcode != TGSI_OPCODE_TG4 &&
++       !dinfo->dst_override_no_wm[0] &&
++       vrend_shader_sampler_views_mask_get(ctx->key->sampler_views_lower_swizzle_mask,
++                                           sinfo->sreg_index))
++      writemask = lower_texture_swizzle(lowered_writemask, writemask,
++                                        ctx->key->tex_swizzle[sinfo->sreg_index],
++                                        ctx->samplers[sinfo->sreg_index].tgsi_sampler_return);
++
+    switch (ctx->samplers[sinfo->sreg_index].tgsi_sampler_return) {
+    case TGSI_RETURN_TYPE_SINT:
+       /* if dstconv isn't an int */
+-- 
+2.56.0
+

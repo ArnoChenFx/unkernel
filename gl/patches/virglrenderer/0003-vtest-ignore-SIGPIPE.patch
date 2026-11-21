@@ -1,0 +1,29 @@
+From b7c6398b6ec7886001a303eceb2e44fc3b3feb51 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sat, 21 Nov 2026 13:55:13 +0000
+Subject: [PATCH] vtest: ignore SIGPIPE
+
+With --no-fork one server process serves every client, and a client
+that is gone when the server writes to it would otherwise kill the
+server and every other client.
+---
+ vtest/vtest_server.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vtest/vtest_server.c b/vtest/vtest_server.c
+index 090a37d..133e9fd 100644
+--- a/vtest/vtest_server.c
++++ b/vtest/vtest_server.c
+@@ -151,6 +151,9 @@ while (__AFL_LOOP(1000)) {
+    } else {
+       vtest_server_set_signal_segv();
+    }
++   /* a client gone while the server writes to it must not take down the
++    * server, which serves every client without --fork */
++   signal(SIGPIPE, SIG_IGN);
+ 
+    vtest_server_run();
+ 
+-- 
+2.56.0
+

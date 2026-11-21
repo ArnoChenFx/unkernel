@@ -103,6 +103,10 @@ pub var table_ok: bool = false;
 pub var simd_ok: bool = false;
 /// Most blocks in one compiled region (see "regions" below).
 pub const max_members = 16;
+/// A region compiled for a page also takes the blocks of that page that have
+/// counted at least threshold >> warm_shift towards the compile threshold
+/// (`pageWarm`).
+const warm_shift = 2;
 
 // Block JIT state (`BlockState.st`): one word, so the per-pass test is a
 // single load.
@@ -791,7 +795,9 @@ pub const Error = error{ Unsupported, Overflow };
 // on host addresses, generations or the pool entry: a revalidated member
 // keeps its code. Regions are formed when a block gets hot (`compile`):
 // that block, the members of an open region of its page that has room
-// (which is then replaced, so a page tends to have one module), then
+// (which is then replaced, so a page tends to have one module), the blocks
+// of its page that have counted a quarter of the threshold (`pageWarm`:
+// otherwise each of them, when hot, compiles the region again), then
 // blocks reachable from those through branch and call-return targets
 // (`I.targets`) that are already decoded, valid under their page's current
 // fill and not compiled elsewhere, on any page, in breadth-first order.
@@ -1675,6 +1681,7 @@ pub fn Jit(comptime I: type) type {
                 freeSlot(cpu, i, .grow);
                 st.grows += 1;
             }
+            pageWarm(cpu, b, rg, limit);
             var q: usize = 0;
             while (q < rg.n and rg.n < limit) : (q += 1) {
                 const m = rg.block(q);
@@ -1684,6 +1691,22 @@ pub fn Jit(comptime I: type) type {
                         if (t) |pc| if (candidate(cpu, b, pc)) |i| addMember(rg, i);
                     }
                 }
+            }
+        }
+
+        /// Add the blocks of b's page that could be members (`candidate`) and have
+        /// counted at least threshold >> warm_shift: most of them would get hot
+        /// later, one at a time, and each would compile the region again to join
+        /// it (`findRegion`). Probes every pc of the page (A64: instructions are
+        /// 4-byte aligned); runs before the breadth-first search, so a module
+        /// that does not fit the buffer drops cold members first.
+        fn pageWarm(cpu: *Cpu, b: *const Block, rg: *Region, limit: usize) void {
+            const min = cpu.priv.jit.threshold >> warm_shift;
+            const base = b.pc & ~@as(u64, 0xfff);
+            var pc = base;
+            while (pc < base + 4096 and rg.n < limit) : (pc += 4) {
+                const i = candidate(cpu, b, pc) orelse continue;
+                if (heatOf(cpu, &cpu.priv.blocks[i]) >= min) addMember(rg, i);
             }
         }
 

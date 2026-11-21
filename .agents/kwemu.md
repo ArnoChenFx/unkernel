@@ -31,7 +31,7 @@ memory64 only, undefined `__stack_pointer`), `zig-out/lib/kwemu-jit.o`,
 `kwemu-harness-jit.wasm`, and the A64 tools and guests.
 
 Build options: `-Dkwemu-jit` (off for plain `zig build`; kernel/build.sh
-turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (8192
+turns it on), `-Dkwemu-jit-threshold` (2^17), `-Dkwemu-jit-grow` (32768
 exits per KiB of module, 0 = never), `-Dkwemu-stats` (counters, the
 `kw_debug_stats` export, CLI `--stats`; `kernel/build.sh stats`),
 `-Dkwemu-atomics` (a shared-memory kernel), `-Dlib-optimize`
@@ -195,7 +195,11 @@ to `run`. `cpu.jit.cur` names the member a region left from.
   both, `member_op` the low 16 bits of each member's op index.
 - **Membership.** When a block gets hot, `compile` takes it, the members
   of an open region of the same virtual page that has room (that region
-  is replaced), then breadth-first the decoded, valid, not-yet-compiled
+  is replaced), the blocks of that page that could be members and have
+  counted at least a quarter of the threshold (`pageWarm`, which probes
+  every pc of the page; without it most of them got hot later, one at a
+  time, and each compiled the region again to join it), then
+  breadth-first the decoded, valid, not-yet-compiled
   blocks reachable through side exits, branch targets and call return
   sites (the ISA's `targets`), on any page. A self-loop keeps a closed
   module of its own (as a plain wasm loop it is much faster than as a

@@ -288,8 +288,41 @@ evicts 78-706 compiled blocks per step after the first.
 
   A larger ring moves the evictions to the slot pool; with both raised
   they nearly stop and the compiled share gains 1.7 points, for no time
-  (Rejected designs). About 2400 frees per boot are regions growing, which
-  no cache size removes. Compiling was 2.6-2.7 s of a boot of about 80 s.
+  (Rejected designs). About 2400 frees per boot were regions growing
+  (before warm page members, next item), which no cache size removes.
+  Compiling was 2.6-2.7 s of a boot of about 80 s.
+- **Regions compiled again** (2026-11-21, stats bundle, one
+  `test/app-bench.mjs` boot each). Of the grows by a hot block of the
+  region's own page (`findRegion`), 90% added a block no member branches
+  to (entered from other pages, by returns or indirect branches), so the
+  breadth-first search could not have found it; more than two thirds came more
+  than 10 M instructions after the region's last compile, so batching
+  grows in time would catch few; half were repeat grows of one region
+  (some 8 times or more); 70% were regions of up to 5 members. So a region
+  takes the blocks of its page that have counted a quarter of the
+  threshold (`jc.pageWarm`, kwemu.md, Regions), and exit growth waits for
+  32768 exits per KiB of module (8192 before):
+
+  | | before | warm at 1/4 | warm at 1/8 | exits x4 | both (current) |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | modules compiled | 6526-6760 | 5362-5373 | 5532-5538 | 6143 | 4873-4877 |
+  | freed: grown by a block of its page | 1803-1964 | 781-788 | 773-778 | 1877 | 764-803 |
+  | freed: grown along exits | 569-612 | 565-629 | 595-600 | 188 | 163-184 |
+  | freed: the ring made room | 3325-3398 | 3239-3294 | 3463-3493 | 3307 | 3157-3213 |
+  | freed: other | 275-290 | 218-231 | 197-203 | 238 | 223-238 |
+  | compiled share of instructions | 63.3-64.0% | 64.4-64.5% | 65.5-65.6% | 63.6% | 63.8-64.5% |
+  | module bytes compiled (MiB) | 49.7-51.6 | 42.9-43.2 | 45.7-46.2 | 47.5 | 39.3-39.8 |
+
+  Compile time fell 21% (2262 to 1789 ms in a pair of boots side by
+  side). Warm at 1/2: 5725 modules; at 1/32: 6136 (members fill the ring:
+  4210 ring frees); any decoded block of the page: 7384 and 62.6%
+  compiled. Timing, quiet host (load 1.3-2.4), 1 CPU, 5 boots, first /
+  later runs: `claude --help` -3.4% / -3.0%, npm +0.3% / -1.6%, `bun
+  cpu.js` -0.6% / -3.5%, `bun build` -3.6% / -2.0%, the mixed pass -1.7%
+  (ranges apart); `node cpu.js` and `node -e 0` moved ±7-15% both ways
+  (their usual spread). 2 CPUs, 6 boots (load 1.6-3.4): claude -2.6% /
+  -8.8%, npm -3.2% / -3.6%, `bun cpu.js` -13.4% / -3.5%, `node cpu.js`
+  0.0% / -1.2%, `bun build` -4.4% / -2.0%, the mixed pass -2.9%.
 - **Compiled code across processes.** node, bun and claude are non-PIE,
   so a later process maps their code at the same addresses and its blocks
   revalidate: code compiled by an earlier process runs again if the
@@ -346,11 +379,12 @@ Node, Bun and Claude Code (Where the time goes), in this order:
 
 1. **Measure again with the 128K ring**: V8's worker
    threads' share of cycles and the decode share (`perf`, Measuring).
-2. **Fewer compiles of the same code**: about 2400 of the 6500 compiles of
-   a `test/app-bench.mjs` boot are regions compiled again to add one block
-   (Where the time goes, Why compiled modules are freed). More cache does
-   not help (Rejected designs: the 512K ring with 4096 slots, the shared
-   op store).
+2. **Fewer compiles of the same code**: about 950 of the 4900 compiles of
+   a `test/app-bench.mjs` boot are regions compiled again to add a block,
+   down from 2400 of 6500 (Where the time goes, Regions compiled again);
+   the ring's 3200 frees are the larger group now. More cache does not
+   help (Rejected designs: the 512K ring with 4096 slots, the shared op
+   store).
 3. **Per-CPU code caches on SMP**: each CPU compiles the same code again
    (kwemu.md, JIT on several CPUs, says what sharing needs); V8 does not
    reuse a compile of the same bytes in another thread, so sharing would
@@ -407,3 +441,4 @@ bundle, boots interleaved.
 | Shorter blocks: `max_block` 32, 48 or 16 instead of 64 (2026-11-20, UP bundle) | 32 with the 128K ring, the profile disk (6 boots): `claude --help` +0.8% / -15.9% (first / later runs; the ring alone -15.7%), npm -4.9% / -2.8%, bun cpu.js 0.0% / -9.0%, the mixed sequence -4.8%; the Alpine 20-row sum -3.3% and -5.6% in two sessions (gzip -32%, sha256sum +4-6%); but OpenSSL (5 boots, two sessions) chacha20-poly1305 -25%, sha512 -10%, aes-128-gcm -5..-9%, aes-256-ctr -6%. 32 alone (an earlier round, 6 boots): claude +0.9% / -12.1%, npm -3.4% / -1.8%, bun cpu.js -4.3% / -5.0%; hot guests (`kwemu-harness-jit.wasm`) -0.9..+3.7% (noise ±4%). 48 with the ring: OpenSSL chacha20-poly1305 -11%, aes-256-ctr -6%, sha512 -5%, aes-128-gcm -5%, and no gzip gain. 16: claude +10.9% / -2.9%, hot sha -15.8%, interp -6.0%. The OpenSSL losses are not traced; a length rule that does not cut OpenSSL's blocks might keep the gains (untested) |
 | Interpreter-loop work for cold code: fewer dispatch mispredicts, denser ops (2026-11-20, perf) | hot and cold code mispredict alike (Where the time goes, Per-unit costs); if every mispredict vanished, at most about 23% of `runOps`; L1/L2 misses on ops bound denser ops below 5% of `runOps` |
 | NZCV of hand-back paths through module helper functions | materialisation fell from 31% to 20% of module bytes, but regions took more members up to the buffer: module bytes unchanged, compile time +9%, time within noise |
+| Warm page members from 1/8 of the threshold instead of 1/4; closing a region after it was grown twice (2026-11-21, `test/app-bench.mjs`) | 1/8: 65.5% compiled and 5530 modules (1/4: 64.5%, 5370), but later `claude --help` runs +10.1% and +5.0% in two sessions on a busy host (load 5-9), against -1.8% at 1/4. Closing after two grows: 6407 modules against 6620, the rest unchanged (Where the time goes, Regions compiled again) |

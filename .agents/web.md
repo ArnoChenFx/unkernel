@@ -538,7 +538,7 @@ out, so the guest has the vtest link alone, for comparison.
   the default CPU count (`--cpus 0`: 4 CPUs here), eglinfo and kmscube on
   the device. Not checked: X on
   kwfb with virgl (`?gpu=0`; a picture on the page's display, its frame
-  rate), `?gpu=0` since the device came, packages kept across reloads on the
+  rate), packages kept across reloads on the
   data disk, the built server's
   `/assets/virgl-*/` files in a browser.
 

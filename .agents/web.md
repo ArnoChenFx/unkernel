@@ -539,7 +539,7 @@ out, so the guest has the vtest link alone, for comparison.
   the device. Not checked: X on
   kwfb with virgl (`?gpu=0`; a picture on the page's display, its frame
   rate), `?gpu=0` since the device came, packages kept across reloads on the
-  data disk, a real GPU, Firefox and Safari, the built server's
+  data disk, the built server's
   `/assets/virgl-*/` files in a browser.
 
 ## Several CPUs

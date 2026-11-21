@@ -460,7 +460,7 @@ GPU). One run each, on the shared host:
    wland). Busy waits: done (Busy waits).
 6. **virtio-gpu 3D.** Done: The DRM path, in the page by default (The
    page), the renderer loaded on first use. Check: `node
-   test/gl/unkernel-check.mjs --drm`. Next: wland on PRIME, a real GPU.
+   test/gl/unkernel-check.mjs --drm`. Next: wland on PRIME.
 
 ## unkernel
 
@@ -771,7 +771,9 @@ Not checked: with `?gpu=0`, a GL client on the page's display (X.Org's
 fbdev driver on kwfb, `sudo Xorg :0`, then `DISPLAY=:0 glmark2-es2`) and
 its frame rate (kwfb is read about 50 times a second, at most about 1M
 pixels); the device on several CPUs; packages
-kept across reloads on the data disk, a real GPU, Firefox and Safari.
+kept across reloads on the data disk. By hand on GPUs (2026-11-22): the
+launcher's kmscube, glmark2 and X + glamor demos (web.md, Launcher) work
+in Chrome, Safari and Firefox.
 
 ## Testing
 
@@ -884,8 +886,8 @@ Workloads that need no window system of ours (so nothing waits on wland):
   and puts it to X either way), and at what rate.
 - Not tried in unkernel: the vtest path and the state checks on the SMP
   kernel (`cpus` > 1; vsock and so GL stay on the owner's thread, as on one
-  CPU; the DRM path only as The DRM path says), Firefox and Safari (WebGL2
-  and OffscreenCanvas in a page's main thread exist there), and a GPU.
+  CPU; the DRM path only as The DRM path says), and the vtest path in
+  Firefox and Safari (the DRM path works there, The page).
 - Busy waits on a GPU: not measured. On SwiftShader the rules of Busy
   waits remove the per-frame park (4.5 ms, about half of it WebGL's lag
   in telling a fence retired); on a GPU the page's Guest GL row shows the

@@ -1,0 +1,435 @@
+From 25cafffec7b60be30898a9f2de76917b8a256331 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 16:07:10 +0000
+Subject: [PATCH] wasm: host devices on SMP
+
+The host's device imports answer on CPU 0 alone, and their interrupts
+arrive there. hvc_wasm: CPU 0's console interrupt moves the input into
+a FIFO and records the window size, which khvcd and openers read on
+any CPU (output works everywhere). kwnet: NAPI runs on CPU 0, and
+another CPU's frames wait in a queue that a work item on CPU 0 sends;
+ndo_open raises the interrupt on CPU 0 instead of looking. kwvsock:
+its work items run on CPU 0, and another CPU's packets wait in the
+tx queue. kwblk, kwfb, kwinput, kwsnd and kwshm refuse to start on
+SMP for now, with a boot message.
+---
+ drivers/block/kwblk.c      |  8 +++++
+ drivers/input/kwinput.c    |  5 +++
+ drivers/misc/kwshm.c       |  5 +++
+ drivers/net/kwnet.c        | 56 +++++++++++++++++++++++++++--
+ drivers/tty/hvc/hvc_wasm.c | 74 ++++++++++++++++++++++++++++++++++++--
+ drivers/video/fbdev/kwfb.c |  5 +++
+ net/vmw_vsock/kwvsock.c    | 35 +++++++++++++-----
+ sound/drivers/kwsnd.c      |  5 +++
+ 8 files changed, 179 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/block/kwblk.c b/drivers/block/kwblk.c
+index 9a0591e9b6c..0b7ca9a6682 100644
+--- a/drivers/block/kwblk.c
++++ b/drivers/block/kwblk.c
+@@ -251,6 +251,14 @@ static int __init kwblk_init(void)
+ 	u32 i;
+ 	int err;
+ 
++	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
++	if (IS_ENABLED(CONFIG_SMP)) {
++		memset(&info, 0, sizeof(info));
++		if (wasm_driver_block_info(0, &info) >= 0)
++			pr_warn("kwblk: disks are not supported on SMP kernels yet\n");
++		return -ENODEV;
++	}
++
+ 	kwblk_major = register_blkdev(0, "kwblk");
+ 	if (kwblk_major < 0)
+ 		return kwblk_major;
+diff --git a/drivers/input/kwinput.c b/drivers/input/kwinput.c
+index 93059b9670f..9c47827a339 100644
+--- a/drivers/input/kwinput.c
++++ b/drivers/input/kwinput.c
+@@ -131,6 +131,11 @@ static int __init kwinput_init(void)
+ 		pr_info("kwinput: no host input\n");
+ 		return 0;
+ 	}
++	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
++	if (IS_ENABLED(CONFIG_SMP)) {
++		pr_warn("kwinput: input devices are not supported on SMP kernels yet\n");
++		return 0;
++	}
+ 
+ 	kbd = kwinput_alloc(KWINPUT_KEYBOARD, "kwinput keyboard", 1);
+ 	mouse = kwinput_alloc(KWINPUT_MOUSE, "kwinput mouse", 2);
+diff --git a/drivers/misc/kwshm.c b/drivers/misc/kwshm.c
+index 50ae019a0e9..f1bf8b7cadc 100644
+--- a/drivers/misc/kwshm.c
++++ b/drivers/misc/kwshm.c
+@@ -629,6 +629,11 @@ static int __init kwshm_init(void)
+ 		pr_info("kwshm: no host shm\n");
+ 		return 0;
+ 	}
++	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
++	if (IS_ENABLED(CONFIG_SMP)) {
++		pr_warn("kwshm: not supported on SMP kernels yet\n");
++		return -ENODEV;
++	}
+ 	/* Held pages, including truncated ones still held: at most half of RAM. */
+ 	kwshm_pin_limit = totalram_pages() / 2;
+ 	INIT_WORK(&kwshm_work, kwshm_work_fn);
+diff --git a/drivers/net/kwnet.c b/drivers/net/kwnet.c
+index 58d472e593d..3ca58cbfa37 100644
+--- a/drivers/net/kwnet.c
++++ b/drivers/net/kwnet.c
+@@ -8,6 +8,10 @@
+  * the kernel, and in the idle loop), and schedules NAPI, which drains the
+  * host queue.
+  *
++ * SMP: the host's imports answer on CPU 0 alone. The interrupt, and so
++ * NAPI, runs there; another CPU's frames wait in a queue that a work item
++ * on CPU 0 sends.
++ *
+  * The host terminates the link itself (a user-mode TCP/IP stack), so it does
+  * not need checksums: the device claims checksum offload and TSO, and marks
+  * received frames CHECKSUM_UNNECESSARY.
+@@ -19,6 +23,7 @@
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/skbuff.h>
++#include <linux/workqueue.h>
+ #include <asm/irq.h>
+ #include <asm/wasm.h>
+ 
+@@ -45,7 +50,11 @@ MODULE_PARM_DESC(mtu, "initial MTU (default 1500)");
+ struct kwnet {
+ 	struct net_device *dev;
+ 	struct napi_struct napi;
+-	u8 *bounce;			/* TX linearisation buffer */
++	u8 *bounce;			/* TX linearisation buffer (CPU 0) */
++#ifdef CONFIG_SMP
++	struct sk_buff_head txq;	/* frames sent from other CPUs */
++	struct work_struct tx_work;	/* sends them, on CPU 0 */
++#endif
+ };
+ 
+ static int kwnet_poll(struct napi_struct *napi, int budget)
+@@ -89,9 +98,10 @@ static irqreturn_t kwnet_irq(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static netdev_tx_t kwnet_xmit(struct sk_buff *skb, struct net_device *dev)
++/* Hand @skb to the host and consume it (on CPU 0, bottom halves off). */
++static void kwnet_send(struct kwnet *priv, struct sk_buff *skb)
+ {
+-	struct kwnet *priv = netdev_priv(dev);
++	struct net_device *dev = priv->dev;
+ 	const void *data = skb->data;
+ 
+ 	if (skb->len > KWNET_MAX_FRAME) {
+@@ -107,6 +117,34 @@ static netdev_tx_t kwnet_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	dev->stats.tx_bytes += skb->len;
+ out:
+ 	dev_consume_skb_any(skb);
++}
++
++#ifdef CONFIG_SMP
++static void kwnet_tx_work(struct work_struct *work)
++{
++	struct kwnet *priv = container_of(work, struct kwnet, tx_work);
++	struct sk_buff *skb;
++
++	local_bh_disable();	/* as in xmit: the bounce buffer is shared */
++	while ((skb = skb_dequeue(&priv->txq)))
++		kwnet_send(priv, skb);
++	local_bh_enable();
++}
++#endif
++
++static netdev_tx_t kwnet_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct kwnet *priv = netdev_priv(dev);
++
++#ifdef CONFIG_SMP
++	/* In order behind frames that wait for CPU 0. */
++	if (smp_processor_id() || !skb_queue_empty_lockless(&priv->txq)) {
++		skb_queue_tail(&priv->txq, skb);
++		queue_work_on(0, system_highpri_wq, &priv->tx_work);
++		return NETDEV_TX_OK;
++	}
++#endif
++	kwnet_send(priv, skb);
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -118,8 +156,12 @@ static int kwnet_open(struct net_device *dev)
+ 	netif_carrier_on(dev);
+ 	netif_start_queue(dev);
+ 	/* Frames may have been queued while the device was down. */
++#ifdef CONFIG_SMP
++	kw_irq_raise(0, BIT(WASM_IRQ_NET));	/* CPU 0 looks */
++#else
+ 	if (wasm_driver_net_rx_len() > 0)
+ 		napi_schedule(&priv->napi);
++#endif
+ 	return 0;
+ }
+ 
+@@ -130,6 +172,10 @@ static int kwnet_stop(struct net_device *dev)
+ 	netif_stop_queue(dev);
+ 	netif_carrier_off(dev);
+ 	napi_disable(&priv->napi);
++#ifdef CONFIG_SMP
++	cancel_work_sync(&priv->tx_work);
++	skb_queue_purge(&priv->txq);
++#endif
+ 	return 0;
+ }
+ 
+@@ -174,6 +220,10 @@ static int __init kwnet_init(void)
+ 	else
+ 		eth_hw_addr_random(dev);
+ 	netif_napi_add(dev, &priv->napi, kwnet_poll);
++#ifdef CONFIG_SMP
++	skb_queue_head_init(&priv->txq);
++	INIT_WORK(&priv->tx_work, kwnet_tx_work);
++#endif
+ 	netif_carrier_off(dev);
+ 
+ 	err = request_irq(WASM_IRQ_NET, kwnet_irq, 0, "kwnet", dev);
+diff --git a/drivers/tty/hvc/hvc_wasm.c b/drivers/tty/hvc/hvc_wasm.c
+index 155b935ce8d..eddb08e94f7 100644
+--- a/drivers/tty/hvc/hvc_wasm.c
++++ b/drivers/tty/hvc/hvc_wasm.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ 
+ #include <linux/interrupt.h>
++#include <linux/kfifo.h>
+ #include <linux/tty.h>
+ #include <asm/irq.h>
+ #include <asm/wasm.h>
+@@ -10,6 +11,66 @@ static struct hvc_struct *hvc_wasm_hp;
+ /* Last host window size (rows << 16 | cols) given to the tty; hp->lock. */
+ static u32 hvc_wasm_size;
+ 
++#ifdef CONFIG_SMP
++/*
++ * SMP: the host's console is CPU 0's (its imports answer there), while
++ * khvcd and openers run on any CPU. CPU 0's console interrupt moves the
++ * input into this FIFO and records the window size; get_chars and
++ * notifier_add read those. Output (put_chars) works on every CPU: each
++ * CPU's host forwards it.
++ */
++static DEFINE_KFIFO(hvc_wasm_in, u8, 4096);
++/* The host window size as CPU 0 last read it. */
++static u32 hvc_wasm_host_size;
++/* The FIFO filled up: CPU 0 pulls more once there is room. */
++static bool hvc_wasm_in_full;
++
++/* CPU 0, interrupts off: take the host's input and window size. */
++static void hvc_wasm_pull(void)
++{
++	u8 buf[256];
++	ssize_t n;
++
++	WRITE_ONCE(hvc_wasm_host_size, wasm_driver_console_size());
++	while (kfifo_avail(&hvc_wasm_in)) {
++		n = wasm_console_read(buf, min_t(size_t, sizeof(buf),
++						 kfifo_avail(&hvc_wasm_in)));
++		if (n <= 0)
++			return;
++		kfifo_in(&hvc_wasm_in, buf, n);
++	}
++	WRITE_ONCE(hvc_wasm_in_full, true);
++}
++
++static u32 hvc_wasm_console_size(void)
++{
++	return READ_ONCE(hvc_wasm_host_size);
++}
++
++/* Called under hp->lock (one reader at a time). */
++static ssize_t hvc_wasm_read(u8 *buf, size_t count)
++{
++	ssize_t n = kfifo_out(&hvc_wasm_in, buf, count);
++
++	if (READ_ONCE(hvc_wasm_in_full) &&
++	    kfifo_avail(&hvc_wasm_in) >= kfifo_size(&hvc_wasm_in) / 2) {
++		WRITE_ONCE(hvc_wasm_in_full, false);
++		kw_irq_raise(0, BIT(WASM_IRQ_CONSOLE));	/* pull the rest */
++	}
++	return n;
++}
++#else
++static u32 hvc_wasm_console_size(void)
++{
++	return wasm_driver_console_size();
++}
++
++static ssize_t hvc_wasm_read(u8 *buf, size_t count)
++{
++	return wasm_console_read(buf, count);
++}
++#endif
++
+ static struct winsize hvc_wasm_winsize(u32 size)
+ {
+ 	return (struct winsize){ .ws_row = size >> 16, .ws_col = size & 0xffff };
+@@ -32,13 +93,13 @@ static ssize_t hvc_wasm_get_chars(uint32_t vtermno, u8 *buf, size_t count)
+ 	u32 size;
+ 
+ 	if (hp) {
+-		size = wasm_driver_console_size();
++		size = hvc_wasm_console_size();
+ 		if (size && size != hvc_wasm_size) {
+ 			hvc_wasm_size = size;
+ 			__hvc_resize(hp, hvc_wasm_winsize(size));
+ 		}
+ 	}
+-	return wasm_console_read(buf, count);
++	return hvc_wasm_read(buf, count);
+ }
+ 
+ /*
+@@ -48,7 +109,7 @@ static ssize_t hvc_wasm_get_chars(uint32_t vtermno, u8 *buf, size_t count)
+  */
+ static int hvc_wasm_notifier_add(struct hvc_struct *hp, int data)
+ {
+-	u32 size = wasm_driver_console_size();
++	u32 size = hvc_wasm_console_size();
+ 	struct winsize ws = hvc_wasm_winsize(size);
+ 	struct tty_struct *tty;
+ 	unsigned long flags;
+@@ -76,6 +137,9 @@ static const struct hv_ops hvc_wasm_ops = {
+ /* The host raises WASM_IRQ_CONSOLE on input or a resize: poll right away. */
+ static irqreturn_t hvc_wasm_input_irq(int irq, void *dev_id)
+ {
++#ifdef CONFIG_SMP
++	hvc_wasm_pull();
++#endif
+ 	hvc_kick();
+ 	return IRQ_HANDLED;
+ }
+@@ -88,6 +152,10 @@ static int __init hvc_wasm_init(void)
+ 	if (IS_ERR(hp))
+ 		return PTR_ERR(hp);
+ 	hvc_wasm_hp = hp;
++#ifdef CONFIG_SMP
++	/* In kernel_init, which runs on CPU 0. */
++	WRITE_ONCE(hvc_wasm_host_size, wasm_driver_console_size());
++#endif
+ #ifdef WASM_IRQ_CONSOLE
+ 	if (request_irq(WASM_IRQ_CONSOLE, hvc_wasm_input_irq, 0, "hvc_wasm",
+ 			NULL))
+diff --git a/drivers/video/fbdev/kwfb.c b/drivers/video/fbdev/kwfb.c
+index 3c757f729dc..f66e8273752 100644
+--- a/drivers/video/fbdev/kwfb.c
++++ b/drivers/video/fbdev/kwfb.c
+@@ -300,6 +300,11 @@ static int __init kwfb_init(void)
+ 		pr_info("kwfb: no host display\n");
+ 		return 0;
+ 	}
++	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
++	if (IS_ENABLED(CONFIG_SMP)) {
++		pr_warn("kwfb: the display is not supported on SMP kernels yet\n");
++		return 0;
++	}
+ 
+ 	/*
+ 	 * A parent on the platform bus: the X.Org fbdev driver skips a
+diff --git a/net/vmw_vsock/kwvsock.c b/net/vmw_vsock/kwvsock.c
+index 90cb8521bb3..4c088366a0c 100644
+--- a/net/vmw_vsock/kwvsock.c
++++ b/net/vmw_vsock/kwvsock.c
+@@ -105,6 +105,16 @@ struct kwvsock {
+ 
+ static struct kwvsock kwvsock;
+ 
++/*
++ * SMP: the host's imports answer on CPU 0 alone, so the work items run
++ * there, and another CPU's packets wait in tx_queue for tx_work.
++ */
++#ifdef CONFIG_SMP
++#define KWVSOCK_CPU	0
++#else
++#define KWVSOCK_CPU	WORK_CPU_UNBOUND
++#endif
++
+ static u32 kwvsock_get_local_cid(void)
+ {
+ 	return KWVSOCK_GUEST_CID;
+@@ -146,10 +156,18 @@ static int kwvsock_send_pkt(struct sk_buff *skb, struct net *net)
+ 	int len = skb->len;
+ 
+ 	/*
+-	 * Straight to the host while nothing waits before it (the kernel is
+-	 * UP without preemption, so the check and the send cannot race the
+-	 * work item); else in order behind the waiting packets.
++	 * Straight to the host while nothing waits before it (the kernel has
++	 * no preemption, and only CPU 0 sends, so the check and the send
++	 * cannot race the work item); else in order behind the waiting
++	 * packets.
+ 	 */
++#ifdef CONFIG_SMP
++	if (smp_processor_id()) {
++		virtio_vsock_skb_queue_tail(&kwvsock.tx_queue, skb);
++		queue_work_on(KWVSOCK_CPU, system_percpu_wq, &kwvsock.tx_work);
++		return len;
++	}
++#endif
+ 	if (skb_queue_empty_lockless(&kwvsock.tx_queue) && kwvsock_xmit(skb))
+ 		return len;
+ 	virtio_vsock_skb_queue_tail(&kwvsock.tx_queue, skb);
+@@ -243,7 +261,8 @@ static void kwvsock_rx_work(struct work_struct *work)
+ 		skb = virtio_vsock_alloc_linear_skb(len, GFP_KERNEL);
+ 		if (!skb) {
+ 			/* The host keeps the packet: try again a little later. */
+-			schedule_delayed_work(&kwvsock.rx_work, msecs_to_jiffies(10));
++			queue_delayed_work_on(KWVSOCK_CPU, system_percpu_wq,
++					      &kwvsock.rx_work, msecs_to_jiffies(10));
+ 			return;
+ 		}
+ 		/* The header lands in the headroom, the payload at skb->data. */
+@@ -262,14 +281,14 @@ static void kwvsock_rx_work(struct work_struct *work)
+ 		virtio_transport_recv_pkt(&kwvsock_transport, skb, NULL);
+ 	}
+ 	/* More may be queued: let other work run first. */
+-	mod_delayed_work(system_percpu_wq, &kwvsock.rx_work, 0);
++	mod_delayed_work_on(KWVSOCK_CPU, system_percpu_wq, &kwvsock.rx_work, 0);
+ }
+ 
+ static irqreturn_t kwvsock_irq(int irq, void *dev_id)
+ {
+-	mod_delayed_work(system_percpu_wq, &kwvsock.rx_work, 0);
++	mod_delayed_work_on(KWVSOCK_CPU, system_percpu_wq, &kwvsock.rx_work, 0);
+ 	if (!skb_queue_empty_lockless(&kwvsock.tx_queue))
+-		schedule_work(&kwvsock.tx_work);
++		queue_work_on(KWVSOCK_CPU, system_percpu_wq, &kwvsock.tx_work);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -328,7 +347,7 @@ static int __init kwvsock_init(void)
+ 	kw_park_register_restore_notifier(&kwvsock_restore_nb);
+ 	pr_info("kwvsock: host vsock, guest CID %u\n", KWVSOCK_GUEST_CID);
+ 	/* Packets may have been queued before the handler existed. */
+-	schedule_delayed_work(&kwvsock.rx_work, 0);
++	queue_delayed_work_on(KWVSOCK_CPU, system_percpu_wq, &kwvsock.rx_work, 0);
+ 	return 0;
+ 
+ err_irq:
+diff --git a/sound/drivers/kwsnd.c b/sound/drivers/kwsnd.c
+index 2d9f808a5eb..50d23ec21fe 100644
+--- a/sound/drivers/kwsnd.c
++++ b/sound/drivers/kwsnd.c
+@@ -273,6 +273,11 @@ static int __init kwsnd_init(void)
+ 		pr_info("kwsnd: no host audio\n");
+ 		return 0;
+ 	}
++	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
++	if (IS_ENABLED(CONFIG_SMP)) {
++		pr_warn("kwsnd: sound is not supported on SMP kernels yet\n");
++		return 0;
++	}
+ 	err = snd_card_new(NULL, -1, "kwsnd", THIS_MODULE, 0, &card);
+ 	if (err)
+ 		return err;
+-- 
+2.56.0
+

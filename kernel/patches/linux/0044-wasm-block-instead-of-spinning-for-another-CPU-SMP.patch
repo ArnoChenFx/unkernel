@@ -1,0 +1,478 @@
+From 1bdcc6f0b6de7b422594fbf09e4905cbfd02068d Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 23:07:54 +0000
+Subject: [PATCH] wasm: block instead of spinning for another CPU (SMP)
+
+A guest CPU is a host thread the host may deschedule at any time. A CPU
+spinning for a lock, a cross-CPU call's answer or a task leaving another
+CPU burns its host time while the CPU it waits for is not running, and
+looks busy to the host, which then deschedules it more often, also while
+it holds a lock (lock-holder preemption with ticket locks). Under host
+load this made a pipe ping-pong 34-148x slower than the guest's share of
+the host explains, nearly all of it spinlock waits of 1-15 ms.
+
+Waiters spin for kw_spin_us= (20) and then block their thread in
+memory.atomic.wait32 on their own word of pending interrupts until the
+word changes, for up to kw_spin_sleep_us= (100) at a time; an IPI ends
+the block at once. With interrupts off a waiter blocks even over an IPI
+it cannot take yet (a reschedule during an irqsave lock wait), never
+over a kick or a stop. A spinlock unlock (now one atomic 16-bit add on
+the owner half, then a read of the sleeper count) and csd_unlock()
+(arch_csd_unlocked(), beside arch_csd_lock_wait()) kick blocked waiters
+with a new handler-less IPI bit, KW_IPI_KICK, on every present CPU (a
+CPU coming up may wait before it is online); the other spins
+(smp_cond_load_relaxed(), so qrwlock and try_to_wake_up()'s wait for
+on_cpu) end each block by the timeout or an interrupt. A kick that comes
+after its waiter stopped waiting is cleared before the next wait. The
+clock is read only after 256 spins, so short waits cost what they did.
+kw_spin_us=0 spins as before. Every 256 spins a waiter with interrupts
+on also takes its timer if it expired: a spinning CPU otherwise never
+saw its own deadline (only the pending word is polled in cpu_relax()),
+and a long spin starved its tick (an RCU stall, "rcu_sched kthread timer
+wakeup didn't happen for 1000 jiffies", on a CPU spinning for a file
+lock).
+
+Nothing here suspends under JSPI: memory.atomic.wait32 blocks the
+thread (every CPU of an SMP kernel runs in a worker) and the clock is a
+plain import. The UP build is unchanged: asm/spinlock.h is included
+only on SMP, the rest is under CONFIG_SMP.
+---
+ arch/wasm/include/asm/Kbuild     |   1 -
+ arch/wasm/include/asm/barrier.h  |  28 ++++
+ arch/wasm/include/asm/irq.h      |   4 +-
+ arch/wasm/include/asm/smp.h      |  17 +++
+ arch/wasm/include/asm/spinlock.h |  75 ++++++++++
+ arch/wasm/kernel/Makefile        |   2 +-
+ arch/wasm/kernel/wait.c          | 231 +++++++++++++++++++++++++++++++
+ 7 files changed, 355 insertions(+), 3 deletions(-)
+ create mode 100644 arch/wasm/include/asm/spinlock.h
+ create mode 100644 arch/wasm/kernel/wait.c
+
+diff --git a/arch/wasm/include/asm/Kbuild b/arch/wasm/include/asm/Kbuild
+index 253cec51c85..1c911ed7fc0 100644
+--- a/arch/wasm/include/asm/Kbuild
++++ b/arch/wasm/include/asm/Kbuild
+@@ -5,7 +5,6 @@ generic-y += asm-offsets.h
+ generic-y += extable.h
+ generic-y += kvm_para.h
+ generic-y += qrwlock.h
+-generic-y += spinlock.h
+ generic-y += spinlock_types.h
+ generic-y += tlb.h
+ generic-y += user.h
+diff --git a/arch/wasm/include/asm/barrier.h b/arch/wasm/include/asm/barrier.h
+index 1abb0482c6f..fa1f387a96f 100644
+--- a/arch/wasm/include/asm/barrier.h
++++ b/arch/wasm/include/asm/barrier.h
+@@ -11,6 +11,34 @@
+ #define __rmb()	__atomic_thread_fence(__ATOMIC_ACQ_REL)
+ #define __wmb()	__atomic_thread_fence(__ATOMIC_ACQ_REL)
+ 
++#if defined(CONFIG_SMP) && !defined(__ASSEMBLER__)
++/*
++ * SMP: a spin until another CPU changes memory (try_to_wake_up() waiting
++ * for a task to leave the other CPU, qrwlock, csd waits) steps through
++ * wait.c, which spins for kw_spin_us= and then blocks the host thread for
++ * up to kw_spin_sleep_us= at a time: the CPU it waits for may be a
++ * descheduled host thread.
++ */
++struct kw_spin {
++	unsigned long long t0;
++	unsigned int n;
++};
++void kw_spin_step(struct kw_spin *s);
++
++#define smp_cond_load_relaxed(ptr, cond_expr) ({		\
++	typeof(ptr) __PTR = (ptr);				\
++	__unqual_scalar_typeof(*ptr) VAL;			\
++	struct kw_spin __kws = { 0, 0 };			\
++	for (;;) {						\
++		VAL = READ_ONCE(*__PTR);			\
++		if (cond_expr)					\
++			break;					\
++		kw_spin_step(&__kws);				\
++	}							\
++	(typeof(*ptr))VAL;					\
++})
++#endif
++
+ #include <asm-generic/barrier.h>
+ 
+ #endif /* _ASM_WASM_BARRIER_H */
+diff --git a/arch/wasm/include/asm/irq.h b/arch/wasm/include/asm/irq.h
+index 25a7042e62e..c1d20c26db9 100644
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -25,7 +25,9 @@
+ #define KW_IPI_RESCHEDULE		24
+ #define KW_IPI_CALL_FUNC		25
+ #define KW_IPI_STOP			26
+-#define KW_IPI_MASK			(7U << KW_IPI_RESCHEDULE)
++/* No handler: ends a blocking wait for a lock or a csd (wait.c). */
++#define KW_IPI_KICK			27
++#define KW_IPI_MASK			(15U << KW_IPI_RESCHEDULE)
+ 
+ #include <asm-generic/irq.h>
+ 
+diff --git a/arch/wasm/include/asm/smp.h b/arch/wasm/include/asm/smp.h
+index 8bda30c28a9..d36a684529a 100644
+--- a/arch/wasm/include/asm/smp.h
++++ b/arch/wasm/include/asm/smp.h
+@@ -21,6 +21,23 @@ void arch_send_call_function_single_ipi(int cpu);
+ /* process.c: tell this CPU's host which stacks will never run again. */
+ void kw_stack_drain(void);
+ 
++/*
++ * kernel/smp.c: wait for a cross-CPU call's answer (wait.c): spin for a
++ * while, then block until csd_unlock() kicks, an interrupt or a timeout.
++ */
++void kw_csd_lock_wait(unsigned int *flags);
++#define arch_csd_lock_wait kw_csd_lock_wait
++void kw_csd_kick(unsigned int *flags);
++extern int kw_csd_sleepers;
++static inline void arch_csd_unlocked(unsigned int *flags)
++{
++	/* The release store is plain: order it before the read (Dekker with kw_csd_lock_wait()). */
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	if (unlikely(__atomic_load_n(&kw_csd_sleepers, __ATOMIC_SEQ_CST)))
++		kw_csd_kick(flags);
++}
++#define arch_csd_unlocked arch_csd_unlocked
++
+ /* setup_arch(): the CPUs the host offers become possible and present. */
+ void __init kw_smp_init_cpus(void);
+ /* kw_secondary_entry (entry.S): a secondary CPU's idle task starts here. */
+diff --git a/arch/wasm/include/asm/spinlock.h b/arch/wasm/include/asm/spinlock.h
+new file mode 100644
+index 00000000000..1ead9e82279
+--- /dev/null
++++ b/arch/wasm/include/asm/spinlock.h
+@@ -0,0 +1,75 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _ASM_WASM_SPINLOCK_H
++#define _ASM_WASM_SPINLOCK_H
++
++/*
++ * asm-generic's ticket lock with the wait out of line (wait.c): a guest CPU
++ * is a host thread that the host may deschedule at any moment, so a waiter
++ * spins only for a while (kw_spin_us=) and then blocks its thread until
++ * the unlock kicks it or a short timeout passes. The unlock is one atomic
++ * 16-bit add on the owner half (a full barrier, cheaper than the fence plus
++ * store of smp_store_release()), which also orders it before the read of
++ * kw_lock_sleepers.
++ */
++#include <linux/atomic.h>
++#include <asm-generic/spinlock_types.h>
++
++void kw_ticket_wait(arch_spinlock_t *lock, u16 ticket);
++void kw_ticket_kick(arch_spinlock_t *lock);
++/* CPUs blocked in kw_ticket_wait() (the unlock kicks them). */
++extern int kw_lock_sleepers;
++
++static __always_inline void arch_spin_lock(arch_spinlock_t *lock)
++{
++	u32 val = atomic_fetch_add(1 << 16, &lock->val);
++	u16 ticket = val >> 16;
++
++	if (ticket == (u16)val)
++		return;
++	kw_ticket_wait(lock, ticket);
++}
++
++static __always_inline bool arch_spin_trylock(arch_spinlock_t *lock)
++{
++	u32 old = atomic_read(&lock->val);
++
++	if ((old >> 16) != (old & 0xffff))
++		return false;
++
++	return atomic_try_cmpxchg(&lock->val, &old, old + (1 << 16)); /* SC, for RCsc */
++}
++
++static __always_inline void arch_spin_unlock(arch_spinlock_t *lock)
++{
++	/* Little endian: the owner is the low half. */
++	__atomic_fetch_add((u16 *)lock, 1, __ATOMIC_SEQ_CST);
++	if (unlikely(__atomic_load_n(&kw_lock_sleepers, __ATOMIC_SEQ_CST)))
++		kw_ticket_kick(lock);
++}
++
++static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
++{
++	u32 val = lock.val.counter;
++
++	return ((val >> 16) == (val & 0xffff));
++}
++
++static __always_inline int arch_spin_is_locked(arch_spinlock_t *lock)
++{
++	arch_spinlock_t val = READ_ONCE(*lock);
++
++	return !arch_spin_value_unlocked(val);
++}
++
++static __always_inline int arch_spin_is_contended(arch_spinlock_t *lock)
++{
++	u32 val = atomic_read(&lock->val);
++
++	return (s16)((val >> 16) - (val & 0xffff)) > 1;
++}
++#define arch_spin_is_contended arch_spin_is_contended
++
++#include <asm/qrwlock.h>
++
++#endif /* _ASM_WASM_SPINLOCK_H */
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index 1f9d572be1b..f1ad3ba5e00 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -13,7 +13,7 @@ obj-y += ptrace.o
+ obj-y += random.o
+ obj-y += reboot.o
+ obj-y += setup.o
+-obj-$(CONFIG_SMP) += smp.o
++obj-$(CONFIG_SMP) += smp.o wait.o
+ obj-y += signal.o
+ obj-y += sync.o
+ obj-y += sys_riscv.o
+diff --git a/arch/wasm/kernel/wait.c b/arch/wasm/kernel/wait.c
+new file mode 100644
+index 00000000000..4a69dca3fab
+--- /dev/null
++++ b/arch/wasm/kernel/wait.c
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * SMP: how a CPU waits for another. A guest CPU is a host thread that the
++ * host may deschedule at any moment and for as long as it likes: a busy or
++ * oversubscribed host, a browser that throttles a worker, a garbage
++ * collection or a synchronous compile in that thread. A CPU that spins
++ * for a lock, a cross-CPU call's answer or a task leaving another CPU
++ * while the CPU it waits for is not running burns its own host time for
++ * nothing and, to the host, looks busy: it is then descheduled more often
++ * itself, also while it holds a lock. With 24 busy host threads beside a
++ * 4-CPU guest a pipe ping-pong ran 34-100x slower than its share of the
++ * host explains, nearly all of it in spinlock waits of 1-15 ms (host load
++ * study, 2026-11-16).
++ *
++ * So a waiter spins for kw_spin_us= (default 20 µs, far longer than a lock
++ * is held while its holder runs) and then blocks its thread in
++ * memory.atomic.wait32 on its own word of pending interrupts until the
++ * word changes, for at most kw_spin_sleep_us= (default 100 µs) at a time.
++ * An IPI to it ends the block at once (kw_irq_raise() sets a bit and
++ * notifies the word), so it still answers shootdowns while it waits. A
++ * spinlock unlock and csd_unlock() kick blocked waiters (KW_IPI_KICK); the
++ * other spins (smp_cond_load_*(), asm/barrier.h) rely on the timeout.
++ * kw_spin_us=0 spins as before. Both are writable in
++ * /sys/module/kernel/parameters/. Every 256 spins the waiter also takes
++ * its timer if it expired (kw_spin_timer()).
++ *
++ * Nothing here suspends under JSPI: memory.atomic.wait32 blocks the thread
++ * (a CPU's thread may block: SMP runs every CPU in a worker), and the
++ * clock is a plain import.
++ */
++
++#include <linux/init.h>
++#include <linux/moduleparam.h>
++#include <linux/percpu.h>
++#include <linux/sched.h>
++#include <linux/smp.h>
++#include <linux/spinlock.h>
++#include <asm/irq.h>
++#include <asm/wasm.h>
++
++static unsigned int kw_spin_us = 20;
++static unsigned int kw_spin_sleep_us = 100;
++core_param(kw_spin_us, kw_spin_us, uint, 0644);
++core_param(kw_spin_sleep_us, kw_spin_sleep_us, uint, 0644);
++
++/*
++ * Blocked waiters, for the kicks. arch_spin_unlock() and csd_unlock() read
++ * the count after their release (ordered by an atomic RMW or a fence), and
++ * then the per-CPU keys; a waiter publishes its key and the count before
++ * it reads the lock word again. Either the waiter sees the release or the
++ * releaser sees the waiter and sets KW_IPI_KICK in its word, which ends or
++ * forestalls the block (memory.atomic.wait32 compares the word first). A
++ * CPU publishes one key at a time: nothing between the publication and
++ * its withdrawal takes an interrupt.
++ */
++int kw_lock_sleepers;
++EXPORT_SYMBOL(kw_lock_sleepers);
++static DEFINE_PER_CPU(void *, kw_lock_waiting);
++int kw_csd_sleepers;
++static DEFINE_PER_CPU(void *, kw_csd_waiting);
++
++static __always_inline u32 *kw_word(void)
++{
++	u32 *word;
++
++	__asm__ volatile("global.get kw_irq_word\n\t"
++			 "local.set %0" : "=r"(word));
++	return word;
++}
++
++static __always_inline u64 kw_now(void)
++{
++	return wasm_cpu_clock_get_monotonic();
++}
++
++/*
++ * A spinning CPU learns of its own timer only at a poll point: cpu_relax()
++ * takes what is in its word of pending interrupts, but the clockevent's
++ * deadline is compared with the clock only at slice ends, in idle and when
++ * interrupts are enabled with something in the word. A long spin with
++ * interrupts on (a descheduled lock holder) so starved this CPU's tick:
++ * RCU reported its kthread's timer as not fired for 1000 jiffies on a
++ * CPU that spun for a file lock. Take an expired timer as an interrupt.
++ */
++static void kw_spin_timer(void)
++{
++	if (arch_local_save_flags() == ARCH_IRQ_ENABLED && wasm_timer_timeout() == 0) {
++		kw_irq_flags_set(ARCH_IRQ_DISABLED);
++		kw_irq_enable_pending();
++	}
++}
++
++/*
++ * One spin of a wait, then every 256 spins: an expired timer, and whether
++ * the CPU has spun for kw_spin_us= since the first such check (a short
++ * wait never reads the clock).
++ */
++static __always_inline bool kw_spun_out(struct kw_spin *s)
++{
++	u64 limit, now;
++
++	cpu_relax();
++	if (++s->n & 255)
++		return false;
++	kw_spin_timer();
++	now = kw_now();
++	if (s->n == 256) {
++		s->t0 = now;
++		return false;
++	}
++	limit = (u64)READ_ONCE(kw_spin_us) * NSEC_PER_USEC;
++	return limit && now - s->t0 >= limit;
++}
++
++/*
++ * Block this CPU's thread until its word of pending interrupts changes (an
++ * IPI, a kick, a device interrupt on CPU 0) or for kw_spin_sleep_us=. With
++ * interrupts on, what is pending already is cpu_relax()'s to take, so do
++ * not block over it. With interrupts off it may have to wait (a reschedule
++ * IPI that arrived during an irqsave lock wait): block until something new
++ * arrives. Never block over a kick or a stop.
++ */
++static void kw_block(u32 *word)
++{
++	u32 cur = READ_ONCE(*word);
++
++	if (cur & (BIT(KW_IPI_KICK) | BIT(KW_IPI_STOP)))
++		return;
++	if (cur && arch_local_save_flags() == ARCH_IRQ_ENABLED)
++		return;
++	__builtin_wasm_memory_atomic_wait32((int *)word, (int)cur,
++			(u64)READ_ONCE(kw_spin_sleep_us) * NSEC_PER_USEC);
++}
++
++/*
++ * A kick that arrived after its waiter had stopped waiting (the releaser
++ * read the key just before it was withdrawn). Cleared only while this CPU
++ * publishes no key, so a kick for a current wait is never lost.
++ */
++static void kw_kick_clear(u32 *word)
++{
++	if (READ_ONCE(*word) & BIT(KW_IPI_KICK))
++		atomic_andnot(BIT(KW_IPI_KICK), (atomic_t *)word);
++}
++
++/* Block until kicked: @key is what the releaser compares, @busy reads the lock again. */
++static void kw_block_on(void __percpu *waiting, int *sleepers, void *key,
++			bool (*busy)(void *key, unsigned long arg), unsigned long arg)
++{
++	void **mine = this_cpu_ptr((void * __percpu *)waiting);
++	u32 *word = kw_word();
++
++	kw_kick_clear(word);
++	__atomic_store_n(mine, key, __ATOMIC_SEQ_CST);
++	__atomic_fetch_add(sleepers, 1, __ATOMIC_SEQ_CST);
++	if (busy(key, arg))
++		kw_block(word);
++	__atomic_fetch_sub(sleepers, 1, __ATOMIC_SEQ_CST);
++	__atomic_store_n(mine, NULL, __ATOMIC_SEQ_CST);
++	kw_kick_clear(word);
++}
++
++static void kw_kick(void __percpu *waiting, void *key)
++{
++	int cpu;
++
++	/* Present, not online: a CPU coming up may wait before it is online. */
++	for_each_present_cpu(cpu)
++		if (__atomic_load_n(per_cpu_ptr((void * __percpu *)waiting, cpu),
++				    __ATOMIC_SEQ_CST) == key)
++			kw_irq_raise(cpu, BIT(KW_IPI_KICK));
++}
++
++static bool kw_ticket_busy(void *key, unsigned long ticket)
++{
++	arch_spinlock_t *lock = key;
++
++	return (u16)__atomic_load_n(&lock->val.counter, __ATOMIC_SEQ_CST) != (u16)ticket;
++}
++
++void kw_ticket_wait(arch_spinlock_t *lock, u16 ticket)
++{
++	struct kw_spin s = { 0, 0 };
++
++	while ((u16)atomic_read(&lock->val) != ticket)
++		if (kw_spun_out(&s))
++			kw_block_on(&kw_lock_waiting, &kw_lock_sleepers, lock,
++				    kw_ticket_busy, ticket);
++	/* As asm-generic's: RCsc acquire. */
++	smp_mb();
++}
++EXPORT_SYMBOL(kw_ticket_wait);
++
++void kw_ticket_kick(arch_spinlock_t *lock)
++{
++	kw_kick(&kw_lock_waiting, lock);
++}
++EXPORT_SYMBOL(kw_ticket_kick);
++
++static bool kw_csd_busy(void *key, unsigned long arg)
++{
++	return __atomic_load_n((unsigned int *)key, __ATOMIC_SEQ_CST) & CSD_FLAG_LOCK;
++}
++
++/* Until CSD_FLAG_LOCK is clear; the caller acquires afterwards. */
++void kw_csd_lock_wait(unsigned int *flags)
++{
++	struct kw_spin s = { 0, 0 };
++
++	while (READ_ONCE(*flags) & CSD_FLAG_LOCK)
++		if (kw_spun_out(&s))
++			kw_block_on(&kw_csd_waiting, &kw_csd_sleepers, flags, kw_csd_busy, 0);
++}
++
++void kw_csd_kick(unsigned int *flags)
++{
++	kw_kick(&kw_csd_waiting, flags);
++}
++
++/* One step of smp_cond_load_relaxed() (asm/barrier.h): no kick, an interrupt or the timeout ends a block. */
++void kw_spin_step(struct kw_spin *s)
++{
++	u32 *word;
++
++	if (!kw_spun_out(s))
++		return;
++	word = kw_word();
++	kw_kick_clear(word);
++	kw_block(word);
++}
++EXPORT_SYMBOL(kw_spin_step);
+-- 
+2.56.0
+

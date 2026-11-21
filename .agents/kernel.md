@@ -42,7 +42,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 - One patch per piece, in this order: generic changes (Joel's two, stock
   LLVM, `VMALLOC_FLAT`, 9p `metatimeout`, the kthread park points, the
   random vmfork reseed, the switches for NET_DEVMEM, DRM_PANEL_BRIDGE,
-  DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backport
+  DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backports
   and capset wait); the arch; the ISA; each driver (kwblk, kwnet,
   kwfb, kwinput, sysrq, kwsnd, kwvsock, kwshm, kwvirtio); parking; kwvsock's reset
   after a restore; `kw_defconfig`; then the SMP series (the atomics and

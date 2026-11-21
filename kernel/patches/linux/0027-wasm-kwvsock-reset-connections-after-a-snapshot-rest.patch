@@ -1,0 +1,197 @@
+From 1bf4a862a4ec652f6821f9704d151dce154b7d9e Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sun, 15 Nov 2026 14:41:37 +0000
+Subject: [PATCH] wasm: kwvsock: reset connections after a snapshot restore
+
+A restored snapshot runs on a new host instance, which knows none of the
+guest's vsock connections, except those it took over from the snapshot
+(the 9p sessions of host file systems). Add a park restore notifier, run
+by kwparkd before any other task resumes, and have kwvsock reset every
+connected socket from it, as virtio-vsock does on TRANSPORT_RESET after a
+live migration, unless the host keeps it: the notifier asks the host
+about each established connection (wasm_driver_vsock_keep()). Listening
+sockets stay, so new connections work.
+---
+ arch/wasm/kernel/park.c | 19 +++++++++++++++--
+ include/linux/kw_park.h | 16 ++++++++++++++
+ net/vmw_vsock/kwvsock.c | 47 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/arch/wasm/kernel/park.c b/arch/wasm/kernel/park.c
+index f899d66488e..c5986eabefd 100644
+--- a/arch/wasm/kernel/park.c
++++ b/arch/wasm/kernel/park.c
+@@ -40,8 +40,9 @@
+  * snapshot enters at kw_resume (entry.S) instead of _start, on a fresh
+  * stack as the idle task: __kw_resume() tells kwemu that the host changed
+  * and resumes kwparkd alone, which steps the realtime clock, reseeds the
+- * RNG (two restores of one snapshot must not share its output) and then
+- * resumes everything else.
++ * RNG (two restores of one snapshot must not share its output), runs the
++ * restore notifiers (kwvsock resets its connections, which the new host
++ * does not have) and then resumes everything else.
+  *
+  * Free pages: at the consistent point the kernel also hands the host a
+  * bitmap of the free pages (one bit per pfn), after draining this CPU's
+@@ -71,6 +72,7 @@
+ #include <linux/kw_park.h>
+ #include <linux/memblock.h>
+ #include <linux/mmzone.h>
++#include <linux/notifier.h>
+ #include <linux/proc_fs.h>
+ #include <linux/random.h>
+ #include <linux/sched.h>
+@@ -115,6 +117,14 @@ extern struct kw_cpu *const wasm_kw_cpu;
+ 
+ static int kw_parkd_fn(void *unused);
+ 
++static BLOCKING_NOTIFIER_HEAD(kw_park_restore_chain);
++
++int kw_park_register_restore_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&kw_park_restore_chain, nb);
++}
++EXPORT_SYMBOL_GPL(kw_park_register_restore_notifier);
++
+ static void kw_park_record(struct task_struct *t)
+ {
+ 	snprintf(kw_park_blocker, sizeof(kw_park_blocker), "%s[%d]:%c",
+@@ -371,6 +381,11 @@ static void kw_park_after_restore(void)
+ 	if (!wasi_random_get(wasi_ptr(kw_park_seed), sizeof(kw_park_seed)))
+ 		add_vmfork_randomness(kw_park_seed, sizeof(kw_park_seed));
+ 	memzero_explicit(kw_park_seed, sizeof(kw_park_seed));
++	/*
++	 * Before anything else runs. On SMP the other CPUs would have to stay
++	 * in the idle loop until this returns.
++	 */
++	blocking_notifier_call_chain(&kw_park_restore_chain, 0, NULL);
+ 	WRITE_ONCE(kw_park_restored, 0);
+ 	kw_unpark_all();
+ 	kw_park_finish(0);
+diff --git a/include/linux/kw_park.h b/include/linux/kw_park.h
+index f041a02ba52..066fefea371 100644
+--- a/include/linux/kw_park.h
++++ b/include/linux/kw_park.h
+@@ -21,11 +21,22 @@
+ #include <linux/compiler.h>
+ #include <linux/types.h>
+ 
++struct notifier_block;
++
+ #ifdef CONFIG_KW_PARK
+ extern int kw_park_kthreads;
+ 
+ void kw_park_kthread(int (*fn)(void *), void *arg);
+ 
++/*
++ * Called after a snapshot was restored into a new host instance, before
++ * any other task resumes: for drivers whose host side did not survive
++ * (connections the new host knows nothing about). Runs in kwparkd while
++ * every other task is still parked, so a callback must not wait for
++ * another task (no flush_work(), no completion).
++ */
++int kw_park_register_restore_notifier(struct notifier_block *nb);
++
+ /*
+  * True while kernel threads are asked to park. Wait conditions that a
+  * plain wake_up_process() does not end (wait_event*()) add it, so that the
+@@ -59,6 +70,11 @@ static inline bool kw_park_pending(void)
+ static inline void kw_park_point(int (*fn)(void *), void *arg)
+ {
+ }
++
++static inline int kw_park_register_restore_notifier(struct notifier_block *nb)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /* _LINUX_KW_PARK_H */
+diff --git a/net/vmw_vsock/kwvsock.c b/net/vmw_vsock/kwvsock.c
+index fedbe869114..90cb8521bb3 100644
+--- a/net/vmw_vsock/kwvsock.c
++++ b/net/vmw_vsock/kwvsock.c
+@@ -33,12 +33,22 @@
+  * a little later. The host keeps each packet within the size given at init,
+  * so every skb is linear and below PAGE_ALLOC_COSTLY_ORDER.
+  *
++ * After a snapshot is restored into a new host instance, the host has none
++ * of the old connections except those it took over from the snapshot (a
++ * host file system's 9p session): like virtio-vsock's TRANSPORT_RESET event
++ * after a live migration, every other connected socket is reset
++ * (ECONNRESET), from the park restore notifier, which asks the host about
++ * each established one (wasm_driver_vsock_keep()). Listening sockets stay,
++ * so new connections work.
++ *
+  * No import here suspends.
+  */
+ 
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
++#include <linux/kw_park.h>
+ #include <linux/module.h>
++#include <linux/notifier.h>
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <linux/virtio_vsock.h>
+@@ -78,6 +88,12 @@ u32 wasm_driver_vsock_rx_len(void)
+  */
+ int wasm_driver_vsock_recv(void *buf, u32 max)
+ 	__unkernel_import(wasm_driver_vsock_recv);
++/*
++ * After a snapshot restore: does the new host have this established
++ * connection (the guest's port, the host's port)? 1: keep it; 0: reset it.
++ */
++int wasm_driver_vsock_keep(u32 guest_port, u32 host_port)
++	__unkernel_import(wasm_driver_vsock_keep);
+ 
+ struct kwvsock {
+ 	struct sk_buff_head tx_queue;	/* packets the host has not taken yet */
+@@ -257,6 +273,36 @@ static irqreturn_t kwvsock_irq(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * As virtio_vsock_reset_sock(): under vsock_table_lock, without sk_lock.
++ * An established connection the new host took over stays.
++ */
++static void kwvsock_reset_sock(struct sock *sk)
++{
++	struct vsock_sock *vsk = vsock_sk(sk);
++
++	if (sk->sk_state == TCP_ESTABLISHED &&
++	    wasm_driver_vsock_keep(vsk->local_addr.svm_port, vsk->remote_addr.svm_port) > 0)
++		return;
++	sk->sk_state = TCP_CLOSE;
++	sk->sk_err = ECONNRESET;
++	sk_error_report(sk);
++}
++
++/*
++ * A snapshot was restored: the new host knows none of the connections but
++ * those it kept. Packets still queued for the others get an RST from it.
++ */
++static int kwvsock_restored(struct notifier_block *nb, unsigned long action, void *data)
++{
++	vsock_for_each_connected_socket(&kwvsock_transport.transport, kwvsock_reset_sock);
++	return NOTIFY_OK;
++}
++
++static struct notifier_block kwvsock_restore_nb = {
++	.notifier_call = kwvsock_restored,
++};
++
+ static int __init kwvsock_init(void)
+ {
+ 	int err;
+@@ -279,6 +325,7 @@ static int __init kwvsock_init(void)
+ 	err = vsock_core_register(&kwvsock_transport.transport, VSOCK_TRANSPORT_F_G2H);
+ 	if (err)
+ 		goto err_irq;
++	kw_park_register_restore_notifier(&kwvsock_restore_nb);
+ 	pr_info("kwvsock: host vsock, guest CID %u\n", KWVSOCK_GUEST_CID);
+ 	/* Packets may have been queued before the handler existed. */
+ 	schedule_delayed_work(&kwvsock.rx_work, 0);
+-- 
+2.56.0
+

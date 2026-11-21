@@ -1,0 +1,276 @@
+From eb71716ffb63120bdfdcf53e63c0d373357164a3 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 10:16:10 +0000
+Subject: [PATCH] wasm: kwinput, a keyboard, a mouse and a tablet fed by the
+ JavaScript host
+
+Three evdev devices for graphical programs, registered only when the
+host has a display (wasm_driver_input_init() < 0 means none, the same
+condition as kwfb): "kwinput keyboard" with every key code below
+BTN_MISC, "kwinput mouse", a relative mouse (REL_X, REL_Y, REL_WHEEL,
+BTN_LEFT/RIGHT/MIDDLE), and "kwinput tablet", an absolute pointer for
+desktops, with which the host's pointer can move in and out of the
+picture without pointer lock. Separate devices, so that udev, libinput
+and X's evdev driver classify them the usual way. No EV_REP.
+
+The tablet is modelled on QEMU's usb-tablet: ABS_X and ABS_Y over
+0..32767 for the whole picture, REL_WHEEL and the three buttons, with no
+BTN_TOUCH, no tool bits and no INPUT_PROP_DIRECT. udev and libinput take
+it as a mouse with absolute motion, and X's evdev driver as an absolute
+pointer that it scales to the screen, i.e. the framebuffer mode.
+
+The host queues events and raises WASM_IRQ_INPUT (5) in wasm_host_irqs,
+polled like the other host interrupts. The handler pulls them into a
+static buffer with wasm_driver_input_read() (12 bytes each: device 0, 1
+or 2, type, code, value) and reports them as they are; the host adds the
+EV_SYN reports.
+
+The input_dev open and close callbacks, which run when the first program
+opens a device through evdev and when the last closes it, report the set
+of open devices with wasm_driver_input_state(), so the host captures
+input only while a program reads it. No import suspends.
+---
+ drivers/input/Kconfig   |   9 ++
+ drivers/input/Makefile  |   1 +
+ drivers/input/kwinput.c | 197 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 207 insertions(+)
+ create mode 100644 drivers/input/kwinput.c
+
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index 88ecdf5218e..92a39d43451 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -152,6 +152,15 @@ config INPUT_EVDEV
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called evdev.
+ 
++config INPUT_KWINPUT
++	bool "unkernel host keyboard and mouse"
++	depends on WASM
++	help
++	  A keyboard, a relative mouse and an absolute pointer (a tablet,
++	  like QEMU's usb-tablet) whose events come from the JavaScript
++	  host of a unkernel instance (js/core/input.ts). They are
++	  registered only when the host has a display (FB_KWFB).
++
+ config INPUT_KUNIT_TEST
+ 	tristate "KUnit tests for Input" if !KUNIT_ALL_TESTS
+ 	depends on INPUT && KUNIT
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index 2cd6e1c9a77..02e370df73d 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -18,6 +18,7 @@ obj-$(CONFIG_INPUT_LEDS)	+= input-leds.o
+ obj-$(CONFIG_INPUT_MOUSEDEV)	+= mousedev.o
+ obj-$(CONFIG_INPUT_JOYDEV)	+= joydev.o
+ obj-$(CONFIG_INPUT_EVDEV)	+= evdev.o
++obj-$(CONFIG_INPUT_KWINPUT)	+= kwinput.o
+ 
+ obj-$(CONFIG_INPUT_KEYBOARD)	+= keyboard/
+ obj-$(CONFIG_INPUT_MOUSE)	+= mouse/
+diff --git a/drivers/input/kwinput.c b/drivers/input/kwinput.c
+new file mode 100644
+index 00000000000..93059b9670f
+--- /dev/null
++++ b/drivers/input/kwinput.c
+@@ -0,0 +1,197 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * kwinput: keyboard and mouse events from the JavaScript host (unkernel).
++ *
++ * Three input devices, registered only when the host has a display (the
++ * condition kwfb uses; wasm_driver_input_init() < 0 means none), in this
++ * order (event0, event1, event2 on a system without other input devices):
++ *  - a keyboard (EV_KEY, every key code below BTN_MISC);
++ *  - a relative mouse (REL_X, REL_Y, REL_WHEEL, BTN_LEFT/RIGHT/MIDDLE), for
++ *    programs that want motion (games; the host locks its pointer);
++ *  - an absolute pointer like QEMU's usb-tablet (ABS_X and ABS_Y over
++ *    0..KWINPUT_ABS_MAX for the whole picture, the same buttons and wheel,
++ *    no BTN_TOUCH, no tool bits, no INPUT_PROP_DIRECT), for desktops: the
++ *    host pointer moves in and out of the picture freely. udev and
++ *    libinput take absolute axes with mouse buttons and without BTN_TOUCH
++ *    or a stylus as a mouse (ID_INPUT_MOUSE) with absolute motion, and X's
++ *    evdev driver as an absolute pointer scaled to the screen.
++ * Separate devices, so that each classifies the usual way.
++ *
++ * The host queues events and raises WASM_IRQ_INPUT in wasm_host_irqs; like
++ * the other host interrupts it is polled when user mode returns to the
++ * kernel and in the idle loop. The handler pulls the events into a static
++ * buffer with wasm_driver_input_read() and reports them as they are,
++ * EV_SYN included: the host groups them.
++ *
++ * The open/close callbacks of the input devices run when the first
++ * program opens one (through evdev) and when the last closes it; each
++ * change is reported with wasm_driver_input_state(), so the host captures
++ * input only while some program reads it.
++ */
++
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <asm/irq.h>
++#include <asm/wasm.h>
++
++/* One event, written by the host (js/core/input.ts). */
++struct kwinput_event {
++	u16 dev;	/* KWINPUT_KEYBOARD, KWINPUT_MOUSE or KWINPUT_TABLET */
++	u16 type;
++	u16 code;
++	u16 reserved;
++	s32 value;
++};
++
++#define KWINPUT_KEYBOARD	0
++#define KWINPUT_MOUSE		1
++#define KWINPUT_TABLET		2
++#define KWINPUT_NDEV		3
++#define KWINPUT_ABS_MAX		32767
++#define KWINPUT_BATCH		64
++
++/* Host imports, module "unkernel". None of them suspends. */
++/* < 0: no input devices (the host has no display). */
++long wasm_driver_input_init(void)
++	__unkernel_import(wasm_driver_input_init);
++/* Move up to @max queued events into @buf; returns how many. */
++long wasm_driver_input_read(struct kwinput_event *buf, long max)
++	__unkernel_import(wasm_driver_input_read);
++/* Which devices some program has open: bit KWINPUT_KEYBOARD, _MOUSE, _TABLET. */
++void wasm_driver_input_state(u32 open_mask)
++	__unkernel_import(wasm_driver_input_state);
++
++static struct input_dev *kwinput_dev[KWINPUT_NDEV];
++static struct kwinput_event kwinput_buf[KWINPUT_BATCH];
++static u32 kwinput_open_mask;
++
++static irqreturn_t kwinput_irq(int irq, void *dev_id)
++{
++	long n, i;
++
++	do {
++		n = wasm_driver_input_read(kwinput_buf, KWINPUT_BATCH);
++		for (i = 0; i < n; i++) {
++			const struct kwinput_event *e = &kwinput_buf[i];
++
++			if (e->dev < KWINPUT_NDEV)
++				input_event(kwinput_dev[e->dev], e->type,
++					    e->code, e->value);
++		}
++	} while (n == KWINPUT_BATCH);
++	return IRQ_HANDLED;
++}
++
++/*
++ * Called with that device's mutex held. The kernel is UP without
++ * preemption, so the mask shared by the devices needs no lock.
++ */
++static int kwinput_open(struct input_dev *dev)
++{
++	kwinput_open_mask |= BIT((unsigned long)input_get_drvdata(dev));
++	wasm_driver_input_state(kwinput_open_mask);
++	return 0;
++}
++
++static void kwinput_close(struct input_dev *dev)
++{
++	kwinput_open_mask &= ~BIT((unsigned long)input_get_drvdata(dev));
++	wasm_driver_input_state(kwinput_open_mask);
++}
++
++static struct input_dev *__init kwinput_alloc(unsigned long which,
++					      const char *name, u16 product)
++{
++	struct input_dev *dev = input_allocate_device();
++
++	if (!dev)
++		return NULL;
++	dev->name = name;
++	dev->phys = which == KWINPUT_KEYBOARD ? "kwinput/input0" :
++		    which == KWINPUT_MOUSE ? "kwinput/input1" : "kwinput/input2";
++	dev->id.bustype = BUS_VIRTUAL;
++	dev->id.vendor = 0x6b77;	/* "kw" */
++	dev->id.product = product;
++	dev->id.version = 1;
++	dev->open = kwinput_open;
++	dev->close = kwinput_close;
++	input_set_drvdata(dev, (void *)which);
++	return dev;
++}
++
++static int __init kwinput_init(void)
++{
++	struct input_dev *kbd, *mouse, *tablet;
++	unsigned int code;
++	int err;
++
++	if (wasm_driver_input_init() < 0) {
++		pr_info("kwinput: no host input\n");
++		return 0;
++	}
++
++	kbd = kwinput_alloc(KWINPUT_KEYBOARD, "kwinput keyboard", 1);
++	mouse = kwinput_alloc(KWINPUT_MOUSE, "kwinput mouse", 2);
++	tablet = kwinput_alloc(KWINPUT_TABLET, "kwinput tablet", 3);
++	if (!kbd || !mouse || !tablet) {
++		err = -ENOMEM;
++		goto err_free;
++	}
++
++	/* Every key code below the buttons (KEY_ESC .. KEY_MICMUTE and on). */
++	__set_bit(EV_KEY, kbd->evbit);
++	for (code = KEY_ESC; code < BTN_MISC; code++)
++		__set_bit(code, kbd->keybit);
++
++	input_set_capability(mouse, EV_REL, REL_X);
++	input_set_capability(mouse, EV_REL, REL_Y);
++	input_set_capability(mouse, EV_REL, REL_WHEEL);
++	input_set_capability(mouse, EV_KEY, BTN_LEFT);
++	input_set_capability(mouse, EV_KEY, BTN_RIGHT);
++	input_set_capability(mouse, EV_KEY, BTN_MIDDLE);
++
++	input_set_abs_params(tablet, ABS_X, 0, KWINPUT_ABS_MAX, 0, 0);
++	input_set_abs_params(tablet, ABS_Y, 0, KWINPUT_ABS_MAX, 0, 0);
++	input_set_capability(tablet, EV_REL, REL_WHEEL);
++	input_set_capability(tablet, EV_KEY, BTN_LEFT);
++	input_set_capability(tablet, EV_KEY, BTN_RIGHT);
++	input_set_capability(tablet, EV_KEY, BTN_MIDDLE);
++
++	kwinput_dev[KWINPUT_KEYBOARD] = kbd;
++	kwinput_dev[KWINPUT_MOUSE] = mouse;
++	kwinput_dev[KWINPUT_TABLET] = tablet;
++	err = request_irq(WASM_IRQ_INPUT, kwinput_irq, 0, "kwinput", NULL);
++	if (err)
++		goto err_free;
++	err = input_register_device(kbd);
++	if (err)
++		goto err_irq;
++	err = input_register_device(mouse);
++	if (err) {
++		input_unregister_device(kbd);
++		kbd = NULL;
++		goto err_irq;
++	}
++	err = input_register_device(tablet);
++	if (err) {
++		input_unregister_device(kbd);
++		input_unregister_device(mouse);
++		kbd = mouse = NULL;
++		goto err_irq;
++	}
++	pr_info("kwinput: host keyboard, mouse and tablet\n");
++	return 0;
++
++err_irq:
++	free_irq(WASM_IRQ_INPUT, NULL);
++err_free:
++	kwinput_dev[KWINPUT_KEYBOARD] = kwinput_dev[KWINPUT_MOUSE] = NULL;
++	kwinput_dev[KWINPUT_TABLET] = NULL;
++	input_free_device(kbd);
++	input_free_device(mouse);
++	input_free_device(tablet);
++	return err;
++}
++device_initcall(kwinput_init);
+-- 
+2.56.0
+

@@ -1,0 +1,90 @@
+From 57ef3ab49d5cbc75afc3a153d52b2f80effce83c Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 20:16:04 +0000
+Subject: [PATCH] wasm: kwinput on SMP
+
+The open and close callbacks update the open mask and report it on CPU
+0 through kw_host_call(), which also serialises the updates of the mask
+the three devices share: CPU 0 runs each to the end. The events already
+arrive through CPU 0's interrupt, and input_event() reaches evdev's
+readers on any CPU. The UP build is unchanged.
+---
+ drivers/input/kwinput.c | 41 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/input/kwinput.c b/drivers/input/kwinput.c
+index 9c47827a339..39d2d9ca487 100644
+--- a/drivers/input/kwinput.c
++++ b/drivers/input/kwinput.c
+@@ -27,6 +27,12 @@
+  * program opens one (through evdev) and when the last closes it; each
+  * change is reported with wasm_driver_input_state(), so the host captures
+  * input only while some program reads it.
++ *
++ * SMP: the host's imports answer on CPU 0 alone, where its interrupt
++ * arrives too; input_event() reaches evdev's readers on any CPU. The
++ * open/close callbacks update the mask and tell the host on CPU 0
++ * (kw_host_call()), which also serialises them: CPU 0 runs one of them at
++ * a time to the end (no preemption, nothing in it sleeps).
+  */
+ 
+ #include <linux/init.h>
+@@ -84,6 +90,35 @@ static irqreturn_t kwinput_irq(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++#ifdef CONFIG_SMP
++/* On CPU 0: bit 0 of @arg opens, the rest is the device. */
++static long kwinput_state_fn(void *arg)
++{
++	unsigned long a = (unsigned long)arg;
++
++	if (a & 1)
++		kwinput_open_mask |= BIT(a >> 1);
++	else
++		kwinput_open_mask &= ~BIT(a >> 1);
++	wasm_driver_input_state(kwinput_open_mask);
++	return 0;
++}
++
++static int kwinput_open(struct input_dev *dev)
++{
++	unsigned long which = (unsigned long)input_get_drvdata(dev);
++
++	kw_host_call(kwinput_state_fn, (void *)(which << 1 | 1));
++	return 0;
++}
++
++static void kwinput_close(struct input_dev *dev)
++{
++	unsigned long which = (unsigned long)input_get_drvdata(dev);
++
++	kw_host_call(kwinput_state_fn, (void *)(which << 1));
++}
++#else
+ /*
+  * Called with that device's mutex held. The kernel is UP without
+  * preemption, so the mask shared by the devices needs no lock.
+@@ -100,6 +135,7 @@ static void kwinput_close(struct input_dev *dev)
+ 	kwinput_open_mask &= ~BIT((unsigned long)input_get_drvdata(dev));
+ 	wasm_driver_input_state(kwinput_open_mask);
+ }
++#endif
+ 
+ static struct input_dev *__init kwinput_alloc(unsigned long which,
+ 					      const char *name, u16 product)
+@@ -131,11 +167,6 @@ static int __init kwinput_init(void)
+ 		pr_info("kwinput: no host input\n");
+ 		return 0;
+ 	}
+-	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
+-	if (IS_ENABLED(CONFIG_SMP)) {
+-		pr_warn("kwinput: input devices are not supported on SMP kernels yet\n");
+-		return 0;
+-	}
+ 
+ 	kbd = kwinput_alloc(KWINPUT_KEYBOARD, "kwinput keyboard", 1);
+ 	mouse = kwinput_alloc(KWINPUT_MOUSE, "kwinput mouse", 2);
+-- 
+2.56.0
+

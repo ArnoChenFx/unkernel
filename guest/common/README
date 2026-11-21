@@ -29,6 +29,12 @@ Things to try
                     run docker. Containers use the guest's network.
 @end
   glimmer           A tiny game, with graphics and sound.
+@if debian
+  kmscube           A spinning cube drawn by your GPU: on the web page
+                    the guest has /dev/dri, and Mesa renders through
+                    the browser's WebGL2. Any key stops it. X with
+                    glamor: Xorg :0 -config kw-kms.conf
+@end
   python3 -m http.server 8000
                     A guest web server (on the web page it opens in the
                     preview, Ctrl-A p).

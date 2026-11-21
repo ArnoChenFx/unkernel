@@ -1,0 +1,194 @@
+From f516146ff504d72b7b2d6541f1bafd27d5396085 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 20:16:03 +0000
+Subject: [PATCH] wasm: kwshm on SMP
+
+kw_host_call(fn, arg) runs fn on CPU 0, where the host's device imports
+answer: at once there, else in a work item on CPU 0 while the caller
+sleeps (work_on_cpu()). A task in the kernel stays on its CPU, so the
+check cannot go stale.
+
+kwshm's work item, which takes the host's requests, now runs on CPU 0,
+and a guest export or release on another CPU attaches and detaches
+through kw_host_call(); the caller holds kwshm_lock across it, which
+the call does not take. The UP build is unchanged.
+---
+ arch/wasm/include/asm/wasm.h |  9 +++++
+ arch/wasm/kernel/smp.c       | 10 ++++++
+ drivers/misc/kwshm.c         | 66 ++++++++++++++++++++++++++++++------
+ 3 files changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index 139f3e96491..9238a99bc2e 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -113,6 +113,15 @@ int wasm_cpu_start(int cpu, struct task_struct *idle)
+  */
+ void wasm_stack_drop(struct task_struct *task)
+ 	__unkernel_import(wasm_stack_drop);
++
++/*
++ * The host's device imports answer on CPU 0 alone (its devices live in
++ * CPU 0's thread; another CPU's host ends the session if one is called
++ * there). Run @fn(@arg) on CPU 0 and return its result: at once on CPU 0,
++ * else in a work item there while the caller sleeps (smp.c). Process
++ * context only; the caller may hold locks that @fn does not take.
++ */
++long kw_host_call(long (*fn)(void *), void *arg);
+ #endif
+ 
+ /* Bits set by the host in wasm_host_irqs (see irq.h). */
+diff --git a/arch/wasm/kernel/smp.c b/arch/wasm/kernel/smp.c
+index ec63ba2d518..54f963f3471 100644
+--- a/arch/wasm/kernel/smp.c
++++ b/arch/wasm/kernel/smp.c
+@@ -24,6 +24,7 @@
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/smp.h>
++#include <linux/workqueue.h>
+ #include <asm/irq.h>
+ #include <asm/kwcpu.h>
+ #include <asm/time.h>
+@@ -155,6 +156,15 @@ void kw_handle_ipis(u32 bits)
+ 		kw_ipi_stop();
+ }
+ 
++long kw_host_call(long (*fn)(void *), void *arg)
++{
++	might_sleep();
++	/* A task in the kernel stays on its CPU (ARCH_TASKS_STAY_ON_CPU). */
++	if (!raw_smp_processor_id())
++		return fn(arg);
++	return work_on_cpu(0, fn, arg);
++}
++
+ void smp_send_stop(void)
+ {
+ 	unsigned long timeout = USEC_PER_SEC;
+diff --git a/drivers/misc/kwshm.c b/drivers/misc/kwshm.c
+index f1bf8b7cadc..d4ff2013bca 100644
+--- a/drivers/misc/kwshm.c
++++ b/drivers/misc/kwshm.c
+@@ -44,6 +44,12 @@
+  * Present only when the host offers it: wasm_driver_shm_init() < 0 means
+  * no device, and then nothing is registered or allocated. No import here
+  * suspends.
++ *
++ * SMP: the host's imports answer on CPU 0 alone. The work item runs there,
++ * and a guest's export or release on another CPU attaches and detaches
++ * through kw_host_call() (the caller sleeps, holding kwshm_lock, which the
++ * call does not take). The host reads and writes the pages while other
++ * CPUs run, which is what sharing them means.
+  */
+ 
+ #include <linux/fcntl.h>
+@@ -151,6 +157,51 @@ static unsigned long kwshm_pinned, kwshm_pin_limit;
+ static struct work_struct kwshm_work;
+ static struct kwshm_req kwshm_reqbuf;	/* only kwshm_work_fn uses it */
+ 
++#ifdef CONFIG_SMP
++#define KWSHM_CPU	0
++
++struct kwshm_attach_args {
++	u32 id, flags, gen, npages;
++	u64 size;
++	const u32 *pages;
++};
++
++static long kwshm_attach_fn(void *arg)
++{
++	struct kwshm_attach_args *a = arg;
++
++	wasm_driver_shm_attach(a->id, a->flags, a->gen, a->size, a->pages,
++			       a->npages);
++	return 0;
++}
++
++static void kwshm_host_attach(u32 id, u32 flags, u32 gen, u64 size,
++			      const u32 *pages, u32 npages)
++{
++	struct kwshm_attach_args a = {
++		.id = id, .flags = flags, .gen = gen, .npages = npages,
++		.size = size, .pages = pages,
++	};
++
++	kw_host_call(kwshm_attach_fn, &a);
++}
++
++static long kwshm_detach_fn(void *arg)
++{
++	wasm_driver_shm_detach((u32)(unsigned long)arg);
++	return 0;
++}
++
++static void kwshm_host_detach(u32 id)
++{
++	kw_host_call(kwshm_detach_fn, (void *)(unsigned long)id);
++}
++#else
++#define KWSHM_CPU	WORK_CPU_UNBOUND
++#define kwshm_host_attach	wasm_driver_shm_attach
++#define kwshm_host_detach	wasm_driver_shm_detach
++#endif
++
+ static int kwshm_pin(struct file *file, loff_t start, u64 size,
+ 		     struct kwshm_pins *p)
+ {
+@@ -259,7 +310,7 @@ static int kwshm_attach(struct kwshm_export_rec *e, struct kwshm_pins *p)
+ 			/* Guest RAM is below 4 GiB (the lowered build relies on it too). */
+ 			tab[k++] = (u32)(unsigned long)folio_address(f) + (j << PAGE_SHIFT);
+ 	}
+-	wasm_driver_shm_attach(e->id, e->flags, e->gen, p->size, tab, k);
++	kwshm_host_attach(e->id, e->flags, e->gen, p->size, tab, k);
+ 	kvfree(tab);
+ 	return 0;
+ }
+@@ -316,7 +367,7 @@ static struct kwshm_export_rec *kwshm_new(struct file *file, loff_t start,
+ 
+ static void kwshm_drop(struct kwshm_export_rec *e)
+ {
+-	wasm_driver_shm_detach(e->id);	/* the host lets go first */
++	kwshm_host_detach(e->id);	/* the host lets go first */
+ 	idr_remove(&kwshm_ids, e->id);
+ 	if (e->owner)
+ 		list_del(&e->node);
+@@ -495,12 +546,12 @@ static void kwshm_work_fn(struct work_struct *work)
+ 		wasm_driver_shm_reply(r->tag, ret);
+ 	}
+ 	/* More may be queued: let other work run first. */
+-	schedule_work(&kwshm_work);
++	queue_work_on(KWSHM_CPU, system_percpu_wq, &kwshm_work);
+ }
+ 
+ static irqreturn_t kwshm_irq(int irq, void *dev_id)
+ {
+-	schedule_work(&kwshm_work);
++	queue_work_on(KWSHM_CPU, system_percpu_wq, &kwshm_work);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -629,11 +680,6 @@ static int __init kwshm_init(void)
+ 		pr_info("kwshm: no host shm\n");
+ 		return 0;
+ 	}
+-	/* SMP: not yet; its host imports answer on CPU 0 alone, from any context. */
+-	if (IS_ENABLED(CONFIG_SMP)) {
+-		pr_warn("kwshm: not supported on SMP kernels yet\n");
+-		return -ENODEV;
+-	}
+ 	/* Held pages, including truncated ones still held: at most half of RAM. */
+ 	kwshm_pin_limit = totalram_pages() / 2;
+ 	INIT_WORK(&kwshm_work, kwshm_work_fn);
+@@ -647,7 +693,7 @@ static int __init kwshm_init(void)
+ 	}
+ 	pr_info("kwshm: host shm, /dev/kwshm\n");
+ 	/* Requests may have been queued before the handler existed. */
+-	schedule_work(&kwshm_work);
++	queue_work_on(KWSHM_CPU, system_percpu_wq, &kwshm_work);
+ 	return 0;
+ }
+ device_initcall(kwshm_init);
+-- 
+2.56.0
+

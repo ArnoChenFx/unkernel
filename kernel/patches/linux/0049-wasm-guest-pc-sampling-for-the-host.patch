@@ -1,0 +1,599 @@
+From 5c5ae398c1329a675d2c1c3a59b63317692dd703 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Fri, 20 Nov 2026 16:38:40 +0000
+Subject: [PATCH] wasm: guest pc sampling for the host
+
+Let the host see where user time goes, by task and user pc, in two
+domains:
+
+- time: the host sets the new WASM_IRQ_PROFILE (bit 9) in each CPU's
+  word of pending interrupts at its own rate, which needs a thread of
+  its own and so a shared memory (the SMP kernel). kwemu polls the word
+  at block ends; the sample takes the pc there and, from
+  kw_debug_last_stop(), the block that ran before and the tier that saw
+  the stop. If the last kw_run() retired nothing, or the bit is taken
+  outside user mode, the sample is the kernel's or the idle task's;
+- instructions: every kw_prof.insn_period user instructions of a CPU,
+  exactly, by lowering kwemu's budget to what is left of the period and
+  giving the slice the rest back. A stop that is only such a sample
+  enters kw_run() again without clearing the exclusive monitor, as if
+  user code had not stopped.
+
+A user sample also names the file that backs its address and the offset
+in it, so the host can add up the same code across processes whatever
+ASLR did. The interrupt cannot take mmap_lock, so it only notes a user
+time sample, and do_user_interrupt() records it right after, on the way
+back to user mode, as user_mode_loop() does an instruction sample: task
+context with nothing held, where a trylock suffices (a busy lock leaves
+the file unknown). A file gets an id when first seen, keyed by device
+and inode, and its path once in a table of 512 names the host reads.
+
+Each CPU writes its own ring of 512 samples in the exported struct
+kw_prof; the host reads them and writes only the flags, the period and
+the ring tails. Samples that find a ring full are counted. With sampling
+off the cost is one load per kw_run().
+---
+ arch/wasm/include/asm/irq.h    |   1 +
+ arch/wasm/include/asm/kwprof.h | 106 +++++++++++
+ arch/wasm/kernel/Makefile      |   1 +
+ arch/wasm/kernel/irq.c         |   5 +
+ arch/wasm/kernel/kwemu_stub.c  |   6 +
+ arch/wasm/kernel/prof.c        | 314 +++++++++++++++++++++++++++++++++
+ arch/wasm/kernel/traps.c       |  18 ++
+ 7 files changed, 451 insertions(+)
+ create mode 100644 arch/wasm/include/asm/kwprof.h
+ create mode 100644 arch/wasm/kernel/prof.c
+
+diff --git a/arch/wasm/include/asm/irq.h b/arch/wasm/include/asm/irq.h
+index c1d20c26db9..edb3f3b94e5 100644
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -14,6 +14,7 @@
+ #define WASM_IRQ_VSOCK			6	/* host: kwvsock packets queued, or room again */
+ #define WASM_IRQ_SHM			7	/* host: kwshm requests queued */
+ #define WASM_IRQ_SNAPSHOT		8	/* host: park every task, then wasm_snapshot_point() */
++#define WASM_IRQ_PROFILE		9	/* host: take a time sample (prof.c), set in every CPU's word */
+ #define WASM_IRQ_VIRTIO			10	/* host: kwvirtio used buffers or a config change */
+ 
+ /*
+diff --git a/arch/wasm/include/asm/kwprof.h b/arch/wasm/include/asm/kwprof.h
+new file mode 100644
+index 00000000000..4daed46617f
+--- /dev/null
++++ b/arch/wasm/include/asm/kwprof.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Guest PC sampling for the host (prof.c; host js/core/profile.ts). The
++ * host reads struct kw_prof (the exported symbol kw_prof) by the offsets
++ * below, and the names of the files samples refer to at kw_prof.files, and
++ * writes only `flags`, `insn_period` and each ring's `tail`.
++ */
++
++#ifndef _ASM_WASM_KWPROF_H
++#define _ASM_WASM_KWPROF_H
++
++#include <linux/cache.h>
++#include <linux/compiler.h>
++#include <linux/types.h>
++
++/* The layout below; the host refuses another. */
++#define KW_PROF_VERSION		2
++/* Samples per CPU ring (a power of two). */
++#define KW_PROF_RING		512
++/* Files with a name in kw_prof.files, and the bytes of each name (with the NUL). */
++#define KW_PROF_FILES		512
++#define KW_PROF_PATH		128
++
++/* kw_prof.flags (host): what to sample. */
++#define KW_PROF_TIME		1	/* on WASM_IRQ_PROFILE, which the host sets */
++#define KW_PROF_INSNS		2	/* every insn_period user instructions of a CPU */
++
++/* kw_prof_sample.kind */
++#define KW_PROF_USER		1	/* time: user code at pc, after block */
++#define KW_PROF_KERNEL		2	/* time: in the kernel (pc: the task's user pc, or 0) */
++#define KW_PROF_IDLE		3	/* time: the idle task */
++#define KW_PROF_INSN		4	/* instructions: pc is the next one to retire */
++
++/*
++ * kw_prof_sample.file, for KW_PROF_USER and KW_PROF_INSN: what backs the
++ * sample's address (`block` if set, else `pc`). 1..KW_PROF_FILES: a file,
++ * whose name is kw_prof.files[file - 1] and `off` the address's offset in
++ * it (stable across processes, whatever ASLR did); else one of these.
++ */
++#define KW_PROF_FILE_ANON	0		/* anonymous memory (a JIT's code, [vdso]): pc only */
++#define KW_PROF_FILE_FULL	0xfffffffe	/* a file, but every name slot is taken */
++#define KW_PROF_FILE_UNKNOWN	0xffffffff	/* not looked up (other kinds), no VMA, or mmap_lock busy */
++
++struct kw_prof_sample {
++	u64 pc;
++	u64 block;	/* KW_PROF_USER: start pc of the block that ran before, 0 if unknown */
++	u64 icount;	/* the CPU's retired user instructions */
++	u32 pid;	/* the thread */
++	u32 tgid;
++	u16 cpu;
++	u8 kind;
++	u8 tier;	/* KW_PROF_USER: how kwemu saw the stop (kw_debug_last_stop) */
++	u32 file;	/* KW_PROF_FILE_* or a file id (above) */
++	char comm[16];
++	u64 off;	/* a file id: the file offset of the sample's address */
++};
++
++struct kw_prof_ring {
++	u32 head;	/* the CPU's next sample (release) */
++	u32 dropped;	/* samples that found the ring full */
++	u32 _pad0[6];
++	u32 tail;	/* the host's next sample to read */
++	u32 _pad1[7];
++	struct kw_prof_sample s[KW_PROF_RING];
++};
++
++struct kw_prof {
++	u32 version;
++	u32 flags;
++	u64 insn_period;
++	u32 nr_rings;
++	u32 ring_size;
++	u32 rec_size;
++	u32 ring_stride;
++	u32 rings_off;
++	u32 irq_bit;
++	/* Address of the names, char[max_files][path_size] (filled at boot). */
++	u32 files;
++	u32 max_files;
++	u32 path_size;
++	/* Names written (release): file ids 1..nr_files have one. */
++	u32 nr_files;
++	/* Each possible CPU's word of pending interrupts (filled at boot). */
++	u32 irq_word[NR_CPUS];
++	struct kw_prof_ring rings[NR_CPUS] ____cacheline_aligned;
++};
++
++struct kw_cpu;
++struct pt_regs;
++
++extern struct kw_prof kw_prof;
++
++static __always_inline bool kw_prof_active(void)
++{
++	return READ_ONCE(kw_prof.flags) != 0;
++}
++
++/* user_mode_loop() around kw_run() while kw_prof_active() (traps.c). */
++u64 kw_prof_enter(struct kw_cpu *cpu);
++bool kw_prof_leave(struct kw_cpu *cpu, struct pt_regs *regs, unsigned int ev, u64 rest);
++/* WASM_IRQ_PROFILE taken (irq.c), with the frame it interrupted. */
++void kw_prof_tick(struct pt_regs *regs);
++/* do_user_interrupt() after the interrupts (traps.c): record a user time sample. */
++void kw_prof_user_tick(void);
++
++#endif /* _ASM_WASM_KWPROF_H */
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index 9f398f70b37..b772b6c7a99 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -9,6 +9,7 @@ obj-y += irq.o
+ obj-y += irqflags.o
+ obj-$(CONFIG_KW_PARK) += park.o
+ obj-y += process.o
++obj-y += prof.o
+ obj-y += ptrace.o
+ obj-y += random.o
+ obj-y += reboot.o
+diff --git a/arch/wasm/kernel/irq.c b/arch/wasm/kernel/irq.c
+index 477eda768e2..69ca8bcd6e1 100644
+--- a/arch/wasm/kernel/irq.c
++++ b/arch/wasm/kernel/irq.c
+@@ -18,6 +18,7 @@
+ #include <linux/export.h>
+ #include <asm/irq.h>
+ #include <asm/irq_regs.h>
++#include <asm/kwprof.h>
+ #include <asm/park.h>
+ #include <asm/time.h>
+ #include <asm/wasm.h>
+@@ -145,6 +146,10 @@ void wasm_poll_irqs(struct pt_regs *regs)
+ 		kw_handle_ipis(pending & KW_IPI_MASK);
+ 	pending &= ~KW_IPI_MASK;
+ #endif
++	if (pending & BIT(WASM_IRQ_PROFILE)) {
++		kw_prof_tick(regs);
++		pending &= ~BIT(WASM_IRQ_PROFILE);
++	}
+ 	for (irq = 0; pending; irq++, pending >>= 1)
+ 		if (pending & 1)
+ 			generic_handle_irq(irq);
+diff --git a/arch/wasm/kernel/kwemu_stub.c b/arch/wasm/kernel/kwemu_stub.c
+index 62408b5d699..f47a82dfbd4 100644
+--- a/arch/wasm/kernel/kwemu_stub.c
++++ b/arch/wasm/kernel/kwemu_stub.c
+@@ -43,3 +43,9 @@ uint64_t kw_set_isa(struct kw_cpu *cpu, uint64_t isa)
+ }
+ 
+ void kw_host_reset(struct kw_cpu *cpu) { }
++
++u32 kw_debug_last_stop(struct kw_cpu *cpu, u64 *block)
++{
++	*block = 0;
++	return 0;
++}
+diff --git a/arch/wasm/kernel/prof.c b/arch/wasm/kernel/prof.c
+new file mode 100644
+index 00000000000..6a2e90487b5
+--- /dev/null
++++ b/arch/wasm/kernel/prof.c
+@@ -0,0 +1,314 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Guest PC sampling for the host (js/core/profile.ts): where user time goes,
++ * by task and user pc, in two domains.
++ *
++ * - Time: the host sets WASM_IRQ_PROFILE in each CPU's word of pending
++ *   interrupts at its own rate (it needs a thread of its own, so a shared
++ *   memory: the SMP kernel). kwemu polls the word at block ends, so the bit
++ *   stops user code within a block, and the sample takes the pc there and,
++ *   from kw_debug_last_stop(), the block that ran before it (the stop pc is
++ *   the next block's start) and the tier that saw it. If the last kw_run()
++ *   retired nothing (the bit was pending when it began) or the bit is taken
++ *   outside user mode, the time went to the kernel or idle, and the sample
++ *   says so.
++ * - Instructions: every insn_period user instructions of a CPU, exactly, by
++ *   lowering kwemu's budget to what is left of the period (its budget is
++ *   exact) and giving the slice the rest back afterwards.
++ *
++ * Each CPU writes its own ring (single producer, interrupts off; the host is
++ * the single consumer), so nothing is shared between CPUs. Samples that find
++ * the ring full are counted. The state is plain memory: a snapshot keeps it,
++ * and the host resets the rings and the flags when it attaches.
++ *
++ * A user sample also says which file backs its address and at what offset
++ * (kw_prof_where()), so the host can add up the same code across processes
++ * whatever ASLR did. That needs the task's mmap_lock, which the interrupt
++ * cannot take: a user time sample is only noted by kw_prof_tick() and
++ * recorded by kw_prof_user_tick() right after, in do_user_interrupt(), and
++ * an instruction sample in user_mode_loop(). Both are task context with
++ * interrupts off and nothing held, on the way back to user mode, so a
++ * trylock (never a sleep) suffices; a busy lock leaves the file unknown.
++ * Each file gets an id when first seen (keyed by device and inode, so all
++ * processes share it) and its path, once, in kw_prof_files[], which the host
++ * reads by id; when the KW_PROF_FILES slots are taken, further files are
++ * KW_PROF_FILE_FULL.
++ */
++
++#include <linux/dcache.h>
++#include <linux/fs.h>
++#include <linux/hash.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/mmap_lock.h>
++#include <linux/percpu.h>
++#include <linux/pid.h>
++#include <linux/sched.h>
++#include <linux/sched/task_stack.h>
++#include <linux/smp.h>
++#include <linux/string.h>
++#include <asm/irq.h>
++#include <asm/kw_emu.h>
++#include <asm/kwcpu.h>
++#include <asm/kwprof.h>
++#include <asm/ptrace.h>
++#include <asm/wasm.h>
++
++/* kwemu, not part of its ABI: how the last interrupt or budget stop was seen. */
++u32 kw_debug_last_stop(struct kw_cpu *cpu, u64 *block);
++
++struct kw_prof kw_prof = {
++	.version	= KW_PROF_VERSION,
++	.nr_rings	= NR_CPUS,
++	.ring_size	= KW_PROF_RING,
++	.rec_size	= sizeof(struct kw_prof_sample),
++	.ring_stride	= sizeof(struct kw_prof_ring),
++	.rings_off	= offsetof(struct kw_prof, rings),
++	.irq_bit	= WASM_IRQ_PROFILE,
++	.max_files	= KW_PROF_FILES,
++	.path_size	= KW_PROF_PATH,
++};
++
++/* Read by the host: file id n's path is kw_prof_files[n - 1]. */
++static char kw_prof_files[KW_PROF_FILES][KW_PROF_PATH];
++
++/* Which file has which id: open addressing, never more than half full. */
++#define KW_PROF_HASH_BITS	(ilog2(KW_PROF_FILES) + 1)
++struct kw_prof_key {
++	u64 ino;
++	dev_t dev;
++	u32 id;		/* 0: free */
++};
++static struct kw_prof_key kw_prof_keys[1 << KW_PROF_HASH_BITS];
++static DEFINE_SPINLOCK(kw_prof_files_lock);
++static char kw_prof_path_buf[256];	/* d_path() under kw_prof_files_lock */
++
++struct kw_prof_cpu {
++	u64 icount0;	/* cpu->icount when kw_run() began */
++	u64 retired;	/* user instructions retired since kw_run() last returned for a reason of its own */
++	u64 carry;	/* retired before a stop that was only the period's end */
++	u64 left;	/* of the instruction period */
++	bool counting;	/* this kw_run() counts towards the period */
++	bool tick;	/* kw_prof_tick() noted a user time sample (below) */
++	u8 tick_tier;
++	u64 tick_pc;
++	u64 tick_block;
++};
++
++static DEFINE_PER_CPU(struct kw_prof_cpu, kw_prof_cpu);
++
++static int __init kw_prof_init(void)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++#ifdef CONFIG_SMP
++		kw_prof.irq_word[cpu] = (u32)(unsigned long)kw_irq_word_of(cpu);
++#else
++		kw_prof.irq_word[cpu] = (u32)(unsigned long)&wasm_host_irqs;
++#endif
++	kw_prof.files = (u32)(unsigned long)kw_prof_files;
++	return 0;
++}
++early_initcall(kw_prof_init);
++
++/* The path the task sees (an overlay's, not its lower layer's), its tail if long. */
++static void kw_prof_name(struct file *f, char *out)
++{
++	char *p = d_path(file_user_path(f), kw_prof_path_buf, sizeof(kw_prof_path_buf));
++	size_t n;
++
++	if (IS_ERR(p)) {
++		snprintf(out, KW_PROF_PATH, ".../%pD4", f);
++		return;
++	}
++	n = strlen(p);
++	if (n >= KW_PROF_PATH)
++		p += n - (KW_PROF_PATH - 1);
++	strscpy(out, p, KW_PROF_PATH);
++}
++
++/* The id of f's file, naming it when first seen. Interrupts off. */
++static u32 kw_prof_file_id(struct file *f)
++{
++	struct inode *inode = file_inode(f);
++	dev_t dev = inode->i_sb->s_dev;
++	u64 ino = inode->i_ino;
++	u32 i = hash_64(ino ^ ((u64)dev << 32), KW_PROF_HASH_BITS);
++	struct kw_prof_key *k;
++	u32 id;
++
++	spin_lock(&kw_prof_files_lock);
++	for (;; i = (i + 1) & (ARRAY_SIZE(kw_prof_keys) - 1)) {
++		k = &kw_prof_keys[i];
++		if (!k->id)
++			break;
++		if (k->ino == ino && k->dev == dev) {
++			id = k->id;
++			goto out;
++		}
++	}
++	id = kw_prof.nr_files;
++	if (id >= KW_PROF_FILES) {
++		id = KW_PROF_FILE_FULL;
++		goto out;
++	}
++	kw_prof_name(f, kw_prof_files[id]);
++	*k = (struct kw_prof_key){ .ino = ino, .dev = dev, .id = ++id };
++	smp_store_release(&kw_prof.nr_files, id);
++out:
++	spin_unlock(&kw_prof_files_lock);
++	return id;
++}
++
++/*
++ * The file that backs user address addr, and the offset in it. Task context,
++ * interrupts off, nothing held (see above): never sleeps.
++ */
++static void kw_prof_where(struct kw_prof_sample *s, u64 addr)
++{
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++
++	s->file = KW_PROF_FILE_UNKNOWN;
++	s->off = 0;
++	if (!mm || !mmap_read_trylock(mm))
++		return;
++	vma = vma_lookup(mm, addr);
++	if (vma && vma->vm_file) {
++		s->file = kw_prof_file_id(vma->vm_file);
++		if (s->file != KW_PROF_FILE_FULL)
++			s->off = ((u64)vma->vm_pgoff << PAGE_SHIFT) + addr - vma->vm_start;
++	} else if (vma) {
++		s->file = KW_PROF_FILE_ANON;
++	}
++	mmap_read_unlock(mm);
++}
++
++/*
++ * Interrupts off, on this CPU. `where`: look up the file at block (if set,
++ * else pc), only from task context (see above).
++ */
++static void kw_prof_record(unsigned int kind, u64 pc, u64 block, unsigned int tier, bool where)
++{
++	unsigned int cpu = smp_processor_id();
++	struct kw_prof_ring *r = &kw_prof.rings[cpu];
++	struct kw_prof_sample *s;
++	u32 head = r->head;
++
++	BUILD_BUG_ON(sizeof(current->comm) < sizeof(s->comm));
++	if (head - smp_load_acquire(&r->tail) >= KW_PROF_RING) {
++		WRITE_ONCE(r->dropped, r->dropped + 1);
++		return;
++	}
++	s = &r->s[head % KW_PROF_RING];
++	s->pc = pc;
++	s->block = block;
++	s->icount = wasm_kw_cpu->icount;
++	s->pid = task_pid_nr(current);
++	s->tgid = task_tgid_nr(current);
++	s->cpu = cpu;
++	s->kind = kind;
++	s->tier = tier;
++	memcpy(s->comm, current->comm, sizeof(s->comm));
++	if (where) {
++		kw_prof_where(s, block ? block : pc);
++	} else {
++		s->file = KW_PROF_FILE_UNKNOWN;
++		s->off = 0;
++	}
++	smp_store_release(&r->head, head + 1);
++}
++
++/*
++ * Before kw_run(): with instruction samples on, lower the budget to what is
++ * left of the period; returns the part of the slice taken away.
++ */
++u64 kw_prof_enter(struct kw_cpu *cpu)
++{
++	struct kw_prof_cpu *p = this_cpu_ptr(&kw_prof_cpu);
++	u64 period = READ_ONCE(kw_prof.insn_period);
++	u64 rest = 0;
++
++	p->icount0 = cpu->icount;
++	p->counting = (READ_ONCE(kw_prof.flags) & KW_PROF_INSNS) && period;
++	if (!p->counting)
++		return 0;
++	if (!p->left || p->left > period)
++		p->left = period;
++	if (cpu->budget > p->left) {
++		rest = cpu->budget - p->left;
++		cpu->budget = p->left;
++	}
++	return rest;
++}
++
++/*
++ * After kw_run(): give the slice its rest back, and take an instruction
++ * sample where the period ended. True if kw_run() stopped only for that
++ * (not a slice end).
++ */
++bool kw_prof_leave(struct kw_cpu *cpu, struct pt_regs *regs, unsigned int ev, u64 rest)
++{
++	struct kw_prof_cpu *p = this_cpu_ptr(&kw_prof_cpu);
++	u64 retired = cpu->icount - p->icount0;
++
++	p->retired = p->carry + retired;
++	p->carry = 0;
++	if (!p->counting)
++		return false;
++	p->counting = false;
++	cpu->budget += rest;
++	if (retired < p->left) {
++		p->left -= retired;
++		return false;
++	}
++	p->left = 0;
++	kw_prof_record(KW_PROF_INSN, regs->user.pc, 0, 0, true);
++	if (ev != KW_EV_BUDGET || !rest)
++		return false;
++	/* User code goes on at once: a time sample after this counts it. */
++	p->carry = p->retired;
++	return true;
++}
++
++/*
++ * In the interrupt: a user sample is only noted here, and recorded by
++ * kw_prof_user_tick(), which do_user_interrupt() calls right after (the
++ * only caller with a user frame).
++ */
++void kw_prof_tick(struct pt_regs *regs)
++{
++	struct kw_prof_cpu *p = this_cpu_ptr(&kw_prof_cpu);
++	struct task_struct *t = current;
++	unsigned int kind;
++	u64 pc = 0;
++
++	if (!(READ_ONCE(kw_prof.flags) & KW_PROF_TIME))
++		return;
++	if (user_mode(regs) && p->retired) {
++		p->tick = true;
++		p->tick_pc = regs->user.pc;
++		p->tick_tier = kw_debug_last_stop(wasm_kw_cpu, &p->tick_block);
++		return;
++	} else if (is_idle_task(t)) {
++		kind = KW_PROF_IDLE;
++	} else {
++		kind = KW_PROF_KERNEL;
++		if (user_mode(regs))
++			pc = regs->user.pc;
++		else if (!(t->flags & PF_KTHREAD))
++			pc = task_pt_regs(t)->user.pc;
++	}
++	kw_prof_record(kind, pc, 0, 0, false);
++}
++
++void kw_prof_user_tick(void)
++{
++	struct kw_prof_cpu *p = this_cpu_ptr(&kw_prof_cpu);
++
++	if (!p->tick)
++		return;
++	p->tick = false;
++	kw_prof_record(KW_PROF_USER, p->tick_pc, p->tick_block, p->tick_tier, true);
++}
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index 9b2e701ea82..0d16828b786 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -17,6 +17,7 @@
+ #include <asm/irq.h>
+ #include <asm/kw_emu.h>
+ #include <asm/kwcpu.h>
++#include <asm/kwprof.h>
+ #include <asm/park.h>
+ #include <asm/syscall.h>
+ #include <asm/tlbflush.h>
+@@ -118,6 +119,8 @@ static void do_user_interrupt(struct pt_regs *regs)
+ 
+ 	irqentry_enter_from_user_mode(regs);
+ 	wasm_poll_irqs(regs);
++	/* A time sample of user code, which needs task context (prof.c). */
++	kw_prof_user_tick();
+ 	irqentry_exit_to_user_mode(regs);
+ 
+ 	if (yield && IS_ENABLED(CONFIG_SMP)) {
+@@ -132,6 +135,9 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 	unsigned int ev;
+ 
+ 	for (;;) {
++		u64 prof_rest;
++		bool prof;
++
+ 		regs->cause = PT_CAUSE_NONE;
+ 
+ 		/*
+@@ -151,6 +157,11 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 		 */
+ 		kw_clear_reservation(cpu);
+ 
++		/* Guest PC sampling (prof.c): may lower the budget to its period's end. */
++resume:
++		prof = kw_prof_active();
++		prof_rest = unlikely(prof) ? kw_prof_enter(cpu) : 0;
++
+ 		/*
+ 		 * As after ERET, user mode runs with interrupts enabled. On SMP
+ 		 * without taking what is pending here: kw_run() sees it at once
+@@ -166,6 +177,13 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 		ev = kw_run(cpu, &regs->user);
+ 		local_irq_disable();
+ 
++		/*
++		 * A stop only for an instruction sample: user code goes on, as if
++		 * it had not stopped (the exclusive monitor stays).
++		 */
++		if (unlikely(prof) && kw_prof_leave(cpu, regs, ev, prof_rest))
++			goto resume;
++
+ 		/* A budget of 0 ends the next kw_run() at once (KW_EV_BUDGET). */
+ 		if (ev == KW_EV_SYSCALL || ev == KW_EV_FAULT)
+ 			cpu->budget -= min(cpu->budget, KW_ENTRY_COST);
+-- 
+2.56.0
+

@@ -1,0 +1,515 @@
+From 4d1f2935d8ea2a4cae84460375d0b34af5b5fc46 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sat, 21 Nov 2026 18:55:03 +0000
+Subject: [PATCH] wasm: kwvirtio, a virtio transport to the JavaScript host
+
+Gives the stock virtio drivers access to device models that the
+JavaScript host implements (virtio-gpu first). Wasm cannot trap MMIO,
+so instead of virtio-mmio's registers the transport calls host imports:
+the device ID, features, config space, status, each queue's size and
+ring addresses, and the queue notification. The rings are split
+virtqueues from vring_create_virtqueue().
+
+The kernel runs in the direct map (virtual == physical == Wasm linear
+address) and the host offers no VIRTIO_F_ACCESS_PLATFORM, so the rings
+and the drivers' commands carry physical addresses, which are offsets
+into the kernel's memory: the host parses the available ring, reads and
+writes the buffers and fills the used ring in place. A notification is
+a call in the caller's (often atomic) context; the host completes the
+buffers during it or later, sets the device's interrupt status (bit 0
+used buffers, bit 1 config change, as virtio-mmio's) and raises
+WASM_IRQ_VIRTIO (10), which every device shares.
+
+Each device gets a platform device kwvirtio.N as its parent, with a
+32-bit DMA mask: virtio-gpu makes the parent its DRM device, and the
+GEM shmem helper maps its page tables with the DMA API on it, which
+dma-direct does one to one.
+
+Nine imports, none of which suspends: wasm_driver_virtio_init(index)
+(the device ID, <= 0: no such device; with none at index 0 nothing is
+registered or allocated), _features(dev), _set_features(dev, features),
+_config(dev, offset, buf, len, write), _status(dev, status) (0 resets),
+_queue_max(dev, queue), _queue_set(dev, queue, num, desc, avail, used)
+(num 0 takes the queue down), _notify(dev, queue) and
+_interrupt(dev) (reads and clears the interrupt status).
+---
+ arch/wasm/include/asm/irq.h |   1 +
+ drivers/virtio/Kconfig      |  11 +
+ drivers/virtio/Makefile     |   1 +
+ drivers/virtio/kwvirtio.c   | 418 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 431 insertions(+)
+ create mode 100644 drivers/virtio/kwvirtio.c
+
+diff --git a/arch/wasm/include/asm/irq.h b/arch/wasm/include/asm/irq.h
+index 93b808d6fca..97330d57a21 100644
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -13,6 +13,7 @@
+ #define WASM_IRQ_INPUT			5	/* host: kwinput events queued */
+ #define WASM_IRQ_VSOCK			6	/* host: kwvsock packets queued, or room again */
+ #define WASM_IRQ_SHM			7	/* host: kwshm requests queued */
++#define WASM_IRQ_VIRTIO			10	/* host: kwvirtio used buffers or a config change */
+ 
+ #include <asm-generic/irq.h>
+ 
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index ce5bc0d9ea2..9d600549fbc 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -150,6 +150,17 @@ config VIRTIO_INPUT
+ 
+ 	 If unsure, say M.
+ 
++config KWVIRTIO
++	bool "unkernel host virtio devices"
++	depends on WASM && HAS_DMA
++	select VIRTIO
++	help
++	  A virtio transport to the JavaScript host of a unkernel instance:
++	  host imports instead of virtio-mmio's registers, split rings in
++	  kernel memory that the host reads in place, and one shared host
++	  interrupt. The host implements the device models (virtio-gpu so
++	  far). Without host devices nothing is registered.
++
+ config VIRTIO_MMIO
+ 	tristate "Platform bus driver for memory mapped virtio devices"
+ 	depends on HAS_IOMEM && HAS_DMA
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index eefcfe90d6b..7de04848b7f 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -4,6 +4,7 @@ obj-$(CONFIG_VIRTIO_ANCHOR) += virtio_anchor.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
++obj-$(CONFIG_KWVIRTIO) += kwvirtio.o
+ obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
+ virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
+ virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
+diff --git a/drivers/virtio/kwvirtio.c b/drivers/virtio/kwvirtio.c
+new file mode 100644
+index 00000000000..f0568d40cda
+--- /dev/null
++++ b/drivers/virtio/kwvirtio.c
+@@ -0,0 +1,418 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * kwvirtio: a virtio transport to the JavaScript host (unkernel).
++ *
++ * Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
++ *
++ * The host implements virtio device models (js/core/virtio.ts in unkernel,
++ * virtio-gpu in js/core/virtio-gpu.ts) and this transport gives the stock
++ * virtio drivers access to them. Wasm cannot trap MMIO, so instead of
++ * virtio-mmio's registers the transport calls host imports: the device ID
++ * and features, the config space, the status, each queue's size and ring
++ * addresses, and the queue notification. The rings are ordinary split
++ * virtqueues from vring_create_virtqueue().
++ *
++ * The kernel runs in the direct map (virtual == physical == Wasm linear
++ * address). Without VIRTIO_F_ACCESS_PLATFORM, which the host does not offer,
++ * virtio_ring and the drivers put physical addresses in the rings, so every
++ * address the host sees, in a ring or in a command, is an offset into the
++ * kernel's memory, which the host reads and writes in place: the device
++ * parses the available ring, reads and writes the buffers and fills the used
++ * ring itself.
++ *
++ * A notification (wasm_driver_virtio_notify()) is a call in the caller's
++ * context, often atomic, which never suspends. The host may complete the
++ * buffers during the call or later. Either way it then sets bit 0 (used
++ * buffers) or bit 1 (configuration change) of the device's interrupt status
++ * and raises WASM_IRQ_VIRTIO, which every device shares; each device's
++ * handler reads and clears its status (wasm_driver_virtio_interrupt()) and
++ * runs vring_interrupt() on its queues or virtio_config_changed().
++ *
++ * Each device gets a platform device "kwvirtio.N" as its parent, with a
++ * 32-bit DMA mask (guest RAM is below 4 GiB), since drivers map buffers
++ * with the DMA API on the parent (virtio-gpu's DRM device is the parent,
++ * and the GEM shmem helper maps its page tables through it); dma-direct
++ * maps physical addresses one to one.
++ *
++ * Present only when the host offers devices: wasm_driver_virtio_init(0) <=
++ * 0 means none, and then nothing is registered or allocated. Device N
++ * exists if devices 0..N-1 do. No import here suspends.
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ring.h>
++#include <uapi/linux/virtio_config.h>
++#include <asm/irq.h>
++#include <asm/wasm.h>
++
++#define KWVIRTIO_MAX_DEVICES	8
++
++/* The ring alignment (only the legacy layout uses it). */
++#define KWVIRTIO_VRING_ALIGN	PAGE_SIZE
++
++/* Interrupt status bits, as virtio-mmio's. */
++#define KWVIRTIO_INT_VRING	BIT(0)
++#define KWVIRTIO_INT_CONFIG	BIT(1)
++
++/* Host imports, module "unkernel" (js/core/virtio.ts). None of them suspends. */
++/* Device @index's virtio device ID; <= 0: there is no such device. */
++int wasm_driver_virtio_init(u32 index)
++	__unkernel_import(wasm_driver_virtio_init);
++/* The device's feature bits. */
++u64 wasm_driver_virtio_features(u32 dev)
++	__unkernel_import(wasm_driver_virtio_features);
++/* The features the driver accepted (FEATURES_OK follows). < 0: refused. */
++int wasm_driver_virtio_set_features(u32 dev, u64 features)
++	__unkernel_import(wasm_driver_virtio_set_features);
++/*
++ * Copy @len bytes of the config space at @offset to @buf (@write 0) or from
++ * it (@write 1), during the call. Multi-byte fields are little-endian.
++ */
++void wasm_driver_virtio_config(u32 dev, u32 offset, void *buf, u32 len, u32 write)
++	__unkernel_import(wasm_driver_virtio_config);
++/* The driver's status byte; 0 resets the device (queues, interrupt status). */
++void wasm_driver_virtio_status(u32 dev, u32 status)
++	__unkernel_import(wasm_driver_virtio_status);
++/* The largest size of queue @index; 0: the device has no such queue. */
++u32 wasm_driver_virtio_queue_max(u32 dev, u32 index)
++	__unkernel_import(wasm_driver_virtio_queue_max);
++/*
++ * Queue @index is ready with @num entries and these ring addresses
++ * (physical, i.e. kernel memory offsets), or with @num 0 no longer in use.
++ */
++int wasm_driver_virtio_queue_set(u32 dev, u32 index, u32 num, u64 desc, u64 avail, u64 used)
++	__unkernel_import(wasm_driver_virtio_queue_set);
++/* Queue @index has new available buffers. */
++void wasm_driver_virtio_notify(u32 dev, u32 index)
++	__unkernel_import(wasm_driver_virtio_notify);
++/* The device's interrupt status (KWVIRTIO_INT_*), cleared by the call. */
++u32 wasm_driver_virtio_interrupt(u32 dev)
++	__unkernel_import(wasm_driver_virtio_interrupt);
++
++struct kwvirtio_device {
++	struct virtio_device vdev;
++	struct platform_device *pdev;
++	u32 index;		/* the host's device number */
++	u8 status;
++};
++
++#define to_kwvirtio(v) container_of(v, struct kwvirtio_device, vdev)
++
++/*
++ * The imports made from process context (probe, config, status, queues) go
++ * through one dispatcher, so that they can be run elsewhere as a whole.
++ */
++enum kwvirtio_op {
++	KWV_FEATURES,
++	KWV_SET_FEATURES,
++	KWV_CONFIG,
++	KWV_STATUS,
++	KWV_QUEUE_MAX,
++	KWV_QUEUE_SET,
++};
++
++struct kwvirtio_call {
++	enum kwvirtio_op op;
++	u32 dev;
++	u32 a, b, c;		/* offset, length, write; or queue, num */
++	u64 x, y, z;		/* features; or the ring addresses */
++	void *buf;
++};
++
++static long kwvirtio_host(void *arg)
++{
++	struct kwvirtio_call *c = arg;
++
++	switch (c->op) {
++	case KWV_FEATURES:
++		c->x = wasm_driver_virtio_features(c->dev);
++		return 0;
++	case KWV_SET_FEATURES:
++		return wasm_driver_virtio_set_features(c->dev, c->x);
++	case KWV_CONFIG:
++		wasm_driver_virtio_config(c->dev, c->a, c->buf, c->b, c->c);
++		return 0;
++	case KWV_STATUS:
++		wasm_driver_virtio_status(c->dev, c->a);
++		return 0;
++	case KWV_QUEUE_MAX:
++		return wasm_driver_virtio_queue_max(c->dev, c->a);
++	case KWV_QUEUE_SET:
++		return wasm_driver_virtio_queue_set(c->dev, c->a, c->b, c->x, c->y, c->z);
++	}
++	return -EINVAL;
++}
++
++static long kwvirtio_call(struct kwvirtio_call *c)
++{
++	return kwvirtio_host(c);
++}
++
++static u64 kwvirtio_get_features(struct virtio_device *vdev)
++{
++	struct kwvirtio_call c = { .op = KWV_FEATURES, .dev = to_kwvirtio(vdev)->index };
++
++	kwvirtio_call(&c);
++	return c.x;
++}
++
++static int kwvirtio_finalize_features(struct virtio_device *vdev)
++{
++	struct kwvirtio_call c = { .op = KWV_SET_FEATURES, .dev = to_kwvirtio(vdev)->index };
++
++	/* Give virtio_ring a chance to accept features. */
++	vring_transport_features(vdev);
++	if (!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
++		dev_err(&vdev->dev, "kwvirtio devices must offer VIRTIO_F_VERSION_1\n");
++		return -EINVAL;
++	}
++	c.x = vdev->features;
++	return kwvirtio_call(&c) < 0 ? -EINVAL : 0;
++}
++
++static void kwvirtio_get(struct virtio_device *vdev, unsigned int offset,
++			 void *buf, unsigned int len)
++{
++	struct kwvirtio_call c = {
++		.op = KWV_CONFIG, .dev = to_kwvirtio(vdev)->index,
++		.a = offset, .b = len, .c = 0, .buf = buf,
++	};
++
++	kwvirtio_call(&c);
++}
++
++static void kwvirtio_set(struct virtio_device *vdev, unsigned int offset,
++			 const void *buf, unsigned int len)
++{
++	struct kwvirtio_call c = {
++		.op = KWV_CONFIG, .dev = to_kwvirtio(vdev)->index,
++		.a = offset, .b = len, .c = 1, .buf = (void *)buf,
++	};
++
++	kwvirtio_call(&c);
++}
++
++static u8 kwvirtio_get_status(struct virtio_device *vdev)
++{
++	return to_kwvirtio(vdev)->status;
++}
++
++static void kwvirtio_set_status(struct virtio_device *vdev, u8 status)
++{
++	struct kwvirtio_device *kd = to_kwvirtio(vdev);
++	struct kwvirtio_call c = { .op = KWV_STATUS, .dev = kd->index, .a = status };
++
++	/* 0 is a reset, which goes through ->reset(). */
++	WARN_ON(!status);
++	kd->status = status;
++	kwvirtio_call(&c);
++}
++
++static void kwvirtio_reset(struct virtio_device *vdev)
++{
++	struct kwvirtio_device *kd = to_kwvirtio(vdev);
++	struct kwvirtio_call c = { .op = KWV_STATUS, .dev = kd->index, .a = 0 };
++
++	/* The host resets the device during the call. */
++	kd->status = 0;
++	kwvirtio_call(&c);
++}
++
++/* Atomic context: the host takes the buffers during the call or later. */
++static bool kwvirtio_notify(struct virtqueue *vq)
++{
++	wasm_driver_virtio_notify(to_kwvirtio(vq->vdev)->index, vq->index);
++	return true;
++}
++
++static irqreturn_t kwvirtio_interrupt(int irq, void *opaque)
++{
++	struct kwvirtio_device *kd = opaque;
++	irqreturn_t ret = IRQ_NONE;
++	struct virtqueue *vq;
++	u32 status;
++
++	status = wasm_driver_virtio_interrupt(kd->index);
++	if (unlikely(status & KWVIRTIO_INT_CONFIG)) {
++		virtio_config_changed(&kd->vdev);
++		ret = IRQ_HANDLED;
++	}
++	if (likely(status & KWVIRTIO_INT_VRING)) {
++		virtio_device_for_each_vq(&kd->vdev, vq)
++			ret |= vring_interrupt(irq, vq);
++	}
++	return ret;
++}
++
++static void kwvirtio_del_vq(struct virtqueue *vq)
++{
++	struct kwvirtio_call c = {
++		.op = KWV_QUEUE_SET, .dev = to_kwvirtio(vq->vdev)->index,
++		.a = vq->index, .b = 0,
++	};
++
++	kwvirtio_call(&c);
++	vring_del_virtqueue(vq);
++}
++
++static void kwvirtio_del_vqs(struct virtio_device *vdev)
++{
++	struct virtqueue *vq, *n;
++
++	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
++		kwvirtio_del_vq(vq);
++	free_irq(WASM_IRQ_VIRTIO, to_kwvirtio(vdev));
++}
++
++static void kwvirtio_synchronize_cbs(struct virtio_device *vdev)
++{
++	synchronize_irq(WASM_IRQ_VIRTIO);
++}
++
++static struct virtqueue *kwvirtio_setup_vq(struct virtio_device *vdev, unsigned int index,
++					   void (*callback)(struct virtqueue *vq),
++					   const char *name, bool ctx)
++{
++	struct kwvirtio_device *kd = to_kwvirtio(vdev);
++	struct kwvirtio_call c = { .op = KWV_QUEUE_MAX, .dev = kd->index, .a = index };
++	struct virtqueue *vq;
++	unsigned int num;
++	long err;
++
++	num = kwvirtio_call(&c);
++	if (!num)
++		return ERR_PTR(-ENOENT);
++	vq = vring_create_virtqueue(index, num, KWVIRTIO_VRING_ALIGN, vdev,
++				    true, true, ctx, kwvirtio_notify, callback, name);
++	if (!vq)
++		return ERR_PTR(-ENOMEM);
++	vq->num_max = num;
++
++	c = (struct kwvirtio_call){
++		.op = KWV_QUEUE_SET, .dev = kd->index,
++		.a = index, .b = virtqueue_get_vring_size(vq),
++		.x = virtqueue_get_desc_addr(vq),
++		.y = virtqueue_get_avail_addr(vq),
++		.z = virtqueue_get_used_addr(vq),
++	};
++	err = kwvirtio_call(&c);
++	if (err < 0) {
++		vring_del_virtqueue(vq);
++		return ERR_PTR(err);
++	}
++	return vq;
++}
++
++static int kwvirtio_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
++			     struct virtqueue *vqs[],
++			     struct virtqueue_info vqs_info[],
++			     struct irq_affinity *desc)
++{
++	int i, err, queue_idx = 0;
++
++	err = request_irq(WASM_IRQ_VIRTIO, kwvirtio_interrupt, IRQF_SHARED,
++			  dev_name(&vdev->dev), to_kwvirtio(vdev));
++	if (err)
++		return err;
++
++	for (i = 0; i < nvqs; ++i) {
++		struct virtqueue_info *vqi = &vqs_info[i];
++
++		if (!vqi->name) {
++			vqs[i] = NULL;
++			continue;
++		}
++		vqs[i] = kwvirtio_setup_vq(vdev, queue_idx++, vqi->callback,
++					   vqi->name, vqi->ctx);
++		if (IS_ERR(vqs[i])) {
++			kwvirtio_del_vqs(vdev);
++			return PTR_ERR(vqs[i]);
++		}
++	}
++	return 0;
++}
++
++static const char *kwvirtio_bus_name(struct virtio_device *vdev)
++{
++	return dev_name(&to_kwvirtio(vdev)->pdev->dev);
++}
++
++static const struct virtio_config_ops kwvirtio_config_ops = {
++	.get			= kwvirtio_get,
++	.set			= kwvirtio_set,
++	.get_status		= kwvirtio_get_status,
++	.set_status		= kwvirtio_set_status,
++	.reset			= kwvirtio_reset,
++	.find_vqs		= kwvirtio_find_vqs,
++	.del_vqs		= kwvirtio_del_vqs,
++	.synchronize_cbs	= kwvirtio_synchronize_cbs,
++	.get_features		= kwvirtio_get_features,
++	.finalize_features	= kwvirtio_finalize_features,
++	.bus_name		= kwvirtio_bus_name,
++};
++
++static void kwvirtio_release(struct device *dev)
++{
++	struct virtio_device *vdev = dev_to_virtio(dev);
++
++	kfree(to_kwvirtio(vdev));
++}
++
++static int __init kwvirtio_add(u32 index, int id)
++{
++	struct platform_device_info info = {
++		.name = "kwvirtio",
++		.id = index,
++		.dma_mask = DMA_BIT_MASK(32),
++	};
++	struct kwvirtio_device *kd;
++	struct platform_device *pdev;
++	int err;
++
++	pdev = platform_device_register_full(&info);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++	kd = kzalloc_obj(*kd);
++	if (!kd) {
++		platform_device_unregister(pdev);
++		return -ENOMEM;
++	}
++	kd->pdev = pdev;
++	kd->index = index;
++	kd->vdev.id.device = id;
++	kd->vdev.id.vendor = VIRTIO_DEV_ANY_ID;
++	kd->vdev.config = &kwvirtio_config_ops;
++	kd->vdev.dev.parent = &pdev->dev;
++	kd->vdev.dev.release = kwvirtio_release;
++
++	err = register_virtio_device(&kd->vdev);
++	if (err) {
++		put_device(&kd->vdev.dev);	/* frees kd */
++		platform_device_unregister(pdev);
++		return err;
++	}
++	pr_info("kwvirtio.%u: virtio device %d\n", index, id);
++	return 0;
++}
++
++static int __init kwvirtio_init(void)
++{
++	u32 i;
++	int id;
++
++	for (i = 0; i < KWVIRTIO_MAX_DEVICES; i++) {
++		id = wasm_driver_virtio_init(i);
++		if (id <= 0)
++			break;
++		if (kwvirtio_add(i, id))
++			pr_warn("kwvirtio.%u: virtio device %d not added\n", i, id);
++	}
++	return 0;
++}
++device_initcall(kwvirtio_init);
+-- 
+2.56.0
+

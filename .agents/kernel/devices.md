@@ -270,7 +270,8 @@ There is no udev: the kw layer's rc gives `card*` to video (0660) and
 - A DIRTYFB transfers its rectangle only: the series backports
   a9cc9905ddb7 ("drm/virtio: Recalculate ignore_damage_clips on every
   update", 7.4), without which the flag sticks after the first commit that
-  changes the framebuffer.
+  changes the framebuffer, and 730f8554f35c, which keeps a rendered
+  resource's damage clips across page flips.
 - DRM_IOCTL_VIRTGPU_GET_CAPS waits up to 30 s for a capset the kernel has
   not cached, killably (patch 0048, "drm/virtio: wait up to 30 s for a
   capset"; upstream 5 s, then -EBUSY): the host loads its 3D renderer on

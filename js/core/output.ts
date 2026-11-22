@@ -71,3 +71,17 @@ export class ConsoleOutput {
 		return () => this.#listeners.delete(listener);
 	}
 }
+
+/**
+ * An error as log text: its stack, led by its name and message where the
+ * engine's stack leaves them out (Firefox and Safari give the frames alone,
+ * so "CPU 1: <frame>" said nothing of what failed).
+ */
+export function errorText(e: unknown): string {
+	const err = e as { name?: unknown; message?: unknown; stack?: unknown } | null | undefined;
+	if (err === null || typeof err !== "object") return String(e);
+	const head = `${typeof err.name === "string" && err.name ? err.name : "Error"}: ${typeof err.message === "string" ? err.message : ""}`;
+	const stack = typeof err.stack === "string" ? err.stack : "";
+	if (!stack) return head;
+	return typeof err.message === "string" && err.message && stack.includes(err.message) ? stack : `${head}\n${stack}`;
+}

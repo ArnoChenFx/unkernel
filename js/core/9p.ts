@@ -42,6 +42,7 @@ import type { MaybePromise } from "./block.ts";
 import { ERRNO, FS_DEFAULT_OWNER, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, type FsFileType, type FsSetAttr } from "./fs.ts";
 import type { MountStats } from "./mounts.ts";
 import { saveVsockConnection, type Vsock, type VsockConnection, type VsockConnSnapshot, type VsockListener } from "./vsock.ts";
+import { errorText } from "./output.ts";
 
 /** The 9p server's vsock port (the 9P well-known port; kw9p's). */
 export const P9_PORT = 564;
@@ -369,7 +370,7 @@ class Export implements P9Export {
 		if (open) this.conn = c;
 		else if (this.conn !== c || !this.connected) return;
 		this.connected = open;
-		try { this.onConnection?.(open); } catch (e) { this.server.log(`[9p] ${this.name}: onConnection threw: ${(e as Error)?.stack ?? e}`); }
+		try { this.onConnection?.(open); } catch (e) { this.server.log(`[9p] ${this.name}: onConnection threw: ${errorText(e)}`); }
 	}
 
 	remove(): void {
@@ -774,7 +775,7 @@ class Session {
 
 	#failed(what: string, e: unknown): number {
 		const n = knownErrno(e);
-		if (!n) this.#log(`${what}: ${(e as Error)?.stack ?? e}`);
+		if (!n) this.#log(`${what}: ${errorText(e)}`);
 		return n || ERRNO.EIO!;
 	}
 

@@ -21,6 +21,7 @@
 // TCP options beyond MSS and window scale (no SACK, no timestamps).
 
 import type { Kernel, NetDevice } from "./kernel.ts";
+import { errorText } from "./output.ts";
 
 /** Events a backend reports for one TCP connection. */
 export interface NetConnectionEvents {
@@ -485,7 +486,7 @@ export class NetStack implements NetDevice {
 		try {
 			this.input(frame);
 		} catch (e) {
-			this.log?.(`[net] dropped malformed frame: ${(e as Error).stack ?? e}`);
+			this.log?.(`[net] dropped malformed frame: ${errorText(e)}`);
 		}
 	}
 

@@ -37,6 +37,7 @@
 // (Connection.saveState(), VsockHost.adopt()).
 
 import type { MountsSnapshot } from "./mounts.ts";
+import { errorText } from "./output.ts";
 
 /** The host's CID (VMADDR_CID_HOST). */
 export const VSOCK_HOST_CID = 2;
@@ -823,7 +824,7 @@ class Listener implements VsockListener {
 		if (this.#handler) {
 			const h = this.#handler;
 			queueMicrotask(() => {
-				try { h(conn); } catch (e) { this.#host.log(`[vsock] listener on port ${this.port} threw: ${(e as Error)?.stack ?? e}`); }
+				try { h(conn); } catch (e) { this.#host.log(`[vsock] listener on port ${this.port} threw: ${errorText(e)}`); }
 			});
 			return;
 		}

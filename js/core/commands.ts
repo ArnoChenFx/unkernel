@@ -32,6 +32,7 @@
 import { guestRun } from "./mounts.ts";
 import { PtyError, TTY_FLAG_CRITICAL, TTY_SIGNALS, TtyFrameParser, encodeTtyFrame, type ExecResult } from "./tty.ts";
 import type { Vsock, VsockConnection, VsockListener } from "./vsock.ts";
+import { errorText } from "./output.ts";
 
 /** The host port kwcmd connects to (guest/src/kwcmd.c KWCMD_PORT). */
 export const CMD_PORT = 1020;
@@ -275,7 +276,7 @@ async function serve(conn: VsockConnection, commands: ReadonlyMap<string, HostCo
 		if (!gone) {
 			await drain();
 			direct(CMD_STDERR, `${name}: ${(e as Error)?.message ?? e}\n`);
-			log(`[host] command ${name} failed: ${(e as Error)?.stack ?? e}`);
+			log(`[host] command ${name} failed: ${errorText(e)}`);
 		}
 	}
 	await drain();
@@ -365,7 +366,7 @@ export class CommandTable {
 		try {
 			this.#listener = vsock.listen(CMD_PORT, (conn) => {
 				serve(conn, this.#commands, this.#log).catch((e) => {
-					this.#log(`[host] host command: ${(e as Error)?.stack ?? e}`);
+					this.#log(`[host] host command: ${errorText(e)}`);
 					conn.reset();
 				});
 			});

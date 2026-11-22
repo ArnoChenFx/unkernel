@@ -46,6 +46,7 @@ import { VirtioHost } from "./virtio.ts";
 import { VirtioGpu, type GpuBackend } from "./virtio-gpu.ts";
 import { VsockDevice } from "./vsock.ts";
 import { WasiHost, never } from "./wasi.ts";
+import { errorText } from "./output.ts";
 
 const IRQ_CONSOLE = 1;
 const IRQ_NET = 2;
@@ -575,7 +576,7 @@ export class Kernel {
 		this.jitMirrors.push(jitMirror);
 		ep.listen({
 			message: (m) => this.onCpuMessage(m),
-			error: (e) => this.fatal(`CPU ${cpu}: ${(e as Error)?.stack ?? e}`),
+			error: (e) => this.fatal(`CPU ${cpu}: ${errorText(e)}`),
 		});
 		return 0;
 	}
@@ -1128,7 +1129,7 @@ export class Kernel {
 	}
 
 	onTrap(e: unknown): void {
-		this.log(`[host] wasm trap: ${(e as Error)?.stack ?? e}`);
+		this.log(`[host] wasm trap: ${errorText(e)}`);
 		this.exit({ code: 254, reason: String(e), kind: "trap", error: e });
 	}
 

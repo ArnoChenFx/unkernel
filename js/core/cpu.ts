@@ -21,6 +21,7 @@
 import { ConsoleRing, type ConsoleBatch, type ConsoleFull } from "./console-ring.ts";
 import { JitHost } from "./jit.ts";
 import { ERRNO, never, yieldToEventLoop } from "./wasi.ts";
+import { errorText } from "./output.ts";
 
 /** What CPU 0's host sends to start a CPU (structured-cloneable). */
 export interface CpuInit {
@@ -200,7 +201,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 	const trap = (e: unknown) => {
 		if (exited) return;
 		exited = true;
-		port.post({ t: "trap", error: `CPU ${cpu}: ${(e as Error)?.stack ?? String(e)}` });
+		port.post({ t: "trap", error: `CPU ${cpu}: ${errorText(e)}` });
 		stopCpu0();
 	};
 

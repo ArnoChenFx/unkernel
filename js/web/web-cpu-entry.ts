@@ -6,6 +6,7 @@
 // build bundles it into a module that imports nothing.
 
 import { runCpu, type CpuInit, type CpuMessage } from "../core/cpu.ts";
+import { errorText } from "../core/output.ts";
 
 /** The dedicated worker's global (the page's tsconfig has no webworker lib). */
 const scope = globalThis as unknown as {
@@ -17,5 +18,5 @@ scope.addEventListener("message", (e) => {
 	const post = (msg: CpuMessage, transfer?: ArrayBuffer[]) => scope.postMessage(msg, transfer);
 	// runCpu() reports its own failures; this catches anything it did not
 	// (a browser's worker reports no unhandled rejection to its owner).
-	runCpu(init, { post }).catch((err: unknown) => post({ t: "fatal", msg: `CPU ${init.cpu}: ${(err as Error)?.stack ?? err}` }));
+	runCpu(init, { post }).catch((err: unknown) => post({ t: "fatal", msg: `CPU ${init.cpu}: ${errorText(err)}` }));
 }, { once: true });

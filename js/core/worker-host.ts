@@ -34,7 +34,7 @@ import type { ProfileReport } from "./profile.ts";
 import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
-import { ConsoleOutput } from "./output.ts";
+import { ConsoleOutput, errorText } from "./output.ts";
 import { SnapshotCommitError, receivedSnapshot, restoreSnapshotMemory, sentSnapshot, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
@@ -330,7 +330,7 @@ export class WorkerKernel implements KernelHandle {
 		endpoint.listen({
 			message: (m) => this.#message(m),
 			error: (e) => {
-				const msg = (e as Error)?.stack ?? String(e);
+				const msg = errorText(e);
 				this.#log(`[host] kernel worker error: ${msg}`);
 				this.#finish({ code: 255, reason: `kernel worker error: ${(e as Error)?.message ?? e}`, kind: "fatal", error: e });
 			},

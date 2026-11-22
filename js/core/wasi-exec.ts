@@ -47,6 +47,7 @@ import {
 	type WasiFromProgram, type WasiProgramEndpoint,
 } from "./wasi-program.ts";
 import { sharedMemoryAvailable } from "./worker-shared.ts";
+import { errorText } from "./output.ts";
 
 export type { WasiFromProgram, WasiProgramEndpoint, WasiProgramPort, WasiToProgram } from "./wasi-program.ts";
 
@@ -197,7 +198,7 @@ export function serveWasiProgramsWith(vsock: Vsock, opts: WasiExecOptions & Wasi
 	const pool = new WorkerPool(opts.spawn, opts.idleWorkers ?? 2, stats);
 	const shared = opts.sharedMemory ?? wasiSharedChannelAvailable();
 	const listener: VsockListener = vsock.listen(port, (conn) => {
-		void runProgram(conn, { log, maxModule, stats, cache, pool, shared }).catch((e) => log(`[wasi] ${(e as Error)?.stack ?? e}`));
+		void runProgram(conn, { log, maxModule, stats, cache, pool, shared }).catch((e) => log(`[wasi] ${errorText(e)}`));
 	});
 	return {
 		port,
@@ -525,7 +526,7 @@ async function runProgram(conn: VsockConnection, ctx: RunContext): Promise<void>
 		ctx.stats.channels++;
 		void serve()
 			.catch((e) => {
-				ctx.log(`[wasi] ${name}: ${(e as Error)?.stack ?? e}`);
+				ctx.log(`[wasi] ${name}: ${errorText(e)}`);
 				conn.reset();
 				end();
 			})

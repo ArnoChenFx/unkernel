@@ -18,6 +18,17 @@
 //      shell sets no GALLIUM_DRIVER (kw-gl.sh, for the page's kw.gl=1, leaves
 //      Mesa to find /dev/dri); with --gpu0 (?gpu=0) there is no device and
 //      the shell has GALLIUM_DRIVER=virpipe; /tmp/.virgl_test exists either way
+//   R  with the device, unless --no-resize: a display size change reaches the
+//      guest's DRM mode. test/gpu/kms-hotplug.c (built here, written into
+//      the guest) holds the display at the stage's size, the size the page
+//      offers; then the page is resized (DevTools Emulation, the window's
+//      size) five times 60 ms apart: the guest gets one hotplug (the page
+//      waits for the stage to settle), whose preferred mode is the new
+//      stage size, which the client sets; the page's canvas then has that
+//      size and the display layer (#fb-layer) and the Wayland desktop's
+//      layer (#wl-layer) cover the stage; a second resize, a second
+//      hotplug and mode; and (unless --eager) the renderer is still not
+//      loaded: a dumb-buffer KMS client needs none
 //   3  unless --no-apt: apt-get installs Mesa over the page's network (the
 //      default Wisp server, deb.debian.org through the page's CORS mirror:
 //      needs the internet), then in a login shell `eglinfo -B -p gbm` (the
@@ -35,20 +46,29 @@
 //      with ?gl=0 (its devices without GL, as every session saved before
 //      GL was on by default) is resumed by a load of the default URL,
 //      with GL off for that resume
+//   L  with --lose (and the device, after step 3): the renderer's WebGL2
+//      context lost while kmscube runs (WEBGL_lose_context; .agents/gl.md,
+//      Context loss): the Guest GL row warns "WebGL context lost"; restored,
+//      the kmscube ends; a new kmscube renders, and the row is back, counting
+//      the loss and the new renderer
 //   4  with --xorg (and the device; untested packages, reported, not judged):
 //      X.Org's modesetting driver with glamor on /dev/dri/card0 (Debian's
 //      xserver-xorg-core), then glxinfo -B and eglinfo on that X server
 //
-//   node test/gl/page-check.mjs [--port N] [--gpu0] [--eager] [--suspend] [--xorg] [--no-apt] [--chrome BIN] [--timeout S] [--cpus N]
+//   node test/gl/page-check.mjs [--port N] [--gpu0] [--eager] [--suspend] [--lose] [--xorg] [--no-apt] [--no-resize] [--inline] [--server URL] [--chrome BIN] [--timeout S] [--cpus N]
 //
 // --cpus N: ?cpus=N (default 1); --cpus 0 leaves it out (the page's default).
+// --inline: ?worker=0 (the kernel on the page's thread; default the page's worker mode).
+// --server URL: load the page from a server that already runs (only read
+// from; e.g. the dev server used by hand) instead of starting one.
 //
 // WebGL2 here is ANGLE on SwiftShader (software). Exit 0 when every check
 // run passed, 1 on a failure, 2 when it could not run.
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { findChrome, sleep, startServer } from "../../web/test/lib.mjs";
 
 const args = process.argv.slice(2);
@@ -60,7 +80,10 @@ const gpu = !args.includes("--gpu0");
 const xorg = gpu && args.includes("--xorg");
 const eager = args.includes("--eager");
 const suspendTest = args.includes("--suspend");
+const loseTest = gpu && args.includes("--lose");
+const resizeTest = gpu && !args.includes("--no-resize");
 const cpus = opt("--cpus", "1");
+const inline = args.includes("--inline");
 const chromeBin = opt("--chrome", process.env.CHROME || findChrome());
 const t0 = performance.now();
 const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
@@ -72,8 +95,11 @@ const report = (name, ok, detail) => {
 	if (!ok) fails++;
 };
 
-say(`dev server on 127.0.0.1:${port}`);
-const server = await startServer({ port, host: "127.0.0.1", dev: true }).catch((e) => {
+// --server URL: a page server that already runs (e.g. the dev server used by hand), only read from.
+const serverUrl = opt("--server");
+const base = serverUrl ? serverUrl.replace(/\/$/, "") : `http://127.0.0.1:${port}`;
+say(serverUrl ? `the running server ${base}` : `dev server on 127.0.0.1:${port}`);
+const server = serverUrl ? { kill: async () => {} } : await startServer({ port, host: "127.0.0.1", dev: true }).catch((e) => {
 	console.error(`the dev server did not start: ${e.message}`);
 	process.exit(2);
 });
@@ -131,10 +157,10 @@ try {
 	await send("Runtime.enable");
 	await send("Network.enable");
 	// Guest GL by default: no ?gl=1.
-	const url = `http://127.0.0.1:${port}/?distro=debian&data=0${cpus !== "0" ? `&cpus=${cpus}` : ""}&mem=1024&autosuspend=0&askleave=0${gpu ? "" : "&gpu=0"}${eager ? "&glload=eager" : ""}`;
+	const url = `${base}/?distro=debian&data=0${cpus !== "0" ? `&cpus=${cpus}` : ""}&mem=1024&autosuspend=0&askleave=0${inline ? "&worker=0" : ""}${gpu ? "" : "&gpu=0"}${eager ? "&glload=eager" : ""}`;
 	say(`open ${url}`);
 	await send("Page.navigate", { url });
-	for (let i = 0; i < 600 && !(await evaluate("typeof globalThis.KW?.ready === 'function'").catch(() => false)); i++) await sleep(200);
+	for (let i = 0; i < 600 && !(await evaluate("typeof globalThis.KW?.ready === 'function' && !!globalThis.KW.config").catch(() => false)); i++) await sleep(200);
 
 	// 1: GL on by default, the forwarder linked, the renderer not loaded (or, --eager, loaded)
 	const cfgGl = await evaluate(`JSON.stringify({ gl: KW.config.gl, gpu: KW.config.gpu, asked: KW.config.glAsked, eager: KW.config.glEager, cpus: KW.config.cpus, worker: KW.config.worker })`);
@@ -190,6 +216,17 @@ try {
 		: /GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1/.test(env) && !/renderD128/.test(env);
 	report("guest env", envOk && /kw\.gl=1/.test(env) && /socket/.test(env), env.trim().replace(/\n/g, "; "));
 
+	// R: the page resized, the guest's DRM mode follows
+	if (resizeTest) {
+		await resizeCheck(evaluate, send);
+		// kms-hotplug is a dumb-buffer KMS client: its DRM file makes a 3D context, which needs no renderer.
+		if (!eager) {
+			const st = JSON.parse(await evaluate("JSON.stringify(KW.vm.gl.status)"));
+			report("resize: a dumb-buffer KMS client leaves the renderer unloaded", st.state === "idle" && virglRequests.length === 0,
+				`status ${st.state}; renderer requests ${JSON.stringify(virglRequests)}`);
+		}
+	}
+
 	// 3: Mesa from apt, then eglinfo on virgl
 	if (apt) {
 		const pkgs = `mesa-utils libegl-mesa0 libgles2${gpu ? " kmscube" : ""}${xorg ? " xserver-xorg-core xserver-xorg-input-evdev libgl1-mesa-dri libglx-mesa0" : ""}`;
@@ -218,6 +255,30 @@ try {
 				const counters = /.*(virtio-gpu: (last|\d).*? errors)/.exec(row2)?.[1] ?? "";
 				say(`row: ${row2}`);
 				report("row's virtio-gpu counters", /\d+ commands/.test(counters) && !/ 0 presents/.test(counters), counters);
+			}
+			if (loseTest) {
+				// L: the context lost under kmscube, restored; a new kmscube after it
+				await evaluate(`(globalThis.__lose = KW.vm.exec("bash", ["-lc", 'mkfifo /tmp/hl && exec 3<>/tmp/hl && timeout 120 kmscube -c 600 <&3 2>&1 | tail -2'], { timeout: 200000 }).then((r) => ({ code: r.exitCode, out: r.stdout + r.stderr })), 1)`);
+				const lost = JSON.parse(await evaluate(`(async () => {
+					const gpu = KW.vm.gl.gpu;
+					for (let i = 0; i < 600 && !(gpu.scanout?.seq > 10); i++) await new Promise((r) => setTimeout(r, 100));
+					const t = gpu.scanout && gpu.texture(gpu.scanout.resource);
+					globalThis.__loseExt = t?.gl.getExtension("WEBGL_lose_context");
+					globalThis.__loseExt?.loseContext();
+					for (let i = 0; i < 50 && !gpu.stats.contextLost; i++) await new Promise((r) => setTimeout(r, 50));
+					return JSON.stringify({ lost: !!globalThis.__loseExt, contextLost: gpu.stats.contextLost, state: KW.vm.gl.status.state });
+				})()`));
+				const lostRow = await rowAt("/\\[warn\\] Guest GL: WebGL context lost/");
+				await evaluate("globalThis.__loseExt?.restoreContext(), 1");
+				const k1 = await evaluate("globalThis.__lose");
+				const k2 = await evaluate(`KW.vm.exec("bash", ["-lc", 'rm -f /tmp/hl; mkfifo /tmp/hl && exec 3<>/tmp/hl && timeout 120 kmscube -c 120 <&3 2>&1 | tail -2'], { timeout: 200000 }).then((r) => ({ code: r.exitCode, out: r.stdout + r.stderr }))`);
+				const after = JSON.parse(await evaluate("JSON.stringify({ ...KW.vm.gl.status, gpu: KW.vm.gl.stats.gpu })"));
+				const backRow = await rowAt("/^\\s*\\[(pass|warn)\\] Guest GL: (?!WebGL context lost).*lost once and a new renderer made once/");
+				report("context lost: the row warns, the running kmscube ends, a new one renders, the row counts it",
+					lost.lost && lost.contextLost && lost.state === "lost" && /WebGL context lost/.test(lostRow) && /Rendered \d+ frames/.test(k1.out) && /Rendered 1[12]\d frames/.test(k2.out) &&
+						after.state === "ready" && after.gpu.renewals === 1 && !after.gpu.contextLost && after.gpu.presents > 0 && /lost once and a new renderer made once/.test(backRow),
+					`at the loss ${JSON.stringify(lost)}; row then: ${lostRow.slice(0, 200)}; kmscube at the loss: ${k1.out.trim().replace(/\n/g, "; ")}; after: ${k2.out.trim().replace(/\n/g, "; ")}; ` +
+						`status ${after.state}, losses ${after.losses}, renewals ${after.renewals}; row after: ${backRow.slice(0, 300)}`);
 			}
 			if (xorg) {
 				const script = [
@@ -270,3 +331,64 @@ clearTimeout(watchdog);
 await cleanup();
 console.log(fails ? `${fails} check(s) failed` : "all checks passed");
 process.exit(fails ? 1 : 0);
+
+/** R: page resizes reach the guest's DRM mode (one hotplug per burst), and the page's layers follow. */
+async function resizeCheck(evaluate, send) {
+	const bin = join(profile, "kms-hotplug");
+	const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
+	const cc = spawnSync(process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", bin, join(root, "test/gpu/kms-hotplug.c")], { stdio: "inherit" });
+	if (cc.status !== 0) return report("resize", false, "building test/gpu/kms-hotplug.c failed");
+	const b64 = readFileSync(bin).toString("base64");
+	await evaluate(`KW.vm.exec("sh", ["-c", "base64 -d >/tmp/kms-hotplug && chmod 755 /tmp/kms-hotplug"], { input: ${JSON.stringify(b64)}, timeout: 60000 }).then(() => 1)`);
+	const metrics = (w, h) => send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: 1, mobile: false });
+	// The size the page offers: the stage's (display.ts size(); not rotated on a desktop).
+	const stage = () => evaluate(`(() => { const s = document.getElementById("stage"); return s.clientWidth + "x" + s.clientHeight; })()`);
+	const log = () => evaluate(`KW.vm.exec("cat", ["/tmp/kh.log"]).then((r) => r.stdout)`);
+	const until = async (re, ms = 60000) => {
+		const end = Date.now() + ms;
+		let text = "";
+		while (Date.now() < end) {
+			text = await log();
+			if (re.test(text)) break;
+			await sleep(300);
+		}
+		return text;
+	};
+	const layers = () => evaluate(`JSON.stringify((() => {
+		const q = (id) => document.getElementById(id), box = (e) => e ? e.offsetWidth + "x" + e.offsetHeight : null;
+		const c = q("fb");
+		return { stage: q("stage").clientWidth + "x" + q("stage").clientHeight, canvas: c ? c.width + "x" + c.height : null, canvasCss: box(c), fbLayer: box(q("fb-layer")), wlLayer: box(q("wl-layer")) };
+	})())`).then(JSON.parse);
+	await metrics(1000, 700);
+	await sleep(1500);
+	const s0 = await stage();
+	await evaluate(`(globalThis.__kh = KW.vm.exec("sh", ["-c", "/tmp/kms-hotplug /dev/dri/card0 120 ss 3 >/tmp/kh.log 2>&1"], { user: "root", timeout: 200000 }), 1)`);
+	let text = await until(/ready|FAILED/);
+	const r0 = /ready (\d+x\d+)/.exec(text)?.[1];
+	report("resize: the guest's mode is the stage's size", r0 === s0, `kms-hotplug ready ${r0}, stage ${s0}`);
+	// A burst: five sizes 60 ms apart, one hotplug when it settles.
+	for (const [w, h] of [[960, 680], [940, 660], [920, 650], [910, 645], [900, 640]]) {
+		await metrics(w, h);
+		await sleep(60);
+	}
+	text = await until(/set \d+x\d+|FAILED/);
+	await sleep(1500);
+	text = await log();
+	const s1 = await stage();
+	const set1 = /set (\d+x\d+)/.exec(text)?.[1], hot1 = /hotplug 1: preferred (\d+x\d+)/.exec(text)?.[1];
+	const uevents = (text.match(/uevent /g) ?? []).length;
+	const l1 = await layers();
+	report("resize: one hotplug for a burst of resizes, the new stage size", uevents === 1 && hot1 === s1 && set1 === s1,
+		`${uevents} uevent(s); hotplug 1 preferred ${hot1}, set ${set1}, stage ${s1}`);
+	report("resize: the canvas has the guest's new mode, the layers cover the stage", l1.canvas === s1 && l1.fbLayer === s1 && l1.wlLayer === s1 && l1.canvasCss === s1, JSON.stringify(l1));
+	// A second size: a second hotplug and mode.
+	await metrics(1100, 760);
+	text = await until(/done|FAILED/);
+	const s2 = await stage();
+	const hot2 = /hotplug 2: preferred (\d+x\d+)/.exec(text)?.[1], set2 = [...text.matchAll(/set (\d+x\d+)/g)].pop()?.[1];
+	const code = await evaluate("globalThis.__kh.then((r) => r.exitCode)");
+	report("resize: a second resize, a second hotplug and mode", hot2 === s2 && set2 === s2 && code === 0, `hotplug 2 preferred ${hot2}, set ${set2}, stage ${s2}, exit ${code}`);
+	console.log(`--- kms-hotplug:\n${text.trim()}`);
+	await send("Emulation.clearDeviceMetricsOverride");
+	await sleep(1000);
+}

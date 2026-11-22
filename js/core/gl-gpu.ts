@@ -152,6 +152,36 @@ function resp(type: number, size = HDR): Uint8Array {
 	return b;
 }
 
+/** A command with a header (type, context) and, if given, the resource id (RESOURCE_UNREF) after it; CTX_CREATE's debug name empty. */
+function hdr(type: number, ctx: number, id?: number): Uint8Array {
+	const b = new Uint8Array(HDR + (type === GPU_CMD.CTX_CREATE ? 72 : 8));
+	const dv = new DataView(b.buffer);
+	dv.setUint32(0, type, true);
+	dv.setUint32(16, ctx, true);
+	if (id !== undefined) dv.setUint32(HDR, id, true);
+	return b;
+}
+
+/** The resource a command names, or 0. */
+function resourceOf(dv: DataView): number {
+	switch (dv.getUint32(0, true)) {
+		case GPU_CMD.TRANSFER_TO_HOST_3D:
+		case GPU_CMD.TRANSFER_FROM_HOST_3D:
+			return dv.byteLength >= HDR + 36 ? dv.getUint32(HDR + 32, true) : 0;
+		case GPU_CMD.SET_SCANOUT:
+			return dv.byteLength >= HDR + 24 ? dv.getUint32(HDR + 20, true) : 0;
+		case GPU_CMD.RESOURCE_FLUSH:
+			return dv.byteLength >= HDR + 20 ? dv.getUint32(HDR + 16, true) : 0;
+		case GPU_CMD.RESOURCE_CREATE_3D:
+		case GPU_CMD.RESOURCE_UNREF:
+		case GPU_CMD.CTX_ATTACH_RESOURCE:
+		case GPU_CMD.CTX_DETACH_RESOURCE:
+			return dv.byteLength >= HDR + 4 ? dv.getUint32(HDR, true) : 0;
+		default:
+			return 0;
+	}
+}
+
 /**
  * The device side of virtio-gpu 3D: a GpuBackend over a GpuLink. Offers
  * VIRTIO_GPU_F_VIRGL and the capsets of VIRGL_CAPSETS (their contents
@@ -174,7 +204,15 @@ export class VirglGpuBackend implements GpuBackend {
 	/** The last command sent to the renderer that had to wait for its init: later sends go after it. */
 	#tail: Promise<unknown> | null = null;
 	#resources = new Map<number, Resource3d>();
+	/** Contexts made in the renderer. */
 	#contexts = new Set<number>();
+	/**
+	 * Contexts the guest made before the renderer was loaded, with their
+	 * CTX_CREATE: the driver makes a DRM file's context at its first dumb
+	 * buffer too, so a 2D client makes one and attaches only 2D resources
+	 * to it, which needs no renderer. Made there when it loads (#start).
+	 */
+	#pending = new Map<number, Uint8Array>();
 	/** Contexts that submitted commands: they hold objects in the renderer (blocker()). */
 	#submitted = new Set<number>();
 
@@ -195,6 +233,7 @@ export class VirglGpuBackend implements GpuBackend {
 	reset(): void {
 		this.#resources.clear();
 		this.#contexts.clear();
+		this.#pending.clear();
 		this.#submitted.clear();
 		this.#tail = null;
 		this.#link.reset();
@@ -216,28 +255,36 @@ export class VirglGpuBackend implements GpuBackend {
 	}
 
 	/**
-	 * A command names a context this side did not see made: one from
-	 * before a restore (blocker() let only empty ones through). Make it in
-	 * the renderer first, as the guest made it then (without
-	 * CONTEXT_INIT: no flags; the debug name is lost).
+	 * A command that needs the renderer names a context it has not made:
+	 * make it there first. Either its CTX_CREATE was held (#pending), or it
+	 * is from before a restore (blocker() let only empty ones through),
+	 * made as the guest made it then (without CONTEXT_INIT: no flags; the
+	 * debug name is lost).
 	 */
 	#adopt(ctx: number): void {
 		if (!ctx || this.#contexts.has(ctx)) return;
 		this.#contexts.add(ctx);
-		this.#log(`[virtio-gpu] context ${ctx} is from before a restore: made again in the renderer`);
-		const b = new Uint8Array(HDR + 72);
-		const dv = new DataView(b.buffer);
-		dv.setUint32(0, GPU_CMD.CTX_CREATE, true);
-		dv.setUint32(16, ctx, true);
+		let b = this.#pending.get(ctx);
+		if (b) this.#pending.delete(ctx);
+		else {
+			this.#log(`[virtio-gpu] context ${ctx} is from before a restore: made again in the renderer`);
+			b = hdr(GPU_CMD.CTX_CREATE, ctx);
+		}
 		this.#start();
 		void this.#send({ cmd: b }, false);
 	}
 
-	/** The guest uses 3D: load the renderer (once). */
+	/**
+	 * The guest uses 3D: load the renderer (once), and make the contexts
+	 * held before it first, so that from here on every context the guest
+	 * holds is in the renderer (a lost renderer's renewal sees a new
+	 * program's CTX_CREATE before its resources, as the driver sends them).
+	 */
 	#start(): void {
 		if (this.#started) return;
 		this.#started = true;
 		this.#link.start();
+		for (const id of [...this.#pending.keys()]) this.#adopt(id);
 	}
 
 	command(cmd: Uint8Array, ctx: GpuBackendContext): Uint8Array | null | Promise<Uint8Array | null> {
@@ -328,20 +375,32 @@ export class VirglGpuBackend implements GpuBackend {
 				const run = () => this.#transferNow(cmd, dv, res, ctx, toHost, fenced);
 				return this.#tail || (!this.#init && !this.#failed) ? this.#after(run) : run();
 			}
-			case GPU_CMD.CTX_CREATE:
+			case GPU_CMD.CTX_CREATE: {
 				need(8);
-				this.#contexts.add(dv.getUint32(16, true));
-				this.#start();
+				const id = dv.getUint32(16, true);
+				// Before the renderer is loaded, held (#pending; a 2D client's never needs it).
+				if (!this.#started && !this.#contexts.has(id)) {
+					this.#pending.set(id, cmd.slice());
+					return resp(GPU_RESP.OK_NODATA);
+				}
+				this.#contexts.add(id);
 				return this.#send({ cmd }, fenced);
-			case GPU_CMD.CTX_DESTROY:
-				this.#contexts.delete(dv.getUint32(16, true));
-				this.#submitted.delete(dv.getUint32(16, true));
+			}
+			case GPU_CMD.CTX_DESTROY: {
+				const id = dv.getUint32(16, true);
+				this.#submitted.delete(id);
+				// Not made in the renderer (held, or from before a restore and not used since): nothing to tell it.
+				if (this.#pending.delete(id) || !this.#contexts.delete(id)) return resp(GPU_RESP.OK_NODATA);
+				return this.#send({ cmd }, fenced);
+			}
+			case GPU_CMD.CTX_ATTACH_RESOURCE:
+			case GPU_CMD.CTX_DETACH_RESOURCE:
+				// A 2D resource (a dumb buffer): the renderer has none of that id, nothing to attach.
+				if (!this.#resources.has(dv.getUint32(HDR, true))) return resp(GPU_RESP.OK_NODATA);
+				this.#adopt(dv.getUint32(16, true));
 				return this.#send({ cmd }, fenced);
 			case GPU_CMD.SUBMIT_3D:
 				this.#submitted.add(dv.getUint32(16, true));
-			// fallthrough
-			case GPU_CMD.CTX_ATTACH_RESOURCE:
-			case GPU_CMD.CTX_DETACH_RESOURCE:
 				this.#adopt(dv.getUint32(16, true));
 				this.#start();
 				return this.#send({ cmd }, fenced);
@@ -593,8 +652,15 @@ export interface GpuRendererStats {
 	 * "SUBMIT_3D ctx 1: 0x1200, the renderer refused it (...)".
 	 */
 	lastError: string;
-	/** The WebGL2 context was lost: every 3D command fails from then on. */
+	/**
+	 * The WebGL2 context is lost and no new renderer has been made since: every
+	 * 3D command fails until the guest's next new GL context makes one
+	 * (GpuRendererOptions.renew).
+	 */
 	contextLost: boolean;
+	/** WebGL2 contexts lost so far, and new renderers made after a loss. */
+	losses: number;
+	renewals: number;
 }
 
 export interface GpuRendererOptions {
@@ -607,7 +673,17 @@ export interface GpuRendererOptions {
 	 */
 	strictWaits?: boolean;
 	log?: (msg: string) => void;
+	/**
+	 * A renderer to go on with after the WebGL2 context was lost: a new
+	 * module instance on a new WebGL2 context (gl.ts, GlLoader.get()),
+	 * asked when the guest makes its next new GL context. Without it a
+	 * loss is final: every 3D command fails from then on.
+	 */
+	renew?: () => Promise<GpuRendererCore>;
 }
+
+/** After a renewal failed, the next new GL context tries again only this much later (ms). */
+const RENEW_RETRY_MS = 1000;
 
 /** The current scanout and its latest frame (GpuRenderer.scanout). */
 export interface GpuScanout {
@@ -631,18 +707,39 @@ export interface GpuScanout {
  * drawFrame() draws into the page's canvas. frame() reads the scanout back
  * on demand (screenshots). image() takes any resource's picture the same
  * way, for a compositor on the page (window images).
+ *
+ * A lost WebGL2 context takes every guest object of the renderer with it
+ * (#loseContext). With `renew`, the guest's next new GL context gets a new
+ * renderer; contexts and resources the guest still holds from the lost one
+ * are stale: commands naming them fail, or are dropped where nothing is
+ * left to do (destroy, unref, detach), so the programs that had them must
+ * be restarted. Contexts that never submitted (a Wayland relay's) hold no
+ * objects and are made again in the new renderer.
  */
 export class GpuRenderer {
 	/** The capsets and the format table once the renderer is up (after start()); rejects if it cannot be. */
 	readonly init: Promise<GpuInit>;
-	stats: GpuRendererStats = { commands: 0, fenced: 0, parks: 0, parkedMs: 0, presents: 0, reads: 0, images: 0, errors: 0, lastError: "", contextLost: false };
+	stats: GpuRendererStats = { commands: 0, fenced: 0, parks: 0, parkedMs: 0, presents: 0, reads: 0, images: 0, errors: 0, lastError: "", contextLost: false, losses: 0, renewals: 0 };
 	/** A new frame was presented, or the scanout changed. */
 	onFrame: (() => void) | undefined;
 	#load: () => Promise<GpuRendererCore>;
+	#renew: (() => Promise<GpuRendererCore>) | undefined;
 	#started = false;
 	#failed = false;
-	/** The WebGL2 context was lost (webglcontextlost, or isContextLost()). */
+	/** The WebGL2 context was lost (webglcontextlost, or isContextLost()) and no new renderer is up yet. */
 	#lost = false;
+	/** The capsets the guest got (from the first renderer): a new renderer's are compared with them. */
+	#capsets: GpuInit["capsets"] = [];
+	/** The current core's lost listener. */
+	#listening: AbortController | null = null;
+	/** Ids the guest still holds from a lost renderer: commands naming them fail, or are dropped. */
+	#staleContexts = new Set<number>();
+	#staleResources = new Set<number>();
+	/** Contexts of a lost renderer that never submitted: made again in the next one. */
+	#idle = new Set<number>();
+	/** Contexts that submitted commands (they hold objects in the renderer). */
+	#submitted = new Set<number>();
+	#renewFailedAt = -Infinity;
 	/** Error lines: when the last was logged, and how many were left out since. */
 	#errorLogAt = -Infinity;
 	#errorsUnlogged = 0;
@@ -672,6 +769,7 @@ export class GpuRenderer {
 	 */
 	constructor(load: () => Promise<GpuRendererCore>, opts: GpuRendererOptions = {}) {
 		this.#load = load;
+		this.#renew = opts.renew;
 		this.#strict = !!opts.strictWaits;
 		this.#log = opts.log ?? (() => {});
 		const core = new Promise<GpuRendererCore>((resolve, reject) => (this.#settle = { resolve, reject }));
@@ -688,10 +786,8 @@ export class GpuRenderer {
 			}
 			const formats = new Uint32Array(512);
 			for (let f = 0; f < formats.length; f++) formats[f] = c.gpu.format(f);
-			this.#core = c;
-			// The browser may drop the context (memory pressure, a page in the background on
-			// iOS, a GPU reset): fail every 3D command cleanly from then on (#loseContext).
-			(c.gl.canvas as OffscreenCanvas).addEventListener?.("webglcontextlost", () => this.#loseContext());
+			this.#capsets = capsets;
+			this.#attach(c);
 			const q = this.#queue ?? [];
 			this.#queue = null;
 			for (const { req, done } of q) {
@@ -731,6 +827,7 @@ export class GpuRenderer {
 	/** Run a command and answer (after the commands before it). */
 	call(req: GpuRequest): GpuReply | Promise<GpuReply> {
 		this.start();
+		this.#maybeRenew(req);
 		if (this.#queue) {
 			const q = this.#queue;
 			return new Promise((resolve) => q.push({ req, done: (r) => void Promise.resolve(r).then(resolve) }));
@@ -742,6 +839,7 @@ export class GpuRenderer {
 	/** Run a command, no answer. */
 	post(req: GpuRequest): void {
 		this.start();
+		this.#maybeRenew(req);
 		if (this.#queue) this.#queue.push({ req });
 		else if (this.#core) void this.#run(req);
 	}
@@ -759,17 +857,15 @@ export class GpuRenderer {
 		for (const w of this.#waits) w.resolve();
 		this.#waits = [];
 		this.#hold = 0;
-		if (!c) return;
-		const hdr = (type: number, ctx: number, id?: number) => {
-			const b = new Uint8Array(HDR + 8);
-			const dv = new DataView(b.buffer);
-			dv.setUint32(0, type, true);
-			dv.setUint32(16, ctx, true);
-			if (id !== undefined) dv.setUint32(HDR, id, true);
-			return b;
-		};
-		for (const id of this.#resources) c.gpu.command(hdr(GPU_CMD.RESOURCE_UNREF, 0, id));
-		for (const ctx of this.#contexts) c.gpu.command(hdr(GPU_CMD.CTX_DESTROY, ctx));
+		this.#staleContexts.clear();
+		this.#staleResources.clear();
+		this.#idle.clear();
+		this.#submitted.clear();
+		// Nothing to destroy in a lost context (its objects are gone; no GL call on it).
+		if (c && !this.#lost) {
+			for (const id of this.#resources) c.gpu.command(hdr(GPU_CMD.RESOURCE_UNREF, 0, id));
+			for (const ctx of this.#contexts) c.gpu.command(hdr(GPU_CMD.CTX_DESTROY, ctx));
+		}
 		this.#resources.clear();
 		this.#contexts.clear();
 	}
@@ -822,7 +918,7 @@ export class GpuRenderer {
 	 * this thread, in `gl`, and do not change its parameters or delete it.
 	 */
 	texture(resource: number): GpuTexture | null {
-		const c = this.#core;
+		const c = this.#lost ? null : this.#core;
 		const i = c?.gpu.info(resource);
 		return c && i ? { gl: c.gl, ...i, alpha: i.alpha ?? false } : null;
 	}
@@ -883,11 +979,11 @@ export class GpuRenderer {
 		const type = dv.getUint32(0, true);
 		const fenced = (dv.getUint32(4, true) & FLAG_FENCE) !== 0;
 		this.stats.commands++;
-		if (this.#lost || c.gl.isContextLost()) {
-			// Counted; lastError keeps saying the context was lost (#loseContext).
-			this.#loseContext();
-			this.stats.errors++;
-			return { code: GPU_RESP.ERR_UNSPEC };
+		if (!this.#lost && c.gl.isContextLost()) this.#loseContext();
+		if (this.#lost || this.#staleContexts.size || this.#staleResources.size || this.#idle.size) {
+			const r = this.#stale(dv, type);
+			// Answered at once: no GPU work to wait for, and no call into a lost renderer.
+			if (r) return r;
 		}
 		let code = 0, data: Uint8Array | undefined;
 		switch (type) {
@@ -909,6 +1005,8 @@ export class GpuRenderer {
 				break;
 			}
 			default:
+				// A submit that fails may have made objects before the command that failed.
+				if (type === GPU_CMD.SUBMIT_3D) this.#submitted.add(dv.getUint32(16, true));
 				code = c.gpu.command(req.cmd, req.data);
 				if (!code) {
 					if (type === GPU_CMD.RESOURCE_CREATE_3D) this.#resources.add(dv.getUint32(HDR, true));
@@ -916,7 +1014,10 @@ export class GpuRenderer {
 						this.#resources.delete(dv.getUint32(HDR, true));
 						if (this.#scanout?.resource === dv.getUint32(HDR, true)) this.#setScanout(null);
 					} else if (type === GPU_CMD.CTX_CREATE) this.#contexts.add(dv.getUint32(16, true));
-					else if (type === GPU_CMD.CTX_DESTROY) this.#contexts.delete(dv.getUint32(16, true));
+					else if (type === GPU_CMD.CTX_DESTROY) {
+						this.#contexts.delete(dv.getUint32(16, true));
+						this.#submitted.delete(dv.getUint32(16, true));
+					}
 				}
 		}
 		if (code) return this.#refused(dv, code, "the renderer refused it (the [gl] virgl: lines before this one have its reason)", true);
@@ -980,25 +1081,174 @@ export class GpuRenderer {
 		return { code };
 	}
 
+	/** A core is the current one: listen for its context's loss. */
+	#attach(c: GpuRendererCore): void {
+		this.#core = c;
+		this.#listening?.abort();
+		const ac = new AbortController();
+		this.#listening = ac;
+		// The browser may drop the context (memory pressure, a GPU reset, a GPU
+		// process ended in the background): #loseContext. preventDefault() lets
+		// the browser restore it (GlLoader, which made it, releases it then).
+		(c.gl.canvas as OffscreenCanvas).addEventListener?.("webglcontextlost", (e: Event) => {
+			e.preventDefault();
+			if (this.#core === c) this.#loseContext();
+		}, { signal: ac.signal });
+	}
+
 	/**
 	 * The WebGL2 context is gone, and with it every object of the renderer:
 	 * the guest's contexts and resources cannot be had back (a restored
-	 * context is a new, empty one, and virtio-gpu has no way to tell the
-	 * guest its GPU objects are gone). Say so once, answer every later 3D
-	 * command with ERR_UNSPEC at once (no GL call on a lost context), and
-	 * let waits for GPU work end now, so no guest program hangs on a fence.
+	 * context is a new, empty one; the guest's Mesa keeps no copy of what it
+	 * made, and virtio-gpu has no way to tell the guest its GPU objects are
+	 * gone). Say so once, answer 3D commands at once without a GL call (#stale:
+	 * failed, or OK where nothing is left to do), and let waits for GPU work
+	 * end now, so no guest program hangs on a fence. What the guest holds
+	 * becomes stale; contexts that never submitted are made again in the
+	 * next renderer (#renewed), which the guest's next new GL context asks for.
 	 */
 	#loseContext(): void {
 		if (this.#lost) return;
 		this.#lost = true;
 		this.stats.contextLost = true;
-		this.#log("[gl] virtio-gpu: the WebGL2 context was lost (the browser dropped it: memory pressure, the page in the background, a GPU reset); " +
-			"every 3D command fails from now on (the guest's kernel logs \"response 0x1200\"), so GL programs in the guest fail; reload the page for a new renderer");
+		this.stats.losses++;
+		this.#log("[gl] virtio-gpu: the WebGL2 context was lost (the browser dropped it: memory pressure, a GPU reset, the GPU process ended); " +
+			"every GL object of the guest went with it, so the GL programs running now fail (the guest's kernel logs \"response 0x1200\") and must be restarted; " +
+			(this.#renew ? "the next GL program gets a new renderer" : "reload the page for a new renderer"));
 		this.stats.lastError = "the WebGL2 context was lost";
 		this.#hold = 0;
 		for (const w of this.#waits) w.resolve();
 		this.#waits = [];
 		this.#setScanout(null);
+		for (const ctx of this.#contexts) (this.#submitted.has(ctx) ? this.#staleContexts : this.#idle).add(ctx);
+		for (const id of this.#resources) this.#staleResources.add(id);
+		this.#contexts.clear();
+		this.#resources.clear();
+		this.#submitted.clear();
+	}
+
+	/**
+	 * A command while the context is lost, or one that names what a lost
+	 * renderer had: its answer (at once), or null to run it. Destroy, unref,
+	 * detach, scanout and flush of stale ids are dropped (OK: nothing is
+	 * left); everything else naming them fails, and while no renderer is up
+	 * every command fails but those.
+	 */
+	#stale(dv: DataView, type: number): GpuReply | null {
+		const lost = this.#lost;
+		const ctx = dv.byteLength >= HDR ? dv.getUint32(16, true) : 0, res = resourceOf(dv);
+		const sc = !!ctx && this.#staleContexts.has(ctx), sr = !!res && this.#staleResources.has(res);
+		const ok: GpuReply = { code: 0 };
+		switch (type) {
+			case GPU_CMD.CTX_CREATE:
+				// The guest frees an id before it makes it again: a stale one cannot come back.
+				this.#staleContexts.delete(ctx);
+				this.#idle.delete(ctx);
+				if (!lost) return null;
+				this.#staleContexts.add(ctx);
+				break;
+			case GPU_CMD.CTX_DESTROY:
+				if (!lost && !sc && !this.#idle.has(ctx)) return null;
+				this.#staleContexts.delete(ctx);
+				this.#idle.delete(ctx);
+				return ok;
+			case GPU_CMD.RESOURCE_CREATE_3D:
+				this.#staleResources.delete(res);
+				if (!lost) return null;
+				this.#staleResources.add(res);
+				break;
+			case GPU_CMD.RESOURCE_UNREF:
+				if (!lost && !sr) return null;
+				this.#staleResources.delete(res);
+				if (this.#scanout?.resource === res) this.#setScanout(null);
+				return ok;
+			case GPU_CMD.CTX_DETACH_RESOURCE:
+				return lost || sc || sr ? ok : null;
+			case GPU_CMD.SET_SCANOUT:
+			case GPU_CMD.RESOURCE_FLUSH:
+				if (!lost && !sr) return null;
+				// Nothing to show: the page shows no 3D frame until a live resource is scanned out.
+				if (type === GPU_CMD.SET_SCANOUT) this.#setScanout(null);
+				return ok;
+			case GPU_CMD.SUBMIT_3D:
+				// A context made again after the loss (it never submitted) that submits while there is no renderer: its objects are lost too.
+				if (lost && this.#idle.delete(ctx)) this.#staleContexts.add(ctx);
+				if (!lost && !sc && !sr) return null;
+				break;
+			default:
+				if (!lost && !sc && !sr) return null;
+		}
+		if (lost) {
+			// Counted; lastError keeps saying the context was lost, and the loss was logged.
+			this.stats.errors++;
+			return { code: GPU_RESP.ERR_UNSPEC };
+		}
+		return this.#refused(dv, GPU_RESP.ERR_UNSPEC, `its ${sc ? "context" : "resource"} was in a WebGL2 context that was lost: restart the program`, true);
+	}
+
+	/**
+	 * While the context is lost, the guest's next new GL context (CTX_CREATE
+	 * of an id that is not stale) asks for a new renderer (`renew`): commands
+	 * queue until it is up (#renewed) or failed (#renewFailed).
+	 */
+	#maybeRenew(req: GpuRequest): void {
+		const c = this.#core;
+		if (this.#queue || !c || !this.#renew) return;
+		if (!this.#lost && c.gl.isContextLost()) this.#loseContext();
+		if (!this.#lost) return;
+		const dv = new DataView(req.cmd.buffer, req.cmd.byteOffset, req.cmd.byteLength);
+		if (dv.byteLength < HDR || dv.getUint32(0, true) !== GPU_CMD.CTX_CREATE || this.#staleContexts.has(dv.getUint32(16, true))) return;
+		if (performance.now() - this.#renewFailedAt < RENEW_RETRY_MS) return;
+		this.#queue = [];
+		this.#log("[gl] virtio-gpu: a new GL context after the WebGL2 context was lost: making a new renderer");
+		let p: Promise<GpuRendererCore>;
+		try {
+			p = this.#renew();
+		} catch (e) {
+			p = Promise.reject(e);
+		}
+		p.then((c2) => this.#renewed(c2), (e: unknown) => this.#renewFailed(e));
+	}
+
+	/** The new renderer is up: make the idle contexts again, and run what queued. */
+	#renewed(c: GpuRendererCore): void {
+		if (c === this.#core || c.gl.isContextLost()) return this.#renewFailed(new Error("the new WebGL2 context is lost too"));
+		for (const { id, version, data } of this.#capsets) {
+			const cs = c.gpu.capset(id);
+			if (!cs || cs.version !== version || cs.data.length !== data.length) return this.#renewFailed(new Error(`the new renderer's capset ${id} differs in version or size from the one the guest has`));
+			if (cs.data.some((b, i) => b !== data[i]))
+				this.#log(`[gl] virtio-gpu: the new WebGL2 context's capset ${id} differs from the one the guest's kernel cached (another GPU?): programs may use features it lacks`);
+		}
+		this.#attach(c);
+		this.#lost = false;
+		this.stats.contextLost = false;
+		this.stats.renewals++;
+		// A fresh start (the loss is in `losses`); a stale program's next command says so again.
+		this.stats.lastError = "";
+		this.#floor = 0;
+		this.#hold = 0;
+		for (const ctx of this.#idle) if (!c.gpu.command(hdr(GPU_CMD.CTX_CREATE, ctx))) this.#contexts.add(ctx);
+		this.#idle.clear();
+		this.#log(`[gl] virtio-gpu: a new renderer is up after the loss (${this.stats.renewals} so far); ${this.#staleContexts.size} stale contexts and ${this.#staleResources.size} stale resources remain until their programs end`);
+		this.#flushQueue();
+	}
+
+	/** No new renderer: what queued is answered as while lost (the new context too: stale). */
+	#renewFailed(e: unknown): void {
+		this.#renewFailedAt = performance.now();
+		const why = (e as Error)?.message ?? String(e);
+		this.stats.lastError = `the WebGL2 context was lost, and no new renderer could be made: ${why}`;
+		this.#log(`[gl] virtio-gpu: no new renderer after the loss: ${why}; the next GL program tries again`);
+		this.#flushQueue();
+	}
+
+	#flushQueue(): void {
+		const q = this.#queue ?? [];
+		this.#queue = null;
+		for (const { req, done } of q) {
+			const r = this.#run(req);
+			done?.(r);
+		}
 	}
 
 	#done(seq: number): boolean {

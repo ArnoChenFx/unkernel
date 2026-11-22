@@ -40,7 +40,9 @@ Decided, do not reopen without new facts:
   is not a prerequisite.
 
 The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
-3.00): no compute shaders, no texture buffers, no GL 3.3 core.
+3.00): no compute shaders, no texture buffers, no GL 3.3 core;
+multisampling up to WebGL2's `MAX_SAMPLES` (4 on SwiftShader) through
+renderbuffers, which cannot be sampled (patch 17).
 
 ## What exists (2026-11-21)
 
@@ -55,8 +57,8 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | `test/gl/kwgl-state.c` | the stale-state check run by `vtest-check.sh state` (surfaceless EGL clients taking turns) |
 | `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
 | `js/core/gl-gpu.ts` | virtio-gpu 3D: `VirglGpuBackend` (device side), `GpuRenderer` (`vm.gl.gpu`); see The DRM path |
-| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c`, `test/gpu/window-image.c`, `test/gpu/int-attrib.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
-| `test/gl-gpu.test.ts` | `VirglGpuBackend` against a fake link: the snapshot blocker, contexts made again after a restore (`pnpm test:gl-gpu`) |
+| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c`, `test/gpu/window-image.c`, `test/gpu/int-attrib.c`, `test/gpu/msaa.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
+| `test/gl-gpu.test.ts` | `VirglGpuBackend` against a fake link: the snapshot blocker, contexts made again after a restore; `GpuRenderer` against fake renderers: a lost context, stale ids, new renderers (`pnpm test:gl-gpu`) |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
 | `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, the default URL); see The page |
@@ -138,6 +140,28 @@ In order, each with its reason in the commit message:
     attachment format": the context in error), and the per-buffer path
     tested the format of a truth value (`surf && surf->format`), so it
     never took them (step h's RGBA8UI clear).
+17. multisample resources as multisample renderbuffers on a GLES host
+    without multisample textures (`vrend_state.ms_renderbuffers`; WebGL2
+    has renderbuffers with up to `MAX_SAMPLES` samples, no
+    `GL_TEXTURE_2D_MULTISAMPLE`): before, no format could be multisampled
+    and the texture_multisample cap was off, so the guest's Mesa offered
+    no multisampling at all (`GL_MAX_SAMPLES` 1, one sample per format),
+    Chromium's ANGLE capped itself at OpenGL ES 2.0 (ES 3.0 needs 4
+    samples for every required renderable format) and Chromium, which
+    asks for ES 3.0 only, rendered in software (web.md, Wayland desktop,
+    Chromium). Formats whose renderbuffer takes `MAX_SAMPLES` samples get
+    the multisample bit, the cap is set (Mesa offers multisampling only
+    with it), attachments of such a resource are renderbuffer attachments,
+    a blit the GL blitter must do (it samples its source) resolves the
+    renderbuffer into a single-sample texture first, and the guest gets the
+    standard sample positions (WebGL cannot tell them). Such resources can
+    be rendered to, cleared and resolved (GLES 3.0 multisample
+    renderbuffers, multisampled EGL configs, WebGL's antialias in a guest
+    browser), not sampled: the cap also gives a desktop GL 2.1 context
+    ARB_texture_multisample, whose `sampler2DMS` does not build on WebGL,
+    and the unit stays empty; nor transferred (Mesa resolves first).
+    Step m (`test/gpu/msaa.c`, 2026-11-22). The GL blitter's resolve
+    path is not reached by any test.
 
 ## Single GL context
 
@@ -616,6 +640,20 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   (vrend inverts transfers of such a resource); the blit flips the first
   kind.
   Page flips are paced by virtio-gpu's emulated vblank (60 Hz).
+- **Display size**: the connector's preferred (and only) mode is the
+  display option's size (the page: its stage), from the device's EDID.
+  `vm.updateDisplaySize()` (the page calls it 300 ms after the stage last
+  changed) gives a running guest a hotplug with the new mode
+  (kernel/devices.md, js.md); the display and the page's canvas follow
+  the mode a client sets, never the size asked. Who switches: KMS
+  clients that read netlink uevents themselves (`test/gpu/kms-hotplug.c`);
+  kmscube and glmark2-es2-drm at their next start; X only by `xrandr`
+  (a plain `xrandr` probes, then `xrandr --output Virtual-1 --auto`; a
+  bare `--auto` turned the output off, 2026-11-22), since its modesetting
+  driver hears hotplugs from udev, which the guest has not: the xglamor
+  demo runs a follower (perl on netlink, then those two). No fbdev
+  emulation on DRM (DRM_FBDEV_EMULATION is off); kwfb takes a new size at
+  its next first open.
 - **dmabuf**: PRIME export and import between openers of the device is the
   stock driver's self-import (no vmap); `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`
   gives the resource id, `vm.gl.gpu.texture(id)` its `WebGLTexture` in
@@ -753,10 +791,17 @@ The renderer (module and WebGL2 context) is loaded on the guest's first GL
 use, not at boot (`GlLoader`, gl.ts): the first vtest client (an OPEN on
 the forwarder's link: `LazyVtestRenderer` notes it and holds its bytes,
 and StreamHost reads no more of the link meanwhile, so vsock credit holds
-the forwarder), or virtio-gpu's first GET_CAPSET or 3D command (context,
-3D resource, submit; `VirglGpuBackend` calls `GpuLink.start()`, in worker
-mode the message `gpu-start`). A 2D client never loads it (SET_SCANOUT 0
-and RESOURCE_FLUSH before any 3D use are answered without it). Commands
+the forwarder), or virtio-gpu's first GET_CAPSET or 3D command (3D resource, submit;
+`VirglGpuBackend` calls `GpuLink.start()`, in worker mode the message
+`gpu-start`). A 2D client never loads it: with virgl the driver makes a
+DRM file's context at its first dumb buffer too (CTX_CREATE, then
+CTX_ATTACH_RESOURCE of each 2D resource it opens, CTX_DETACH and
+CTX_DESTROY at the exit; no 3D resource), so before the load CTX_CREATE
+is held (`#pending`) and made in the renderer when it loads, before the
+command that loads it; attach and detach of a 2D resource, the destroy of
+a context the renderer never got, and SET_SCANOUT 0 and RESOURCE_FLUSH
+before any 3D use are answered without it (`test/gl-gpu.test.ts`; the
+page check's case R, `kms-hotplug`). Commands
 wait meanwhile: GET_CAPSET for the capsets, a 3D transfer for the format
 table, and sends after a waiting one queue behind it. `gl.eager` loads it
 before the boot instead (the page's `?glload=eager`).
@@ -815,6 +860,142 @@ compile, WebGL2 context, renderer init) and 80 to 100 ms on first use.
 Over a network the fetch dominates: `virgl.wasm` is 155 KB brotli
 (184 KB gzip), `virgl.mjs` 30 KB gzip.
 
+## Context loss
+
+The browser may drop the renderer's WebGL2 context: a GPU reset or driver
+crash, the GPU process ended (WebKit marks every context of a GPU process
+that went away lost, jetsam included; Chrome after a GPU process crash),
+memory pressure, more than 16 contexts (the oldest goes; 4 in a worker),
+`WEBGL_lose_context`. Every object the guest made lives only in that
+context and the module instance that used it, so it cannot be had back.
+Decided: a new renderer for new programs (level 1, below); nothing tells
+the guest, and nothing is replayed.
+
+What the guest can do about it (sources read 2026-11-22):
+
+- Mesa 25.0.7's virgl keeps nothing to replay (objects are encoded into
+  command buffers and forgotten), sets neither `get_device_reset_status`
+  nor `set_device_reset_callback` (`src/gallium/drivers/virgl`; its only
+  robustness cap is `robust_buffer_access_behavior`), so
+  `glGetGraphicsResetStatus` never reports a reset on virgl and
+  GL_KHR_robustness clients (Chromium, Firefox, GTK) never recreate their
+  contexts for it. Its DRM winsys ignores failures: an EXECBUFFER error is
+  a debug print ("got error from kernel - expect bad rendering"), the
+  transfer ioctls' results are dropped.
+- The kernel driver: an error answer is a rate-limited `response 0x1200
+  (command 0x...)`, the fence is signalled all the same, and the ioctl
+  returned long before. Nothing in the tree acts on
+  VIRTIO_CONFIG_S_NEEDS_RESET (only its define); `config_changed` handles
+  only VIRTIO_GPU_EVENT_DISPLAY; the PM restore path makes only non-virgl
+  objects again (`virtio_gpu_object_restore_all`: "store non-virgl object
+  ... to the restore list"), and hibernation is refused with virgl ("S4 not
+  allowed when VIRGL is enabled"). So no device-side signal makes the guest
+  notice, let alone rebuild.
+
+Levels: (1) a new renderer that new programs use: done. (2) Making the
+guest notice would take a kernel change: a host request that unbinds and
+rebinds the device (remove: `drm_dev_unplug`, open DRM files get -ENODEV
+and their programs fail; probe again: the nodes come back, maybe as new
+minors while old files are open), which ends every user of the device,
+2D ones (fbcon, X without glamor, compositors) included, and gives no state
+back; or a new event and a Mesa change (unmodified Mesa is the rule). Not
+done. (3) Replay: rebuilding a context needs every object its command
+streams made (shaders, states, views, surfaces, sub contexts, queries),
+so the host would record and replay each context's whole command history,
+and what the GPU wrote (render targets, transform feedback, query results)
+exists only in the lost context. The cheap part, uploading 3D resources
+again from their guest backing (the device side keeps it), brings back
+only what the guest last uploaded, which no program can use without its
+context's objects: not done.
+
+What happens (gl.ts `GlLoader`, `LazyVtestRenderer`; gl-gpu.ts
+`GpuRenderer`):
+
+- **At the loss**: the loader and the device each log a line; the event's
+  default is prevented (so the browser may restore it). The vtest link
+  closes every client (its Mesa sees the socket end). virtio-gpu answers
+  every command at once without a GL call: ERR_UNSPEC (fenced ones too:
+  the kernel signals the fence), OK for destroy, unref, detach, scanout
+  and flush; waits for GPU work end, the scanout is cleared, `image()` and
+  `texture()` give null. Contexts that submitted and every 3D resource
+  become stale; contexts that never submitted (a Wayland relay's: its DRM
+  file imports buffers, which makes a context, and never renders) are kept.
+- **The next new GL use** makes a new renderer: virtio-gpu's next
+  CTX_CREATE of an id that is not stale (the kernel makes a DRM file's
+  context at its first 3D use, before its first resource), or the next
+  vtest client. It is a new instance of the module (the factory again;
+  `virgl.wasm` fetched again, normally from the HTTP cache) on a new
+  OffscreenCanvas, 0.14 to 0.18 s on SwiftShader; commands queue
+  meanwhile, the kept contexts are made again, the capsets are compared
+  with those the guest's kernel cached (a size or version change fails it;
+  other bytes are logged, as another GPU may lack features the guest
+  uses). One try at a time; after a failure (no WebGL2 context: Chrome
+  blocks a site from 3D after two GPU losses within 2 minutes, then
+  `getContext()` gives null) the queued commands are answered as while
+  lost and the next new GL program tries again a second later. A context
+  that comes lost from its creation (the GPU process restarting) gets 5 s
+  to be restored.
+- **A restored context** (`webglcontextrestored`) is released at once
+  (`loseContext()`): it is empty, and the module that used it is gone. The
+  new renderer does not wait for it: Chrome restores a simulated loss only
+  on `restoreContext()`, WebKit retries a real one every second, and a new
+  context on a new canvas works in both while the page is not blocked.
+- **After it**: commands naming a stale context or resource fail ("its
+  context was in a WebGL2 context that was lost: restart the program",
+  logged at most once a second) or are dropped (destroy, unref, detach,
+  scanout, flush), so a stale program's ids leave no trace; new programs
+  work as before.
+
+What the user sees: programs running at the loss go on with every 3D
+command failing until they exit, and must be restarted: glmark2-es2-drm ran
+its scene to the end with a meaningless score, kmscube flipped its frames
+to the end (paced by the vblank) with nothing shown, the guest's kernel
+logged its rate-limited `response 0x1200` lines; X with glamor or a
+compositor on the device: the same, restart it. A vtest client's socket
+ends (glmark2-es2 under Xvfb: "lost connection to rendering server",
+aborted). 2D is untouched: dumb buffers (fbcon, kms-dumb, X without glamor)
+are the 2D model's, their pixels the guest's (a DRM file that opens one
+makes a 3D context, which never submits: kept, or new; held without a
+renderer if none was loaded). The page's display
+shows no 3D frame until a live resource is scanned out (a stale KMS
+client's scanout shows nothing; the 2D scanout returns when it exits).
+Wayland: `image()` gives null for the stale clients' buffers, the relay
+goes on, GL apps started after the loss show. Snapshots: stale resources
+still block one until their programs end. The page's Guest GL row says
+"WebGL context lost" (a warning: restart the GL programs; the next one
+gets a new renderer, no reload) and afterwards counts the losses.
+
+iOS (no device here; WebKit's source and bug reports, 2026-11-22): a
+hidden or suspended page does not lose its contexts by itself (suspend
+sets a flag); a GPU process that ends (crash, jetsam) loses every context
+in it, restored by retries every second where the page prevented the
+default (`didClose` -> `markContextLost`). Safari 16.7/17 betas lost
+contexts on backgrounding (WebKit bugs 261331, 262628, fixed by 261313
+around 17.1); on iOS 18 a page using about 2.7 GB lost its context, and
+iOS may kill the whole page under memory pressure, reloading it, with no
+event (bug 300782). No documented budget or guidance. `visibilitychange`
+is not used: nothing of the renderer can be saved, so releasing the
+context when hidden would itself end every GL program, and the new
+renderer is made only on the guest's next GL use anyway. The iPhone
+report of a second glmark2 run failing with SUBMIT_3D errors fits a loss
+during or after the first run (every later command failed until a
+reload); unconfirmed, and with this the next run gets a new renderer.
+
+Checked 2026-11-22, `unkernel-check.mjs --drm --lose` (inline and
+`--worker`, SwiftShader), four losses in one boot: during glmark2-es2-drm and restored, during
+kmscube and a vtest glmark2-es2 and restored, during glmark2-es2-drm not
+restored, during kmscube with `getContext()` giving no WebGL2 (the renewal
+failed, the program at the loss and one after it ended); each time a
+kmscube started after it rendered (frames on the canvas equal to the
+scanout read back, 4096 colours, no failed command in the guest's kernel),
+and after the first a dumb-buffer KMS client showed its picture and a vtest
+client got virgl. `page-check.mjs --lose`: the row's warning, then the
+ready row counting the loss after a new kmscube. `test/wland/page-check.mjs
+--built --gpu` (worker): a weston-simple-egl window, the loss and restore,
+then a new weston-simple-egl shown by resource with no renderer error
+(the relay not restarted). `test/gl-gpu.test.ts` has the stale ids, the
+kept contexts and two renewals against fake renderers.
+
 ## The page
 
 Guest GL (Options: Guest GL; on by default on Debian where the display
@@ -840,7 +1021,7 @@ WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
 is a warning and a toast) and how long the load took and `vm.gl.stats` with the per-readback
 breakdown of the renderer's counters (Stats) and the device's
 (`vm.gl.stats.gpu`: presents, parks, time parked, readbacks, errors and
-the last one's text; a lost WebGL2 context fails the row); `?glwait=strict` answers busy
+the last one's text; a lost WebGL2 context is a warning row, Context loss); `?glwait=strict` answers busy
 waits as vtest does. The browser console has `[unkernel] guest GL: WebGL2
 renderer ...`.
 
@@ -901,12 +1082,16 @@ node test/gl/unkernel-check.mjs --drm --fail --glfail module   # the renderer fa
 node test/gl/unkernel-check.mjs --drm --fail --gl-flags "--disable-gpu --disable-software-rasterizer"   # no WebGL2 context: the 2D device
 node test/gl/unkernel-check.mjs --drm --skip b,c,d,e --gl-delay 8   # virgl.mjs served 8 s late: the first GET_CAPS waits
 node test/gl/unkernel-check.mjs --drm --snapshot --skip a,b,c,d,e,g   # step s: a snapshot with an idle 3D context, restored, the context used again
-pnpm test:gl-gpu                             # VirglGpuBackend's snapshot blocker and contexts made again, no browser
+node test/gl/unkernel-check.mjs --drm --skip a,b,c,d,e,g,h   # step r: a display size change (--resize WxH): the hotplug, kmscube and glmark2-es2-drm at the new mode, the canvas (Display size)
+node test/gl/unkernel-check.mjs --drm --lose --skip a,b,c,d,e,g,h,r   # step l: the WebGL2 context lost four ways, new programs after each (Context loss)
+pnpm test:gl-gpu                             # VirglGpuBackend's snapshot blocker and contexts made again, GpuRenderer's context loss, no browser
 node test/gl/page-check.mjs                  # the page's option (dev server, port 8091, the default URL), about 1 min; needs the internet
 node test/gl/page-check.mjs --suspend        # plus suspend and resume before GL use, the refusal while kmscube runs, a session saved without GL
+node test/gl/page-check.mjs --lose           # plus the WebGL2 context lost under kmscube: the row's warning, a new kmscube, the row after (Context loss)
 node test/gl/page-check.mjs --gpu0           # the same with ?gpu=0 (the vtest link alone)
 node test/gl/page-check.mjs --xorg           # plus X.Org's modesetting driver with glamor on the device (reported)
-node test/gl/page-check.mjs --no-apt         # without Mesa: GL up and the guest's environment only
+node test/gl/page-check.mjs --no-apt         # without Mesa: GL up, the guest's environment and the display resize (R)
+node test/gl/page-check.mjs --no-apt --server http://127.0.0.1:8080   # against a dev server that runs (only read from); --inline for ?worker=0
 ```
 
 `unkernel-check.mjs` builds what it needs and skips what exists: `pnpm
@@ -963,6 +1148,9 @@ Results (2026-11-21, the series of Patches):
 | `unkernel-check.mjs --drm --skip c`, lazy and `--eager`; `--fail` both ways; `--gl-delay 8` | all pass (2026-11-21); Loading on first use |
 | `page-check.mjs`, `--suspend` | all pass; The page |
 | `unkernel-check.mjs --drm --skip c` (inline; `--worker --skip c,d`) with window images (g), `--snapshot` (s) both modes | all pass (2026-11-22); The DRM path |
+| `unkernel-check.mjs --drm --lose` (inline, `--worker`), `page-check.mjs --lose`, `test/wland/page-check.mjs --built --gpu`'s loss case | pass (2026-11-22); Context loss |
+| `unkernel-check.mjs --drm --skip c` (inline) with multisampling (m, patch 17) | all pass (2026-11-22) |
+| `unkernel-check.mjs --drm --skip a,b,c,d,e,g,h` (step r) and `page-check.mjs --no-apt` (R), inline and worker mode | all pass (2026-11-22); Display size |
 
 Workloads that need no window system of ours (so nothing waits on wland):
 

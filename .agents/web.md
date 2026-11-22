@@ -315,7 +315,12 @@ elsewhere) and Ctrl-Shift-O; Copy diagnostics is y after the prefix
   first.
 - Display and input: the mode offered to the guest is the stage size in
   CSS pixels (turned when the rotate chip is on), and the canvas is scaled
-  to fit. While a program has the evdev keyboard open, keys go to it and
+  to fit. kwfb takes it at a program's first open; virtio-gpu (guest GL)
+  is told when the stage settles at another size (a ResizeObserver on the
+  stage and the rotate chip, `vm.updateDisplaySize()` 300 ms after the
+  last change: window resizes, full screen, a turned phone, the preview
+  docked), a hotplug with the new preferred mode; the canvas follows the
+  mode the guest then sets (gl.md, Display size). While a program has the evdev keyboard open, keys go to it and
   not to the terminal. With the tablet open the pointer goes there as
   absolute positions and nothing locks; this wins when both mice are open.
   Otherwise a click with the relative mouse open takes pointer lock. Phone
@@ -494,7 +499,12 @@ out, so the guest has the vtest link alone, for comparison.
   option was set): the device is 2D and GL programs use llvmpipe. A
   renderer that fails at first use, or a `vm.gl.ready` that rejects
   otherwise (no forwarder in an older bundle), is a failed row and a
-  toast, not fatal.
+  toast, not fatal. A lost WebGL2 context (status "lost", or
+  `stats.gpu.contextLost`) is a warning row "WebGL context lost": the GL
+  programs that were running fail and must be restarted, the next one
+  gets a new renderer, no reload (gl.md, Context loss); "loading" while
+  that renderer is made, then the ready row again, whose note counts the
+  losses and new renderers.
 - A suspended session records GL with the device options (`gl` and `gpu`
   in `SessionDevices`; absent in older records: off), since its kernel's
   command line has `kw.gl=1` or not and its devices differ. It is matched
@@ -524,7 +534,9 @@ out, so the guest has the vtest link alone, for comparison.
   libgl1-mesa-dri libglx-mesa0`, then the kw layer's
   `/etc/X11/kw-kms.conf` (kernel/guest.md), `sudo
   Xorg :0 -config kw-kms.conf -nolisten tcp &`, then `DISPLAY=:0
-  glxgears`. Without the device (`?gpu=0`) X runs on kwfb (kernel/guest.md,
+  glxgears`; after the page resized, `xrandr; xrandr --output Virtual-1
+  --auto` (x11-xserver-utils; X hears no hotplug without udev; the X +
+  glamor tile's start.sh follows by itself: gl.md, Display size). Without the device (`?gpu=0`) X runs on kwfb (kernel/guest.md,
   X.Org on the framebuffer: `xserver-xorg-video-fbdev`, `sudo Xorg :0
   -nolisten tcp &`) and GL clients on it go through the vtest link,
   reading each frame back; for frame rates without the display,
@@ -670,7 +682,10 @@ answered at the kernel's next yield.
   ImageBitmap blitted in the renderer's WebGL2 context, no readback (a
   promise only while the renderer loads; a buffer at a plane offset gives
   null, logged once), which wland draws into the window's canvas and
-  `release` closes. Without the source wland leaves linux-dmabuf out, also
+  `release` closes. After a lost WebGL2 context `image()` gives null for
+  the buffers of the GL clients that ran then (restart them); the relay's
+  own context never submitted, so the new renderer makes it again, and GL
+  clients started after the loss show (gl.md, Context loss). Without the source wland leaves linux-dmabuf out, also
   in front of a relay with `--dmabuf`, and GL apps render in software
   (llvmpipe) into wl_shm buffers like any app: GL off (no render node, no
   flag), `?gpu=0` (the vtest link: with `GALLIUM_DRIVER=virpipe
@@ -878,6 +893,39 @@ answered at the kernel's next yield.
   there as everywhere (Ctrl-A Ctrl-A sends it on). Guest memory with
   Firefox on a page: 730 MiB used of 1978, its processes' RSS 1.4 GiB
   (shared pages counted in each).
+- Chromium (Debian's chromium 156, 2026-11-22, headless Chromium on
+  SwiftShader, worker mode on 4 CPUs, 2 GiB): renders on the GPU path,
+  its window by GPU resource (ABGR8888), with two conditions. Mesa's EGL
+  must be installed: the package's recommends bring the DRI driver, GBM
+  and GLX but not `libegl1` and `libegl-mesa0`, which its ANGLE loads
+  as `libEGL.so.1` (without them the GPU process cannot start;
+  `/etc/chromium.d/kw-wayland` then prints the apt-get line where the
+  render node is; `libgles2` is not needed). And the renderer needs
+  multisampling (gl.md, patch 17): Chromium's ANGLE (its GL backend on
+  the native EGL, `gl=egl-angle,angle=opengl`) offers OpenGL ES 3.0 only
+  where each required colour and depth format takes 4 samples, and
+  Chromium 156 asks for ES 3.0 and nothing less. Before the patch the
+  guest's Mesa offered no multisampling on any WebGL2 host (WebGL2 has
+  no multisample textures, the GPU or SwiftShader alike), so its GPU
+  process logged `eglCreateContext: Requested version is not supported`
+  (ANGLE's EGL refusing ES 3.0 on its ES 2.0 cap, not Mesa: virgl's
+  context is ES 3.0) and `ES version fallback is disabled`, exited three
+  times, and Chromium composited in software into wl_shm buffers
+  (chrome://gpu all "Software only" or "Disabled", WebGL too; seen the
+  same on an M4 Pro with ANGLE Metal). Now chrome://gpu has Compositing,
+  Rasterization, Canvas and WebGL hardware accelerated, `GL_RENDERER
+  ANGLE (Mesa, virgl (ANGLE (...)), OpenGL ES 3.0 Mesa 25.0.7)`, GL_VERSION
+  OpenGL ES 3.0 (one more `Requested version is not supported` is a
+  context of a higher version, WebGPU's, which stays unusable). Measured
+  (one run each, a fresh profile once started before): a CSS animation
+  (a 200x200 gradient moving and turning) 54 rAF/s and 51 to 53 commits/s
+  by resource against 45 to 49 rAF/s and 44 to 47 commits/s with
+  `--disable-gpu` (3084 KiB a commit read in place); a WebGL2 page
+  (antialias, 4 samples) 54 rAF/s by resource, while with `--disable-gpu`
+  (as before the patch) Chromium has no WebGL; the window maps 10 to 14
+  s after the start either way (9.1 to 9.3 s with `--disable-gpu`). No
+  flag is needed or set by default (`page-check.mjs --chromium` checks
+  the GPU path). Not measured on a GPU.
 - GL frame rates (2026-11-22, `page-check.mjs --built --gpu --pacing`,
   headless Chromium on SwiftShader, so a floor; 61 rAF/s; worker mode;
   weston-simple-egl -o, which redraws everything each frame; one run

@@ -858,7 +858,8 @@ parts that are easy to get wrong.
   renderer (the module, a WebGL2 context on a 1x1 OffscreenCanvas, the
   module's `virgl.Renderer`) is loaded on the guest's first GL use: the
   first vtest client (`LazyVtestRenderer`) or virtio-gpu's first capset or
-  3D command (gl.md, Loading on first use); before the boot only
+  3D command, not a 2D client's context (held until the load; gl.md,
+  Loading on first use); before the boot only
   `probeWebGl2()` makes a WebGL2 context and drops it, and without one the
   loader is failed from the start (the device is 2D). `gl.eager` loads it
   before the boot instead. `gl.ready` resolves once the forwarder's LOG
@@ -867,10 +868,21 @@ parts that are easy to get wrong.
   (logged) when there can be no renderer (no WebGL2 context; with `eager`,
   a load that failed), the forwarder fails or the link does not come
   within 30 s. `vm.gl.status` (`GlRendererStatus`) says idle, loading,
-  ready or failed, when the load started, how long it took, the error, and
-  the WebGL2 implementation; `vm.gl.loaded` settles once the renderer is
-  up or failed (never while the guest uses no GL); `vm.gl.load()` starts
-  it.
+  ready, lost or failed, when the load started, how long it took, the
+  error, the WebGL2 implementation, and how often the context was lost and
+  a new renderer made (`losses`, `renewals`); `vm.gl.loaded` settles once
+  the first renderer is up or failed (never while the guest uses no GL);
+  `vm.gl.load()` starts it. A lost WebGL2 context (the loader's listener
+  calls `preventDefault()`, so the browser may restore it; a restored one
+  is empty and released at once) makes the state "lost": `GlLoader.get()`,
+  which the vtest link and virtio-gpu both use, makes a new renderer (a
+  new instance of the module's factory, virgl.wasm fetched again, normally
+  from the HTTP cache, on a new OffscreenCanvas; a context that comes lost
+  may take 5 s to be restored) on the guest's next GL use, one try at a
+  time, the next a second after a failure. `LazyVtestRenderer` closes
+  every vtest client at the loss (the guest's Mesa sees its socket end)
+  and makes a new `virgl.Renderer` for the next client; virtio-gpu:
+  `GpuRenderer`, below (gl.md, Context loss).
 - `vm.gl.stats` is `StreamHost.stats`, with the renderer's counters once
   it is loaded (`VtestRenderer.totals()`, `VirglTotals`: the wasm module's
   `KW_VIRGL_STAT_*`, which count virtio-gpu's commands too; gl.md, Stats)
@@ -1237,9 +1249,28 @@ parts that are easy to get wrong.
   model, one scanout; 3D through a `GpuBackend` (virtio-gpu 3D, below;
   never on the CLI: Node has no WebGL2). Display info and the EDID (`makeEdid()`, CVT-RB timings, the
   physical size from the display option's dpi) come from
-  `DisplayHost.wantedSize()`, the size kwfb is offered too. The `gpu`
-  option implies `display` (and so the evdev devices) when that is not
-  given.
+  `DisplayHost.wantedSize()`, the size kwfb is offered too, fitted by
+  `fitGpuSize()`: 64 to 4095 a side (an EDID detailed timing has 12 bits
+  a side; Linux drops one under 64), shrunk with its aspect until the
+  60 Hz pixel clock fits the EDID's 16 bits (about 3840x2400). The stock
+  driver takes the EDID's one mode as the connector's only, preferred
+  mode, odd sizes as they are (without an EDID it would use
+  `drm_cvt_mode()`, which rounds the width down to a multiple of 8, plus
+  standard modes). The `gpu` option implies `display` (and so the evdev
+  devices) when that is not given.
+- Display size changes: `updateDisplaySize(size?)` (KernelHandle, both
+  modes; a size replaces the option, else a function is asked again: in
+  worker mode on the owner's thread, sent as "display-size" with
+  `hotplug`) calls `displayChanged()`, which raises a config interrupt with
+  VIRTIO_GPU_EVENT_DISPLAY when the fitted size differs from the one the
+  driver last read (GET_DISPLAY_INFO; nothing before the driver has read
+  one). The driver asks for the EDID and display info again and sends a
+  drm uevent with HOTPLUG=1; a client that probes the connector (the DRM
+  master's GETCONNECTOR) finds the new preferred mode and sets it or not.
+  The display, frames and `onDisplay` follow the mode set (the scanout),
+  never the size asked. A restore raises the event once (`force`): the
+  size the snapshot's driver read is not saved. worker-host's `resize()`
+  sends a function's new size for kwfb only (no event).
 - Pixels: a resource's backing is the guest's pages, read in place. The
   host keeps an XRGB8888 copy only of resources that have been scanned out:
   SET_SCANOUT fills it from the backing, TRANSFER_TO_HOST_2D copies the
@@ -1272,9 +1303,7 @@ parts that are easy to get wrong.
   "virtio-gpu commands" refuse a snapshot; `held()` is the part that lasts
   while a program runs (resources and contexts), which `Kernel.snapshot()`
   refuses at once, before the guest parks (a task waiting on the device
-  might not park in time, and the reason would be lost); `displayChanged()` raises a config interrupt with
-  VIRTIO_GPU_EVENT_DISPLAY, after which the driver asks for the display
-  info again (nothing calls it yet).
+  might not park in time, and the reason would be lost).
 - Test: `node test/gpu/check.mjs` (testing.md).
 
 ### virtio-gpu 3D (`js/core/gl-gpu.ts`)
@@ -1336,17 +1365,24 @@ parts that are easy to get wrong.
   fenced answers, parks and time parked, presents, readbacks and errors,
   with `lastError` (the latest failed command, its context and resource,
   the answer and why; failures are logged at most once a second) and
-  `contextLost`. A lost WebGL2 context (`webglcontextlost`, or
-  `isContextLost()`; iOS drops contexts under memory pressure and in the
-  background) is said once in the log, and from then on every 3D command
-  is answered ERR_UNSPEC at once without a GL call, waits for GPU work
-  end, and `image()` gives null: the guest's GL programs fail rather than
-  hang. Not recovered: a restored context is a new, empty one, every
-  guest context and resource lived in the old one, and virtio-gpu cannot
-  tell the guest they are gone; recovery would take a new renderer on the
-  restored context for new clients and a reset of the device (the guest's
-  driver re-probing, its GL programs restarted), so the page has to be
-  reloaded.
+  `contextLost`, `losses`, `renewals`. A lost WebGL2 context
+  (`webglcontextlost`, or `isContextLost()`; a GPU reset, memory pressure,
+  the GPU process ended) is said once in the log; the guest's contexts
+  and resources become stale (contexts that never submitted are kept to
+  be made again), every 3D command is answered at once without a GL call
+  (ERR_UNSPEC; OK for destroy, unref, detach, scanout and flush), waits
+  for GPU work end, and `texture()` and `image()` give null. With
+  `renew` (gl.ts passes `GlLoader.get()`), the guest's next CTX_CREATE of
+  a context that is not stale asks for a new renderer; commands queue
+  until it is up, where the idle contexts are made again and the queue
+  runs, its capsets checked against the first's (a size or version
+  change fails the renewal; other bytes are logged: the guest's kernel
+  keeps the capsets it cached). Commands naming a stale context or
+  resource then fail (or are dropped as above), so the programs running
+  at the loss fail until restarted, and new ones work (gl.md, Context
+  loss). A renewal that fails answers what queued as while lost; the next
+  new context tries again after a second. Without `renew` a loss is
+  final.
 - `texture(resourceId)`: the resource's `WebGLTexture` in the renderer's
   context (`gl`), its size, virgl format, `alpha` (the format has alpha)
   and `yTop` (the texture's row k
@@ -1373,8 +1409,8 @@ parts that are easy to get wrong.
   context it did not see made again before the first command naming it
   (gl.md, The DRM path, Snapshots).
 - Not shared with kwfb: dumb buffers stay 2D (the 2D model's host copies),
-  so a 3D context cannot use one (CTX_ATTACH_RESOURCE of a dumb buffer
-  fails). Blobs, UUIDs and host-visible memory are not offered.
+  so a 3D context cannot use one (CTX_ATTACH_RESOURCE of a dumb buffer is
+  answered without the renderer, which has no such resource). Blobs, UUIDs and host-visible memory are not offered.
 - Test: `node test/gl/unkernel-check.mjs --drm` (gl.md, The DRM path;
   `--snapshot` for the idle context across a restore), `pnpm test:gl-gpu`.
 

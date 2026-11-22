@@ -1299,12 +1299,16 @@ export function start(): void {
 			const key = `${s.state} ${now}`;
 			if (key === shown) return;
 			shown = key;
-			if (s.state === "ready" && st.gpu?.contextLost)
-				ui.check("gl", "Guest GL", "fail", "WebGL context lost", `the browser dropped the renderer's WebGL2 context (memory pressure, the page in the background, a GPU reset): every 3D command fails from then on, so GL programs in the guest fail; reload the page for a new renderer. ${now}.`);
-			else if (s.state === "ready")
-				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `WebGL2: ${webgl}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${s.what}${cfg.gpu ? ", virtio-gpu 3D" : ""}; ${loadNote}. ${how} ${now}.`);
-			else if (s.state === "loading")
-				ui.check("gl", "Guest GL", "info", "loading", `the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context) for ${fmtS(at - (s.startedAt ?? at))}. ${how}`);
+			const losses = s.losses ? `; the WebGL2 context was lost ${s.losses === 1 ? "once" : `${s.losses} times`} and a new renderer made ${s.renewals === 1 ? "once" : `${s.renewals} times`} (the GL programs running at a loss had to be restarted)` : "";
+			if (s.state === "lost" || (s.state === "ready" && st.gpu?.contextLost))
+				ui.check("gl", "Guest GL", "warn", "WebGL context lost", `the browser dropped the renderer's WebGL2 context (memory pressure, a GPU reset, the GPU process ended; ${s.losses} so far): ` +
+					`every GL object of the guest went with it, so the GL programs that were running fail: restart them; the next GL program gets a new renderer, no page reload needed` +
+					`${s.error ? ` (the last try failed: ${s.error})` : ""}. ${now}.`);
+			else if (s.state === "ready") {
+				const name = s.webgl ?? webgl;
+				ui.check("gl", "Guest GL", soft ? "warn" : "pass", name, `WebGL2: ${name}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${s.what}${cfg.gpu ? ", virtio-gpu 3D" : ""}; ${loadNote}${losses}. ${how} ${now}.`);
+			} else if (s.state === "loading")
+				ui.check("gl", "Guest GL", "info", "loading", `${s.losses ? "a GL program after the WebGL2 context was lost: making a new renderer" : "the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context)"} for ${fmtS(at - (s.startedAt ?? at))}. ${how}`);
 			else if (linked)
 				ui.check("gl", "Guest GL", "info", "on, not loaded yet", `the renderer (virglrenderer in wasm, virgl.mjs and virgl.wasm, about 480 KB) is fetched and started on this browser's WebGL2 on the guest's first GL use (a program opening /dev/dri for 3D, or a vtest client), which waits for it; nothing of it was loaded at boot. ${how} ${now}.`);
 		};
@@ -1364,7 +1368,7 @@ export function start(): void {
 			? `last ${(ms / 1000).toFixed(0)} s: ${(d("presents") * 1000 / ms).toFixed(1)} presents/s, ${d("parks")} parks, ${(d("parks") ? d("parkedMs") / d("parks") : 0).toFixed(2)} ms parked each; `
 			: "";
 		return `virtio-gpu: ${rate}${g.presents} presents, ${g.commands} commands (${g.fenced} fenced: ${g.parks} parked, ${g.parkedMs.toFixed(0)} ms in all), ` +
-			`${g.reads} readbacks, ${g.errors} errors${g.contextLost ? " (the WebGL2 context was lost: reload the page)" : g.lastError ? ` (last: ${g.lastError})` : ""}`;
+			`${g.reads} readbacks, ${g.errors} errors${g.contextLost ? " (the WebGL2 context is lost: restart the GL programs; the next one gets a new renderer)" : g.lastError ? ` (last: ${g.lastError})` : ""}`;
 	}
 
 	/**
@@ -1379,7 +1383,8 @@ export function start(): void {
 	function glFrameTimes(r: VirglTotals, p: VirglTotals | undefined, ms: number): string | null {
 		const d = (k: keyof VirglTotals) => r[k] - (p?.[k] ?? 0);
 		const n = d("reads");
-		if (!n || ms <= 0) return null;
+		// n < 0: a new renderer after a loss counts from 0 again
+		if (n <= 0 || ms <= 0) return null;
 		const per = (k: keyof VirglTotals) => `${(d(k) / n).toFixed(2)} ms`;
 		const busy = d("submitMs") + d("readMs") + d("writeMs") + d("otherMs");
 		const atOnce = d("waitsRead") + d("waitsDone") + d("waitsAhead");

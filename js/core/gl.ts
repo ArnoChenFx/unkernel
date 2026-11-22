@@ -25,7 +25,9 @@
 // forwarder reconnects every second while the link is down, so a restored
 // guest finds the new host by itself. Renderer state (the clients' GL
 // contexts) is not in a snapshot: a restore resets the link, which ends the
-// guest's GL clients.
+// guest's GL clients. Nor does it survive the browser dropping the WebGL2
+// context: the GL clients running then end (vtest) or fail (virtio-gpu),
+// and the guest's next GL use gets a new renderer (GlLoader.get()).
 //
 // Both modes: vsock is served on the thread that owns the VM (worker mode
 // too), so GL runs there, which must have OffscreenCanvas and WebGL2 (a
@@ -115,12 +117,18 @@ export type { VirglTotals };
 /** Where the renderer is (KernelHandle.gl.status). */
 export interface GlRendererStatus {
 	/**
-	 * "idle": not loaded yet, it loads on the guest's first GL use; "loading";
-	 * "ready"; "failed": it cannot be had (`error` says why), and the guest's
-	 * GL programs get no renderer (with virtio-gpu, Mesa falls back to
-	 * software rendering).
+	 * "idle": not loaded yet, it loads on the guest's first GL use; "loading"
+	 * (also a new renderer after a loss); "ready"; "lost": the browser
+	 * dropped its WebGL2 context, the GL programs that were running fail and
+	 * must be restarted, and the guest's next GL use makes a new renderer
+	 * (`error` says why the last try failed, if one did); "failed": it cannot
+	 * be had (`error` says why), and the guest's GL programs get no renderer
+	 * (with virtio-gpu, Mesa falls back to software rendering).
 	 */
-	state: "idle" | "loading" | "ready" | "failed";
+	state: "idle" | "loading" | "ready" | "lost" | "failed";
+	/** WebGL2 contexts lost so far, and new renderers made after a loss. */
+	losses: number;
+	renewals: number;
 	/** Loaded before the kernel booted (gl.eager), not on first use. */
 	eager: boolean;
 	/** performance.now() when the load started, or null. */
@@ -185,7 +193,7 @@ export class GlHost {
 	/** Where the wasm renderer is: not loaded yet, loading, ready (with how long the load took), failed. */
 	get status(): GlRendererStatus {
 		if (this.#loader) return { ...this.#loader.status };
-		return { state: "ready", eager: true, startedAt: null, loadMs: null, error: null, what: "custom renderer (gl.renderer)", webgl: null };
+		return { state: "ready", eager: true, startedAt: null, loadMs: null, error: null, what: "custom renderer (gl.renderer)", webgl: null, losses: 0, renewals: 0 };
 	}
 
 	/** Load the renderer now, as the guest's first GL use would (nothing if it is loaded or loading); resolves as `loaded`. */
@@ -325,14 +333,39 @@ function rendererAttrs(module: VirglModule): WebGLContextAttributes {
  */
 async function loadGlCore(url: string, log: (msg: string) => void): Promise<GlCore> {
 	if (typeof OffscreenCanvas !== "function") throw new Error("no OffscreenCanvas here, so no WebGL2");
+	// A second load (a new renderer after a loss) imports nothing again; the
+	// module's factory makes a new instance (its own heap and GL tables),
+	// fetching virgl.wasm again (from the HTTP cache, normally).
 	const mod = await import(/* @vite-ignore */ url) as { default: (o: object) => Promise<VirglModule> };
 	const say = (s: string) => log(`[gl] virgl: ${s}`);
 	const Module = await mod.default({ print: say, printErr: say });
 	const gl = new OffscreenCanvas(1, 1).getContext("webgl2", rendererAttrs(Module));
 	if (!gl) throw new Error("no WebGL2 context (OffscreenCanvas.getContext(\"webgl2\") gave none)");
-	gl.canvas.addEventListener("webglcontextlost", () => log("[host] gl: the WebGL2 context was lost; GL clients will fail"));
+	// Made while the GPU is away (its process restarting after a crash): the
+	// context comes lost, and the browser restores it once the GPU is back.
+	if (gl.isContextLost() && !await restored(gl, RESTORE_WAIT_MS))
+		throw new Error(`the new WebGL2 context was lost from the start and not restored within ${RESTORE_WAIT_MS / 1000} s`);
 	Module.virgl.init(gl);
 	return { module: Module, gl, gpu: Module.virgl.gpu };
+}
+
+/** How long a context that comes lost may take to be restored (loadGlCore). */
+const RESTORE_WAIT_MS = 5000;
+
+/** Whether a lost context is restored within `ms` (asks for it: preventDefault() on its loss). */
+function restored(gl: WebGL2RenderingContext, ms: number): Promise<boolean> {
+	const canvas = gl.canvas as OffscreenCanvas;
+	return new Promise((resolve) => {
+		const ac = new AbortController();
+		const end = (ok: boolean) => {
+			ac.abort();
+			clearTimeout(timer);
+			resolve(ok);
+		};
+		const timer = setTimeout(() => end(!gl.isContextLost()), ms);
+		canvas.addEventListener("webglcontextlost", (e) => e.preventDefault(), { signal: ac.signal });
+		canvas.addEventListener("webglcontextrestored", () => end(true), { signal: ac.signal });
+	});
 }
 
 /**
@@ -353,23 +386,34 @@ export function probeWebGl2(): string {
 }
 
 /**
- * @internal The wasm renderer, loaded once, on the first load(): the
- * guest's first GL use (a vtest client, virtio-gpu's first capset or 3D
- * command), GlHost.load(), or before boot with `eager`.
+ * @internal The wasm renderer, loaded on the first load(): the guest's
+ * first GL use (a vtest client, virtio-gpu's first capset or 3D command),
+ * GlHost.load(), or before boot with `eager`. When the browser drops its
+ * WebGL2 context, get() makes a new one (a new module instance on a new
+ * WebGL2 context) on the guest's next GL use; the vtest link and virtio-gpu
+ * share whichever is current.
  */
 export class GlLoader {
 	readonly status: GlRendererStatus;
+	/** The first renderer (the first load). */
 	readonly loaded: Promise<GlCore>;
 	#url: string;
 	#log: (msg: string) => void;
 	#settle!: { resolve: (c: GlCore) => void; reject: (e: Error) => void };
 	#started = false;
+	/** The current renderer once one is up. */
+	#core: GlCore | null = null;
+	/** Renderers whose context was lost (webglcontextlost, or isContextLost() seen first). */
+	#lost = new WeakSet<GlCore>();
+	#renewing: Promise<GlCore> | null = null;
+	#renewFailedAt = -Infinity;
+	#onLost = new Set<(c: GlCore) => void>();
 
 	/** `failed`: it cannot be had at all (no WebGL2 context when probed), so load() rejects with that. */
 	constructor(url: string, log: (msg: string) => void, eager: boolean, failed?: string) {
 		this.#url = url;
 		this.#log = log;
-		this.status = { state: failed ? "failed" : "idle", eager, startedAt: null, loadMs: null, error: failed || null, what: null, webgl: null };
+		this.status = { state: failed ? "failed" : "idle", eager, startedAt: null, loadMs: null, error: failed || null, what: null, webgl: null, losses: 0, renewals: 0 };
 		this.loaded = new Promise<GlCore>((resolve, reject) => (this.#settle = { resolve, reject }));
 		this.loaded.catch(() => {});
 		if (failed) {
@@ -387,9 +431,7 @@ export class GlLoader {
 		if (!st.eager) this.#log("[host] gl: the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context)");
 		loadGlCore(this.#url, this.#log).then((c) => {
 			st.loadMs = performance.now() - t0;
-			st.state = "ready";
-			st.webgl = webglName(c.gl);
-			st.what = `virglrenderer (wasm) on ${c.gl.getParameter(c.gl.VERSION)}`;
+			this.#up(c);
 			this.#log(`[host] gl: renderer loaded in ${(st.loadMs / 1000).toFixed(2)} s: ${st.what}; ${st.webgl}`);
 			this.#settle.resolve(c);
 		}, (e: unknown) => {
@@ -401,6 +443,92 @@ export class GlLoader {
 		});
 		return this.loaded;
 	}
+
+	/**
+	 * The renderer to use now: the first load (started if need be), the
+	 * current renderer, or, when its context was lost, a new one (one try at
+	 * a time; after a failure the next try waits a second). Rejects if there
+	 * is none.
+	 */
+	get(): Promise<GlCore> {
+		if (!this.#started) return this.load();
+		const c = this.#core;
+		if (!c) return this.loaded;
+		if (c.gl.isContextLost()) this.#lose(c);
+		if (!this.#lost.has(c)) return Promise.resolve(c);
+		if (this.#renewing) return this.#renewing;
+		if (performance.now() - this.#renewFailedAt < 1000) return Promise.reject(new Error(this.status.error ?? "no renderer"));
+		const st = this.status, t0 = performance.now();
+		st.state = "loading";
+		st.startedAt = t0;
+		this.#log("[host] gl: a GL program after the WebGL2 context was lost: making a new renderer (a new module instance on a new WebGL2 context)");
+		const p = loadGlCore(this.#url, this.#log).then((n) => {
+			st.loadMs = performance.now() - t0;
+			st.renewals++;
+			this.#up(n);
+			this.#log(`[host] gl: a new renderer in ${(st.loadMs / 1000).toFixed(2)} s (${st.renewals} after ${st.losses} losses): ${st.what}; ${st.webgl}`);
+			return n;
+		}, (e: unknown) => {
+			this.#renewFailedAt = performance.now();
+			st.state = "lost";
+			st.error = (e as Error)?.message ?? String(e);
+			this.#log(`[host] gl: no new renderer after the loss: ${st.error}; the guest's next GL use tries again`);
+			throw e instanceof Error ? e : new Error(st.error);
+		}).finally(() => {
+			if (this.#renewing === p) this.#renewing = null;
+		});
+		this.#renewing = p;
+		return p;
+	}
+
+	/** Hear when the current renderer's context is lost (with the renderer). */
+	onLost(fn: (c: GlCore) => void): void {
+		this.#onLost.add(fn);
+	}
+
+	/** A renderer is up: the current one; its context's loss and restore are watched. */
+	#up(c: GlCore): void {
+		const st = this.status;
+		this.#core = c;
+		st.state = "ready";
+		st.error = null;
+		st.webgl = webglName(c.gl);
+		st.what = `virglrenderer (wasm) on ${c.gl.getParameter(c.gl.VERSION)}`;
+		const canvas = c.gl.canvas as OffscreenCanvas;
+		const ac = new AbortController();
+		canvas.addEventListener("webglcontextlost", (e) => {
+			// Ask for the restore: it tells that the GPU is back, and is released then.
+			e.preventDefault();
+			this.#lose(c);
+		}, { signal: ac.signal });
+		canvas.addEventListener("webglcontextrestored", () => {
+			// An empty context: everything of the module that used it is gone,
+			// and a new module instance takes a new context (get()), so let the
+			// browser have this one back.
+			ac.abort();
+			this.#log("[host] gl: the browser restored the lost WebGL2 context: released (a new renderer is made on the guest's next GL use)");
+			try {
+				c.gl.getExtension("WEBGL_lose_context")?.loseContext();
+			} catch {}
+		}, { signal: ac.signal });
+	}
+
+	#lose(c: GlCore): void {
+		if (this.#lost.has(c)) return;
+		this.#lost.add(c);
+		const st = this.status;
+		st.losses++;
+		if (c === this.#core) {
+			st.state = "lost";
+			this.#log("[host] gl: the WebGL2 context was lost (the browser dropped it: memory pressure, a GPU reset, the GPU process ended): " +
+				"GL programs that were running fail and must be restarted; the guest's next GL use makes a new renderer");
+		}
+		for (const fn of this.#onLost) {
+			try {
+				fn(c);
+			} catch {}
+		}
+	}
 }
 
 /**
@@ -409,7 +537,9 @@ export class GlLoader {
  * then clients are only noted, and their bytes wait (feed() returns a
  * promise, so StreamHost reads no more from the link and vsock credit holds
  * the forwarder). If the renderer cannot be had, each client is closed
- * (the guest's Mesa sees its vtest socket end).
+ * (the guest's Mesa sees its vtest socket end). When the renderer's WebGL2
+ * context is lost, every client is closed (its GL state is gone) and the
+ * next one gets a new renderer (GlLoader.get()).
  */
 class LazyVtestRenderer implements VtestRenderer {
 	onreply: (id: number, bytes: Uint8Array) => void = () => {};
@@ -417,8 +547,11 @@ class LazyVtestRenderer implements VtestRenderer {
 	#loader: GlLoader;
 	#strict: boolean;
 	#real: VtestRenderer | null = null;
-	#failed: string | null = null;
+	/** The renderer #real runs on, and the clients opened on it. */
+	#core: GlCore | null = null;
+	#ids = new Set<number>();
 	#ready: Promise<VtestRenderer> | null = null;
+	/** Clients waiting for the renderer. */
 	#opened = new Set<number>();
 
 	constructor(loader: GlLoader, strictWaits: boolean) {
@@ -426,6 +559,21 @@ class LazyVtestRenderer implements VtestRenderer {
 		this.#strict = strictWaits;
 		// Loaded for virtio-gpu (or eagerly): made now too, so that totals() counts from then on.
 		loader.loaded.then(() => void this.#start().catch(() => {}), () => {});
+		loader.onLost((c) => {
+			if (c !== this.#core) return;
+			// Every client's contexts and resources were in it: end them (the
+			// guest's Mesa sees its vtest socket end), and leave the old module
+			// (closing them there first stops its polls of parked clients).
+			const r = this.#real!, ids = [...this.#ids];
+			this.#real = this.#core = this.#ready = null;
+			this.#ids.clear();
+			for (const id of ids) {
+				try {
+					r.close(id);
+				} catch {}
+				this.onclose(id, "the WebGL2 context was lost");
+			}
+		});
 	}
 
 	async init(): Promise<string> {
@@ -433,31 +581,38 @@ class LazyVtestRenderer implements VtestRenderer {
 	}
 
 	#start(): Promise<VtestRenderer> {
-		this.#ready ??= this.#loader.load().then(async (c) => {
+		const p = this.#ready ??= this.#loader.get().then(async (c) => {
 			const r = new c.module.virgl.Renderer(c.gl, { strictWaits: this.#strict });
 			await r.init();
 			r.onreply = (id, b) => this.onreply(id, b);
-			r.onclose = (id, why) => this.onclose(id, why);
+			r.onclose = (id, why) => {
+				this.#ids.delete(id);
+				this.onclose(id, why);
+			};
 			this.#real = r;
-			for (const id of this.#opened) r.open(id);
+			this.#core = c;
+			for (const id of this.#opened) {
+				r.open(id);
+				this.#ids.add(id);
+			}
 			this.#opened.clear();
 			return r;
 		}, (e: unknown) => {
-			this.#failed = (e as Error)?.message ?? String(e);
+			// The next client tries again (GlLoader.get(): a renderer that failed to load stays failed).
+			if (this.#ready === p) this.#ready = null;
+			const why = (e as Error)?.message ?? String(e);
 			const ids = [...this.#opened];
 			this.#opened.clear();
-			for (const id of ids) this.onclose(id, `no renderer: ${this.#failed}`);
+			for (const id of ids) this.onclose(id, `no renderer: ${why}`);
 			throw e;
 		});
-		return this.#ready;
+		return p;
 	}
 
 	open(id: number): void {
-		if (this.#real) return this.#real.open(id);
-		if (this.#failed) {
-			const why = this.#failed;
-			queueMicrotask(() => this.onclose(id, `no renderer: ${why}`));
-			return;
+		if (this.#real) {
+			this.#ids.add(id);
+			return this.#real.open(id);
 		}
 		this.#opened.add(id);
 		this.#start().catch(() => {});
@@ -465,14 +620,14 @@ class LazyVtestRenderer implements VtestRenderer {
 
 	feed(id: number, bytes: Uint8Array): unknown {
 		if (this.#real) return this.#real.feed(id, bytes);
-		if (this.#failed || !this.#ready) return undefined;
+		if (!this.#ready || !this.#opened.has(id)) return undefined;
 		// Busy until the renderer is up; then these bytes go first.
 		return this.#ready.then((r) => r.feed(id, bytes), () => {});
 	}
 
 	close(id: number): void {
-		if (this.#real) return this.#real.close(id);
 		this.#opened.delete(id);
+		if (this.#ids.delete(id)) this.#real?.close(id);
 	}
 
 	stats(id: number): { parks: number; parkedMs: number } | undefined {
@@ -545,7 +700,7 @@ export function prepareGl(opt: GlOption | undefined, gpu: boolean, vsock: boolea
 		log(`[host] gpu: 2D only: ${failed}`);
 		return { opts, loader };
 	}
-	const renderer = new GpuRenderer(() => loader.load(), { strictWaits: opts.strictWaits, log });
+	const renderer = new GpuRenderer(() => loader.load(), { strictWaits: opts.strictWaits, log, renew: () => loader.get() });
 	if (eager) renderer.start();
 	return { opts, loader, gpu: renderer };
 }

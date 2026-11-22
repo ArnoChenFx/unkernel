@@ -23,7 +23,7 @@
 //
 //   node test/gl/unkernel-check.mjs [--worker] [--size WxH] [--scenes LIST] [--skip a,b,c]
 //        [--state-ref FILE] [--out DIR] [--browser BIN] [--gl-flags FLAGS] [--timeout S] [--no-build]
-//   node test/gl/unkernel-check.mjs --drm [--eager | --fail [--glfail module]] ...
+//   node test/gl/unkernel-check.mjs --drm [--resize WxH] [--eager | --fail [--glfail module]] ...
 //
 // --drm checks the virtio-gpu path instead (drm-page.js): a kernel with
 // kwvirtio (--kernel, default $KW_BUILD/bundle/unkernel.wasm) and
@@ -65,11 +65,28 @@
 //      must be right and the guest's kernel must log no failed virtio-gpu
 //      command (WebGL refuses a draw whose shader input types differ from
 //      the attributes', which put the renderer's context in error)
+//   m  test/gpu/msaa.c (built as kwgl-state is): 4 samples for each colour
+//      and depth format OpenGL ES 3.0 requires (what Chromium's ANGLE needs
+//      before it offers ES 3.0), and a 4-sample draw with a depth test
+//      resolved by glBlitFramebuffer: right colours, partly covered pixels
+//      on the triangle's edge, no failed virtio-gpu command
+//   r  a display size change on the running machine (vm.updateDisplaySize()
+//      to --resize WxH, default 960x540): test/gpu/kms-hotplug.c (built
+//      here) reads the drm uevent with HOTPLUG=1 from netlink and probes
+//      the new preferred mode; kmscube started afterwards puts that mode on
+//      the scanout, and the display's mode and the page's canvas follow;
+//      glmark2-es2-drm's surface has that size; modetest -c is reported
 //
-// --lose adds step l: glmark2-es2-drm twice, then a run during which the
-// renderer's WebGL2 context is lost (WEBGL_lose_context) and one after:
-// both earlier runs without a failed virtio-gpu command, and after the
-// loss the renderer says so (stats.contextLost) and the runs end.
+// --lose adds step l: glmark2-es2-drm twice (both without a failed
+// virtio-gpu command), then the renderer's WebGL2 context lost
+// (WEBGL_lose_context) four times: during glmark2-es2-drm and restored;
+// during kmscube and a vtest glmark2-es2 and restored; during
+// glmark2-es2-drm and not restored; during kmscube with getContext giving
+// no WebGL2 for a while. Each time the programs running at the loss must
+// end and a kmscube started after it must render (its frames on the
+// canvas equal the scanout read back, no failed command in the guest's
+// kernel); after the first, a dumb-buffer KMS client (test/gpu/kms-dumb.c)
+// must show its picture and a vtest client must get virgl.
 //
 // --snapshot adds step s (the Debian disk's overlay then lives in the
 // page's IndexedDB, so that the machine can be snapshotted): prime.c leaves
@@ -130,6 +147,7 @@ const primeBin = join(out, "prime");
 const windowBin = join(out, "window-image");
 const kmsDumbBin = join(out, "kms-dumb");
 const intAttribBin = join(out, "int-attrib");
+const msaaBin = join(out, "msaa");
 
 const step = (what, cmd, cmdArgs) => {
 	console.log(`== ${what}`);
@@ -157,7 +175,9 @@ if (drm && !existsSync(kernelFile)) {
 if (drm) step("test/gpu/prime.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", primeBin, join(root, "test/gpu/prime.c")]);
 if (drm) step("test/gpu/window-image.c for the guest", join(here, "build-guest-state.sh"), [windowBin, join(root, "test/gpu/window-image.c")]);
 if (drm) step("test/gpu/int-attrib.c for the guest", join(here, "build-guest-state.sh"), [intAttribBin, join(root, "test/gpu/int-attrib.c")]);
-if (drm && has("--fail")) step("test/gpu/kms-dumb.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", kmsDumbBin, join(root, "test/gpu/kms-dumb.c")]);
+if (drm) step("test/gpu/msaa.c for the guest", join(here, "build-guest-state.sh"), [msaaBin, join(root, "test/gpu/msaa.c")]);
+if (drm) step("test/gpu/kms-hotplug.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", join(out, "kms-hotplug"), join(root, "test/gpu/kms-hotplug.c")]);
+if (drm && (has("--fail") || has("--lose"))) step("test/gpu/kms-dumb.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", kmsDumbBin, join(root, "test/gpu/kms-dumb.c")]);
 
 const types = { ".html": "text/html", ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm" };
 let resolveResult;
@@ -215,7 +235,9 @@ const server = createServer(async (req, res) => {
 	if (p === "/files/prime" && drm) return sendFile(req, res, primeBin, "application/octet-stream");
 	if (p === "/files/window-image" && drm) return sendFile(req, res, windowBin, "application/octet-stream");
 	if (p === "/files/int-attrib" && drm) return sendFile(req, res, intAttribBin, "application/octet-stream");
+	if (p === "/files/msaa" && drm) return sendFile(req, res, msaaBin, "application/octet-stream");
 	if (p === "/files/kms-dumb" && drm && existsSync(kmsDumbBin)) return sendFile(req, res, kmsDumbBin, "application/octet-stream");
+	if (p === "/files/kms-hotplug" && drm) return sendFile(req, res, join(out, "kms-hotplug"), "application/octet-stream");
 	// --gl-delay: the renderer's module, late (/slow/virgl.mjs; virgl.wasm next to it on time)
 	if (p === "/slow/virgl.mjs" || p === "/slow/virgl.wasm") {
 		if (p.endsWith(".mjs")) await new Promise((r) => setTimeout(r, Number(opt("--gl-delay", "0")) * 1000));
@@ -233,7 +255,7 @@ const server = createServer(async (req, res) => {
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const query = new URLSearchParams();
 if (has("--worker")) query.set("worker", "1");
-for (const k of ["size", "scenes", "skip", "cmd", "glfail"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
+for (const k of ["size", "resize", "scenes", "skip", "cmd", "glfail"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
 if (has("--eager")) query.set("eager", "1");
 if (has("--snapshot")) query.set("snap", "1");
 if (has("--lose")) query.set("lose", "1");
@@ -335,9 +357,10 @@ function judgeDrm(res) {
 	console.log(`renderer status: at boot ${res.statusAtBoot?.state}, at gl.ready ${res.statusAtReady?.state}, at the end ${st?.state}` +
 		`${st?.startedAt != null ? `; load started ${(st.startedAt / 1000).toFixed(2)} s after the page started, took ${(st.loadMs / 1000).toFixed(2)} s` : ""}` +
 		`${st?.error ? `; error: ${st.error}` : ""}; virgl fetches: at boot ${res.fetchesAtBoot?.length ?? "?"}, at gl.ready ${res.fetchesAtReady?.length ?? "?"}, in all ${JSON.stringify(res.fetches)}`);
+	const load = res.statusAtLoad ?? st;
 	if (res.glOption === true && !has("--fail"))
-		report("lazy", res.statusAtBoot?.state === "idle" && res.statusAtReady?.state === "idle" && !res.fetchesAtReady?.length && (!first || first.startMs >= st.startedAt),
-			`no renderer fetch before the guest's first GL use (first fetch ${first ? `${first.startS} s, the load started ${(st.startedAt / 1000).toFixed(2)} s` : "never"})`);
+		report("lazy", res.statusAtBoot?.state === "idle" && res.statusAtReady?.state === "idle" && !res.fetchesAtReady?.length && (!first || first.startMs >= load.startedAt),
+			`no renderer fetch before the guest's first GL use (first fetch ${first ? `${first.startS} s, the load started ${(load.startedAt / 1000).toFixed(2)} s` : "never"})`);
 	if (res.glOption?.eager) report("eager", res.statusAtReady?.state === "ready" && !!res.fetchesAtBoot?.length, `renderer ready at gl.ready, ${(st.loadMs / 1000).toFixed(2)} s to load, fetched at ${res.fetches?.map((f) => `${f.file} ${f.startS} s`).join(", ")}`);
 	if (res.steps["fail-kms-dumb"]) {
 		const kd = res.steps["fail-kms-dumb"];
@@ -398,18 +421,46 @@ function judgeDrm(res) {
 			`${JSON.stringify(sn.adopted)}; image ${sn.size} pixel (40, 8) ${JSON.stringify(sn.pixel)}; renderer after the restore ${JSON.stringify(sn.gpu)}; ` +
 			`prime: ${(sn.before ?? "").trim().split("\n").join(" | ")} || ${(sn.after ?? "").trim().split("\n").join(" | ")}`);
 	}
+	if (res.resize) {
+		const r = res.resize, hp = r.hotplug?.stdout ?? "";
+		const m = /hotplug 1: preferred (\d+)x(\d+)/.exec(hp);
+		report("resize: hotplug", !!m && `${m[1]}x${m[2]}` === r.size && r.hotplug?.end?.code === 0, hp.trim().split("\n").join("; "));
+		const k = r.kmscube ?? {};
+		report("resize: kmscube", k.scanout === r.size && k.mode === r.size && k.canvas === r.size, `${JSON.stringify(k)}, want ${r.size}`);
+		const g = res.steps["resize-glmark2"];
+		report("resize: glmark2-es2-drm", g?.exitCode === 0 && new RegExp(`Surface Size:\\s+${r.size}`).test(g.stdout), (g?.stdout ?? "").trim().split("\n").join("; "));
+		console.log(`--- resize-modetest:\n${res.steps["resize-modetest"]?.stdout.trim()}`);
+	}
 	if (res.lose) {
-		const runs = [1, 2, 3, 4].map((i) => res.steps[`lose-run${i}`]);
+		const runs = [1, 2].map((i) => res.steps[`lose-run${i}`]);
 		for (const [i, r] of runs.entries()) console.log(`--- lose-run${i + 1} (exit ${r?.exitCode}, ${((r?.ms ?? 0) / 1000).toFixed(1)} s):\n${r?.stdout.trim()}`);
-		const errs = (r) => Number(/kernel errors (\d+)/.exec(r?.stdout ?? "")?.[1] ?? -1);
-		const a = res.lose.after ?? {};
-		report("second run", errs(runs[0]) === 0 && errs(runs[1]) === 0 && /Score/.test(runs[1]?.stdout ?? ""), `kernel errors after run 1: ${errs(runs[0])}, after run 2: ${errs(runs[1])}`);
-		report("context lost", res.lose.lost && a.contextLost === true && runs[2] && runs[3] && (runs[3].ms ?? 1e9) < 120_000,
-			`lost ${res.lose.lost}; stats after ${JSON.stringify({ errors: a.errors, lastError: a.lastError, contextLost: a.contextLost })}; runs 3 and 4 ended after ${((runs[2]?.ms ?? 0) / 1000).toFixed(1)} and ${((runs[3]?.ms ?? 0) / 1000).toFixed(1)} s`);
+		const errs = (s) => Number(/kernel errors (\d+)/.exec(s ?? "")?.[1] ?? -1);
+		report("second run", errs(runs[0]?.stdout) === 0 && errs(runs[1]?.stdout) === 0 && /Score/.test(runs[1]?.stdout ?? ""), `kernel errors after run 1: ${errs(runs[0]?.stdout)}, after run 2: ${errs(runs[1]?.stdout)}`);
+		// a program running at a loss ends (whatever its exit) instead of hanging
+		const ended = (r) => !!r && r.ms < 120_000;
+		const secs = (r) => (r ? `${(r.ms / 1000).toFixed(1)} s, exit ${r.exitCode ?? r.signal}: ${r.tail}` : "?");
+		// a program started after it renders: its frame on the page's canvas, as read back, not flat, no failed command
+		const kmsOk = (k) => !!k?.frame && k.frame.colours > 16 && k.frame.differFromReadback === 0 && errs(k.tail) === 0 && k.after?.contextLost === false;
+		const kmsSay = (k) => `new kmscube: ${k?.frame ? `seq ${k.frame.seq} ${k.frame.size} ${k.frame.colours} colours, ${k.frame.differFromReadback} pixels differ from the readback` : "no frame"}, ` +
+			`${k?.presents} presents, ${k?.rendererErrors} renderer errors, ${k?.tail}`;
+		const [p1, p2, p3, p4] = res.lose.phases ?? [];
+		report("loss 1 (restored), running glmark2-es2-drm", p1?.lost && p1.whileLost?.contextLost && p1.whileLost.state === "lost" && ended(p1.running) && kmsOk(p1.kms),
+			`while lost ${JSON.stringify(p1?.whileLost)}; after the restore ${JSON.stringify(p1?.restored)}; the run at the loss: ${secs(p1?.running)}; ${kmsSay(p1?.kms)}`);
+		report("loss 1: dumb-buffer KMS and a vtest client after it", !!p1?.dumb?.pic && p1.dumb.exitCode === 0 && /virgl/.test(p1?.vtest?.tail ?? ""),
+			`kms-dumb: ${JSON.stringify(p1?.dumb?.pic)} (${p1?.dumb?.tail}); vtest: ${p1?.vtest?.tail}`);
+		report("loss 2 (restored), running kmscube and a vtest glmark2-es2", p2?.lost && p2.vtestClients > 0 && ended(p2.vtestRunning) && ended(p2.kmsRunning) && kmsOk(p2.kms),
+			`${p2?.vtestClients} vtest clients at the loss; vtest glmark2: ${secs(p2?.vtestRunning)}; kmscube: ${secs(p2?.kmsRunning)}; ${kmsSay(p2?.kms)}`);
+		report("loss 3 (not restored)", p3?.lost && ended(p3.running) && kmsOk(p3.kms), `the run at the loss: ${secs(p3?.running)}; ${kmsSay(p3?.kms)}`);
+		report("loss 4 (no new WebGL2 context for a while)", p4?.lost && ended(p4.kmsRunning) && ended(p4.refused) && p4.whileRefused?.contextLost === true && /no new renderer|no WebGL2/.test(p4.whileRefused?.lastError ?? "") && kmsOk(p4.kms),
+			`kmscube at the loss: ${secs(p4?.kmsRunning)}; glmark2 without WebGL2: ${secs(p4?.refused)}, ${JSON.stringify(p4?.whileRefused)}; then ${kmsSay(p4?.kms)}`);
+		console.log(`   renderer before ${JSON.stringify(res.lose.before)}; after ${JSON.stringify(res.lose.after)}`);
 	}
 	const ia = res.steps["int-attrib"];
 	if (ia) report("integer attributes", ia.exitCode === 0 && /^ok int$/m.test(ia.stdout) && /^ok uint$/m.test(ia.stdout) && /^kernel errors 0$/m.test(ia.stdout),
 		ia.stdout.trim().split("\n").join("; ") + (ia.stderr.trim() ? ` (stderr: ${ia.stderr.trim()})` : ""));
+	const ms = res.steps.msaa;
+	if (ms) report("multisampling", ms.exitCode === 0 && /^ok samples/m.test(ms.stdout) && /^ok draw/m.test(ms.stdout) && /^kernel errors 0$/m.test(ms.stdout),
+		ms.stdout.trim().split("\n").join("; ") + (ms.stderr.trim() ? ` (stderr: ${ms.stderr.trim()})` : ""));
 	const wi = res.windowImages;
 	if (wi) {
 		const named = Object.entries(wi.bufs).map(([n, b]) => `${n} res ${b.res}${b.texture ? ` (virgl format ${b.texture.format}, yTop ${b.texture.yTop}, alpha ${b.texture.alpha})` : ""}`);

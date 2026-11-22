@@ -74,8 +74,10 @@
 //             line, KW.wayland.stats()'s GPU counters, no shm reads) with
 //             alpha kept and the right way up; -o (XRGB) opaque, and
 //             stopped, its window equals its last resource's picture (no
-//             stale frame); foot (shm) and a GL window together;
-//             gtk4-widget-factory with GTK's GL renderer; a relay without
+//             stale frame); foot (shm) and a GL window together; the
+//             renderer's WebGL2 context lost and restored under a GL window,
+//             then a new GL window by resource (the relay kept, no renderer
+//             error); gtk4-widget-factory with GTK's GL renderer; a relay without
 //             --dmabuf (wland says so, GL apps go to shm); with --pacing
 //             commits per second and per-commit cost at 250x250 and
 //             maximized; in worker mode Suspend refused while es2gears
@@ -89,8 +91,11 @@
 //             /etc/chromium.d/kw-wayland adds --ozone-platform=wayland), and
 //             with no Wayland variables at all (the hook runs wland), each
 //             maps a Chromium window
-//             within 3 min; imports debian-wland-chromium.img (debian-disk.mjs
-//             --chromium: chromium as apt installs it, 270 MiB gzipped)
+//             within 3 min, and renders on the GPU: its GPU process stays and
+//             the window comes by GPU resource (GPU commits, the relay's
+//             "first ... → resource" line); imports debian-wland-chromium.img
+//             (debian-disk.mjs --chromium: chromium as apt installs it, and
+//             Mesa's EGL, 260 MiB gzipped)
 //
 //   --firefox  instead of the cases above, in worker mode on 4 CPUs with
 //             mem=2048 (--only and --cpus change them): firefox-esr from a
@@ -550,10 +555,23 @@ addEventListener("scroll",T);addEventListener("resize",T);addEventListener("keyd
 			// variables at all (a plain sh: the chromium.d hook gets them from wland).
 			await sh("pkill -x chromium; true");
 			for (const [how, start] of [["in a login shell", "bash -lc 'exec chromium'"], ["with no Wayland variables", "chromium"]]) {
+				const before = await statsNow();
 				await sh(`setsid ${start} >/tmp/wl-chromium.log 2>&1 </dev/null & sleep 0.2; echo started`);
 				const win = await waitFor("KW.wayland.windows().find((w) => /Chromium/.test(w.title)) && JSON.stringify(KW.wayland.windows())", 180000, 1000);
 				const flags = await sh("tr '\\0' ' ' < /proc/$(pgrep -o -x chromium)/cmdline 2>/dev/null | grep -o -- '--ozone-platform=[a-z]*'");
 				report(`${mode}: plain chromium ${how} maps a window`, !!win && /wayland/.test(flags), `windows ${win}; ${flags || "no chromium running"}${win ? "" : `\n--- its output:\n${await sh("grep -v ssl_client /tmp/wl-chromium.log | tail -15")}\n--- relay log:\n${await relayLog()}`}`);
+				// The GPU path (the disk has Mesa's EGL; the renderer's multisample renderbuffers give
+				// ANGLE OpenGL ES 3.0): Chromium's GPU process stays, and its window comes by GPU
+				// resource (GPU commits, no shm reads; the relay logs its first buffer by resource once).
+				if (win) {
+					await sleep(5000);
+					const after = await statsNow();
+					const firsts = (await relayLog()).split("\n").filter((l) => /virtgpu: conn \d+ buffer \d+: first /.test(l));
+					const gpuLog = await sh("grep -E 'Exiting GPU process|Requested version is not supported|gpu_init' /tmp/wl-chromium.log | grep -v ssl_client | head -3; echo \"gpu processes $(pgrep -f type=gpu-process | wc -l)\"");
+					const gpuCommits = after.gpuCommits - before.gpuCommits, reads = after.reads - before.reads;
+					report(`${mode}: chromium ${how} renders on the GPU (its window by resource)`, gpuCommits > 0 && reads === 0 && firsts.length > 0 && !/Exiting GPU process/.test(gpuLog),
+						`${gpuCommits} GPU commits, ${after.commits - before.commits} commits, ${reads} shm reads; ${firsts.at(-1)?.replace(/^.*virtgpu: /, "") ?? "no buffer by resource"}; ${gpuLog.replace(/\n/g, "; ")}`);
+				}
 				await sh("pkill -x chromium; true");
 				await waitFor("KW.wayland.windows().length === 0 && 1", 30000);
 			}
@@ -1086,6 +1104,44 @@ addEventListener("scroll",T);addEventListener("resize",T);addEventListener("keyd
 				`in ${((b.t - a.t) / 1000).toFixed(1)} s: ${b.reads - a.reads} shm reads (${b.views - a.views} views in place), ${b.gpuCommits - a.gpuCommits} GPU commits; foot ${pf?.colours} colours, simple-egl ${pe?.colours}`);
 			await cleanupApps();
 
+			// The renderer's WebGL2 context lost and restored (WEBGL_lose_context; .agents/gl.md,
+			// Context loss) under a GL window: its client is stale and ended; the relay's context
+			// (it never submitted) is made again in the new renderer, and a GL app started after the
+			// loss shows by resource with no renderer error.
+			say("gpu: the WebGL2 context lost and restored");
+			{
+				await launch("weston-simple-egl", "egl-lose");
+				const w0 = await waitWindow("simple-egl");
+				await sleep(1500);
+				const lost = JSON.parse(await evaluate(`(async () => {
+					const ref = KW.wayland.gpuLast(), t = ref && KW.vm.gl.gpu.texture(ref.resource);
+					const ext = t?.gl.getExtension("WEBGL_lose_context");
+					if (!ext) return JSON.stringify({ lost: false });
+					ext.loseContext();
+					for (let i = 0; i < 50 && !KW.vm.gl.gpu.stats.contextLost; i++) await new Promise((r) => setTimeout(r, 50));
+					const at = { contextLost: KW.vm.gl.gpu.stats.contextLost, state: KW.vm.gl.status.state };
+					await new Promise((r) => setTimeout(r, 1000));
+					ext.restoreContext();
+					return JSON.stringify({ lost: true, ...at });
+				})()`));
+				await cleanupApps();
+				const e0 = await evaluate("KW.vm.gl.stats.gpu.errors");
+				a = await statsNow();
+				await launch("weston-simple-egl", "egl-after-loss");
+				const w1 = await waitWindow("simple-egl");
+				await sleep(2500);
+				b = await statsNow();
+				const e1 = await evaluate("KW.vm.gl.stats.gpu.errors");
+				const pl = w1 ? await windowPixels("simple-egl") : null;
+				const st = JSON.parse(await evaluate("JSON.stringify({ state: KW.vm.gl.status.state, gpu: KW.vm.gl.stats.gpu })"));
+				report("gpu: the WebGL2 context lost and restored under a GL window: a GL app started after it shows by resource, the relay as it was, no renderer error",
+					!!w0 && lost.lost && lost.contextLost && lost.state === "lost" && !!w1 && b.gpuImages - a.gpuImages > 30 && st.state === "ready" && st.gpu.renewals >= 1 && !st.gpu.contextLost &&
+						e1 === e0 && pl?.blueY != null && pl?.redGreenY != null && pl.blueY < pl.redGreenY,
+					`at the loss ${JSON.stringify(lost)}; after it ${b.gpuCommits - a.gpuCommits} GPU commits, ${b.gpuImages - a.gpuImages} images in ${((b.t - a.t) / 1000).toFixed(1)} s, ` +
+						`${e1 - e0} renderer errors; renderer ${st.state}, losses ${st.gpu.losses}, renewals ${st.gpu.renewals}; pixels ${JSON.stringify(pl)}`);
+				await cleanupApps();
+			}
+
 			// GTK 4 with its GL renderer (GskGLRenderer on virgl).
 			say("gpu: gtk4-widget-factory");
 			a = await statsNow();
@@ -1143,6 +1199,8 @@ addEventListener("scroll",T);addEventListener("resize",T);addEventListener("keyd
 				await cleanupApps();
 				await sh("pkill -x wlandr; rm -f /tmp/kw-rnode; sleep 0.5");
 				await waitFor("!document.querySelector('#bar-desktop') && 1", 10000);
+				// A relay as the boot leaves one, for the plain apps of the cases below (the launcher's tile).
+				await sh("/usr/lib/kw/bin/wland true");
 			}
 
 			// Frame rates of a continuously drawing GL client, at 250x250 and maximized, by resource.

@@ -8,7 +8,8 @@
 // repainted per animation frame: GlHost.gpu.drawFrame() while a GL client
 // has the scanout, frame() otherwise), runs the steps in the guest with no
 // GL environment variables and posts what they printed; the harness judges.
-// Query: size=WxH (the display), scenes= (glmark2 -b list), skip=a,b,c,d,e,g,
+// Query: size=WxH (the display), resize=WxH (step r's size, default 960x540; not 800x600: DRM_GLMARK),
+// scenes= (glmark2 -b list), skip=a,b,c,d,e,g,h,r,
 // cmd= (a command run first, as root; for debugging), eager (gl: { eager:
 // true }: the renderer loads before the boot; by default it loads on the
 // guest's first GL use), glmodule=URL (another virgl.mjs: the harness's
@@ -122,6 +123,8 @@ async function main() {
 	result.bootS = Number(secs());
 	result.bootMs = Math.round(performance.now() - t0);
 	result.statusAtBoot = vm.gl?.status;
+	// the first load's status (a new renderer after a loss, step l, starts another)
+	vm.gl?.loaded.then(() => (result.statusAtLoad = vm.gl.status), () => {});
 	result.fetchesAtBoot = virglFetches();
 	try {
 		result.renderer = await vm.gl.ready;
@@ -150,7 +153,7 @@ async function main() {
 	};
 
 	// the test programs, in /tmp
-	for (const name of ["kwgl-state", "prime", "kms-dumb", "window-image", "int-attrib"]) {
+	for (const name of ["kwgl-state", "prime", "kms-dumb", "kms-hotplug", "window-image", "int-attrib", "msaa"]) {
 		const r = await fetch(`/files/${name}`);
 		if (!r.ok) continue;
 		const bin = new Uint8Array(await r.arrayBuffer());
@@ -275,27 +278,33 @@ async function main() {
 	if (!skip.has("h"))
 		await run("int-attrib", "dmesg -C; /tmp/int-attrib /dev/dri/renderD128; e=$?; echo \"kernel errors $(dmesg | grep -c 'response 0x')\"; exit $e");
 
+	// (m) multisampling (renderbuffers on WebGL 2: what Chromium's ANGLE needs
+	// for OpenGL ES 3.0): 4 samples per format, an antialiased draw resolved
+	if (!skip.has("m"))
+		await run("msaa", "dmesg -C; /tmp/msaa /dev/dri/renderD128; e=$?; echo \"kernel errors $(dmesg | grep -c 'response 0x')\"; exit $e");
+
+	// (r) a display size change on the running machine (vm.updateDisplaySize()):
+	// a KMS client reading uevents hears the hotplug and probes the new
+	// preferred mode; kmscube and glmark2-es2-drm started afterwards take it,
+	// and the display (its mode, the canvas, the scanout) follows them
+	if (!skip.has("r")) await resize(vm, shown, result, run);
+
 	// (l) lose=1: glmark2-es2-drm twice (the second run gets the first's
-	// context id again), then a third run during which the renderer's WebGL2
-	// context is lost (WEBGL_lose_context, as iOS drops contexts), then a
-	// fourth: the renderer must say so (stats.contextLost, lastError) and
-	// answer at once, so that the runs end instead of hanging
-	if (q.has("lose")) {
-		const gm = (name) => run(name, `${HOLD} timeout 300 glmark2-es2-drm ${DRM_GLMARK} -b build:duration=2 2>&1 <&3 | tail -3; echo "kernel errors $(dmesg | grep -c 'response 0x')"`);
-		await run("lose-clear", "dmesg -C");
-		await gm("lose-run1");
-		await gm("lose-run2");
-		result.lose = { before: { ...vm.gl.gpu.stats } };
-		const third = gm("lose-run3");
-		for (let i = 0; i < 600 && !(vm.gl.gpu.scanout?.seq > 10); i++) await sleep(100);
-		const sc = vm.gl.gpu.scanout, t = sc && vm.gl.gpu.texture(sc.resource);
-		const ext = t?.gl.getExtension("WEBGL_lose_context");
-		ext?.loseContext();
-		result.lose.lost = !!ext;
-		await third;
-		await gm("lose-run4");
-		result.lose.after = { ...vm.gl.gpu.stats };
-	}
+	// context id again), then the renderer's WebGL2 context lost
+	// (WEBGL_lose_context, as a GPU reset or iOS drops contexts) four times
+	// (gl.md, The DRM path, Context loss):
+	//   1  during glmark2-es2-drm, restored while it still runs: it must end;
+	//      then a new kmscube must render (its frames on the page's canvas
+	//      equal the scanout read back, not flat), a dumb-buffer KMS client
+	//      must show its picture, and a vtest client must get virgl
+	//   2  while kmscube and glmark2-es2 on the vtest link (Xvfb) run,
+	//      restored: both must end; a new kmscube must render
+	//   3  during glmark2-es2-drm, not restored: a new kmscube must render (a
+	//      new renderer on a new WebGL2 context)
+	//   4  during kmscube while the page gives no new WebGL2 context
+	//      (getContext patched to null): a glmark2-es2-drm run must end (its
+	//      commands fail); with WebGL2 back, a new kmscube must render
+	if (q.has("lose")) await loseContext(vm, shown, result, run);
 
 	// (f) without a renderer (glfail=module, or no WebGL2): what Mesa does, and the 2D KMS path
 	if (q.has("fail")) {
@@ -322,6 +331,179 @@ async function main() {
 	await post("/result", JSON.stringify(result));
 	log("done");
 	await (vm2 ?? vm).stop().catch(() => {});
+}
+
+async function resize(vm, shown, result, run) {
+	const size = q.get("resize") || "960x540";
+	const [RW, RH] = size.split("x").map(Number);
+	const out = (result.resize = { size });
+	const p = await vm.spawn("/tmp/kms-hotplug", ["/dev/dri/card0", "120", "r"], { user: "root", pty: false });
+	const errText = new Response(p.stderr).text();
+	const reader = p.stdout.getReader(), dec = new TextDecoder();
+	let text = "";
+	const until = async (re) => {
+		for (;;) {
+			const m = re.exec(text);
+			if (m) return m;
+			const { value, done } = await reader.read();
+			if (done) return null;
+			text += dec.decode(value, { stream: true });
+		}
+	};
+	if (await until(/ready \d+x\d+|FAILED/)) {
+		vm.updateDisplaySize({ width: RW, height: RH, dpi: 96 });
+		await until(/done\n|FAILED/);
+	}
+	await until(/(?!)/); // to the end
+	out.hotplug = { end: await p.ended, stdout: text, stderr: await errText };
+	log(`resize: kms-hotplug ${JSON.stringify(out.hotplug)}`);
+	// kmscube on its next start: the new mode on the scanout, the display and the page's canvas
+	const kms = run("resize-kmscube", `${HOLD} timeout 300 kmscube -D /dev/dri/card0 -c 300 2>&1 <&3 | tail -5`);
+	for (let i = 0; i < 1200 && !out.kmscube; i++) {
+		await sleep(100);
+		const s = vm.gl.gpu.scanout, m = vm.display?.mode;
+		if (s && s.seq > 30) {
+			await sleep(100); // a paint of the page's canvas
+			out.kmscube = { scanout: `${s.width}x${s.height}`, mode: m && `${m.width}x${m.height}`, canvas: `${shown.canvas.width}x${shown.canvas.height}` };
+		}
+	}
+	await kms;
+	await run("resize-glmark2", `${HOLD} timeout 300 glmark2-es2-drm ${DRM_GLMARK} -b build:duration=2 2>&1 <&3 | grep -E 'Surface|Score|rror'`);
+	await run("resize-modetest", "modetest -M virtio_gpu -c 2>&1 | head -12");
+	vm.updateDisplaySize({ width: W, height: H, dpi: 96 });
+}
+
+async function loseContext(vm, shown, result, run) {
+	const gpu = vm.gl.gpu;
+	const out = (result.lose = { phases: [] });
+	const errs = "echo \"kernel errors $(dmesg | grep -c 'response 0x')\"";
+	const gm = (name, secs = 2) => run(name, `${HOLD} timeout 300 glmark2-es2-drm ${DRM_GLMARK} -b build:duration=${secs} 2>&1 <&3 | tail -3; ${errs}`);
+	const brief = (r) => ({ exitCode: r.exitCode, signal: r.signal, ms: r.ms, tail: r.stdout.trim().split("\n").slice(-4).join(" | ") });
+	const stats = () => {
+		const s = gpu.stats, st = vm.gl.status;
+		return { contextLost: s.contextLost, losses: s.losses, renewals: s.renewals, errors: s.errors, lastError: s.lastError, state: st.state, statusLosses: st.losses, statusRenewals: st.renewals, error: st.error };
+	};
+	// The renderer's context lost (from a resource on the scanout: a KMS client runs); its WEBGL_lose_context, to restore it.
+	const lose = async () => {
+		for (let i = 0; i < 600 && !(gpu.scanout?.seq > 10); i++) await sleep(100);
+		const sc = gpu.scanout, t = sc && gpu.texture(sc.resource);
+		const ext = t?.gl.getExtension("WEBGL_lose_context");
+		if (!ext) return null;
+		const losses = gpu.stats.losses;
+		ext.loseContext();
+		for (let i = 0; i < 100 && gpu.stats.losses === losses; i++) await sleep(50);
+		log(`lost the renderer's WebGL2 context: ${JSON.stringify(stats())}`);
+		return ext;
+	};
+	// A new kmscube: one frame from the page's canvas against the scanout read back, and no failed command in the guest's kernel.
+	const kms = async (name) => {
+		const before = { ...gpu.stats };
+		const p = run(name, `dmesg -C; ${HOLD} timeout 300 kmscube -D /dev/dri/card0 -c 240 2>&1 <&3 | tail -2; ${errs}`);
+		let frame = null;
+		for (let i = 0; i < 1200 && !frame; i++) {
+			await sleep(100);
+			const s = gpu.scanout;
+			if (!s || s.seq < 30) continue;
+			gpu.drawFrame(shown.ctx, true);
+			const img = shown.ctx.getImageData(0, 0, s.width, s.height);
+			const back = vm.frame();
+			let diff = 0;
+			for (let k = 0; back && k < img.data.length; k += 4)
+				if (img.data[k] !== back.data[k] || img.data[k + 1] !== back.data[k + 1] || img.data[k + 2] !== back.data[k + 2]) diff++;
+			frame = { seq: s.seq, size: `${s.width}x${s.height}`, ...summary(img.data), differFromReadback: back ? diff : -1 };
+		}
+		const r = await p;
+		return { ...brief(r), frame, presents: gpu.stats.presents - before.presents, rendererErrors: gpu.stats.errors - before.errors, after: stats() };
+	};
+	// A dumb-buffer KMS client: its picture (glimmer's pattern, a white square at (16, 16)) read from the 2D scanout.
+	const dumb = async (name) => {
+		const p = run(name, "/tmp/kms-dumb /dev/dri/card0 4 2>&1 | tail -2");
+		let pic = null;
+		for (let i = 0; i < 150 && !pic; i++) {
+			await sleep(100);
+			if (gpu.scanout || !vm.display?.mode) continue;
+			const f = vm.frame();
+			if (!f) continue;
+			const at = (x, y) => Array.from(f.data.slice((y * f.width + x) * 4, (y * f.width + x) * 4 + 3));
+			const sum = summary(f.data);
+			if (at(40, 40).join() !== "255,255,255" || sum.colours <= 16) continue;
+			pic = { size: `${f.width}x${f.height}`, ...sum, square: at(40, 40) };
+		}
+		return { ...brief(await p), pic };
+	};
+
+	await run("lose-clear", "dmesg -C");
+	await gm("lose-run1");
+	await gm("lose-run2");
+	out.before = stats();
+
+	// 1: during glmark2-es2-drm, restored while it runs
+	{
+		const ph = { n: 1 };
+		const g = gm("lose-1-glmark2", 8);
+		const ext = await lose();
+		ph.lost = !!ext;
+		ph.whileLost = stats();
+		await sleep(1000);
+		ext?.restoreContext();
+		await sleep(500);
+		ph.restored = stats();
+		ph.running = brief(await g);
+		ph.kms = await kms("lose-1-kmscube");
+		ph.dumb = await dumb("lose-1-kms-dumb");
+		ph.vtest = brief(await run("lose-1-vtest", `${VIRPIPE} eglinfo -B -p surfaceless 2>&1 | grep -i 'renderer' | head -3`));
+		out.phases.push(ph);
+	}
+
+	// 2: kmscube and a vtest client (glmark2-es2 under Xvfb) running, restored
+	{
+		const ph = { n: 2 };
+		const v = run("lose-2-vtest-glmark2", `${VIRPIPE} timeout 300 xvfb-run -a -s "-screen 0 ${W}x${H}x24" glmark2-es2 -s 320x240 -b build:duration=30 2>&1 | tail -4`);
+		const k = run("lose-2-kmscube-running", `${HOLD} timeout 300 kmscube -D /dev/dri/card0 -c 900 2>&1 <&3 | tail -2`);
+		for (let i = 0; i < 1200 && !(vm.gl.stats.clients > 0 && gpu.scanout?.seq > 10); i++) await sleep(100);
+		await sleep(3000);
+		ph.vtestClients = vm.gl.stats.clients;
+		const ext = await lose();
+		ph.lost = !!ext;
+		await sleep(1000);
+		ext?.restoreContext();
+		ph.vtestRunning = brief(await v);
+		ph.kmsRunning = brief(await k);
+		ph.kms = await kms("lose-2-kmscube");
+		out.phases.push(ph);
+	}
+
+	// 3: during glmark2-es2-drm, not restored
+	{
+		const ph = { n: 3 };
+		const g = gm("lose-3-glmark2", 8);
+		ph.lost = !!(await lose());
+		ph.running = brief(await g);
+		ph.kms = await kms("lose-3-kmscube");
+		out.phases.push(ph);
+	}
+
+	// 4: during kmscube, with no WebGL2 context to be had for a while
+	{
+		const ph = { n: 4 };
+		const k = run("lose-4-kmscube-running", `${HOLD} timeout 300 kmscube -D /dev/dri/card0 -c 300 2>&1 <&3 | tail -2`);
+		const getContext = OffscreenCanvas.prototype.getContext;
+		ph.lost = !!(await lose());
+		OffscreenCanvas.prototype.getContext = function (type, ...rest) {
+			return type === "webgl2" ? null : getContext.call(this, type, ...rest);
+		};
+		try {
+			ph.kmsRunning = brief(await k);
+			ph.refused = brief(await gm("lose-4-glmark2-refused"));
+			ph.whileRefused = stats();
+		} finally {
+			OffscreenCanvas.prototype.getContext = getContext;
+		}
+		await sleep(1200);
+		ph.kms = await kms("lose-4-kmscube");
+		out.phases.push(ph);
+	}
+	out.after = stats();
 }
 
 async function snapshotIdleContext(vm, vmOpts, result, run) {

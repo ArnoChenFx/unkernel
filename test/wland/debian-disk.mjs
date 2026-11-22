@@ -12,14 +12,17 @@
 // to make them again, e.g. after a new Debian image: the upper layer belongs
 // to the image it was made on).
 //
-//   node test/wland/debian-disk.mjs [--gl | --chromium] [--out FILE] [--kernel unkernel.wasm] [--distro debian.erofs]
+//   node test/wland/debian-disk.mjs [--gl | --chromium | --firefox] [--out FILE] [--kernel unkernel.wasm] [--distro debian.erofs]
 //
 // Default out: $KW_BUILD/wland/debian-wland.img (vendor/build), with --gl
 // $KW_BUILD/wland/debian-wland-gl.img, with --chromium
-// $KW_BUILD/wland/debian-wland-chromium.img, and FILE.kwsparse.gz. --gl adds
+// $KW_BUILD/wland/debian-wland-chromium.img, with --firefox
+// $KW_BUILD/wland/debian-wland-firefox.img, and FILE.kwsparse.gz. --gl adds
 // the GL clients of page-check.mjs --gpu (WLAND_GL_PACKAGES, below);
 // --chromium installs chromium instead, as a user does (apt-get install
-// chromium: with its recommends) for page-check.mjs --chromium.
+// chromium: with its recommends) for page-check.mjs --chromium; --firefox
+// adds firefox-esr (no recommends) to the GL disk's packages for
+// page-check.mjs --firefox.
 import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,9 +54,11 @@ const opt = (name, dflt) => {
 export const defaultDisk = join(build, "wland/debian-wland.img");
 export const defaultGlDisk = join(build, "wland/debian-wland-gl.img");
 export const defaultChromiumDisk = join(build, "wland/debian-wland-chromium.img");
-const gl = args.includes("--gl");
+export const defaultFirefoxDisk = join(build, "wland/debian-wland-firefox.img");
+const firefox = args.includes("--firefox");
+const gl = args.includes("--gl") || firefox;
 const chromium = args.includes("--chromium");
-const out = resolve(opt("--out", gl ? defaultGlDisk : chromium ? defaultChromiumDisk : defaultDisk));
+const out = resolve(opt("--out", firefox ? defaultFirefoxDisk : gl ? defaultGlDisk : chromium ? defaultChromiumDisk : defaultDisk));
 const sparse = `${out}.kwsparse.gz`;
 const kernel = opt("--kernel");
 const distro = resolve(opt("--distro", join(build, "distro/debian.erofs")));
@@ -100,7 +105,7 @@ const vm = await createKernel({
 	distro,
 	disks: [{ kind: "file", path: tmp }],
 	net: { kind: "net", backend: { kind: "direct" } },
-	memoryMiB: chromium ? 2048 : 1024,
+	memoryMiB: chromium || firefox ? 2048 : 1024,
 });
 vm.onOutput((b) => process.stderr.write(b));
 // apt as the image's kw-apt-install does it: the image's package lists
@@ -116,11 +121,11 @@ dpkg -l | awk '/^ii/ { print $2 }' | grep -E '^(dbus|systemd|libpam-systemd|libg
 sync` : `set -e
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /tmp/debs/partial
-inst() { apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/tmp/debs ${[...WLAND_PACKAGES, ...(gl ? WLAND_GL_PACKAGES : [])].join(" ")} systemd- </dev/null; }
+inst() { apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/tmp/debs ${[...WLAND_PACKAGES, ...(gl ? WLAND_GL_PACKAGES : []), ...(firefox ? ["firefox-esr"] : [])].join(" ")} systemd- </dev/null; }
 inst || { apt-get update -q && inst; }
 (cd /tmp && apt-get download -q weston && dpkg-deb -x weston_*.deb /tmp/weston)
 install -m 755 /tmp/weston/usr/bin/weston-simple-shm /tmp/weston/usr/bin/weston-presentation-shm ${gl ? "/tmp/weston/usr/bin/weston-simple-egl " : ""}/usr/local/bin/
-for c in foot wayland-info wl-copy wl-paste l3afpad weston-simple-shm weston-presentation-shm${gl ? " weston-simple-egl es2gears_wayland eglinfo glmark2-es2-wayland gtk4-demo" : ""}; do command -v $c >/dev/null || { echo "missing: $c"; exit 1; }; done
+for c in foot wayland-info wl-copy wl-paste l3afpad weston-simple-shm weston-presentation-shm${gl ? " weston-simple-egl es2gears_wayland eglinfo glmark2-es2-wayland gtk4-demo" : ""}${firefox ? " firefox-esr" : ""}; do command -v $c >/dev/null || { echo "missing: $c"; exit 1; }; done
 ! ldd /usr/local/bin/weston-* | grep "not found"
 fc-list | grep -q . || { echo "no fonts"; exit 1; }
 sync`;

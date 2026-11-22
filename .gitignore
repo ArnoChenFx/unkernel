@@ -5,6 +5,7 @@ node_modules/
 __pycache__/
 dist/
 web/.output/
+web/.wland-local/
 web/.vercel/
 web/kernel/
 web/public/distros/

@@ -35,11 +35,11 @@ export function findChrome() {
 
 /**
  * Start the page's server on `port`: the built output (web/.output, `pnpm
- * build:web`), or with `dev` the Vite dev server. `env` adds variables.
- * Resolves once it answers; kill() stops it.
+ * build:web`, or the `output` directory), or with `dev` the Vite dev
+ * server. `env` adds variables. Resolves once it answers; kill() stops it.
  */
-export async function startServer({ port, host, dev = flag("dev"), env = {} }) {
-	const entry = path.join(webDir, ".output/server/index.mjs");
+export async function startServer({ port, host, dev = flag("dev"), env = {}, output = path.join(webDir, ".output") }) {
+	const entry = path.join(output, "server/index.mjs");
 	let child;
 	const stdio = ["ignore", verbose ? "inherit" : "ignore", "inherit"];
 	const allEnv = { ...process.env, ...env };

@@ -715,11 +715,18 @@ answered at the kernel's next yield.
   and the npm version in `web/package.json`, then `kernel/build.sh base`
   without `KW_WLANDR`. To try a local wland build:
   `KW_WLANDR=<wland>/zig-out/release/wlandr-link-linux-arm64 kernel/build.sh
-  base` (guest/base/build.sh; refused with `KW_RELEASE=1`), and
-  `web/node_modules/wland` replaced by that checkout's package
-  (`package.json`, `LICENSE`, `README.md`, `dist/`), then
-  `web/node_modules/.vite/deps` removed (else the dev server keeps the old
-  prebundled `wland_client.js`: "function import requires a callable").
+  base` (guest/base/build.sh; refused with `KW_RELEASE=1`), and for the
+  page a build against that checkout's package: copy its `package.json`,
+  `LICENSE`, `README.md` and `dist/` to a directory of their own, then
+  `KW_WLAND_PKG=<dir> node node_modules/vite/bin/vite.js build` in `web/`
+  (`unkernel:wland-pkg` in vite.config.ts resolves `wland` and its
+  subpaths through that package's exports; build only) writes
+  `web/.wland-local/output/`, and `node test/wland/page-check.mjs --output
+  web/.wland-local/output` (any case) or `PORT=<port> node
+  web/.wland-local/output/server/index.mjs` runs it. It leaves
+  `web/node_modules` (Nitro's `last-build.json` is put back), `web/.output`
+  and a running dev server alone: never replace `web/node_modules/wland`,
+  a pnpm store link (a swapped package broke a running dev server's page).
 - The launcher's foot demo (`demos/foot.ts`, Debian: foot,
   fonts-dejavu-core, fontconfig; `needs.wayland`: dimmed without the
   desktop) runs `wland foot`; its README suggests wl-clipboard,
@@ -842,22 +849,34 @@ answered at the kernel's next yield.
   phones (touch, the on-screen keyboard), the guest display under the
   desktop.
 - Firefox (Debian's firefox-esr 153, 2026-11-22, headless Chromium,
-  worker mode on 4 CPUs, a scratch disk with it installed): WebRender on
+  worker mode on 4 CPUs, `debian-disk.mjs --firefox`): WebRender on
   virgl, its window by GPU resource (ARGB8888, one buffer reused, as wland
   releases it after the image), renders a page since renderer patch 15
   (gl.md, Patches; before, the window stayed fully transparent and the
   guest's kernel flooded with failed transfers). 512
   MiB is too little: the guest thrashes (about 20 MiB left, half the CPU
   time in I/O wait) and the first page takes minutes; with 2 GiB (the
-  page's default on desktops) its window maps in about 45 s. It takes no input yet, on the GPU path and in
-  software alike: wland 0.1.0-261122 keeps one wl_pointer and one
-  wl_keyboard per client (the last made; `pointer_id`, `keyboard_id` in
-  its compositor.zig), while Firefox binds wl_seat twice (GTK's seat, then
-  its own for serials and pointer constraints), so the events go to
-  Firefox's own objects and GTK's get none (seen with WAYLAND_DEBUG:
-  `wl_pointer#36.button`, `wl_keyboard#37.key`, nothing for GTK's
-  `wl_pointer#8`, `wl_keyboard#19`). A wland issue: a seat's events go to
-  every wl_pointer and wl_keyboard a client made.
+  page's default on desktops) its window maps in about 45 to 65 s (a new
+  profile; 24 s for the next start in the same boot). With the pinned
+  wland it takes no input, on the GPU path and in software alike: wland
+  0.1.0-261122 keeps one wl_pointer and one wl_keyboard per client (the
+  last made; `pointer_id`, `keyboard_id` in its compositor.zig), while
+  Firefox binds wl_seat twice (GTK's at v5, then its own at v8 for serials
+  and pointer constraints), so the events go to Firefox's own objects and
+  GTK's get none (seen with WAYLAND_DEBUG: `wl_pointer#36.button`,
+  `wl_keyboard#37.key`, nothing for GTK's `wl_pointer#8`,
+  `wl_keyboard#19`). wland's fix after that release sends each seat event
+  to every pointer, keyboard, relative pointer and data and
+  primary-selection device of a client (WAYLAND_DEBUG: `wl_pointer#8` and
+  `#36` both get the motion, button and frame, one enter serial for
+  both), and with it (a local build, `KW_WLAND_PKG`) Firefox takes
+  clicks, typing, Ctrl+L and a typed URL, its context menu (a click on an
+  item, Escape), the wheel, a drag selection (the primary selection) and
+  Ctrl+C and Ctrl+V with wl-copy and wl-paste, on the GPU path and with
+  `?wlgpu=0` (`page-check.mjs --firefox`). Ctrl+A is the page's prefix
+  there as everywhere (Ctrl-A Ctrl-A sends it on). Guest memory with
+  Firefox on a page: 730 MiB used of 1978, its processes' RSS 1.4 GiB
+  (shared pages counted in each).
 - GL frame rates (2026-11-22, `page-check.mjs --built --gpu --pacing`,
   headless Chromium on SwiftShader, so a floor; 61 rAF/s; worker mode;
   weston-simple-egl -o, which redraws everything each frame; one run

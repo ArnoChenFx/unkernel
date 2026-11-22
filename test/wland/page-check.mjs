@@ -92,18 +92,28 @@
 //             within 3 min; imports debian-wland-chromium.img (debian-disk.mjs
 //             --chromium: chromium as apt installs it, 270 MiB gzipped)
 //
+//   --firefox  instead of the cases above, in worker mode on 4 CPUs with
+//             mem=2048 (--only and --cpus change them): firefox-esr from a
+//             login shell maps its window on a local page whose title shows
+//             what reached it; two clicks on a button, typing into a text
+//             field, a right click opens the context menu and Escape closes
+//             it, the wheel scrolls down and back, a drag selects text (the
+//             primary selection) and Ctrl+C copies it (wl-paste), a link
+//             click and Ctrl+L with a typed URL and Enter navigate; imports
+//             debian-wland-firefox.img (debian-disk.mjs --firefox)
+//
 //   S  with --suspend (worker mode): foot started again in the demo's
 //      window, Suspend (KW.suspend()) and a plain load resume the session;
 //      the old foot is gone (its link dropped), the relay (a guest process)
 //      goes idle and the new page fetches nothing of wland, and a plain
 //      `foot` typed in the demo's window maps (the relay dials again)
 //
-//   node test/wland/page-check.mjs [--port N] [--cpus N] [--only worker|inline] [--apps] [--gtk] [--keys] [--pacing] [--all] [--gpu] [--chromium] [--suspend] [--fresh] [--built] [--chrome BIN] [--timeout S] [--shots DIR] [--keep-open] [--verbose]
+//   node test/wland/page-check.mjs [--port N] [--cpus N] [--only worker|inline] [--apps] [--gtk] [--keys] [--pacing] [--all] [--gpu] [--chromium] [--firefox] [--suspend] [--fresh] [--built] [--output DIR] [--chrome BIN] [--timeout S] [--shots DIR] [--keep-open] [--verbose]
 //
 // --fresh skips the prepared disk: the foot tile installs its packages with
 // apt over the page's network (the internet; minutes) before foot maps; use
 // it with --only. --built runs the built page (web/.output, pnpm build:web) instead of the
-// dev server. --gpu imports the GL disk instead (a superset of the default one). --shots DIR
+// dev server; --output DIR another build's output (web/.wland-local/output: a local wland, KW_WLAND_PKG). --gpu imports the GL disk instead (a superset of the default one). --shots DIR
 // writes the page and each window screenshot there. --verbose shows the server's output. Exit 0 when every check
 // passed, 1 on a failure, 2 when it could not run.
 import { spawn, execFileSync } from "node:child_process";
@@ -121,19 +131,21 @@ const args = process.argv.slice(2);
 const opt = (n, d) => (args.includes(n) ? args[args.indexOf(n) + 1] : d);
 const port = Number(opt("--port", "8092"));
 const timeout = Number(opt("--timeout", "900")) * 1000;
-const cpus = opt("--cpus", "1");
-const only = opt("--only", "");
+const firefoxTest = args.includes("--firefox");
+const cpus = opt("--cpus", firefoxTest ? "4" : "1");
+const only = opt("--only", firefoxTest ? "worker" : "");
 const shots = opt("--shots", "");
 const suspendTest = args.includes("--suspend");
 const all = args.includes("--all");
 const want = (f) => all || args.includes(f);
-const built = args.includes("--built");
+const output = opt("--output", "");
+const built = args.includes("--built") || !!output;
 const fresh = args.includes("--fresh");
 const chromeBin = opt("--chrome", process.env.CHROME || findChrome());
 const build = process.env.KW_BUILD ? resolve(process.env.KW_BUILD) : join(root, "vendor/build");
 const gpuTest = args.includes("--gpu");
 const chromiumTest = args.includes("--chromium");
-const diskGz = join(build, gpuTest ? "wland/debian-wland-gl.img.kwsparse.gz" : chromiumTest ? "wland/debian-wland-chromium.img.kwsparse.gz" : "wland/debian-wland.img.kwsparse.gz");
+const diskGz = join(build, firefoxTest ? "wland/debian-wland-firefox.img.kwsparse.gz" : gpuTest ? "wland/debian-wland-gl.img.kwsparse.gz" : chromiumTest ? "wland/debian-wland-chromium.img.kwsparse.gz" : "wland/debian-wland.img.kwsparse.gz");
 /** The kw layer's wland (not on the PATH of KW.vm.exec()'s shells). */
 const WL = "/usr/lib/kw/bin/wland";
 const t0 = performance.now();
@@ -148,7 +160,7 @@ const report = (name, ok, detail) => {
 
 if (!fresh && !existsSync(diskGz)) {
 	say("making the prepared disk (test/wland/debian-disk.mjs)");
-	try { execFileSync(process.execPath, [join(here, "debian-disk.mjs"), ...(gpuTest ? ["--gl"] : chromiumTest ? ["--chromium"] : [])], { stdio: "inherit" }); } catch {
+	try { execFileSync(process.execPath, [join(here, "debian-disk.mjs"), ...(firefoxTest ? ["--firefox"] : gpuTest ? ["--gl"] : chromiumTest ? ["--chromium"] : [])], { stdio: "inherit" }); } catch {
 		console.error("the prepared disk could not be made");
 		process.exit(2);
 	}
@@ -165,8 +177,8 @@ const files = createServer((req, res) => {
 await new Promise((r) => files.listen(0, "127.0.0.1", r));
 const diskUrl = `http://127.0.0.1:${files.address().port}/disk.kwsparse.gz`;
 
-say(`${built ? "built server (web/.output)" : "dev server"} on 127.0.0.1:${port}`);
-const server = await startServer({ port, host: "127.0.0.1", dev: !built }).catch((e) => {
+say(`${built ? `built server (${output || "web/.output"})` : "dev server"} on 127.0.0.1:${port}`);
+const server = await startServer({ port, host: "127.0.0.1", dev: !built, ...(output ? { output: resolve(output) } : {}) }).catch((e) => {
 	console.error(`the server did not start: ${e.message}`);
 	process.exit(2);
 });
@@ -292,7 +304,7 @@ try {
 		if (!await waitFor("typeof globalThis.KW?.ready === 'function'", 120000)) throw new Error(`the page did not load: ${await evaluate("location.href + ' | ' + document.body?.innerText.replace(/\\s+/g, ' ').slice(0, 600)").catch((e) => e.message)}`);
 		await evaluate("KW.ready().then(() => 1)");
 	};
-	const base = `http://127.0.0.1:${port}/?distro=debian${cpus !== "0" ? `&cpus=${cpus}` : ""}&mem=1024&autosuspend=0&askleave=0`;
+	const base = `http://127.0.0.1:${port}/?distro=debian${cpus !== "0" ? `&cpus=${cpus}` : ""}&mem=${firefoxTest ? 2048 : 1024}&autosuspend=0&askleave=0`;
 
 	// --- input as a keyboard and a mouse send it (Input.dispatch*) ---
 	const MOD = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
@@ -429,6 +441,89 @@ try {
 	/** Counters over an interval: KW.wayland.stats() and the time. */
 	const statsNow = async () => JSON.parse(await evaluate("JSON.stringify({ ...KW.wayland.stats(), t: performance.now() })"));
 
+	/**
+	 * --firefox: firefox-esr from a login shell on a local page whose title
+	 * shows what reached it (clicks, wheel events, scroll position, the last
+	 * key, the text field, context menus, its innerHeight: where the content
+	 * starts below Firefox's own bars), then pointer, keyboard, menu, wheel,
+	 * selection and navigation, each seen in the window's title.
+	 */
+	const firefoxCase = async (mode) => {
+		const page = `<!doctype html><meta charset="utf-8"><title>kwtest</title>
+<style>body{margin:0;height:4000px;font:28px sans-serif}#b,#i,#s,#a{position:absolute;left:0;margin:0}#b{top:0;width:300px;height:150px}#i{top:170px;width:300px;height:40px;font-size:20px}#s{top:230px}#a{top:290px;width:300px;height:80px;display:block;background:#fc8}</style>
+<button id="b">click</button><input id="i"><p id="s">selectme words</p><a id="a" href="t2.html">link</a>
+<script>const s={c:0,x:0,w:0,k:""},i=document.getElementById("i");
+const T=()=>{document.title="kwtest c"+s.c+" x"+s.x+" w"+s.w+" s"+Math.round(scrollY)+" h"+innerHeight+" k:"+s.k+" i:"+i.value;};
+document.getElementById("b").onclick=()=>{s.c++;T();};addEventListener("contextmenu",()=>{s.x++;T();});addEventListener("wheel",()=>{s.w++;T();});
+addEventListener("scroll",T);addEventListener("resize",T);addEventListener("keydown",(e)=>{s.k=e.key;T();});i.oninput=T;T();</script>`;
+		const prefs = 'user_pref("browser.shell.checkDefaultBrowser", false);\nuser_pref("datareporting.policy.firstRunURL", "");\n';
+		await sh(`pkill -x firefox-esr; rm -rf /tmp/ffp; mkdir -p /tmp/ffp; cd /tmp; echo ${Buffer.from(page).toString("base64")} | base64 -d > t.html; echo '<title>kwtwo</title>two' > t2.html; echo '<title>kwthree</title>three' > t3.html; printf '${prefs.replace(/\n/g, "\\n")}' > /tmp/ffp/user.js`);
+		const before = await statsNow();
+		const started = performance.now();
+		await launch.plain("firefox-esr --profile /tmp/ffp --no-remote file:///tmp/t.html", "firefox");
+		const title = (re, ms = 20000) => waitFor(`KW.wayland.windows().map((w) => w.title).find((t) => ${re}.test(t)) || ""`, ms, 300);
+		const titleNow = () => evaluate("KW.wayland.windows().map((w) => w.title).join(' | ')");
+		const ffShot = async (name) => { if (shots) writeFileSync(join(shots, `${mode}-firefox-${name}.png`), Buffer.from((await send("Page.captureScreenshot", { format: "png" })).result.data, "base64")); };
+		const mapped = await title(/^kwtest .* h\d+/, 240000);
+		const mapSecs = ((performance.now() - started) / 1000).toFixed(1);
+		const w = (await windows()).find((x) => /^kwtest/.test(x.title));
+		const st = await statsNow();
+		const gpuPath = st.gpuCommits > before.gpuCommits;
+		report(`${mode}: firefox-esr maps its window with the page`, !!mapped && !!w?.rect, `${mapped ? `"${mapped}" after ${mapSecs} s` : "no window in 240 s"}; ${w ? `${w.rect.w}x${w.rect.h}, maximized ${w.maximized}, focused ${w.focused}` : ""}; ${st.gpuCommits - before.gpuCommits} GPU commits, ${st.commits - before.commits} commits${mapped ? "" : `\n--- its output:\n${await sh("tail -15 /tmp/wl-firefox.log")}\n--- relay log:\n${await relayLog()}`}`);
+		if (!mapped || !w?.rect) return void await sh("pkill -x firefox-esr; true");
+		// The page's content: the window's bottom innerHeight pixels.
+		const ox = w.rect.x, oy = w.rect.y + w.rect.h - Number(/ h(\d+)/.exec(mapped)[1]);
+		const at = (x, y) => [ox + x, oy + y];
+		await mouse(...at(150, 75));
+		await mouse(...at(150, 75));
+		const clicked = await title(/^kwtest c2 /);
+		await mouse(...at(150, 190));
+		await typeText("abc");
+		const typed = await title(/ i:abc /);
+		report(`${mode}: firefox: two clicks on a button, then typing into a text field`, !!clicked && !!typed, `after the clicks "${clicked}"; after typing "${typed}"`);
+		await mouse(...at(600, 300), { button: "right" });
+		const menu = await waitFor("KW.wayland.popups() === 1 && 1", 20000, 250);
+		const xEvent = await title(/ x1 /, 5000);
+		await ffShot("menu");
+		await press(...special("Escape"));
+		const menuGone = await waitFor("KW.wayland.popups() === 0 && 1", 10000, 250);
+		report(`${mode}: firefox: a right click opens its context menu, Escape closes it`, !!menu && !!xEvent && !!menuGone, `popup ${!!menu}, contextmenu event ${!!xEvent}, closed ${!!menuGone}`);
+		const wheel = async (dy) => {
+			const [x, y] = at(600, 300);
+			await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+			for (let n = 0; n < 3; n++) { await send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY: dy }); await sleep(120); }
+		};
+		await wheel(120);
+		// Firefox may count more wheel events than notches (smooth scrolling): the position tells.
+		const down = await title(/ w[1-9]\d* s[1-9]/);
+		await wheel(-120);
+		const up = await title(/ w([4-9]|\d\d+) s0 /);
+		if (!down || !up) await ffShot("wheel");
+		report(`${mode}: firefox: the wheel scrolls the page down and back`, !!down && !!up, `"${down}", then "${up}"${down && up ? "" : `; now "${await titleNow()}"`}`);
+		await mouse(...at(2, 247), { to: at(215, 247) });
+		// Firefox takes the primary selection a moment after the release.
+		const primary = await sh(`for i in $(seq 10); do p=$(timeout 10 ${WL} wl-paste -p -n 2>&1); rc=$?; [ $rc = 0 ] && break; sleep 0.5; done; echo "$p rc=$rc"`);
+		await press(...letter("c"), ["ctrl"]);
+		const clip = await sh(`for i in $(seq 10); do sleep 0.5; p=$(timeout 10 ${WL} wl-paste -n 2>&1); rc=$?; [ $rc = 0 ] && break; done; echo "$p rc=$rc"`);
+		await ffShot("selection");
+		report(`${mode}: firefox: a drag selects text (primary selection), Ctrl+C copies it (wl-paste)`, /^selectme words rc=0/.test(primary) && /^selectme words rc=0/.test(clip), `primary ${JSON.stringify(primary)}, clipboard ${JSON.stringify(clip)}`);
+		await mouse(...at(50, 330));
+		const link = await title(/^kwtwo/, 30000);
+		// A loaded machine slows Firefox down enough that the URL bar may not have the focus yet when
+		// the typing starts (2026-11-22, a load of 14 on 16 cores): a second try (Ctrl+L selects what is there).
+		let typedUrl = "", tries = 0;
+		while (!typedUrl && tries++ < 2) {
+			await press(...letter("l"), ["ctrl"]);
+			await sleep(2000);
+			await typeText("file:///tmp/t3.html");
+			await press(...special("Enter"));
+			typedUrl = await title(/^kwthree/, 30000);
+		}
+		report(`${mode}: firefox: a click on a link navigates; Ctrl+L, a typed URL and Enter navigate`, !!link && !!typedUrl, `"${link}", then "${typedUrl}"${typedUrl && tries > 1 ? ` (try ${tries})` : ""}${typedUrl ? "" : `; now "${await titleNow()}"`}`);
+		await sh("pkill -x firefox-esr; for i in $(seq 20); do pgrep -x firefox-esr >/dev/null || break; sleep 0.5; done; pkill -9 -x firefox-esr; true");
+		await waitFor("KW.wayland.windows().length === 0 && 1", 30000);
+	};
+
 	// The prepared disk into this profile's data disk (the page reloads itself after the import); --fresh: none.
 	if (!fresh) {
 		await openPage(`${base}&worker=0`);
@@ -462,6 +557,10 @@ try {
 				await sh("pkill -x chromium; true");
 				await waitFor("KW.wayland.windows().length === 0 && 1", 30000);
 			}
+			continue;
+		}
+		if (firefoxTest) {
+			await firefoxCase(mode);
 			continue;
 		}
 		if ((!fresh && !/foot/.test(has)) || !/wlandr/.test(has)) { report(`${mode}: guest`, false, has); continue; }

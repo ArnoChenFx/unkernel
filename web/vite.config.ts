@@ -29,16 +29,24 @@
 // where the Node server answers them (server/distros.ts) and Vercel's CDN
 // serves them as static files, immutable either way.
 //
+// A local wland build (.agents/web.md, Wayland desktop): KW_WLAND_PKG=<dir>
+// (a copy of a wland checkout's package.json, LICENSE, README.md and dist/)
+// makes a build import `wland` and its subpaths from there instead of
+// node_modules (unkernel:wland-pkg), into .wland-local/output/ (Nitro's
+// build directory .wland-local/build/), so web/.output, node_modules and a
+// running dev server are left alone. Build only: a dev server still takes
+// wland from node_modules.
+//
 // Runtime settings (environment variables of the built Node server):
 //   PORT, HOST (NITRO_PORT, NITRO_HOST)  where it listens (default: port 3000, all interfaces)
 import { execFileSync } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { copyFile, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import { nitro } from "nitro/vite";
 import { GL_FILES, baseSplit, pageSource, rescanImages, servedName, splitBase, type PageImage } from "./scripts/kernel.ts";
 import { IMMUTABLE, distroReply } from "./server/range.ts";
@@ -69,6 +77,39 @@ let output: { dir: string; publicDir: string; preset: string } | undefined;
 
 /** The dev server's images as they are now (sizes and hashes read again: an image may have been rebuilt). */
 let devImages: Promise<PageImage[]> | undefined;
+
+/** KW_WLAND_PKG: a local wland package for a build, and where that build goes. */
+const wlandPkg = process.env.KW_WLAND_PKG ? path.resolve(import.meta.dirname, process.env.KW_WLAND_PKG) : undefined;
+const wlandLocal = path.join(import.meta.dirname, ".wland-local");
+
+/**
+ * `wland` and `wland/<sub>` (with any ?query) to the files the local
+ * package's exports name. Build only, before Vite's own resolution.
+ */
+function wlandPkgPlugin(dir: string): Plugin {
+	const exports = (JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { exports: Record<string, string> }).exports;
+	// Nitro always points node_modules/.nitro/last-build.json at the newest
+	// output (for `nitro preview`): put back what it said before.
+	const lastBuild = path.join(import.meta.dirname, "node_modules/.nitro/last-build.json");
+	let before: string | undefined;
+	try { before = readFileSync(lastBuild, "utf8"); } catch {}
+	process.once("exit", () => {
+		try { if (before === undefined) rmSync(lastBuild, { force: true }); else writeFileSync(lastBuild, before); } catch {}
+	});
+	return {
+		name: "unkernel:wland-pkg",
+		apply: "build",
+		enforce: "pre",
+		configResolved() { console.log(`[wland] from ${dir} (KW_WLAND_PKG), output in ${path.relative(process.cwd(), wlandLocal)}/output`); },
+		resolveId(id) {
+			const m = /^wland(\/[^?]*)?(\?.*)?$/.exec(id);
+			if (!m) return null;
+			const target = exports[`.${m[1] ?? ""}`];
+			if (!target) throw new Error(`[wland] ${dir}/package.json exports no ${id}`);
+			return path.join(dir, target) + (m[2] ?? "");
+		},
+	};
+}
 
 export default defineConfig({
 	// Every interface, so a phone on the LAN can open http://<this-machine>:8080/.
@@ -199,9 +240,11 @@ export default defineConfig({
 				});
 			},
 		},
+		...(wlandPkg ? [wlandPkgPlugin(wlandPkg)] : []),
 		react(),
 		tailwindcss(),
 		nitro({
+			...(wlandPkg ? { buildDir: path.join(wlandLocal, "build"), output: { dir: path.join(wlandLocal, "output") } } : {}),
 			// The kernel (9 MiB) is sent br/zstd/gzip-encoded by the Node server.
 			// Every file in the output's public directory is compressed (types
 			// it does not know count as text), which is why the distro images

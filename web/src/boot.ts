@@ -8,8 +8,9 @@
 // the page is cross-origin isolated, else as messages, and sound as messages):
 // a wterm terminal with a systemd-style boot transcript, the status
 // indicator and stages (ui.ts), and the kernel's console as window 0, with
-// more terminal windows over vsock (windows.ts), and the guest preview
-// (preview.ts: guest web servers in an iframe). With several CPUs (?cpus=N,
+// more terminal windows over vsock (windows.ts), the guest preview
+// (preview.ts: guest web servers in an iframe), and the Wayland desktop
+// (wayland.ts: the guest's Wayland apps as windows, through kwshm). With several CPUs (?cpus=N,
 // config.ts) it loads the SMP kernel instead and boots it in worker mode,
 // whose worker starts the other CPUs; whatever stops that before the
 // kernel runs reloads once on one CPU (bootUpOnce()). A suspended session
@@ -40,6 +41,7 @@ import { APPLE, CHORD } from "./shortcuts.ts";
 import { dropLegacyScope } from "./sw.ts";
 import { clearResumeRequest, setResumeRequest, takeResumeRequest } from "./ui.ts";
 import { createWindows, pasteText, setTermFont, termText, TERM_OPTIONS } from "./windows.ts";
+import { attachWayland, waylandApi } from "./wayland.ts";
 import {
 	BootError, ConsoleRouter, KernelInstance, SnapshotCommitError, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot, type SnapshotHoldDecision,
@@ -654,7 +656,14 @@ export function start(): void {
 	}
 
 	// --- the suspended session (session.ts) ------------------------------------------
-	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data, gl: cfg.gl, gpu: cfg.gpu });
+	/**
+	 * kwshm, for the Wayland desktop (wayland.ts): on unless ?shm=0, and for the
+	 * resume of a session the session's (adoptSessionGl()), since a restore
+	 * needs the snapshot's devices.
+	 */
+	let shm = cfg.shm;
+	let shmOwn: boolean | null = null;
+	const sessionDevices = (): SessionDevices => ({ display: cfg.display, sound: cfg.sound, net: cfg.net, data: cfg.data, gl: cfg.gl, gpu: cfg.gpu, shm });
 	/**
 	 * The devices a suspended session is matched against: this load's, except
 	 * that guest GL and its virtio-gpu device follow the session's (it resumes
@@ -662,10 +671,10 @@ export function start(): void {
 	 * ?gpu=, or the session had GL and this load cannot (no WebGL2, no
 	 * renderer, another distro: the distro is matched anyway). So a session
 	 * saved before GL was on by default (no gl, no gpu) still resumes, as it
-	 * was; a fresh boot uses the options.
+	 * was; a fresh boot uses the options. kwshm always follows the session's.
 	 */
 	const sessionDevicesFor = (m: SessionMeta): SessionDevices => {
-		const d = sessionDevices();
+		const d = { ...sessionDevices(), shm: !!m.devices.shm };
 		if (cfg.glFromUrl) return d;
 		const gl = !!m.devices.gl, gpu = !!m.devices.gpu;
 		if (gl && (cfg.glBlocked || !GL_DISTROS.includes(cfg.guest))) return d;
@@ -673,9 +682,14 @@ export function start(): void {
 	};
 	/** This load's own GL devices, while a resume runs with the session's (a failed resume boots fresh with these). */
 	let glOwn: { gl: boolean; gpu: boolean; why: string | null } | null = null;
-	/** Resume `m` with its own guest GL devices (sessionDevicesFor()). */
+	/** Resume `m` with its own guest GL devices and kwshm (sessionDevicesFor()). */
 	const adoptSessionGl = (m: SessionMeta) => {
 		const d = sessionDevicesFor(m);
+		if (!!d.shm !== shm) {
+			shmOwn = shm;
+			shm = !!d.shm;
+			ui.hostLog(`[host] suspended session: resumed ${shm ? "with" : "without"} kwshm (the Wayland desktop), as it was saved; a fresh boot ${cfg.shm ? "has" : "has not"} it`);
+		}
 		if (!!d.gl === cfg.gl && !!d.gpu === cfg.gpu) return;
 		glOwn = { gl: cfg.gl, gpu: cfg.gpu, why: cfg.glWhy };
 		cfg.gl = !!d.gl;
@@ -685,6 +699,10 @@ export function start(): void {
 	};
 	/** The resume failed: the fresh boot gets this load's own GL devices (its command line has them). */
 	const dropSessionGl = () => {
+		if (shmOwn !== null) {
+			shm = shmOwn;
+			shmOwn = null;
+		}
 		if (!glOwn) return;
 		cfg.gl = glOwn.gl;
 		cfg.gpu = glOwn.gpu;
@@ -1281,7 +1299,9 @@ export function start(): void {
 			const key = `${s.state} ${now}`;
 			if (key === shown) return;
 			shown = key;
-			if (s.state === "ready")
+			if (s.state === "ready" && st.gpu?.contextLost)
+				ui.check("gl", "Guest GL", "fail", "WebGL context lost", `the browser dropped the renderer's WebGL2 context (memory pressure, the page in the background, a GPU reset): every 3D command fails from then on, so GL programs in the guest fail; reload the page for a new renderer. ${now}.`);
+			else if (s.state === "ready")
 				ui.check("gl", "Guest GL", soft ? "warn" : "pass", webgl, `WebGL2: ${webgl}${soft ? " (a software renderer: no GPU behind it)" : ""}; ${s.what}${cfg.gpu ? ", virtio-gpu 3D" : ""}; ${loadNote}. ${how} ${now}.`);
 			else if (s.state === "loading")
 				ui.check("gl", "Guest GL", "info", "loading", `the guest's first GL use: loading the renderer (virgl.mjs, virgl.wasm, a WebGL2 context) for ${fmtS(at - (s.startedAt ?? at))}. ${how}`);
@@ -1338,12 +1358,13 @@ export function start(): void {
 	 * refused commands, over the last MS and in all.
 	 */
 	function gpuFrames(g: GpuRendererStats, p: GpuRendererStats | undefined, ms: number): string {
-		const d = (k: keyof GpuRendererStats) => g[k] - (p?.[k] ?? 0);
+		type Counter = Exclude<keyof GpuRendererStats, "lastError" | "contextLost">;
+		const d = (k: Counter) => g[k] - (p?.[k] ?? 0);
 		const rate = p && ms > 0 && (d("presents") || d("commands"))
 			? `last ${(ms / 1000).toFixed(0)} s: ${(d("presents") * 1000 / ms).toFixed(1)} presents/s, ${d("parks")} parks, ${(d("parks") ? d("parkedMs") / d("parks") : 0).toFixed(2)} ms parked each; `
 			: "";
 		return `virtio-gpu: ${rate}${g.presents} presents, ${g.commands} commands (${g.fenced} fenced: ${g.parks} parked, ${g.parkedMs.toFixed(0)} ms in all), ` +
-			`${g.reads} readbacks, ${g.errors} errors`;
+			`${g.reads} readbacks, ${g.errors} errors${g.contextLost ? " (the WebGL2 context was lost: reload the page)" : g.lastError ? ` (last: ${g.lastError})` : ""}`;
 	}
 
 	/**
@@ -1445,6 +1466,11 @@ export function start(): void {
 		// Guest GL: the guest's shells point Mesa at virgl, at the vtest link where there is no
 		// /dev/dri render node (kw-gl.sh in the base's kw layer).
 		if (cfg.gl) cfg.cmdline += " kw.gl=1";
+		// The Wayland desktop: with kwshm the page listens for wland's relay (attachWayland()), and
+		// kw.wayland=1 has the guest start the relay at boot, which dials only when an app connects,
+		// and give its shells the session (wland --boot and kw-wayland.sh in the base's kw layer).
+		// This load's own kwshm, like kw.gl=1: a resume keeps the saved kernel's command line.
+		if (cfg.shm) cfg.cmdline += " kw.wayland=1";
 		if (distroOpening) {
 			try {
 				const { d, ms } = await distroOpening;
@@ -1528,9 +1554,11 @@ export function start(): void {
 		// made: a resumed session keeps its own (adoptSessionGl()). The renderer loads on the guest's
 		// first GL use (?glload=eager: before the boot); with it virtio-gpu, the guest's /dev/dri, 3D on
 		// that renderer (?gpu=0: none).
+		// And kwshm, for the Wayland desktop (wayland.ts; a resumed session keeps its own too).
 		const glDevices = () => ({
 			gl: cfg.gl && (cfg.glStrictWaits || cfg.glEager ? { ...(cfg.glStrictWaits ? { strictWaits: true } : {}), ...(cfg.glEager ? { eager: true } : {}) } : true),
 			gpu: cfg.gpu,
+			shm,
 		});
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);
@@ -1620,6 +1648,9 @@ export function start(): void {
 		KW.vm = vm;
 		// The guest preview (preview.ts) relays /vm/<id>/<port>/ to vm.fetch().
 		attachPreview(vm);
+		// Wayland apps (wayland.ts): wland's relay connects to vsock port 1023 when the guest's first Wayland app starts.
+		const stopWayland = attachWayland(vm, (l) => ui.hostLog(l));
+		KW.wayland = waylandApi;
 		// The guest's open and xdg-open (open.ts): its URLs, in the preview or a
 		// new tab once the user confirms. Added once the kernel runs rather than
 		// as createKernel's commands: spawn() and exec() (the windows, the demos)
@@ -1697,6 +1728,7 @@ export function start(): void {
 		clearInterval(quiet);
 		unquiet(); // it ended before the screen was restored
 		attachPreview(null); // previews now get 503
+		stopWayland?.();
 		stopWindows(`the kernel stopped (${res.kind})`);
 		if (holdState) {
 			// Held, the session saved: stopped after AUTO_SUSPEND_HOLD_MS (or by Suspend), or ended otherwise

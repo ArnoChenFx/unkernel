@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /etc/chromium.d/kw-wayland (the kw layer): Debian's chromium wrapper
+# sources this. In a Wayland session (in the page every shell has one:
+# kw-wayland.sh) Chromium uses Wayland rather than look for an X display;
+# and started with neither a Wayland nor an X display (not from a shell,
+# or a machine booted without kw.wayland=1) where the machine can show
+# Wayland windows (/dev/kwshm), it gets wland's session: wland starts the
+# relay if needed and prints the variables, or fails within seconds
+# outside the page (then Chromium says what it always says without a
+# display).
+
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ -c /dev/kwshm ] && [ -x /usr/lib/kw/bin/wland ]; then
+	_kw_env=$(/usr/lib/kw/bin/wland 2>/dev/null) && eval "$_kw_env"
+	unset _kw_env
+fi
+[ -z "${WAYLAND_DISPLAY:-}" ] || CHROMIUM_FLAGS="$CHROMIUM_FLAGS --ozone-platform=wayland"

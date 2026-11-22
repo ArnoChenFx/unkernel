@@ -20,7 +20,8 @@ a separate chunk loaded only after the preflight passes), `windows.ts`
 it gets shorter), `net.ts` (Wisp only), `apk.ts` (apk index prefetch), `download.ts` (files the page fetches for the guest), `sudo.ts` (root in the guest: `SUDO_SH`, `execAsRoot()`), `sdk.ts`, `kw.ts` (`window.KW`),
 `data.ts` (the data disk), `session.ts` (the suspended session), `autosuspend.ts` (suspending in the background and the question on leaving: when, decided without a DOM), `display.ts` (the guest display's state, the
 mode offered, keyboard routing), `audio.ts` (Web Audio output),
-`preview.ts` (the guest preview's page side), `open.ts` (the guest's
+`preview.ts` (the guest preview's page side), `wayland.ts` (the Wayland
+desktop: wland on vsock and kwshm), `open.ts` (the guest's
 `open` and `xdg-open`, host commands: a URL on the guest's own address in
 the preview, any other http(s) URL in a new tab, each only after the user
 confirms), `sw.ts` (the service
@@ -30,7 +31,8 @@ runs; the demos are in `src/demos/`), `style.css`
 (layout, viewport, key bar visibility, pinch), `Bar.tsx` (the status line), `Launcher.tsx` (its first item and the
 launcher overlay),
 `Panel.tsx` (the dialog), `Options.tsx`, `Display.tsx` (the display layer,
-rotation, mouse and touch input, touch controls), `Keys.tsx` (extra keys),
+rotation, mouse and touch input, touch controls), `Desktop.tsx` (the
+Wayland desktop's layer), `Keys.tsx` (extra keys),
 `Overlays.tsx` (splash, toast, paste and confirm dialogs), `About.tsx`
 (the status line's triangle and the credits dialog), `Preview.tsx`
 (the preview panel), `icons.tsx`. `src/env.d.ts` declares `__KW_BUILD__`,
@@ -257,7 +259,7 @@ deploying the page needs no kernel toolchain.
   because React drops change events for a value set from script (the test
   does that).
 - `window.KW` is what the browser tests read, together with the element
-  ids: `#bar-win-N` (window N), `#bar-new`, `#bar-display`, `#bar-log`,
+  ids: `#bar-win-N` (window N), `#bar-new`, `#bar-display`, `#bar-desktop`, `#bar-log`,
   `#bar-errors`, `#status` (its CSS `color` turns red on an error) and
   `#status-label`, `#panel` (class `open`), `#confirm`. Keep them working.
 - Safe areas are the CSS variables `--st`, `--sr`, `--sb`, `--sl` (style.css). On iOS,
@@ -505,8 +507,8 @@ out, so the guest has the vtest link alone, for comparison.
   before GL was on by default resumes as it was, and a fresh boot uses the
   options. The renderer being loaded or not changes nothing in a session
   (gl.md, Loading on first use). The SDK refuses a snapshot while the
-  device holds resources or 3D contexts (a running GL program or KMS
-  client), before the guest parks, and Suspend then says that a program is
+  device holds resources or 3D contexts that submitted commands (a running
+  GL program or KMS client; gl.md, The DRM path), before the guest parks, and Suspend then says that a program is
   using the GPU and to quit it (`refusal()`, boot.ts; the same text in
   the auto-suspend and Pause notes). The renderer's state is not saved: a
   resume ends the guest's GL clients, and the forwarder relinks by itself
@@ -541,6 +543,341 @@ out, so the guest has the vtest link alone, for comparison.
   rate), packages kept across reloads on the
   data disk, the built server's
   `/assets/virgl-*/` files in a browser.
+
+## Wayland desktop
+
+Wayland apps in the guest show as windows on the page, through
+[wland](https://github.com/pithings/wland) (npm `wland`, pinned exactly
+in `web/package.json`; `src/wayland.ts`, `components/Desktop.tsx`): its
+compositor (wasm) runs on the page's thread, its relay in the guest. The
+page boots with `createKernel({ shm: true })` (kwshm; js.md, shm) and
+`kw.wayland=1` on the command line (with kwshm only, as `kw.gl=1` with
+GL; a resume keeps the saved kernel's command line) and, once the kernel
+runs, listens on vsock port 1023 (`WAYLAND_PORT`). Wayland is always
+there in the guest (with a relay that has `--link-on-demand`: wland after
+the pinned release, below): with `kw.wayland=1` the kw layer's rc starts the relay
+`/usr/lib/kw/wlandr --link vsock:2:1023 --buffers kwshm --link-on-demand`
+for the image's user (with `--dmabuf virtgpu:/dev/dri/renderD128
+--no-fence-wait` where guest GL's render node is: GL apps, below), which
+binds `/run/user/UID/wayland-0` and dials the page only when an app
+connects, and every login and interactive shell has the variables that
+make toolkits pick Wayland (`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE=wayland`
+and the rest; Debian's chromium gets `--ozone-platform=wayland`), so
+`foot` started plainly maps a window (kernel/guest.md, the kw layer).
+`wland CMD` (`/usr/lib/kw/bin/wland`) still works: it starts a relay
+where none runs (killed, or a relay without `--link-on-demand`, which
+the boot leaves out: it would dial at once and load wland at every page
+boot) and runs CMD in the session. The relay tells its features with
+`wlandr --version` (a `features:` line; a relay without it, the pinned
+release, is read from `--help`). The apps' buffers stay in guest memory: the
+relay exports each through `/dev/kwshm` and the compositor reads it in
+place wherever `ShmFile.inPlace` (inline, and worker mode on several CPUs:
+the SMP kernel's memory is shared with the page, js.md, shm): wland takes
+the export's page runs (its `view`: `ShmFile.views()`, no copy of ours; a
+single run is presented as it is, several have the damaged spans
+gathered). Else (one CPU in worker mode) every damaged span of a commit
+goes in one `readv`, a `ShmFile.read()` each, posted together through the
+shared transport's ring and served at the kernel's next clock read (about
+0.6 ms), and with `?shared=0` (or no cross-origin isolation) as messages
+answered at the kernel's next yield.
+
+- Loaded on first use: the relay's first connection (at the first app)
+  imports wland (its own chunk) and `wland.wasm` (passed by URL:
+  `wland/wland.wasm?url`, since the dev server's dep optimizer breaks the
+  package's own `import.meta.url` lookup); a page that never runs a
+  Wayland app fetches neither. The relay's next connection after a drop
+  goes to the same wland (a fresh compositor; the apps of the old link are
+  gone). The relay counts a completed connect as the compositor attached
+  and the SDK's listener completes every connect, so the page takes a
+  connection only where wland serves it: one at a time (a second
+  relay's is reset, its apps fail at once instead of waiting), none once
+  wland failed to load (the listener closes, so dials are refused), and
+  one that went away before wland took it (a dial that timed out while
+  wland loaded) is skipped. After the last window the link stays up and
+  wland loaded: closing it frees only the compositor's state (the module
+  stays) and races an app connecting meanwhile.
+- Costs when unused (2026-11-22): the relay's RSS 904 to 908 KiB, its
+  start at boot about 35 ms of guest time (`wland --boot` 0.11 s against
+  0.08 s for `sudo true`, Node CLI; whole boots to a prompt 1.05 s
+  without, 1.09 s with the flag, within the noise), nothing fetched and no
+  compositor until the first app (`page-check.mjs`, "idle before an
+  app"). Plain foot maps 1.1 to 1.2 s after its start in a fresh page,
+  wland's chunks and wasm fetched 0.3 s after it.
+- Failure: outside the page (the Node CLI, which never adds the flag) no
+  relay starts and shells get no session: `foot` fails at once as on any
+  machine without a compositor (`failed to connect to wayland`). Where
+  the relay runs but nothing takes its dial (the CLI with `--shm` and
+  `wland`, an app before the page listens) the app fails within 0.3 s:
+  the host refuses the connect, the relay closes the waiting app and logs
+  `wayland client refused: no engine on link vsock:2:1023
+  (ConnectionRefused)`; foot prints `no compositor` and `failed to flush
+  wayland socket` (exit 230), and `wland CMD` adds that the page did not
+  take the link.
+- The view: a layer over the stage (`#wl-layer`, z-11, over the display,
+  under the preview) with wland's container `#wl-desktop`, the stage's
+  size (the output size the apps get), always mounted and only hidden
+  (`invisible`, `inert`). The store's `desktop` state: `attached` while
+  the relay is connected, which shows the status line's desktop icon
+  (`#bar-desktop`, overlapping windows, its tooltip lists the windows);
+  `shown` when the first window maps and hidden when the last one goes,
+  or by hand: the icon, Ctrl-A w (`toggleDesktop()`); picking a terminal
+  window or the display hides it. wland does its own input: a click
+  focuses a window, whose keys go to wland's hidden editable sink, which
+  display.ts and the terminals leave alone (display.ts takes no keys while
+  the desktop is shown); the page's shortcuts (Ctrl-A) still come first,
+  and Ctrl-A Ctrl-A sends Ctrl-A on to the app. Hiding the desktop gives
+  the terminal the keyboard if a window had it (not on touch devices);
+  showing it gives the top window the keyboard once the layer has rendered
+  (`focusDesktop()` from Desktop.tsx: an inert layer takes no focus).
+  Windows have the apps' own title bars (wland draws no decorations);
+  wland's window manager: Alt+drag moves, Alt+F9/F10/F11 minimize,
+  maximize, fullscreen (to the desktop's size, which follows the stage:
+  wland's output follows its container's size, so `wl.output` is not
+  used).
+  The clipboard works between the apps (wl-copy, foot, GTK), and wland's
+  bridge (its `clipboard` option, left on) joins it to the page's for
+  plain text: a paste chord in the desktop (Ctrl+V, Ctrl+Shift+V,
+  Shift+Insert) gives the focused app the page clipboard's text (from the
+  browser's paste event), and an app's copy is written to the page
+  clipboard around a click or key in the desktop. On because it asks for
+  no permission: it reads the page clipboard only from a paste event (or
+  on focus where clipboard-read was granted already) and writes only
+  around a gesture, so no browser prompts; a relay without the bridge
+  (0.1.0) turns it off for its link.
+- Sessions: kwshm is a device of the snapshot, so a session records it
+  (`SessionDevices.shm`; absent in older ones: off) and resumes with its
+  own (`adoptSessionGl()`); a fresh boot has it unless `?shm=0` (this
+  load only, config.ts), which boots without it as the page did before
+  the desktop. Without kwshm the page does not listen, the foot tile is
+  dimmed with why, and `wland` says there is no `/dev/kwshm`; no
+  `kw.wayland=1`, so no relay at boot. A resume resets vsock: the
+  relay's apps of the old link are gone and it dials again at the next
+  app (`link ... closed; dialing again for the next app`); the resumed
+  page fetches nothing of wland until then. A session saved before the
+  relay started at boot resumes as it was (its relay, started by `wland`,
+  dials at once and the page loads wland).
+- **GL apps by GPU resource** (`gpuSource()`): with guest GL's virtio-gpu
+  device (gl.md, The DRM path) the relay starts with
+  `--dmabuf virtgpu:/dev/dri/renderD128` where that node exists and the
+  relay has the mode (`dmabuf:virtgpu` in `--version`, else its `--help`;
+  0.1.0 has not), with `--no-fence-wait` where it has that, and the page gives
+  wland a `gpu` source where `vm.gl.gpu` exists (the `gl` and `gpu`
+  options, WebGL2), unless `?wlgpu=0` (this load only, config.ts). wland
+  then offers linux-dmabuf v4 (AR24, XR24, AB24, XB24, each with the
+  implicit modifier and LINEAR), the relay names each GL client buffer by
+  its virtio-gpu resource, and `resolve()` is `vm.gl.gpu.image(resource,
+  { width, height, opaque: XR24 or XB24, flipY: y_invert })`: an
+  ImageBitmap blitted in the renderer's WebGL2 context, no readback (a
+  promise only while the renderer loads; a buffer at a plane offset gives
+  null, logged once), which wland draws into the window's canvas and
+  `release` closes. Without the source wland leaves linux-dmabuf out, also
+  in front of a relay with `--dmabuf`, and GL apps render in software
+  (llvmpipe) into wl_shm buffers like any app: GL off (no render node, no
+  flag), `?gpu=0` (the vtest link: with `GALLIUM_DRIVER=virpipe
+  LIBGL_ALWAYS_SOFTWARE=1` Mesa's software winsys shows virpipe's frames
+  in wl_shm buffers), a 2D device (no WebGL2 at boot: the node and the
+  flag are there, the source is not), `?wlgpu=0`. A relay started without
+  the flag (a session resumed from a boot without the node) keeps GL apps
+  in software; `wland` says so and that `pkill -x wlandr` (which ends its
+  apps) lets the next `wland` start one with it.
+- Ordering: in both modes a GL client's SUBMIT_3D reaches the renderer
+  before the relay's commit naming its buffer reaches wland (in worker
+  mode virtio-gpu requests and vsock packets share the worker's one
+  message channel to the page, which runs a submit as it arrives), so the
+  blit sees the frame. So the relay runs with `--no-fence-wait` where it
+  has it; a relay without (the pinned release) waits up to 100 ms per
+  commit for the dmabuf's write fence (signalled once the device answered
+  the submit), which only adds latency, and logs `still being written
+  after 100 ms` once per connection at GTK 4's first frame (shader
+  compiles on SwiftShader); the window is right either way. An on-demand
+  relay started without its render node warns (`linux-dmabuf off for
+  now`) and looks the node up again at each dial (page-check `--gpu`).
+- What Mesa picks (Debian 13, Mesa 25.0.7; 2026-11-22): EGL's Wayland
+  platform on the `virtio_gpu` DRI driver, window configs in B8G8R8A8 and
+  B8G8R8X8 only (no R8G8B8A8 one), so ARGB8888 with alpha and XRGB8888
+  without, always with the LINEAR modifier (0), never y_invert, plane
+  offset 0, stride width x 4. GTK 4.18 draws with GskGLRenderer (no Vulkan
+  driver installed), which needed renderer patch 14 (gl.md, Patches).
+- One wland release on both sides: the npm version in `web/package.json`
+  and the relay's `WLANDR_VERSION` (guest/base/pins.sh) change together
+  (the link protocol is theirs). The page needs wland 0.1.0-261122 or
+  later (the `gpu` source, `view`, `readv`, the clipboard bridge); with
+  the first 0.1.0 package it still runs, wland ignoring what it does not
+  know (a read per span, no GL windows by resource, no bridge). The
+  relay asset is `wlandr-link-linux-arm64.tar.gz` (the `--link`-only
+  build, its entry `wlandr`). The relay at boot needs `--link-on-demand`
+  (and `--version`, `--no-fence-wait`): wland after v0.1.0-261122-f36330a,
+  which the pin still is, so a base built with the pin starts no relay at
+  boot and gives shells no session (plain apps fail as outside the page;
+  `wland CMD` works as before); the page side needs no change for it
+  (the link protocol is the same; checked against wland 1567138). On
+  wland's next release: `WLANDR_VERSION` and `WLANDR_SHA256` in pins.sh
+  and the npm version in `web/package.json`, then `kernel/build.sh base`
+  without `KW_WLANDR`. To try a local wland build:
+  `KW_WLANDR=<wland>/zig-out/release/wlandr-link-linux-arm64 kernel/build.sh
+  base` (guest/base/build.sh; refused with `KW_RELEASE=1`), and
+  `web/node_modules/wland` replaced by that checkout's package
+  (`package.json`, `LICENSE`, `README.md`, `dist/`), then
+  `web/node_modules/.vite/deps` removed (else the dev server keeps the old
+  prebundled `wland_client.js`: "function import requires a callable").
+- The launcher's foot demo (`demos/foot.ts`, Debian: foot,
+  fonts-dejavu-core, fontconfig; `needs.wayland`: dimmed without the
+  desktop) runs `wland foot`; its README suggests wl-clipboard,
+  wayland-info and a GTK 3 app (l3afpad, installed with `systemd-`: GTK's
+  dbus would otherwise make apt swap sysv-rc for systemd). The GL windows
+  demo (`demos/wlgl.ts`, Debian: mesa-utils; `needs.wayland`) runs `wland
+  es2gears_wayland` after `eglinfo -B -p wayland`; its README suggests
+  glmark2-es2-wayland and gtk4-widget-factory (GTK 4).
+- `KW.wayland`: `windows()` (title, focused, maximized, fullscreen,
+  minimized), `container()`, `loaded()`, `popups()` (mapped now) and
+  `popupKeys()`, `stats()` (buffer handles opened; reads, how many in
+  place and of those views, bytes, the reads' total and longest time;
+  commits; GPU commits, images, waits for the renderer, image()'s total
+  and longest time, and resolve to release, which includes wland's draw),
+  `gpuLast()` (the last GPU buffer a commit named), `log()` (wland's
+  last 500 wire-level lines: the apps' decoded requests), `wland()`
+  (wland itself, for debugging).
+- Frame pacing (2026-11-22, `page-check.mjs --built --pacing`, headless
+  Chromium at 61 rAF/s, worker mode): weston-simple-shm (250x250, redraws
+  everything) 60 commits/s on 1 CPU (readv through the ring, 0.25 ms) and
+  on 4 (in place, 0.01 ms); inline 60 (0.01 ms). foot under `yes` output
+  (696x468, 116x36 cells of DejaVu Sans Mono 8 pt) redraws its whole
+  window each commit (1272 KiB: more than a screenful arrives between
+  frames, so every row is dirty): 13.5 to 14.8 commits/s on 1 CPU (reads
+  0.9 ms, 1% of the time; 12.0 to 12.5 while the page's vsock packets
+  went as messages, below), 19 on 4, 11 to 15 inline (repeated runs).
+  Where a frame goes (2026-11-22, one CPU, worker mode, timestamps at
+  each hop: the packets in the worker's VsockDevice and the page's
+  VsockHost, wland's commit event, rAF, and foot's `WAYLAND_DEBUG` and an
+  LD_PRELOAD shim on its reads, the guest's clock aligned to the page's
+  within about 2 ms): foot's commit to the relay's packet leaving the
+  guest 1 to 3 ms, to the page 0.1 to 0.2 ms (posted at the kernel's next
+  task switch), to wland's commit event 1.5 ms (the readv), to the frame
+  callback at the next rAF 0 to 16 ms (8 on average: wland answers at the
+  first rAF after it presents, as it should), into the guest 0.2 ms (the
+  shared transport's vsock ring; as messages 0.6 to 20 ms, 12 on average,
+  waiting for the kernel's yield), the guest takes it within 0.3 ms; then
+  about 25 ms until foot reads its Wayland socket and 30 to 40 ms to its
+  next commit. That last part is foot: between commits it reads the pty
+  in 4 KiB pieces, each parsed in about 1.4 ms here, up to ten per pass of
+  its event loop, and handles the Wayland socket after them, so the frame
+  callback waits one or two such passes (`nice -n 19 foot` changes
+  nothing). weston-simple-shm next to a `yes > /dev/null` keeps 60
+  commits/s (49 while the packets went as messages). Inline the page runs
+  only at the kernel's 20 ms yields (about 48 rAF/s under foot's load),
+  and the packets need no crossing. The page's counters are every
+  window's: the pacing check fails while another window is open (60 to 75
+  commits/s at about 430 KiB measured once for foot were 13 of foot's
+  plus about 47 of a weston-simple-shm that the cleanup had missed;
+  both together give 61 at 429 KiB). With `?shared=0` each read is a
+  message that waits for the kernel's next yield, as are the vsock
+  packets: a read about 11 ms under foot's load, foot 10 commits/s
+  instead of 13.5 to 14.8; weston-simple-shm keeps 60
+  (0.22 ms: the idle kernel yields soon). wland processes nothing else
+  while a read is pending (a synchronous read never leaves one pending).
+  Not taken: the engine in
+  the kernel's worker, an early yield on request (a kernel change), the
+  SMP kernel on one CPU (js.md, Worker mode).
+- wland issues: the two seen with 0.1.0 and reported upstream are fixed in
+  the release after it (checked with the local build, 2026-11-22): a GTK
+  window's popups (l3afpad's context menu) open at the pointer (the menu
+  1 px right of and below the click; it was about 20 px up and left), and
+  a quick click on foot's resize border (its request comes after the
+  release) no longer starts a resize that follows the pointer (a drag on
+  the border resizes by the drag, foot rounding to whole cells).
+- Not wland's: l3afpad (GTK 3) ignored a right click in its text about
+  every other time (2026-11-22: 6 of 12 and 4 of 6 attempts, its menu
+  never came) when the left click before it had its press and release
+  sent back to back, as the DevTools protocol does: both reach the app in
+  one read, and l3afpad's own `button-press-event` handler (`view.c`,
+  `cb_button_press_event`) calls `gtk_clipboard_wait_for_text(PRIMARY)`,
+  a nested main loop, which dispatches the release before GtkTextView's
+  gestures have seen the press (traced with an LD_PRELOAD shim on GTK's
+  calls into GLib and GDK). Those gestures stay pressed, and the next
+  right press goes to cancelling them instead of the context menu. With
+  the button held 60 ms, as a hand does, 14 of 14 menus opened, and 10 of
+  10 with clicks held 80 ms while `yes` kept the guest's CPU busy, so
+  people do not meet it unless the app is too busy to read the press
+  before the release arrives. page-check's clicks hold the button 60 ms
+  (`holdMs`). The strip GTK redraws at the window's right edge after the
+  pointer moves is its overlay scrollbar fading in and out (about a
+  second).
+- Checked 2026-11-22 with `test/wland/page-check.mjs` (testing.md): the
+  dev server and the built page, headless Chromium (Playwright's) on
+  SwiftShader (wland's 2D path: it uses WebGL only on hardware), the
+  prepared disk imported into the fresh profile's data disk, worker mode
+  on 1 CPU and on 4, and inline: nothing of wland fetched before the tile
+  (its chunk nor its wasm), foot's window mapped about 1 s after the click
+  (33 s from a fresh Debian, apt over the page's network), its pixels on
+  the page, typed keys reached its shell and not the terminal, `exit`
+  closed it and hid the desktop, the relay ran on, a second `wland` reused
+  it, a killed relay was replaced by the next `wland foot`; two foot
+  windows (focus by click, keys to the focused one, closing one gives the
+  other the keyboard), Alt+F10 and the page resized while maximized,
+  Alt+drag, the clipboard from wl-copy to foot and from foot to wl-paste;
+  l3afpad (GTK 3): typing, its context menu (a popup) and Escape, Ctrl-A
+  Ctrl-A then Ctrl+C to wl-paste; foot's keys (Ctrl-C, Up, Left, Alt+.,
+  Ctrl-U, auto-repeat: 24 x for a 1.13 s hold, Ctrl-A Ctrl-A), Ctrl-A w
+  both ways and the status line's window, with the focus following;
+  Suspend with foot open (worker mode) and a plain load resumed, the relay
+  reconnected, a new foot mapped; a session saved with `?shm=0` resumed
+  without kwshm and the next boot had it. Again with wland's release
+  after 0.1.0 (the local build, `--built`, worker mode on 1 CPU and
+  inline): all of that, plus the bridge to the page's clipboard both ways,
+  the two fixes above and edge resizing by drag; and `--gpu` (worker mode
+  on 1 CPU and inline; on 4 CPUs the pacing run): the relay
+  with `--dmabuf virtgpu`, linux-dmabuf v4 offered, the renderer loaded on
+  the first GL frame (not before), weston-simple-egl by resource (no shm
+  reads) with its translucent background kept (alpha 128) and the right
+  way up, `-o` opaque, a stopped client's window equal pixel for pixel to
+  its last resource's picture taken afresh, foot and a GL window updating
+  together, gtk4-widget-factory (GskGLRenderer) with no renderer errors,
+  a relay without `--dmabuf` (wland's note; GL apps in shm windows),
+  the GL windows tile (es2gears by resource), Suspend refused while
+  es2gears ran and done after, es2gears by resource
+  after the resume, `?wlgpu=0` (linux-dmabuf not offered although the
+  relay has `--dmabuf`; llvmpipe frames in shm windows) and `?gpu=0`
+  (virpipe frames over the vtest link in shm windows). Not checked: real
+  GPUs (wland's WebGL path; the GPU path's cost there), Safari,
+  phones (touch, the on-screen keyboard), the guest display under the
+  desktop.
+- Firefox (Debian's firefox-esr 153, 2026-11-22, headless Chromium,
+  worker mode on 4 CPUs, a scratch disk with it installed): WebRender on
+  virgl, its window by GPU resource (ARGB8888, one buffer reused, as wland
+  releases it after the image), renders a page since renderer patch 15
+  (gl.md, Patches; before, the window stayed fully transparent and the
+  guest's kernel flooded with failed transfers). 512
+  MiB is too little: the guest thrashes (about 20 MiB left, half the CPU
+  time in I/O wait) and the first page takes minutes; with 2 GiB (the
+  page's default on desktops) its window maps in about 45 s. It takes no input yet, on the GPU path and in
+  software alike: wland 0.1.0-261122 keeps one wl_pointer and one
+  wl_keyboard per client (the last made; `pointer_id`, `keyboard_id` in
+  its compositor.zig), while Firefox binds wl_seat twice (GTK's seat, then
+  its own for serials and pointer constraints), so the events go to
+  Firefox's own objects and GTK's get none (seen with WAYLAND_DEBUG:
+  `wl_pointer#36.button`, `wl_keyboard#37.key`, nothing for GTK's
+  `wl_pointer#8`, `wl_keyboard#19`). A wland issue: a seat's events go to
+  every wl_pointer and wl_keyboard a client made.
+- GL frame rates (2026-11-22, `page-check.mjs --built --gpu --pacing`,
+  headless Chromium on SwiftShader, so a floor; 61 rAF/s; worker mode;
+  weston-simple-egl -o, which redraws everything each frame; one run
+  each):
+
+  | weston-simple-egl -o | 1 CPU | 4 CPUs |
+  | --- | --- | --- |
+  | by resource, 250x250 | 60.0 commits/s, 0.15 ms | 60.0, 0.35 ms |
+  | by resource, maximized (1280x772) | 55.6, 0.17 ms | 56.1, 0.18 ms |
+  | software (`?wlgpu=0`), 250x250 | 59.9, reads 0.44 ms | 60.0, in place 0.01 ms |
+  | software (`?wlgpu=0`), maximized | 13.9, reads 1.33 ms (1938 KiB) | 30.7, in place 0.01 ms |
+
+  By resource the page's cost per commit is resolve to release (image()'s
+  blit and wland's drawImage of it, as issued: their GPU work runs later
+  in Chromium's GPU process and is not counted); image() alone 0.07 to
+  0.16 ms. In software the
+  guest renders with llvmpipe and the page reads the buffer. glmark2-es2-
+  wayland (800x600 windowed, by resource, 1 CPU): build 110, texture 125,
+  phong 103 FPS (it swaps without waiting for frame callbacks, and every
+  frame is an image).
 
 ## Several CPUs
 
@@ -1084,7 +1421,7 @@ default Wisp server) the riscv64 Ubuntu Base tarball (31 MB) took 1.5 to
 4.4 s to fetch and 0.2 s to push; the arm64 26.10 one (35 MB) took 0.3 s
 to push (Node SDK, 2026-11-18). A demo with `hidden` set is left out of the launcher. A demo runs once at a time: picking one whose window
 is open (a dot under its tile) shows that window. A demo whose `needs`
-(display, net, sound) the page's options rule out is dimmed, with why; so
+(display, net, sound; wayland: the Wayland desktop) the page's options rule out is dimmed, with why; so
 is one whose `packages` leave out this boot's distro.
 Failures are toasts. Checked by hand only.
 

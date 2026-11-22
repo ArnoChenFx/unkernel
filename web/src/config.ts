@@ -71,6 +71,13 @@
 //                                      guest's shells use the vtest link (guest GL as it was
 //                                      before the device, for comparison). Also none with
 //                                      ?display=0.
+//   ?shm=0                             this load only: no kwshm device, so no Wayland desktop
+//                                      (wayland.ts; the launcher's Wayland demos are disabled).
+//                                      A resumed session keeps the device it was saved with.
+//   ?wlgpu=0                           this load only: the Wayland desktop takes no GPU buffers
+//                                      (no gpu source for wland: GL apps render in software,
+//                                      llvmpipe over wl_shm, instead of by resource on the
+//                                      page's renderer; for comparison).
 //   ?glload=eager                      with guest GL, this load only: load the renderer before
 //                                      the boot (the SDK's gl.eager), as the page did before it
 //                                      loaded on first use.
@@ -283,6 +290,10 @@ export interface Config {
 	glStrictWaits: boolean;
 	/** With guest GL, the virtio-gpu device (createKernel({ gpu })): unless ?gpu=0 or ?display=0. */
 	gpu: boolean;
+	/** kwshm, for the Wayland desktop (wayland.ts): unless ?shm=0 (this load's URL only). */
+	shm: boolean;
+	/** The Wayland desktop shows GPU apps' buffers by resource (wayland.ts): unless ?wlgpu=0 (this load's URL only). */
+	wlGpu: boolean;
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
@@ -475,6 +486,8 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		// Not settings (SETTING_NAMES): this load's URL only.
 		glStrictWaits: url.get("glwait") === "strict",
 		gpu: glParam && !glWhy && url.get("gpu") !== "0" && params.get("display") !== "0",
+		shm: url.get("shm") !== "0",
+		wlGpu: url.get("wlgpu") !== "0",
 		mobile,
 		coarse,
 		mobileUA,

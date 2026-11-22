@@ -153,6 +153,18 @@ sudo apt-get install -y xvfb xauth glmark2-es2-x11
 xvfb-run -a -s "-screen 0 640x480x24" glmark2-es2   # frame rates
 ```
 
+Wayland apps show as windows on the page: `wland foot` (or the
+launcher's foot tile) starts wland's relay in the guest and runs the app
+against it; [wland](https://github.com/pithings/wland)'s compositor runs in
+the page and reads the app's pixels straight from guest memory. The status
+line's desktop icon (Ctrl-A w) switches between the windows and the
+terminal.
+
+```sh
+sudo apt-get install -y foot fonts-dejavu-core
+wland foot
+```
+
 Browsers can't open raw TCP sockets, so the page reaches the internet
 through a Wisp proxy. The default one accepts only known origins, so if you
 host the page somewhere else, point `?wisp=` at your own proxy.
@@ -480,8 +492,10 @@ await input.write(0, bytes);
 
 `/dev/shm` exists once the guest's init has mounted it, so wait for the
 guest before `create()` (an `exec()` waits for it). `openId(id)` opens a
-memfd that a guest program exported through `/dev/kwshm`. `views()`
-exists only when the kernel runs inline.
+memfd that a guest program exported through `/dev/kwshm`. `views()` and
+`readSync()` work where `vm.shm.inPlace` is true: inline, and in worker mode
+with several CPUs and shared memory (cross-origin isolated pages, Node);
+elsewhere `read()` crosses to the kernel's worker.
 
 ### Display, input and sound
 

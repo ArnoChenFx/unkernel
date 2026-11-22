@@ -15,7 +15,7 @@ overlay root are in data-disk.md.
 `vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
 rdinit=/init`, the data disk template, the SMP patch) and copies that to
 `web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
-1668 KiB (934 KiB gzipped), bundle 9.8 MiB (2026-11-19).
+2293 KiB (1147 KiB gzipped; wlandr, the kw layer below, is 586 KiB of it), bundle 10.7 MiB (2026-11-22).
 
 - Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
   with its own Alpine release), every applet linked in `/bin` (names from
@@ -55,6 +55,42 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/lib/kw/vtest-bridge` (Guest tools, below): the guest GL forwarder,
   in the layer for the same reason (its link protocol belongs to the SDK's
   `gl` option).
+- `/usr/lib/kw/wlandr` and `/usr/lib/kw/bin/wland`: Wayland apps as
+  windows on the page (web.md, Wayland desktop). `wlandr` is wland's relay
+  (https://github.com/pithings/wland, MPL-2.0 and MIT), the static aarch64
+  release binary pinned in `guest/base/pins.sh` (`WLANDR_*`; about 590 KB,
+  its HTTP server included: the release has no smaller build;
+  `KW_WLANDR=<file>` builds the base with a local one instead, web.md,
+  Wayland desktop). One relay per user (`setsid`, its pid in
+  `$XDG_RUNTIME_DIR/wlandr.pid`, its log `wlandr.log` there, afresh for
+  each relay) with `--link vsock:2:1023 --buffers kwshm`, plus what its
+  `wlandr --version` features line has (a relay without `--version`, the
+  pinned release, is read from `--help`): `--link-on-demand` (dial at the
+  first app, not at start; after a drop at the next app; a failed dial
+  closes the waiting apps at once), and where `/dev/dri/renderD128` exists
+  `--dmabuf virtgpu:/dev/dri/renderD128` (GL apps by GPU resource; a
+  running relay without it gets a note on how to restart it) with
+  `--no-fence-wait`. `wland --boot` (the layer's rc, as root, with
+  `kw.wayland=1` on the command line: the page's boot) starts it for the
+  image's user (`kw.user=`, else `user`, else root, as `kwtty login`
+  picks), through busybox `su`, after making `/run/user/UID` (0700, the
+  user's) and root's `/run/user/0`; only on a distro (not the base
+  shell), with `/dev/kwshm` and a relay that has `link-on-demand` (else
+  it would dial at once and the page load wland at every boot). `wland
+  [CMD...]` starts one where none runs (killed, or not started at boot),
+  making `/run/user/UID` (through `sudo -n`) where `XDG_RUNTIME_DIR` is
+  unset, then runs CMD with `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY` (default
+  `wayland-0`), the toolkit hints and `LANG` (default C.UTF-8); without
+  CMD it prints them as `export` lines. As root it uses the image user's
+  running relay (`WAYLAND_DISPLAY` that socket's path, `XDG_RUNTIME_DIR`
+  root's own) instead of starting a second one (the page takes one link
+  at a time). With an on-demand relay CMD runs as a child, and when it
+  fails while the relay's log got a new `wayland client refused` line,
+  `wland` says the page did not take the link; with a relay that dials at
+  once it fails (exit 1, saying why) when the log has not said the link is
+  connected within 3 s (not in the page: an app would wait for a
+  compositor forever). Apps close when the link drops. `wland` fails
+  without `/dev/kwshm`.
 - `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
   hostname (`/etc/hostname` unless empty or `localhost`, else
   `unkernel`), binfmt_misc and the WASI format (kwwasi), the console
@@ -63,7 +99,8 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   `/dev/snd/*` to audio, 0660, by group name; `/dev/fuse` and
   `/dev/dri/renderD*` 0666; the drivers make them at boot, none later),
   udev's links `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`,
-  and `drm.vblankoffdelay` 100 ms (kernel/devices.md, kwvirtio).
+  `drm.vblankoffdelay` 100 ms (kernel/devices.md, kwvirtio), and with
+  `kw.wayland=1` wland's relay (`wland --boot`, above).
 - The image's user: every distro image has `user` (uid and gid 1000,
   `/home/user` mode 700, `install_user` in guest/lib/stage.sh; bash on
   Debian, `/bin/sh` on Alpine) in audio, video, input and users, plus sudo
@@ -96,10 +133,27 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   line, which the page's GL option adds, and no DRM render node:
   `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1`, so Mesa renders
   through the host's WebGL2 over vtest; with `/dev/dri` it sets nothing;
-  gl.md), `/etc/profile.d/kw-term.sh
+  gl.md), `/etc/profile.d/kw-wayland.sh` (a shell gets `XDG_RUNTIME_DIR`
+  and `WAYLAND_DISPLAY=wayland-0` for its user's `/run/user/UID` where the
+  relay's socket is there, or, with `kw.wayland=1`, wherever that
+  directory exists (made at boot for the image's user); root's shells
+  there (`sudo -s`, `su`) get the user's socket by its path and
+  `/run/user/0`; `sudo CMD` clears them, `sudo /usr/lib/kw/bin/wland CMD`
+  does not (sudo's PATH has no `/usr/lib/kw/bin`); wherever
+  `WAYLAND_DISPLAY` is set, and for `wland CMD`, which sources it:
+  `XDG_SESSION_TYPE=wayland` and the GTK, Qt, SDL, Firefox and Electron
+  variables that pick Wayland, each only where unset; builtins only, `[ -O
+  / ]` for root) with `/etc/chromium.d/kw-wayland` (Debian's chromium
+  wrapper clears `CHROMIUM_FLAGS` and sources that directory:
+  `--ozone-platform=wayland` in a Wayland session, and a `chromium` with
+  no display at all, such as one not started from a shell, gets wland's
+  session first, where `/dev/kwshm` is). Programs the host starts without
+  a shell (`vm.exec()`, `vm.spawn()`) get no session: `/etc/environment`
+  is static and kwtty sets none, `/etc/profile.d/kw-term.sh
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
-  `/usr/share/licenses/unkernel` (the GPL notice for these files).
+  `/usr/share/licenses/unkernel` (the GPL notice for these files, which
+  names wlandr's own licences).
 - `/usr/lib/kw/shrc`: the `/etc/profile.d/kw-*.sh` files (PATH, TERM, the
   prompt, command not found, the package manager through sudo) for
   interactive shells that are not login
@@ -266,7 +320,16 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   `/run/kw-runlevel` (`N 2`), so that a package's invoke-rc.d starts its
   service on install (`apt-get install cron`: running, and started at
   every boot with a data disk). sudo's script is disabled (it only resets
-  `/run/sudo`). apt: `90kw` (no recommends, pdiffs or pty), debconf
+  `/run/sudo`). The base's init execs `/usr/local/sbin/kw-init` itself
+  where the image has it, not `/sbin/init`, and
+  `/etc/apt/preferences.d/kw-init` pins `systemd-sysv` away: desktop
+  packages (chromium, GTK apps) reach it through dbus-user-session and
+  libpam-systemd, it would replace `/sbin/init` and have apt remove
+  sysv-rc, and systemd as PID 1 does not come up here (it waits for
+  `dev-hvc0.device`); without it apt takes dbus-x11, and systemd itself
+  (not as init) installs fine. On a disk where it already happened the
+  boot is kw-init's again, without services (no `/etc/init.d/rc`) until
+  `apt-get install sysv-rc`. apt: `90kw` (no recommends, pdiffs or pty), debconf
   Noninteractive, the package lists of the image's date baked in
   (`DEBIAN_LISTS`, compressed by `tools/apt-lz4` as apt does) and apt's
   source cache made by the image's own apt at build time

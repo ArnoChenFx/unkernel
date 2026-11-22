@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The page: the stage (the terminal, the splash card) with the guest preview
 // panel docked right of it, the key bar, the status line at the bottom, the
-// guest's display over the stage (or over all of them, rotated), and over them the
+// guest's display over the stage (or over all of them, rotated), the Wayland
+// desktop over the stage (Desktop.tsx), and over them the
 // dialog, the paste dialog and the toast. Also the page-wide behaviour: the keyboard
 // shortcuts (shortcuts.ts), following the visual viewport (the on-screen
 // keyboard), when the key bar shows, and the pinch that sets the font size
@@ -14,6 +15,7 @@ import { KW } from "../kw.ts";
 import { installShortcuts } from "../shortcuts.ts";
 import { ui$, useStore } from "../store.ts";
 import { Bar } from "./Bar.tsx";
+import { Desktop } from "./Desktop.tsx";
 import { Display } from "./Display.tsx";
 import { Keys } from "./Keys.tsx";
 import { Launchpad } from "./Launcher.tsx";
@@ -59,6 +61,8 @@ export function App() {
 				<Bar />
 				{/* Over the stage, or rotated over the whole page (status line included). */}
 				<Display stage={stage} />
+				{/* The Wayland desktop, over the stage and the display while shown. */}
+				<Desktop stage={stage} />
 			</div>
 			<Panel />
 			<Launchpad />

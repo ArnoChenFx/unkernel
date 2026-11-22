@@ -181,6 +181,7 @@ export function createUi(cfg: Config) {
 			rotate: store("fbRotate") === "1", layout: padLayout(store("padLayout")),
 			touchMode: store("touchMode") === "trackpad" ? "trackpad" : "mouse",
 			controls: store("padHidden") !== "1" },
+		desktop: { available: false, attached: false, shown: false, windows: [] },
 		win: 0, wins: [], preview: null, launcher: false,
 		options,
 	} satisfies UiState);

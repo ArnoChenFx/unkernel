@@ -43,7 +43,8 @@
 // Alpine and curl on Debian, apk's or dpkg's database). Alpine's come from
 // main; a demo with `community` enables community first (lazy in the image,
 // .agents/kernel/guest.md), once per guest.
-// A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0) is listed
+// A demo whose `needs` the page cannot meet (?display=0, ?net=0, ?sound=0, a
+// kernel without the Wayland desktop) is listed
 // but disabled, with why; so is one whose `packages` leave out this boot's
 // distro (?distro=).
 import { fmtMiB, getFile, pushFile, type FileSpec } from "./download.ts";
@@ -96,7 +97,8 @@ export interface Demo {
 	icon?: string | DemoIcon;
 	/** The tile's gradient, top left to bottom right (CSS colours). */
 	colors?: [string, string];
-	needs?: { display?: boolean; net?: boolean; sound?: boolean };
+	/** wayland: the Wayland desktop (wayland.ts: a kernel with vsock and kwshm). */
+	needs?: { display?: boolean; net?: boolean; sound?: boolean; wayland?: boolean };
 	/** The working directory in the guest. Default ~/demos/<id>. */
 	dir?: string;
 	/**
@@ -158,6 +160,7 @@ export function unavailable(d: Demo): string | null {
 	if (d.needs?.display && !KW.config.display) return "needs the display (off with ?display=0)";
 	if (d.needs?.net && !KW.config.net) return "needs the network (off with ?net=0)";
 	if (d.needs?.sound && !KW.config.sound) return "needs sound (off with ?sound=0)";
+	if (d.needs?.wayland && KW.vm && !ui$().get().desktop.available) return "needs the Wayland desktop: this boot has no kwshm (?shm=0, or a session resumed from before the desktop)";
 	const on = demoDistros(d);
 	const g = KW.config.guest;
 	if (on && !(isDistro(g) && on.includes(g)))

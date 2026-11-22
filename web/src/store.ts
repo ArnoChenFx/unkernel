@@ -39,6 +39,20 @@ export interface DisplayState {
 	controls: boolean;
 }
 
+/** A window on the Wayland desktop (wayland.ts), as wland lists it. */
+export interface DesktopWindow { key: string; title: string; focused: boolean; minimized: boolean }
+
+/** The Wayland desktop (wayland.ts, components/Desktop.tsx). */
+export interface DesktopState {
+	/** The page listens for wland's relay (the kernel has vsock and kwshm). */
+	available: boolean;
+	/** The relay is connected: the compositor runs (the status line's desktop icon). */
+	attached: boolean;
+	/** The desktop is shown over the stage (it covers the terminal and the display). */
+	shown: boolean;
+	windows: DesktopWindow[];
+}
+
 /** Terminal windows 1 to 9 (the digits; 0 is the console). */
 export const MAX_WINDOWS = 9;
 
@@ -102,6 +116,7 @@ export interface UiState {
 	/** The Copy diagnostics fallback text, shown when the clipboard is unavailable. */
 	copyText: string | null;
 	display: DisplayState;
+	desktop: DesktopState;
 	/** The current terminal window: 0 is the console (hvc0), 1 to 9 are in wins. */
 	win: number;
 	/** The terminal windows besides window 0, by number. */

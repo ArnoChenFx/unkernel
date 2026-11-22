@@ -8,20 +8,21 @@
 // current or under the pointer), and the prefix: ^A, faint, which opens the
 // Keys tab, or while it is armed, highlighted with what it takes. Right, in
 // groups: the views, inverted while shown (a monitor for
-// the guest's display while a program has it open; a globe for the preview
+// the guest's display while a program has it open; overlapping windows for
+// the Wayland desktop while wland's relay is connected; a globe for the preview
 // while it is open, Preview.tsx has its close); the data disk's used
 // space (opens System) and kernel memory (opens Environment); Errors with
 // their count, only while there are any; Suspend (a pause icon while the
 // system runs; a play icon, Resume, once suspended) and Reboot; the About
 // triangle (About.tsx); and last the Kernel log and System, which also shows
-// the state in its colour. Below sm, all but the display,
+// the state in its colour. Below sm, all but the display, the desktop,
 // the preview and Errors move into a ⋯ menu (More). The windows and icons
 // are buttons, so phones get around by tapping; on touch the line is taller
 // and its buttons wider (--bar-h, style.css).
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { KW } from "../kw.ts";
 import { previewCovers, togglePreview, useNarrow } from "../preview.ts";
-import { PREFIX, PREFIX_SHORT, closeWindow, newWindow, selectWindow, toggleDisplay } from "../shortcuts.ts";
+import { PREFIX, PREFIX_SHORT, closeWindow, newWindow, selectWindow, toggleDesktop, toggleDisplay } from "../shortcuts.ts";
 import { MAX_WINDOWS, useStore, type Tab } from "../store.ts";
 import { About, openAbout } from "./About.tsx";
 import { LauncherButton } from "./Launcher.tsx";
@@ -85,6 +86,8 @@ const PlayIcon = () => <Icon><path d="M7 4.5v15L19.5 12 7 4.5Z" /></Icon>;
 const ErrIcon = () => <Icon><path d="M12 3.5 2.5 20h19L12 3.5Z" /><path d="M12 10v4.5M12 17.5h0" /></Icon>;
 /** A monitor on a stand: the guest's display. */
 const DisplayIcon = () => <Icon><rect x="3" y="4" width="18" height="12" rx="1.5" /><path d="M8 20h8M12 16v4" /></Icon>;
+/** Two overlapping windows: the Wayland desktop. */
+const DesktopIcon = () => <Icon><rect x="3" y="7" width="13" height="11" rx="1.5" /><path d="M8 7V5.5A1.5 1.5 0 0 1 9.5 4h10A1.5 1.5 0 0 1 21 5.5v8a1.5 1.5 0 0 1-1.5 1.5H16" /></Icon>;
 /** A prompt in a window: the console and the terminal windows. */
 const TermIcon =() => <Icon><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12.5 15H17" /></Icon>;
 /** A globe: the preview of a web server in the guest. */
@@ -170,6 +173,7 @@ export function Bar() {
 	const errors = useStore((s) => s.errors.length);
 	const panel = useStore((s) => (s.panelOpen ? s.tab : null));
 	const display = useStore((s) => s.display);
+	const desktop = useStore((s) => s.desktop);
 	const prefix = useStore((s) => s.prefix);
 	const disk = useStore((s) => s.disk);
 	const win = useStore((s) => s.win);
@@ -178,8 +182,10 @@ export function Bar() {
 	const mem = KW.memActualMiB || KW.config.memMiB;
 	// A preview that covers the stage (narrow, or [□]) is the view shown, over a terminal or the display.
 	const covers = previewCovers(preview, useNarrow());
-	const picture = display.attached && display.shown && !covers;
-	const term = !panel && !picture && !covers;
+	const desk = desktop.shown && !covers;
+	const picture = display.attached && display.shown && !covers && !desk;
+	const term = !panel && !picture && !covers && !desk;
+	const deskTitles = desktop.windows.map((w) => w.title || "untitled").join(", ");
 	const tab = (t: Tab) => () => ui.togglePanel(t);
 	const canOpen = wins.length < MAX_WINDOWS && state !== "halted" && state !== "error";
 
@@ -208,6 +214,12 @@ export function Bar() {
 				{display.attached && (
 					<Seg id="bar-display" on={!panel && picture} title={picture ? "Show the terminal" : "Show the display"} hint="d" onClick={toggleDisplay}>
 						<DisplayIcon />
+					</Seg>
+				)}
+				{(desktop.attached || desktop.shown) && (
+					<Seg id="bar-desktop" on={!panel && desk} hint="w" onClick={toggleDesktop}
+						title={`Wayland desktop${deskTitles ? ` (${deskTitles})` : ", no windows"}: ${desk ? "show the terminal" : "show it"}`}>
+						<DesktopIcon />
 					</Seg>
 				)}
 				{preview && (

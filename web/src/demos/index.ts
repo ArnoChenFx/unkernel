@@ -8,6 +8,7 @@ import claude from "./claude.ts";
 import docker from "./docker.ts";
 import doom from "./doom.ts";
 import dos from "./dos.ts";
+import foot from "./foot.ts";
 import fx from "./fx.ts";
 import git from "./git.ts";
 import glimmer from "./glimmer.ts";
@@ -30,6 +31,7 @@ import sshfs from "./sshfs.ts";
 import tmux from "./tmux.ts";
 import ubuntu from "./ubuntu.ts";
 import valkey from "./valkey.ts";
+import wlgl from "./wlgl.ts";
 import xglamor from "./xglamor.ts";
 
-export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, docker, claude, fx, sshfs, nginx, node, bun, nitro, python, go, rust, postgres, sqlite, valkey, radio, speak, dos, doom, kmscube, glmark2, xglamor];
+export const DEMOS: Demo[] = [glimmer, tmux, htop, mc, nvim, git, ubuntu, docker, claude, fx, sshfs, nginx, node, bun, nitro, python, go, rust, postgres, sqlite, valkey, radio, speak, dos, doom, kmscube, glmark2, xglamor, foot, wlgl];

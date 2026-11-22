@@ -1,0 +1,203 @@
+#!/run/kw-lower/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+# /usr/lib/kw/bin/wland (the kw layer); the comment below is what the image carries.
+
+# wland: Wayland apps as windows in the unkernel page.
+#
+#   wland [CMD [ARGS...]]
+#
+# wland's relay, /usr/lib/kw/wlandr (https://github.com/pithings/wland),
+# serves the Wayland socket /run/user/UID/wayland-0 and links it to the
+# page over vsock port 1023, where wland's compositor shows each app's
+# windows; the apps' buffers stay in guest memory, which the page reads in
+# place through /dev/kwshm.
+#
+# In the page the relay is always there: the page boots with kw.wayland=1
+# on the kernel command line, the kw layer's rc starts the relay for the
+# image's user (wland --boot), and it dials the page only when the first
+# app connects (so a page that runs no Wayland app loads nothing of wland).
+# Every login and interactive shell has XDG_RUNTIME_DIR, WAYLAND_DISPLAY
+# and the hints that make toolkits pick Wayland (/etc/profile.d/kw-wayland.sh:
+# XDG_SESSION_TYPE=wayland, GTK, Qt, SDL, Firefox, Electron; Debian's
+# chromium through /etc/chromium.d), so `foot` just works. An app started
+# when the page does not take the link (outside the page, or before it
+# listens) fails at once with its own "cannot connect" error; the relay's
+# log says why (wayland client refused: ...). Apps close when the link
+# drops (a reload, a resumed session); the relay dials again at the next.
+#
+# wland CMD starts the relay unless it runs (a killed one, or a machine
+# booted without kw.wayland=1), then runs CMD with XDG_RUNTIME_DIR,
+# WAYLAND_DISPLAY, the hints and LANG C.UTF-8 where it is unset, and
+# says why when CMD failed because the page refused it. Without CMD it
+# prints them as shell assignments (eval "$(wland)"). The relay's log is
+# $XDG_RUNTIME_DIR/wlandr.log (each new relay starts it again).
+# As root (a root shell, sudo /usr/lib/kw/bin/wland CMD), wland uses the
+# image's user's relay rather than start a second one: the page takes one
+# link at a time. Root's shells get that session too (sudo -s, su);
+# `sudo CMD` does not (sudo clears the variables).
+#
+# GL apps: where the guest has a virtio-gpu render node (/dev/dri/renderD128:
+# guest GL on in the page) the relay takes their buffers by GPU resource
+# (--dmabuf virtgpu), which the page's GL renderer shows without copying
+# them back; the page decides whether it offers that (without, GL apps
+# render in software, as everywhere without the node). A relay started
+# before the node existed keeps rendering them in software: kill it
+# (pkill -x wlandr) to start one that takes them, which ends its apps.
+
+bb=/run/kw-lower/bin/busybox
+relay=/usr/lib/kw/wlandr
+link=vsock:2:1023
+die() { echo "wland: $*" >&2; exit 1; }
+[ -x $relay ] || die "no $relay in this system"
+
+# What the relay can do: the features line of `wlandr --version` (tokens:
+# link-on-demand, dmabuf:virtgpu, no-fence-wait, ...). Relays up to wland
+# v0.1.0-261122 have no --version: dmabuf:virtgpu from their --help.
+feat=
+features() {
+	[ -n "$feat" ] && return
+	feat=" $($relay --version 2>/dev/null | $bb sed -n 's/^features: //p') "
+	[ "$feat" = "  " ] && $relay --help 2>&1 | $bb grep -q "virtgpu\[" && feat=" dmabuf:virtgpu "
+}
+has() { features; case $feat in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Start the relay for $dir (this user's runtime directory) and $disp in its
+# own session (setsid execs it: a background job leads no group, so a
+# terminal that closes does not hang it up): on demand where it can, GPU
+# buffers by resource where the render node is.
+start() {
+	flags=
+	has link-on-demand && flags=--link-on-demand
+	if [ -c /dev/dri/renderD128 ] && has dmabuf:virtgpu; then
+		flags="$flags --dmabuf virtgpu:/dev/dri/renderD128"
+		# The page's renderer gets a GL client's work before the relay's commit (one channel).
+		has no-fence-wait && flags="$flags --no-fence-wait"
+	fi
+	XDG_RUNTIME_DIR=$dir $bb setsid $relay --link $link --buffers kwshm $flags --display "$disp" \
+		</dev/null >"$dir/wlandr.log" 2>&1 &
+	pid=$!
+	$bb rm -f "$dir/wlandr.pid"
+	echo "$pid" > "$dir/wlandr.pid"
+}
+
+# The relay that serves socket $2 runs (its pid in $1/wlandr.pid); sets pid.
+running() {
+	pid=$($bb cat "$1/wlandr.pid" 2>/dev/null)
+	[ -n "$pid" ] && [ "$($bb readlink "/proc/$pid/exe" 2>/dev/null)" = $relay ] && [ -S "$2" ]
+}
+
+case ${1-} in
+--boot)
+	# The kw layer's rc, as root, with kw.wayland=1 on the kernel command
+	# line (the page adds it when it shows Wayland windows): the relay for
+	# the image's user (kw.user=, else "user", else root, as kwtty login
+	# picks), on demand. Nothing in the base shell (no apps), without
+	# /dev/kwshm, or with a relay that cannot wait for an app to dial (it
+	# would have the page load wland at every boot): there wland CMD
+	# starts one as before.
+	[ -e /usr/lib/kw-distro ] && [ -c /dev/kwshm ] && has link-on-demand || exit 0
+	user=
+	read -r c < /proc/cmdline
+	for w in $c; do case $w in kw.user=*) user=${w#kw.user=} ;; esac; done
+	[ -n "$user" ] && $bb id -u "$user" >/dev/null 2>&1 || user=user
+	$bb id -u "$user" >/dev/null 2>&1 || user=root
+	uid=$($bb id -u "$user")
+	# Made as logind would: the user's, 0700, on tmpfs (/run); and root's,
+	# for root's shells (kw-wayland.sh gives them this user's session).
+	$bb mkdir -p -m 755 /run/user
+	$bb install -d -m 700 -o "$uid" -g "$($bb id -g "$user")" "/run/user/$uid" || exit 1
+	$bb install -d -m 700 /run/user/0
+	[ "$uid" = 0 ] && exec "$0" --start
+	# The relay runs as the user (its socket and directory are the user's).
+	exec $bb su -s /run/kw-lower/bin/sh "$user" -c "exec $0 --start"
+	;;
+--start)
+	# --boot, as the user: start the relay unless it runs.
+	dir=/run/user/$($bb id -u) disp=wayland-0
+	running "$dir" "$dir/$disp" || start
+	exit 0
+	;;
+esac
+
+[ -c /dev/kwshm ] || die "no /dev/kwshm: this machine has no kwshm device (Wayland apps show in the unkernel web page, which gives it)"
+uid=$($bb id -u)
+own=/run/user/$uid
+dir=${XDG_RUNTIME_DIR:-$own}
+disp=${WAYLAND_DISPLAY:-wayland-0}
+# The socket, and the relay's directory (its pid file and log): another
+# user's where WAYLAND_DISPLAY is a path (root's shells: the user's relay).
+case $disp in /*) sock=$disp ;; *) sock=$dir/$disp ;; esac
+rdir=${sock%/*}
+if ! running "$rdir" "$sock" && [ "$uid" = 0 ]; then
+	# Root: the image's user's relay where one runs (not a second relay).
+	for f in /run/user/*/wayland-0; do
+		[ "${f%/*}" != "$own" ] && running "${f%/*}" "$f" && { sock=$f rdir=${f%/*} disp=$f; break; }
+	done
+fi
+if ! running "$rdir" "$sock"; then
+	# Start one of our own, in our runtime directory.
+	[ "$rdir" = "$dir" ] || { dir=$own disp=wayland-0 sock=$own/wayland-0 rdir=$own; }
+	if [ ! -d "$dir" ]; then
+		# Made as logind would: the user's, 0700, on tmpfs (/run). The image's
+		# user has sudo without a password.
+		if [ "$uid" = 0 ]; then
+			$bb mkdir -p -m 700 "$dir" || die "cannot make $dir"
+		else
+			sudo -n $bb install -d -m 700 -o "$uid" -g "$($bb id -g)" "$dir" || die "cannot make $dir (sudo)"
+		fi
+	fi
+	start
+	i=0
+	until [ -S "$sock" ]; do
+		$bb kill -0 "$pid" 2>/dev/null || { $bb tail -n 5 "$rdir/wlandr.log" >&2; die "the relay exited"; }
+		i=$((i + 1))
+		[ $i -gt 100 ] && die "no socket $sock after 10 s ($rdir/wlandr.log)"
+		$bb sleep 0.1
+	done
+fi
+cmdline=" $($bb tr '\0' ' ' < "/proc/$pid/cmdline")"
+case $cmdline in *" --dmabuf "*) ;; *)
+	[ -c /dev/dri/renderD128 ] && has dmabuf:virtgpu &&
+		echo "wland: the running relay ($pid) renders GL apps in software (it started without /dev/dri/renderD128); pkill -x wlandr, then wland again, starts one that shows them on the page's GPU (its apps close)" >&2
+esac
+log=$rdir/wlandr.log
+ondemand=
+case $cmdline in *" --link-on-demand "*) ondemand=1 ;; esac
+if [ -z "$ondemand" ]; then
+	# A relay that dials at once (no --link-on-demand): fail rather than
+	# leave CMD waiting when it has not reached the page within 3 s (not
+	# in the page: the Node CLI has no compositor). Its latest line about
+	# the link says connected.
+	linked() { $bb grep -F "link $link" "$log" 2>/dev/null | $bb tail -n 1 | $bb grep -q " connected\$"; }
+	i=0
+	until linked; do
+		i=$((i + 1))
+		[ $i -gt 30 ] && die "the relay cannot reach the page on vsock port 1023: Wayland apps show only in the unkernel web page (its log: $log)"
+		$bb sleep 0.1
+	done
+fi
+# Root with the user's relay keeps a runtime directory of its own.
+[ "$rdir" = "$dir" ] || { dir=$own; [ -d "$dir" ] || $bb mkdir -p -m 700 "$dir"; }
+export XDG_RUNTIME_DIR="$dir" WAYLAND_DISPLAY="$disp"
+# The toolkit hints (XDG_SESSION_TYPE=wayland, GTK, Qt, SDL, Firefox, Electron).
+[ -r /etc/profile.d/kw-wayland.sh ] && . /etc/profile.d/kw-wayland.sh
+if [ $# -eq 0 ]; then
+	echo "export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' WAYLAND_DISPLAY='$WAYLAND_DISPLAY' XDG_SESSION_TYPE='$XDG_SESSION_TYPE' GDK_BACKEND='$GDK_BACKEND' QT_QPA_PLATFORM='$QT_QPA_PLATFORM' SDL_VIDEODRIVER='$SDL_VIDEODRIVER' MOZ_ENABLE_WAYLAND='$MOZ_ENABLE_WAYLAND' ELECTRON_OZONE_PLATFORM_HINT='$ELECTRON_OZONE_PLATFORM_HINT'"
+	exit 0
+fi
+export LANG="${LANG:-C.UTF-8}"
+[ -n "$ondemand" ] || exec "$@"
+# On demand: the relay dials the page for CMD; when the page does not take
+# the link it closes CMD's connection and logs why. Say so if CMD failed.
+n=$($bb grep -c "wayland client refused" "$log" 2>/dev/null)
+"$@"
+rc=$?
+if [ $rc -ne 0 ]; then
+	l=$($bb grep "wayland client refused" "$log" 2>/dev/null | $bb tail -n +$((${n:-0} + 1)) | $bb tail -n 1)
+	if [ -n "$l" ]; then
+		why=${l##*\(}
+		echo "wland: no compositor: the relay could not reach the page (${why%)}); Wayland apps show as windows only in the unkernel web page" >&2
+	fi
+fi
+exit $rc

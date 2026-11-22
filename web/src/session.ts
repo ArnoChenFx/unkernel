@@ -98,6 +98,8 @@ export interface SessionDevices {
 	gl?: boolean;
 	/** The virtio-gpu device that comes with guest GL (?gpu=0: none); absent in sessions saved before: off. */
 	gpu?: boolean;
+	/** kwshm, for the Wayland desktop (wayland.ts); absent in sessions saved before: off. */
+	shm?: boolean;
 }
 
 const reqP = <T>(r: IDBRequest<T>): Promise<T> =>
@@ -190,7 +192,7 @@ export function sessionMismatch(m: SessionMeta, kernelUrl: string | null, device
 		if (was && distro && was.name === distro.name) return `it was saved on another build of the ${was.name} image (${was.url}; now ${distro.url})`;
 		return `it was saved on ${was ? `the ${was.name} image` : "no distro image"}, this boot runs ${distro ? `the ${distro.name} image` : "none"} (Options, Distro)`;
 	}
-	const names: Record<keyof SessionDevices, string> = { display: "Display", sound: "Sound", net: "Network", data: "Data disk", gl: "Guest GL", gpu: "virtio-gpu (?gpu=0)" };
+	const names: Record<keyof SessionDevices, string> = { display: "Display", sound: "Sound", net: "Network", data: "Data disk", gl: "Guest GL", gpu: "virtio-gpu (?gpu=0)", shm: "kwshm (the Wayland desktop)" };
 	for (const k of Object.keys(names) as Array<keyof SessionDevices>)
 		if (!!m.devices[k] !== !!devices[k]) return `it was saved with ${names[k]} ${m.devices[k] ? "on" : "off"} (Options)`;
 	return null;

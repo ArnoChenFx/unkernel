@@ -24,6 +24,7 @@
     "react-dom": "19.3.1",
     "tailwindcss": "4.3.5",
     "typescript": "^7.0.2",
-    "vite": "^8.3.8"
+    "vite": "^8.3.8",
+    "wland": "0.1.0-261122-f36330a"
   }
 }

@@ -189,7 +189,8 @@ export function createDisplayUi(opts: DisplayUiOptions): DisplayUi {
 			e.stopImmediatePropagation();
 			return;
 		}
-		if (!ev.keyboardOpen || !$.get().display.shown) return;
+		// Not while the Wayland desktop covers the display (wayland.ts): its windows have the keyboard.
+		if (!ev.keyboardOpen || !$.get().display.shown || $.get().desktop.shown) return;
 		e.preventDefault();
 		e.stopImmediatePropagation();
 		if (down && code !== undefined) ev.key(code, true);

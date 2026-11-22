@@ -67,6 +67,8 @@ On the web page
                     switches between them.
   Ctrl-Shift-O      The demo launcher (Cmd-K on a Mac, or the arrow at
                     the left of the status line).
+  Ctrl-A w          The Wayland desktop: "wland foot" runs foot (a
+                    Wayland app) as a window on the page.
 
 The status icon opens options, diagnostics, and export or reset of the
 disk kept in your browser (IndexedDB). Open the page with ?data=0 for a

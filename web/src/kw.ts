@@ -9,7 +9,7 @@
 // KW.jitStats() (kwemu's JIT counters), the data disk (KW.dataDisk, KW.sync(),
 // KW.exportData(), KW.importData(), KW.resetData()), KW.suspend() (session.ts), the terminal windows (KW.windows:
 // list(), open(), select(), close(), text(), send(); windows.ts), the guest preview (KW.preview: open(), close(), url();
-// preview.ts); KW.kernel and globalThis.kernel (the
+// preview.ts), the Wayland desktop (KW.wayland: windows(), container(); wayland.ts); KW.kernel and globalThis.kernel (the
 // low-level Kernel, with sendInput(); not in worker mode) and globalThis.term (the wterm WTerm).
 import type { Config } from "./config.ts";
 import type { CowDisk, JitStats, KernelHandle } from "./sdk.ts";
@@ -105,6 +105,8 @@ export interface KWGlobal {
 	ready?: () => Promise<KernelHandle>;
 	/** The terminal windows, once the boot module runs. */
 	windows?: WindowsApi;
+	/** The Wayland desktop (wayland.ts), once the kernel runs: its windows, its container, whether wland is loaded. */
+	wayland?: typeof import("./wayland.ts").waylandApi;
 	/** The guest preview panel (preview.ts): open(port) (false: not a port), close(), and the /vm/ URL of a guest port. */
 	preview?: { open(port?: number | string): boolean; close(): void; url(port: number, path?: string): string };
 	[key: string]: unknown;

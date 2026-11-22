@@ -82,7 +82,7 @@ const SENTINEL = "__";
 const KEY = { up: 103, down: 108, left: 105, right: 106, ctrl: 29, space: 57, enter: 28, esc: 1, shift: 42, alt: 56, tab: 15, y: 21, n: 49 };
 
 /** The element's content size, kept up to date. */
-function useSize(el: HTMLElement | null): { w: number; h: number } {
+export function useSize(el: HTMLElement | null): { w: number; h: number } {
 	const [size, setSize] = useState({ w: el?.clientWidth ?? 0, h: el?.clientHeight ?? 0 });
 	useEffect(() => {
 		if (!el) return;

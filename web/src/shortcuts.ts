@@ -16,6 +16,7 @@
 //   ⌘K on Apple devices (free there: the terminal sends nothing for ⌘) and
 //   Ctrl-Shift-O everywhere (Ctrl-K is readline's kill-line, so not that);
 // - Ctrl-A p opens the guest preview (preview.ts), or hides and shows it;
+//   Ctrl-A w shows the Wayland desktop (wayland.ts) or the terminal under it;
 //   Ctrl-A z suspends at once (session.ts: Resume, or the next load, resumes it).
 // While a dialog is open the keys act on it directly (DIALOG_KEYS) and
 // never reach the terminal or the guest under it.
@@ -29,6 +30,7 @@ import { KW } from "./kw.ts";
 import { toggleLauncher } from "./launcher.ts";
 import { previewCovers, togglePreview, yieldPreview } from "./preview.ts";
 import { ui$, type Tab } from "./store.ts";
+import { setDesktopShown } from "./wayland.ts";
 
 /** macOS, iOS, iPadOS: ⌘A is the prefix too. */
 export const APPLE = /mac|iphone|ipad|ipod|ios/i.test((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || navigator.userAgent);
@@ -53,14 +55,22 @@ export function selectWindow(n: number): void {
 	ui.closePanel();
 	const d = ui$().get().display;
 	if (d.attached && d.shown) setDisplayShown(false);
+	setDesktopShown(false);
 	if (w) w.select(n);
 }
 /** Ctrl-A d and the status line: show the display, or the terminal under it. Under a preview that covers the stage, show the display. */
 export function toggleDisplay(): void {
 	KW.ui!.closePanel();
 	const shown = ui$().get().display.shown;
-	if (previewCovers()) { yieldPreview(); setDisplayShown(true); }
+	if (ui$().get().desktop.shown) { setDesktopShown(false); setDisplayShown(true); }
+	else if (previewCovers()) { yieldPreview(); setDisplayShown(true); }
 	else setDisplayShown(!shown);
+}
+/** Ctrl-A w and the status line: show the Wayland desktop, or what is under it. Under a preview that covers the stage, show the desktop. */
+export function toggleDesktop(): void {
+	KW.ui!.closePanel();
+	if (previewCovers()) { yieldPreview(); setDesktopShown(true); }
+	else setDesktopShown(!ui$().get().desktop.shown);
 }
 /** Open a terminal window (its own shell over vsock) and show it. */
 export function newWindow(): void {
@@ -69,6 +79,7 @@ export function newWindow(): void {
 	ui.closePanel();
 	const d = ui$().get().display;
 	if (d.attached && d.shown) setDisplayShown(false);
+	setDesktopShown(false);
 	// A failure after the window was made shows in the window itself.
 	w.open().catch((e: Error & { window?: number }) => { if (e?.window === undefined) ui.toast(e?.message ?? String(e)); });
 }
@@ -104,6 +115,10 @@ export const COMMANDS: Command[] = [
 	{ keys: ["d"], label: "Switch between the display and the terminal", run: () => {
 		if (ui$().get().display.attached) toggleDisplay();
 		else KW.ui!.toast("No program has the display open");
+	} },
+	{ keys: ["w"], label: "Switch between the Wayland desktop and the terminal", run: () => {
+		if (ui$().get().desktop.attached || ui$().get().desktop.shown) toggleDesktop();
+		else KW.ui!.toast("No Wayland app runs: wland CMD in a terminal starts one (the launcher's foot)");
 	} },
 	{ keys: ["o"], chord: "KeyO", meta: "KeyK", label: "Demos: the launcher (again closes it)", run: toggleLauncher },
 	{ keys: ["p"], label: "Preview a web server in the guest (the last port, or 8000; again hides or shows it)", run: togglePreview },

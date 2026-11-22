@@ -46,11 +46,13 @@ if [ -n "${WAYLAND_DISPLAY:-}" ]; then
 	export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
 	export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland,x11}"
 	# SDL 2.32 hangs before its window's first buffer when the compositor answers
-	# the decoration protocol with "client-side" (wland draws no title bars): it
-	# moves the window to libdecor in the middle of its wait for the first
-	# configure. Preferring libdecor from the start avoids that move; with the
-	# plugin (libdecor-0-plugin-1-cairo) the window gets a title bar, without it
-	# none, and it maps either way.
+	# the decoration protocol with "client-side" (wland's default: it draws no
+	# title bars): it moves the window to libdecor in the middle of its wait for
+	# the first configure. Preferring libdecor from the start avoids that move;
+	# with the plugin (libdecor-0-plugin-1-cairo) the window gets a title bar,
+	# without it none, and it maps either way. The web page asks wland for
+	# server-side decorations, which libdecor takes: there the window gets the
+	# page's frame.
 	export SDL_VIDEO_WAYLAND_PREFER_LIBDECOR="${SDL_VIDEO_WAYLAND_PREFER_LIBDECOR:-1}"
 	export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
 	export ELECTRON_OZONE_PLATFORM_HINT="${ELECTRON_OZONE_PLATFORM_HINT:-auto}"

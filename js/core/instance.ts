@@ -217,7 +217,8 @@ export interface CreateKernelOptions {
 	/**
 	 * Host commands (commands.ts): names to functions of the host that the
 	 * guest runs as programs. Each gets a link /run/kw/bin/NAME to the
-	 * guest's kwcmd (first on PATH), made through kwtty once it answers; a
+	 * guest's kwbox, which runs kwcmd (first on PATH; not "kwcmd" or "kwbox"),
+	 * made through kwtty once it answers; a
 	 * guest process that runs NAME is a normal process, and the function is
 	 * called with its arguments, environment, stdin, stdout and stderr, and
 	 * what it returns ends that process. spawn() and exec() wait for the
@@ -233,7 +234,7 @@ export interface CreateKernelOptions {
 	 * module (virgl.mjs and virgl.wasm next to the web entry) is fetched only
 	 * with `gl`, and only on the guest's first GL use (`gl.eager`: before the
 	 * boot); the host listens on vsock port 1019 and starts the guest's
-	 * forwarder (/usr/lib/kw/vtest-bridge) through kwtty, after which GL
+	 * forwarder (`kwbox vtest`) through kwtty, after which GL
 	 * programs run with GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1
 	 * (Debian: Mesa from apt). true, or options. Needs vsock and WebGL2:
 	 * where there is none (Node) it is ignored with a log line, unless

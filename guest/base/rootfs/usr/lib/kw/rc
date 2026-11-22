@@ -38,8 +38,8 @@ case $h in '' | localhost | localhost.*) h=unkernel ;; esac
 hostname "$h"
 d=/proc/sys/fs/binfmt_misc
 if [ -d $d ] && { mountpoint -q $d || mount -t binfmt_misc binfmt_misc $d 2>/dev/null; } &&
-	[ -x /usr/bin/kwwasi ] && [ ! -e $d/wasi ]; then
-	printf '%s\n' ':wasi:M::\x00asm\x01\x00\x00\x00::/usr/bin/kwwasi:P' > $d/register
+	[ -x /usr/lib/kw/kwwasi ] && [ ! -e $d/wasi ]; then
+	printf '%s\n' ':wasi:M::\x00asm\x01\x00\x00\x00::/usr/lib/kw/kwwasi:P' > $d/register
 fi
 dev() {
 	g=$1 m=$2

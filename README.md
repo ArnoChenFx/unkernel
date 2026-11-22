@@ -444,7 +444,7 @@ host change shows in the guest within a second.
 
 ```js
 const listener = vm.vsock.listen(5000);          // guest programs connect to CID 2, port 5000
-vm.write("echo hello | kwvsock connect 5000\n");
+vm.write("echo hello | kwbox vsock connect 5000\n");
 const conn = await listener.accept();
 console.log(await new Response(conn.readable).text());   // "hello\n"
 conn.close();

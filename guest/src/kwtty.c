@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 /*
  * kwtty: terminal sessions over AF_VSOCK (static aarch64 musl),
- * /usr/bin/kwtty in the Alpine initramfs, started by inittab as
- * "::respawn:/usr/bin/kwtty serve". The host side is js/core/tty.ts.
+ * `kwbox tty` in the base's kw layer (kwbox.c), started by inittab as
+ * "::respawn:/usr/bin/kwbox tty serve". The host side is
+ * js/core/tty.ts.
  *
  *   kwtty serve [PORT]   serve the host (CID 2) on PORT (default 1022, so
  *                        only root can bind it); without a vsock device
@@ -1861,7 +1862,7 @@ static void __attribute__((noreturn)) session(int s)
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: kwtty serve [PORT] | kwtty login\n");
+	fprintf(stderr, "usage: kwbox tty serve [PORT] | kwbox tty login\n");
 	return 2;
 }
 

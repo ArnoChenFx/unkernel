@@ -18,9 +18,9 @@
 #      else (no data disk, safe mode, kw.root=initramfs) a tmpfs at /kw/tmp;
 #   5. the root: overlay of /kw/layer (the kw tools and runtime, on top) and
 #      /kw/distro under that upper layer, checked (the merged /bin/sh runs,
-#      its init is executable), then pivot_root with this root at
-#      /run/kw-lower, /dev /proc /sys /run /data moved along and a tmpfs on
-#      /tmp.
+#      its init is executable and is not one from before kwbox), then
+#      pivot_root with this root at /run/kw-lower, /dev /proc /sys /run
+#      /data moved along and a tmpfs on /tmp.
 #
 # State of a distro on the data disk, in /data/distros/NAME/:
 #   upper, work          the overlay's upper and work directories
@@ -163,11 +163,18 @@ root() {
 	mount -t overlay overlay -o "lowerdir=/kw/layer:/kw/distro,upperdir=$1,workdir=$2,redirect_dir=off,index=off,xino=off,metacopy=off" /mnt
 }
 # Whether the merged root can boot: its /bin/sh runs (a broken shell or C
-# library shows up here) and its init (kw-init, else /sbin/init) is
-# executable. Sets $bad.
+# library shows up here), its init (kw-init, else /sbin/init) is
+# executable, and that init does not run /usr/bin/kwtty (an image, or an
+# inittab or kw-init in the upper layer, from before kwbox: this base has
+# no such file, so there would be no console shell and no kwtty serve).
+# Sets $bad.
 check() {
 	bad=
-	chroot /mnt /bin/sh -c '[ -x /usr/local/sbin/kw-init ] || [ -x /sbin/init ]' 2>/dev/null && return 0
+	if chroot /mnt /bin/sh -c '[ -x /usr/local/sbin/kw-init ] || [ -x /sbin/init ]' 2>/dev/null; then
+		grep -qs '^[^#]*/usr/bin/kwtty' /mnt/usr/local/sbin/kw-init /mnt/etc/inittab || return 0
+		bad="its init runs /usr/bin/kwtty, from before kwbox (now /usr/bin/kwbox tty)"
+		return 1
+	fi
 	if chroot /mnt /bin/sh -c : 2>/dev/null; then
 		bad="/sbin/init is missing or not executable"
 	elif [ -e /mnt/bin/sh ] || [ -L /mnt/bin/sh ]; then

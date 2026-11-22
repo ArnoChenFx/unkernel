@@ -190,8 +190,9 @@ deploying the page needs no kernel toolchain.
     `cache: "no-cache"` (the one request that revalidates), then reads the
     prefetch the image's distro header names (Alpine: the whole image, one
     plain GET; Debian: one streamed Range request of its first 4 MiB), the
-    background tier it names once the guest has read the image and the boot is quiet (Debian: the warm set,
-    apt's files, from 4 to 27 MiB, in 4 MiB Range requests one at a time),
+    background tier it names once the guest has read the image and the
+    boot is quiet (Debian: the warm set, apt's files, from 4 to 27 MiB, in
+    4 MiB Range requests one at a time),
     and lazy and read-ahead ranges (256 KiB-aligned; read-ahead up to 4 MiB),
     all `cache: "force-cache"`, comparing each response's
     ETag with the opening one's and fetching a mismatch again with

@@ -351,7 +351,7 @@ export function createWindows(opts: WindowsOptions): Windows {
 		if (code === "ABORTED" || code === "ECONNABORTED" || !opts.alive()) return null;
 		if (code === "ETIMEDOUT")
 			return `No terminal server answered in the guest within ${OPEN_TIMEOUT / 1000} s (kwtty on vsock port 1022). Window 0 still works.\n` +
-				"The distro's init must keep /usr/bin/kwtty serve running (Alpine: the line ::respawn:/usr/bin/kwtty serve in /etc/inittab). " +
+				"The distro's init must keep /usr/bin/kwbox tty serve running (Alpine: the line ::respawn:/usr/bin/kwbox tty serve in /etc/inittab). " +
 				"A root changed on the data disk can hide the image's init files (kw-overlay status says where the changes are).";
 		if (code === "ENODEV") return "This kernel was started without the vsock device, so it has no terminal sessions.";
 		if (code === "ENOENT") return `The session did not survive the suspend: ${(e as Error).message.replace(/^kwtty: /, "")}`;

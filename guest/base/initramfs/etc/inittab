@@ -7,6 +7,6 @@
 
 ::sysinit:/kw/lib/sysinit
 hvc0::respawn:-/bin/sh
-::respawn:/bin/sh -c "/usr/lib/kw/net wait 2>/dev/null; exec /usr/bin/kwtty serve"
+::respawn:/bin/sh -c "/usr/lib/kw/net wait 2>/dev/null; exec /usr/bin/kwbox tty serve"
 ::ctrlaltdel:/bin/reboot
 ::shutdown:/usr/lib/kw/shutdown

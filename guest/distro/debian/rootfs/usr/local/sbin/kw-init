@@ -55,10 +55,10 @@ declare -A role started
 # environment, in its home) in a session of its own with hvc0 as its
 # controlling terminal (job control, ^C), respawned like busybox init's
 # "respawn".
-console() { setsid -c /usr/bin/kwtty login <>/dev/hvc0 >&0 2>&0 & role[$!]=console; started[$!]=$SECONDS; }
+console() { setsid -c /usr/bin/kwbox tty login <>/dev/hvc0 >&0 2>&0 & role[$!]=console; started[$!]=$SECONDS; }
 # kwtty sleeps in pause() when there is no vsock device, so it is not
 # respawned in a loop.
-kwtty() { { /usr/lib/kw/net wait 2>/dev/null; exec /usr/bin/kwtty serve; } </dev/null & role[$!]=kwtty; started[$!]=$SECONDS; }
+kwtty() { { /usr/lib/kw/net wait 2>/dev/null; exec /usr/bin/kwbox tty serve; } </dev/null & role[$!]=kwtty; started[$!]=$SECONDS; }
 console
 kwtty
 while [ -z "$action" ]; do

@@ -16,7 +16,7 @@ kwemu. The guest runs stock Mesa with the `virgl` driver; the host runs
 virglrenderer compiled to wasm against one WebGL2 context.
 
 ```
-vtest: app -> Mesa virgl (virpipe) -> /tmp/.virgl_test -> /usr/lib/kw/vtest-bridge
+vtest: app -> Mesa virgl (virpipe) -> /tmp/.virgl_test -> kwbox vtest
        -> kwvsock, host CID 2, port 1019 -> VsockHost -> StreamHost
 DRM:   app -> Mesa virtio_gpu (virgl) -> /dev/dri/renderD128 -> virtio_gpu
        -> kwvirtio -> VirtioGpu + VirglGpuBackend -> GpuRenderer
@@ -541,10 +541,11 @@ GPU). One run each, on the shared host:
   (Loading on first use). Node: ignored with a log line (no
   OffscreenCanvas), unless `gl.renderer` gives a renderer object (the
   relay works there).
-- **Guest** (`/usr/lib/kw/vtest-bridge`, kernel/guest.md): the bridge
+- **Guest** (`kwbox vtest`, kernel/guest.md): the bridge
   built stream-only, in the base's kw layer (in the bundle, so it always
-  matches the SDK that speaks its link; 67 KB of RAM-resident layer for
-  every distro, Alpine included, which cannot use it). The SDK starts it
+  matches the SDK that speaks its link; 12 KB of the layer's kwbox,
+  RAM-resident for every distro, Alpine included, which cannot use it;
+  67 KB as a program of its own). The SDK starts it
   through kwtty as root once the renderer is up (`bridge --link
   vsock:2:1019 --daemon`); it makes `/tmp/.virgl_test` mode 0666 when the
   host sends READY (at once: the renderer is not needed for that), and

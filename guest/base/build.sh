@@ -16,14 +16,16 @@
 #   /kw/lib/sysinit          sysinit of the base shell (etc/inittab)
 #   /kw/layer/              rootfs/: the top lower layer of the root, so
 #                           every distro has it (RAM-resident: keep it
-#                           small): usr/bin/{kwtty,kw9p,kwvsock,kwshm,
-#                           kwwasi,kwcmd} (guest/src/), usr/sbin/kw-overlay,
+#                           small): usr/bin/kwbox (guest/src/kwbox.c: the
+#                           guest tools kwtty, kw9p, kwvsock, kwshm, kwwasi,
+#                           kwcmd (guest/src/) and vtest-bridge
+#                           (gl/bridge/vtest-bridge.c, stream link only, the
+#                           guest GL forwarder that the SDK's `gl` option
+#                           starts) as one program), usr/sbin/kw-overlay,
 #                           usr/lib/kw/ (rc, welcome, net, udhcpc, shutdown,
 #                           data-stop: the runtime a distro's init calls; shrc: the kw-*.sh profile files for
 #                           interactive shells that are not login shells;
-#                           vtest-bridge: gl/bridge/vtest-bridge.c, stream
-#                           link only, the guest GL forwarder that the SDK's
-#                           `gl` option starts;
+#                           kwwasi: binfmt_misc's interpreter, a link to kwbox;
 #                           shim and bin/: fx, claude, opencode, node,
 #                           npm, npx, bun, bunx, uv, uvx on first use;
 #                           bin/wland: Wayland apps in the page, through
@@ -101,12 +103,26 @@ echo hvc0 > "$stage/etc/securetty"
 # the same ones (the top lower layer wins), so they are all 755.
 layer="$stage/kw/layer"
 mkdir -p "$layer"/{data,etc/profile.d,usr/bin,usr/sbin,usr/lib/kw}
-for t in kwvsock kwshm kwtty kw9p kwwasi kwcmd; do
-	"${cc_guest[@]}" -o "$layer/usr/bin/$t" "$guest/src/$t.c"
-	ln -s "/kw/layer/usr/bin/$t" "$stage/usr/bin/$t"   # for the base shell
+# The guest tools as one program, usr/bin/kwbox (guest/src/kwbox.c: one
+# libc for all; `kwbox TOOL ARGS`), each tool's source an object with its
+# main renamed. vtest-bridge is the guest GL forwarder (.agents/gl.md):
+# vtest clients to the host's renderer over kwvsock. binfmt_misc cannot
+# pass a TOOL, so kwwasi has a link of its own (relative: the layer is at
+# / in a distro's root).
+tools=(kwvsock kwshm kwtty kw9p kwwasi kwcmd)
+obj="$out/kwbox-obj"
+objs=()
+rm -rf "$obj"
+mkdir -p "$obj"
+for t in "${tools[@]}"; do
+	"${cc_guest[@]}" -c "-Dmain=${t}_main" -o "$obj/$t.o" "$guest/src/$t.c"
+	objs+=("$obj/$t.o")
 done
-# The guest GL forwarder (.agents/gl.md): vtest clients to the host's renderer over kwvsock.
-"${cc_guest[@]}" -DVTEST_BRIDGE_STREAM_ONLY -o "$layer/usr/lib/kw/vtest-bridge" "$root/gl/bridge/vtest-bridge.c"
+"${cc_guest[@]}" -c -DVTEST_BRIDGE_STREAM_ONLY -Dmain=vtest_bridge_main -o "$obj/vtest-bridge.o" "$root/gl/bridge/vtest-bridge.c"
+"${cc_guest[@]}" -o "$layer/usr/bin/kwbox" "$guest/src/kwbox.c" "${objs[@]}" "$obj/vtest-bridge.o"
+rm -rf "$obj"
+ln -s /kw/layer/usr/bin/kwbox "$stage/usr/bin/kwbox"   # for the base shell
+ln -s ../../bin/kwbox "$layer/usr/lib/kw/kwwasi"
 install_tree "$src/rootfs" "$layer"
 ln -s /kw/layer/usr/sbin/kw-overlay "$stage/usr/sbin/kw-overlay"
 ln -s /kw/layer/usr/lib/kw "$stage/usr/lib/kw"

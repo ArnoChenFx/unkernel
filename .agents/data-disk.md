@@ -38,7 +38,9 @@ missing).
   `kw-overlay`, `data-stop` and the page.
 - **Safe mode** is deterministic and for one boot: before the switch the
   merged root is checked (its `/bin/sh` runs under `chroot`, its init,
-  `/usr/local/sbin/kw-init` or else `/sbin/init`, is executable). If that fails, or the overlay does not mount, this boot
+  `/usr/local/sbin/kw-init` or else `/sbin/init`, is executable and does
+  not run `/usr/bin/kwtty`: an inittab or kw-init changed before kwbox,
+  kernel/guest.md, Guest tools). If that fails, or the overlay does not mount, this boot
   runs the image on a tmpfs upper with `/data` mounted and the data upper
   untouched, and says `kw-overlay: SAFE MODE: <reason>`; the next boot
   checks again, so a repair in `/data/distros/NAME/upper` (from the safe

@@ -854,7 +854,7 @@ parts that are easy to get wrong.
   `GlHost` (`vm.gl`) on the thread that owns the VM, in both modes, since
   vsock is served there. It listens on vsock port 1019 (`GL_PORT`) and
   serves each connection with `StreamHost`, then runs the guest's
-  forwarder (`GL_FORWARDER`, `--daemon`) through kwtty as root. The
+  forwarder (`GL_FORWARDER`, `kwbox vtest`, `--daemon`) through kwtty as root. The
   renderer (the module, a WebGL2 context on a 1x1 OffscreenCanvas, the
   module's `virgl.Renderer`) is loaded on the guest's first GL use: the
   first vtest client (`LazyVtestRenderer`) or virtio-gpu's first capset or
@@ -910,7 +910,7 @@ parts that are easy to get wrong.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 
-- The host client of kwtty (`guest/src/kwtty.c`, `/usr/bin/kwtty
+- The host client of kwtty (`guest/src/kwtty.c`, `/usr/bin/kwbox tty
   serve`, respawned by inittab), which gives each connection its own pty
   and runs a user's login shell, or a program, on it, or with PIPES runs it
   on stdin, stdout and stderr pipes. On a pty the API follows zigpty /
@@ -935,7 +935,7 @@ parts that are easy to get wrong.
   root, so a guest from before USER (whose sessions are root's) refuses
   only that; a guest that gets no USER (a host from before it) runs root's
   session, as before. The SDK's own programs run as root (`guestRun()`:
-  kw9p, umount, `kwcmd sync`, which links into `/run/kw/bin`), so do
+  `kwbox 9p`, umount, `kwbox cmd sync`, which links into `/run/kw/bin`), so do
   `guest/tools/vm-run.ts`'s build steps. The console is not a kwtty session:
   its user is `kw.user=` on the command line (the CLI's `--user`).
 - Connections into the guest (CONNECT, OPENED feature bit 1
@@ -1041,7 +1041,7 @@ parts that are easy to get wrong.
   own later Tattaches (the kernel attaches again for each uid it acts as)
   work. An unknown name fails Tattach with ENOENT, and so does a later
   Tattach on a bound connection that names another export. One backend
-  mounted at two paths is two exports with a connection each. The guest's `kw9p NAME DIR [ro]`
+  mounted at two paths is two exports with a connection each. The guest's `kwbox 9p NAME DIR [ro]`
   (`guest/src/kw9p.c`) makes DIR (`mkdir -p`), refuses one that is
   already a mount point (EBUSY), connects to CID 2 and mounts 9p with
   `trans=fd` on the socket, source `kw9p:NAME`, and fixed options
@@ -1454,7 +1454,9 @@ parts that are easy to get wrong.
 - `HttpBase` `background` (default: the distro header's, unless
   `prefetch` is false; `false` turns it off; not in the `http` spec):
   `[prefetch, background)`, the image's warm set, fetched once the
-  prefetch has settled and no request has been made for a second, in
+  prefetch has settled, the image has been read from (it is often opened
+  while its kernel still loads) and then neither read nor requested for a
+  second, in
   sequential streamed pieces of `maxRequest` (4 MiB), one at a time; a
   read waits only for its own chunks of the piece in flight and fetches
   later ones itself, and a piece skips chunks that are already here or

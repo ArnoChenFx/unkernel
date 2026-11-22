@@ -42,9 +42,9 @@ To add a test: for the emulator, a unit test in `src/a64/tests.zig` or a
 guest in `test/guest/a64/` plus entries in `build.zig` (`a64_guests`) and
 `test/a64-test.mjs`; for the kernel, a `CHECK(...)` in
 `guest/src/test/kwtest.c`. A separate static guest program goes into
-`guest/src/` and the `kwvsock kwshm ...` loop of `guest/base/build.sh`,
-or into `guest/src/test/` and the `kwtest kwbench` loop if it is only for
-tests (those, and abitest, stay out of release bundles; base-test.cpio
+`guest/src/`, the `tools` list of `guest/base/build.sh` and the table
+in `guest/src/kwbox.c` (the layer's tools are one program), or into
+`guest/src/test/` and the `kwtest kwbench` loop if it is only for tests (those, and abitest, stay out of release bundles; base-test.cpio
 always has them).
 
 ## Full matrix

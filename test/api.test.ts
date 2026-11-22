@@ -191,7 +191,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		if (!worker && kernelHasShm) test("shm: no /dev/kwshm without the option", async () => {
 			const { vm, s, waitFor } = k;
 			const at = s.text.length;
-			vm.write("kwshm memfd 4096 < /dev/null; echo rc=$?\n");
+			vm.write("kwbox shm memfd 4096 < /dev/null; echo rc=$?\n");
 			await waitFor(/rc=\d/, at);
 			assert.match(s.text.slice(at), /kwshm: open \/dev\/kwshm: No such device[\s\S]*rc=1/);
 		});
@@ -581,7 +581,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			return n;
 		})();
 		const at = s.text.length;
-		vm.write(`dd if=/dev/zero bs=65536 count=${SIZE / 65536} 2>/dev/null | kwvsock connect 5000; echo rc=$?\n`);
+		vm.write(`dd if=/dev/zero bs=65536 count=${SIZE / 65536} 2>/dev/null | kwbox vsock connect 5000; echo rc=$?\n`);
 		await waitFor(/rc=0/, at, 30000);
 		assert.equal(await got, SIZE);
 		l.close();
@@ -674,7 +674,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 				return { n, sum: hash.digest("hex"), closed: await c.closed };
 			})();
 			let at = s.text.length;
-			vm.write(`head -c ${SIZE} /dev/urandom > /tmp/blob; kwvsock connect 5000 < /tmp/blob > /tmp/back; echo rc=$?; sha256sum /tmp/blob /tmp/back\n`);
+			vm.write(`head -c ${SIZE} /dev/urandom > /tmp/blob; kwbox vsock connect 5000 < /tmp/blob > /tmp/back; echo rc=$?; sha256sum /tmp/blob /tmp/back\n`);
 			await waitFor(/rc=\d+[\s\S]*\/tmp\/back/, at, 120000);
 			const out1 = s.text.slice(at);
 			assert.match(out1, /rc=0/, out1);
@@ -689,7 +689,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			// 2. The host connects to a guest listener and sends 4 MiB; the guest has already
 			// sent its reply and shut down its side (a half-close), so the host reads it, then EOF.
 			at = s.text.length;
-			vm.write("echo reply-$((6*7)) > /tmp/reply; kwvsock listen 5001 < /tmp/reply > /tmp/in; echo rc=$?; sha256sum /tmp/in\n");
+			vm.write("echo reply-$((6*7)) > /tmp/reply; kwbox vsock listen 5001 < /tmp/reply > /tmp/in; echo rc=$?; sha256sum /tmp/in\n");
 			await waitFor(/kwvsock: listening on port 5001/, at);
 			const data = new Uint8Array(SIZE);
 			for (let i = 0, x = 12345; i < SIZE; i++) data[i] = (x = (x * 1103515245 + 12345) >>> 0) >>> 24;
@@ -713,7 +713,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			// 3. Refused both ways, and a reset by the host while the guest sends.
 			await assert.rejects(v.connect(5999), (e: Error & { code?: string }) => e.name === "VsockError" && e.code === "ECONNREFUSED");
 			at = s.text.length;
-			vm.write("kwvsock connect 5002 < /dev/null; echo rc=$?\n");
+			vm.write("kwbox vsock connect 5002 < /dev/null; echo rc=$?\n");
 			await waitFor(/rc=\d/, at);
 			assert.match(s.text.slice(at), /kwvsock: connect: Connection reset by peer[\s\S]*rc=1/);
 			let resetClosed: Promise<string> | undefined;
@@ -727,7 +727,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 				})();
 			});
 			at = s.text.length;
-			vm.write("yes | kwvsock connect 5003 > /dev/null; echo rc=$?\n");
+			vm.write("yes | kwbox vsock connect 5003 > /dev/null; echo rc=$?\n");
 			await waitFor(/rc=\d/, at);
 			assert.match(s.text.slice(at), /kwvsock: send: Broken pipe[\s\S]*rc=1/);
 			assert.equal(await resetClosed, "reset");
@@ -806,7 +806,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			// 4. A memfd the guest exports through /dev/kwshm; the host opens it by id.
 			const MFD = 3000000;
 			let at = s.text.length;
-			vm.write(`kwshm memfd ${MFD} 7\n`);
+			vm.write(`kwbox shm memfd ${MFD} 7\n`);
 			await waitFor(/kwshm: id=(\d+) size=(\d+) pages=(\d+) fnv=([0-9a-f]{8})/, at);
 			const [, idS, sizeS, pagesS, fnvS] = s.text.slice(at).match(/kwshm: id=(\d+) size=(\d+) pages=(\d+) fnv=([0-9a-f]{8})/)!;
 			assert.deepEqual([Number(sizeS), Number(pagesS)], [MFD, Math.ceil(MFD / 4096)]);
@@ -839,7 +839,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			rangedSha.update((await rangedHost.read()).subarray(8192, 8192 + 50000));
 			await rangedHost.close();
 			at = s.text.length;
-			vm.write("kwshm export /dev/shm/ranged -u -r -o 8192 -l 50000\n");
+			vm.write("kwbox shm export /dev/shm/ranged -u -r -o 8192 -l 50000\n");
 			await waitFor(/kwshm: id=(\d+) size=50000 pages=13 /, at);
 			const ranged = await shm.openId(Number(s.text.slice(at).match(/kwshm: id=(\d+) size=50000/)![1]));
 			assert.deepEqual({ size: ranged.size, writable: ranged.writable }, { size: 50000, writable: false });
@@ -953,7 +953,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		/** Start kwshm.c on a memfd of `size` bytes (pattern `seed`); its export's id. */
 		const memfd = async (size: number, seed: number) => {
 			const from = s.text.length;
-			vm.write(`kwshm memfd ${size} ${seed}\n`);
+			vm.write(`kwbox shm memfd ${size} ${seed}\n`);
 			await waitFor(/kwshm: id=(\d+) size=/, from);
 			return Number(s.text.slice(from).match(/kwshm: id=(\d+) size=/)![1]);
 		};
@@ -1541,7 +1541,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			};
 			return { srv, connect };
 		};
-		const relays = async () => (await k.vm.exec("sh", ["-c", "ps -o args | grep -c '[k]wtty serve'"])).stdout.trim();
+		const relays = async () => (await k.vm.exec("sh", ["-c", "ps -o args | grep -c '[k]wbox tty serve'"])).stdout.trim();
 
 		test("connect(): an echo server, half-close, 1 MiB each way under credit; a refused port is ECONNREFUSED; close() of an idle connection ends the guest's relay", async () => {
 			const { srv, connect } = await guestServer(7000, ["cat"]);
@@ -1659,7 +1659,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 
 		test("exec() waits for createKernel's commands: arguments, environment, cwd, stdout and the exit status; a link per command, first on PATH", async () => {
 			const r = await sh("cd /tmp && FOO=bar hello a 'b c'; echo rc=$?; command -v hello; readlink /run/kw/bin/hello; ls /run/kw/bin | tr '\\n' ' '");
-			assert.equal(r.stdout, "hello a,b c\nrc=0\n/run/kw/bin/hello\n/usr/bin/kwcmd\nask big boom die first hang hello noawait upper ");
+			assert.equal(r.stdout, "hello a,b c\nrc=0\n/run/kw/bin/hello\n/usr/bin/kwbox\nask big boom die first hang hello noawait upper ");
 			const call = seen.pop() as Record<string, unknown>;
 			assert.ok((call.pid as number) > 1);
 			assert.deepEqual({ ...call, pid: 0 }, { args: ["a", "b c"], cwd: "/tmp", uid: 0, tty: { stdin: false, stdout: false, stderr: false }, foo: "bar", pid: 0 });
@@ -1705,8 +1705,8 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			await p.close();
 		});
 
-		test("a name the host does not have (127), kwcmd run, addCommand() and removeCommand(), bad names", async () => {
-			const r = await sh("ln -s /usr/bin/kwcmd /tmp/nope; /tmp/nope; echo rc=$?; kwcmd run hello via-run");
+		test("a name the host does not have (127), kwbox cmd run, addCommand() and removeCommand(), bad names", async () => {
+			const r = await sh("ln -s /usr/bin/kwbox /tmp/nope; /tmp/nope; echo rc=$?; kwbox cmd run hello via-run");
 			assert.deepEqual(r, { stdout: "rc=127\nhello via-run\n", stderr: "nope: the host does not provide this command\n", exitCode: 0, signal: null });
 			await k.vm.addCommand("late", () => 7);
 			assert.equal((await sh("late; echo rc=$?")).stdout, "rc=7\n");
@@ -1715,7 +1715,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			await k.vm.removeCommand("late");
 			assert.equal((await sh("late 2>/dev/null; echo rc=$?; ls /run/kw/bin | wc -l")).stdout, "rc=127\n9\n");
 			assert.ok(!k.vm.commands.has("late"));
-			for (const bad of ["", "a/b", ".x", "-x", "kwcmd", "a b"])
+			for (const bad of ["", "a/b", ".x", "-x", "kwcmd", "kwbox", "a b"])
 				await assert.rejects(k.vm.addCommand(bad, () => 0), (e: Error) => e instanceof sdk.CommandError && e.code === "EINVAL", bad);
 		});
 	});
@@ -1730,11 +1730,11 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const alp = sharedKernel(() => ({ distro: alpine!, log: () => {}, commands: { whoru: (c) => `uid ${c.uid}\n` } }));
 
 		test("boots the Alpine image under the overlay root, with the kw layer on top", async () => {
-			const r = await alp.vm.exec("sh", ["-c", "cat /etc/alpine-release /usr/lib/kw-distro; apk --version; grep ' / ' /proc/self/mounts; command -v kwtty"]);
+			const r = await alp.vm.exec("sh", ["-c", "cat /etc/alpine-release /usr/lib/kw-distro; apk --version; grep ' / ' /proc/self/mounts; command -v kwbox"]);
 			assert.equal(r.exitCode, 0, r.stderr);
 			assert.match(r.stdout, /^\d+\.\d+\.\d+\nalpine\napk-tools \S+/);
 			assert.match(r.stdout, /^overlay \/ overlay .*lowerdir=\/kw\/layer:\/kw\/distro/m);
-			assert.match(r.stdout, /\/usr\/bin\/kwtty$/m);
+			assert.match(r.stdout, /\/usr\/bin\/kwbox$/m);
 			assert.equal(alp.vm.distro?.label, "kwroot");
 		});
 
@@ -1867,7 +1867,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		void new Response(sub.stdout).arrayBuffer().catch(() => {});
 		void new Response(sub.stderr).arrayBuffer().catch(() => {});
 		const l = vm.vsock!.listen(5005);
-		vm.write("kwvsock connect 5005 </dev/null >/tmp/vs.out 2>&1 & echo vs-started\n");
+		vm.write("kwbox vsock connect 5005 </dev/null >/tmp/vs.out 2>&1 & echo vs-started\n");
 		await a.waitFor(/vs-started/);
 		const conn = (await l.accept())!;
 		// snapshot() refuses while vsock packets are in flight (the accept's and kwtty's last ones may still be), and the guest goes on.

@@ -155,9 +155,11 @@ lives in virtio_transport.c, so kwvsock has its own).
 - kw_defconfig: VSOCKETS, VSOCKETS_DIAG (`ss --vsock`), KWVSOCK, not
   VSOCKETS_LOOPBACK.
 - Guest tools (guest.md): `kwvsock`, `kwtty` (terminal sessions, programs
-  on pipes and TCP relays for the host, port 1022), `kw9p`, and the guest
+  on pipes and TCP relays for the host, port 1022), `kw9p`, the guest
   GL forwarder `/usr/lib/kw/vtest-bridge` (connects to host port 1019;
-  gl.md).
+  gl.md), and wland's relay `/usr/lib/kw/wlandr` (connects to host port
+  1023, the page's `WAYLAND_PORT`; its buffers are kwshm exports, below;
+  web.md, Wayland desktop).
 
 ## kwshm (shared memory)
 
@@ -192,7 +194,10 @@ the id to the host over any channel.
   and released, so a guest export's page list is at the host before the
   guest sends its id, and an attach comes before the reply to the request
   that caused it. A refresh unpins the old pages only after the new list's
-  attach, a release only after the detach returned.
+  attach, a release only after the detach returned. A host that reads the
+  pages from another thread (worker mode on the SMP kernel's shared
+  memory, js.md, shm) keeps this by waiting inside those imports for its
+  reader to let go.
 - Host opens look the name up in PID 1's fs (`scoped_with_init_fs()`: a
   kworker's own root is nullfs) without following a final symlink.
 - Closing `/dev/kwshm` releases its exports; an export is writable for the

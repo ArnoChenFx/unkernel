@@ -448,22 +448,38 @@ parts that are easy to get wrong.
   checks IDLE, both seq-cst) and the owner posts one `kick` per idle wait.
   Frames: a SharedArrayBuffer per display size, three XRGB slots as a
   triple buffer (the worker never touches the front slot). A failed
-  allocation falls back to credits. Sound, vsock and shm stay messages.
+  allocation falls back to credits. shm reads go through a third ring
+  (`SHM_HEAD`), answered by a "shm-read" message posted from the clock
+  import. vsock packets for the guest go through a fourth (`VS_HEAD`,
+  length-prefixed records; what does not fit waits on the owner's side,
+  never a message, to keep the stream's order), queued in the
+  VsockDevice at the clock read. Sound, the guest's vsock packets and the
+  other shm calls stay messages.
   With more than one CPU, console output comes through a SharedArrayBuffer
   of its own, the console ring (CPU threads, below), sent in the boot spec
   as `console`.
-  - Sharing the kernel's own memory is ruled out: the module imports an
+  - Sharing the UP kernel's own memory is ruled out: the module imports an
     unshared memory (a shared one is a LinkError), the posted compiled
     Module cannot be rewritten, kwemu's JIT modules import the same memory,
     the host's read-modify-write of `wasm_host_irqs` would race the
     kernel's plain stores, and browsers refuse shared views in
     `TextDecoder.decode` and `crypto.getRandomValues`. A seqlock over one
     frame buffer forces retries, since the owner converts while the worker
-    copies the next frame.
+    copies the next frame. The SMP kernel's memory is shared anyway; the
+    owner holds it only for shm reads in place (shm, below). Running the
+    SMP kernel on one CPU to get that on the page's default was not taken:
+    it would change what every one-CPU page runs, for a read the ring now
+    serves in about 1 ms.
 - vsock in a worker: the protocol (VsockHost) runs on the owner, so
   `WorkerKernel.vsock` is the same object as inline; the worker's kernel
   only passes packets (`createKernelOn` with `vsock: { raw }`), in order.
-  Credit bounds what is in flight.
+  Credit bounds what is in flight. The owner's packets reach the kernel
+  through the shared transport's ring (at its next clock read; as
+  messages they waited for its yield, up to 20 ms under load: 2026-11-22,
+  12 ms on average of each frame of a Wayland app under load, web.md),
+  else as messages; the worker posts the guest's per microtask (the
+  kernel's next task switch or yield), or at once from inside the import
+  past 64 KiB or 64 packets.
 - Packaging: from source, `js/node/worker.ts` starts
   `new URL("./worker-entry.ts", import.meta.url)`. `pnpm build` bundles
   each entry with rolldown, and the `unkernel:inline-worker` plugin
@@ -612,7 +628,7 @@ parts that are easy to get wrong.
   shared view in browsers (`TextDecoder`, `getRandomValues`, the JIT's
   `WebAssembly.Module`); the device paths hand on copies too (block
   writes gather into a new buffer, PCM chunks and worker frames are
-  copied, shm `read()` copies), except `InlineShmFile.views()` and
+  copied, shm `read()` copies), except `ShmFile.views()` and
   `DisplayHost.pixels()`, which are views of the memory by design.
 - CPU 0's host sets IRQ bits with `Atomics.or` (`Kernel.setIrqBits`),
   and its idle `poll_oneoff` also waits on `Atomics.waitAsync` of
@@ -1163,18 +1179,41 @@ parts that are easy to get wrong.
   in place. `ShmDevice` (`Kernel.shm`) is the kernel's end (each live
   export's page list merged into runs of consecutive pages); `ShmClient`
   is the API (`vm.shm`) on a backend that runs `ShmCall`s: the ShmDevice
-  itself inline (`inlineShm()`), messages in worker mode.
-- Inline, `read()`/`write()` copy at once, and `InlineShmFile.views()`
-  returns one `Uint8Array` per page run over kernel memory, no copy, valid
-  only until the kernel runs again: use them synchronously. In worker mode
-  each call is a round trip, taken when the kernel next suspends (up to
-  20 ms while the guest is busy); `views()` throws EOPNOTSUPP.
+  itself inline (`inlineShm()`), messages in worker mode, plus an optional
+  synchronous `ShmLocal`.
+- In place (`Shm.inPlace`, `ShmFile.inPlace`, `readSync()`, `views()`;
+  `read()`/`write()` then copy at once too): inline, and in worker mode
+  where the kernel's memory is a SharedArrayBuffer (the SMP kernel; the UP
+  kernel imports an unshared memory, below) and the shared transport is
+  on. The worker then posts that memory and `ShmShareServer`'s slot table
+  ("shm-share", before "started"), every info reply carries the export's
+  page runs (`ShmPlace`), and `ShmInPlace` reads and writes on the owner's
+  thread with no message. `views()` gives one `Uint8Array` per page run,
+  no copy, valid until the caller awaits or returns to the event loop.
+  Elsewhere `readSync()`/`views()` throw EOPNOTSUPP, and EAGAIN while the
+  owner has no current page list (a refresh until its answer, a release on
+  its way): `read()` then goes the other way and says what happened.
+- Not in place: with the shared transport `read()` goes through its shm
+  ring and is served at the kernel's next clock read (worker-shared.ts;
+  1.1 ms median for 512 KiB with the guest busy, 2026-11-22), else every
+  call is a round trip taken when the kernel next suspends (21 ms there).
+  Writes, opens, refreshes and closes are always round trips; reads go as
+  messages while a write is on its way, behind it.
 - Lifetime: the kernel unpins an export's pages only after its detach
   import returned, and a refresh only after the new list's attach, so
-  ShmDevice never copies from a freed page. At exit everything is dropped
-  and handles end with "exit".
-- Test: `test/api.test.ts` (inline and worker) with `guest/src/kwshm.c`.
-  Skipped when the kernel has no kwshm.
+  ShmDevice never copies from a freed page. Across threads the slot table
+  keeps that (the protocol is at the top of shm.ts): the owner pins a slot
+  for a copy (views(): until its microtasks run) and then checks the slot's
+  token; inside those imports (`ShmDevice.onRetire`) the worker clears the
+  token and waits for the pin (`Atomics.wait`, at most 1 s, then logs).
+  The guest writes the pages meanwhile (other CPUs): pixels read in place
+  can be mid-frame, as inline between two yields. Memory never grows, and
+  a restore is a new instance with its own share. At exit everything is
+  dropped and handles end with "exit".
+- Test: `test/api.test.ts` (inline and worker; "shm in worker mode" for
+  each read path: SMP in place, the ring, messages on UP and SMP, with a
+  release while views are held and a snapshot and restore) with
+  `guest/src/kwshm.c`. Skipped when the kernel has no kwshm.
 
 ## virtio and virtio-gpu (`js/core/virtio.ts`, `virtio-gpu.ts`)
 
@@ -1280,7 +1319,9 @@ parts that are easy to get wrong.
   once, or after a presented frame once that frame is done; readbacks at
   once), and presents: a RESOURCE_FLUSH of the scanout's resource sizes
   the renderer's OffscreenCanvas to the scanout, blits the texture into its
-  drawing buffer (`kw_vgpu_present`) and keeps `transferToImageBitmap()`.
+  drawing buffer (`kw_vgpu_present`, alpha 1) and keeps `transferToImageBitmap()`.
+  The renderer's context has `alpha: true` (premultiplied, gl.ts
+  `rendererAttrs()`) where the module has `kw_vgpu_blit`, for `image()`.
   `drawFrame(ctx, force?)` draws that bitmap into a 2D context (true: drew
   a new one; false: nothing new; null: no 3D resource on the scanout), and
   the page's Display.tsx does so per animation frame before frame().
@@ -1288,19 +1329,50 @@ parts that are easy to get wrong.
   WorkerKernel.frame()/readFrame() use it while a 3D resource is on the
   scanout; for screenshots, not per frame). `onFrame` hears each present
   and scanout change; `stats` (also `vm.gl.stats.gpu`) counts commands,
-  fenced answers, parks and time parked, presents, readbacks and errors.
+  fenced answers, parks and time parked, presents, readbacks and errors,
+  with `lastError` (the latest failed command, its context and resource,
+  the answer and why; failures are logged at most once a second) and
+  `contextLost`. A lost WebGL2 context (`webglcontextlost`, or
+  `isContextLost()`; iOS drops contexts under memory pressure and in the
+  background) is said once in the log, and from then on every 3D command
+  is answered ERR_UNSPEC at once without a GL call, waits for GPU work
+  end, and `image()` gives null: the guest's GL programs fail rather than
+  hang. Not recovered: a restored context is a new, empty one, every
+  guest context and resource lived in the old one, and virtio-gpu cannot
+  tell the guest they are gone; recovery would take a new renderer on the
+  restored context for new clients and a reset of the device (the guest's
+  driver re-probing, its GL programs restarted), so the page has to be
+  reloaded.
 - `texture(resourceId)`: the resource's `WebGLTexture` in the renderer's
-  context (`gl`), its size, virgl format and `yTop` (the texture's row k
+  context (`gl`), its size, virgl format, `alpha` (the format has alpha)
+  and `yTop` (the texture's row k
   holds the picture's row k counted from the top, or with `yTop` its row
   height - 1 - k), or null. For host code that
   composes guest buffers: a guest client's dmabuf, through
   DRM_IOCTL_VIRTGPU_RESOURCE_INFO, gives the resource id. Use it on that
   thread and context; do not change its parameters or delete it (vrend
   caches texture state); sample it through a sampler object.
+- `image(resourceId, { x, y, width, height, opaque, flipY })`: the
+  resource's picture (a rectangle, default all, clamped) as an
+  ImageBitmap of the caller's (close() it), for a compositor on the page
+  (wland's `gpu.resolve()`; gl.md, Window images): row 0 at the top
+  (`flipY`: at the bottom, for y_invert), alpha premultiplied as the
+  client rendered it, or opaque (`opaque`; default for a format without
+  alpha). A blit in the module and `transferToImageBitmap()`, no readback;
+  the content is what the guest's commands before the call drew. Null for
+  an unknown id, a buffer, an empty rectangle or no renderer; a promise
+  while the renderer loads; it never starts the load. `stats.images`
+  counts them.
+- Snapshots (`blocker()`): refused while any 3D resource exists or a
+  context submitted commands; a context that only had buffers attached
+  (a Wayland relay's) passes, and after a restore the device side makes a
+  context it did not see made again before the first command naming it
+  (gl.md, The DRM path, Snapshots).
 - Not shared with kwfb: dumb buffers stay 2D (the 2D model's host copies),
   so a 3D context cannot use one (CTX_ATTACH_RESOURCE of a dumb buffer
   fails). Blobs, UUIDs and host-visible memory are not offered.
-- Test: `node test/gl/unkernel-check.mjs --drm` (gl.md, The DRM path).
+- Test: `node test/gl/unkernel-check.mjs --drm` (gl.md, The DRM path;
+  `--snapshot` for the idle context across a restore), `pnpm test:gl-gpu`.
 
 ## Disks (`js/core/block.ts`)
 

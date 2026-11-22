@@ -929,6 +929,171 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		});
 	});
 
+	// shm's read paths in worker mode (shm.ts, worker-shared.ts): in place on this thread where the
+	// worker shares the kernel's memory (an SMP kernel, with the shared transport), else reads through
+	// the shared transport's ring (the UP kernel), else messages (shared: false).
+	const SHM_PATHS = [
+		{ name: "SMP: in place", opts: { worker: true, cpus: 2 }, via: "in place", smp: true },
+		{ name: "the shared transport's ring", opts: { worker: true, cpus: 1 }, via: "ring", smp: false },
+		{ name: "messages", opts: { worker: true, cpus: 1, shared: false }, via: "messages", smp: false },
+		{ name: "SMP, messages", opts: { worker: true, cpus: 2, shared: false }, via: "messages", smp: true },
+	] as const;
+	for (const { name, opts, via, smp } of SHM_PATHS) test(`shm in worker mode (${name}): read, readSync, views and write, in order; reads while the guest is busy; a refresh; a release while views are held; across a snapshot and restore`,
+		{ skip: (!kernelHasShm && "the kernel under test has no kwshm") || (smp && !hasSmpPatch && "the kernel under test carries no SMP kernel") }, async (t) => {
+		const logs: string[] = [];
+		const base = { ...opts, shm: true, vsock: false, log: (m: string) => logs.push(m) };
+		const vm = await boot(t, base);
+		const a = screen(vm);
+		const { s, waitFor } = a;
+		await waitFor(PROMPT);
+		const sh = shell(vm, a);
+		const shm = vm.shm!;
+		const inPlace = via === "in place";
+		const code = (c: string) => (e: Error & { code?: string }) => e.name === "ShmError" && e.code === c;
+		/** Start kwshm.c on a memfd of `size` bytes (pattern `seed`); its export's id. */
+		const memfd = async (size: number, seed: number) => {
+			const from = s.text.length;
+			vm.write(`kwshm memfd ${size} ${seed}\n`);
+			await waitFor(/kwshm: id=(\d+) size=/, from);
+			return Number(s.text.slice(from).match(/kwshm: id=(\d+) size=/)![1]);
+		};
+		/** Type a line to kwshm.c and wait for `re`. */
+		const helper = async (line: string, re: RegExp) => {
+			const from = s.text.length;
+			vm.write(`${line}\n`);
+			await waitFor(re, from);
+			return s.text.slice(from);
+		};
+		assert.equal(shm.inPlace, inPlace, "Shm.inPlace");
+
+		// A file the host creates: written and read in place (or not), then grown by the guest and refreshed.
+		const CR = 4 * 65536;
+		const c = await shm.create("paths", CR);
+		assert.equal(c.inPlace, inPlace);
+		const data = shmPattern(CR, 3);
+		await c.write(0, data);
+		assert.equal(await sh("md5sum < /dev/shm/paths | cut -c1-32"), `${createHash("md5").update(data).digest("hex")}\n`, "the guest reads the host's write");
+		if (inPlace) assert.deepEqual(c.readSync(), data);
+		await sh(`truncate -s ${2 * CR} /dev/shm/paths`);
+		assert.equal(await c.refresh(), true);
+		assert.equal(c.size, 2 * CR);
+		assert.equal(c.inPlace, inPlace, "in place again after the refresh's answer");
+		const grown = new Uint8Array(2 * CR);
+		grown.set(data);
+		assert.deepEqual(inPlace ? c.readSync() : await c.read(), grown, "the new page list");
+		await c.close();
+		assert.equal(c.inPlace, false, "an ended handle");
+		assert.throws(() => c.readSync(0, 1), code("EBADF"));
+
+		// A guest export by id.
+		const MFD = 3000000;
+		const pattern = shmPattern(MFD, 7);
+		const f = await shm.openId(await memfd(MFD, 7));
+		assert.equal(f.inPlace, inPlace);
+		assert.equal(fnv32(await f.read()), fnv32(pattern));
+		if (inPlace) {
+			assert.equal(fnv32(f.readSync()), fnv32(pattern));
+			const out = new Uint8Array(10000);
+			assert.equal(f.readSync(4095, 10000, out), out, "into the buffer given");
+			assert.deepEqual(out, pattern.subarray(4095, 14095), "an unaligned read across pages");
+			const views = f.views(100, MFD - 200);
+			assert.ok(views.length >= 1 && views.every((v) => v.buffer instanceof SharedArrayBuffer), "views of the shared memory");
+			assert.equal(fnv32(Buffer.concat(views)), fnv32(pattern.subarray(100, MFD - 100)), "the views cover the range in order");
+			assert.throws(() => f.readSync(MFD, 1), code("EINVAL"));
+		} else {
+			assert.throws(() => f.readSync(), code("EOPNOTSUPP"));
+			assert.throws(() => f.views(), code("EOPNOTSUPP"));
+		}
+		// A write and a read right behind it, not awaited: the read sees the write.
+		const hello = new TextEncoder().encode("hello, in order");
+		const w = f.write(5000, hello), r = f.read(5000, hello.length);
+		await w;
+		assert.deepEqual(await r, hello);
+		const written = pattern.slice();
+		written.set(hello, 5000);
+		const out = await helper("", /kwshm: fnv=([0-9a-f]{8})/);
+		assert.equal(out.match(/kwshm: fnv=([0-9a-f]{8})/)![1], fnv32(written), "the guest sees the host's write");
+		await helper("q", PROMPT);
+		assert.equal(await f.closed, "released");
+
+		// Reads while the guest keeps every CPU busy: in place or through the ring they do not wait for the kernel's yield.
+		await sh(`rm -f /tmp/spin; for i in $(seq ${opts.cpus}); do (while :; do :; done) & echo $! >> /tmp/spin; done`);
+		const id2 = await memfd(MFD, 7);
+		const g = await shm.openId(id2);
+		const times: number[] = [];
+		for (let i = 0; i < 25; i++) {
+			const t0 = performance.now();
+			const b = await g.read(i * 65536, 524288);
+			times.push(performance.now() - t0);
+			assert.equal(fnv32(b), fnv32(pattern.subarray(i * 65536, i * 65536 + 524288)));
+		}
+		times.sort((x, y) => x - y);
+		const median = times[12]!;
+		// This thread's own delay (a zero timer): with every test of the suite at once it alone can exceed a yield.
+		const lags: number[] = [];
+		for (let i = 0; i < 9; i++) {
+			const t0 = performance.now();
+			await new Promise((res) => setTimeout(res, 0));
+			lags.push(performance.now() - t0);
+		}
+		const lag = lags.sort((x, y) => x - y)[4]!;
+		t.diagnostic(`${via}: reads of 512 KiB with the guest busy: median ${median.toFixed(2)} ms, longest ${times.at(-1)!.toFixed(1)} ms (this thread's timer delay ${lag.toFixed(2)} ms)`);
+		if (via === "in place") assert.ok(median < 2, `in place: median ${median} ms`);
+		if (via === "ring" && lag < 2) assert.ok(median < 8, `through the ring: median ${median} ms (a message waits for the kernel's 20 ms yield)`);
+		assert.equal(shm.stats.inPlaceReads > 0, inPlace, JSON.stringify(shm.stats));
+
+		if (inPlace) {
+			// Released by the guest while this thread holds views: the kernel's detach waits until this
+			// task's microtasks run (here past the worker's 1 s limit, which it then logs), and the views
+			// keep the pages meanwhile.
+			const v = g.views(0, MFD);
+			const from = s.text.length;
+			vm.write("release\n");
+			const until = performance.now() + 1300;
+			while (performance.now() < until) { /* hold the views */ }
+			assert.equal(fnv32(Buffer.concat(v)), fnv32(pattern), "the views, still held");
+			assert.equal(await g.closed, "released");
+			await waitFor(/kwshm: released/, from);
+			assert.throws(() => g.readSync(0, 1), code("EBADF"));
+			assert.ok(logs.some((l) => l.includes(`export ${id2} retired while the owner still had it pinned`)), `the worker waited for the pin: ${logs.join("\n")}`);
+			await helper("q", PROMPT);
+			// A short hold: the release waits for it, and then goes on without a word.
+			const id3 = await memfd(100000, 5);
+			const h = await shm.openId(id3);
+			const hv = h.views();
+			vm.write("release\n");
+			const short = performance.now() + 200;
+			while (performance.now() < short) { /* hold the views */ }
+			assert.equal(fnv32(Buffer.concat(hv)), fnv32(shmPattern(100000, 5)));
+			assert.equal(await h.closed, "released");
+			assert.ok(!logs.some((l) => l.includes(`export ${id3} retired`)), logs.join("\n"));
+		} else {
+			await helper("release", /kwshm: released/);
+			assert.equal(await g.closed, "released");
+		}
+		await helper("q", PROMPT);
+		await sh("kill $(cat /tmp/spin)");
+
+		// Across a snapshot: a guest export held by a process, opened again in the restored machine.
+		const id4 = await memfd(200000, 9);
+		const k = await shm.openId(id4);
+		const snap = await vm.snapshot({ stop: true });
+		assert.equal(await k.closed, "exit");
+		assert.equal(shm.inPlace, false, "not after the exit");
+		assert.throws(() => k.readSync(), code("EBADF"));
+		const vm2 = await boot(t, { ...base, restore: snap });
+		const b2 = screen(vm2);
+		assert.equal(vm2.shm!.inPlace, inPlace, "in place in the restored machine as before");
+		const k2 = await vm2.shm!.openId(id4);
+		assert.equal(k2.inPlace, inPlace);
+		assert.equal(fnv32(inPlace ? k2.readSync() : await k2.read()), fnv32(shmPattern(200000, 9)), "the restored export's pages");
+		if (inPlace) assert.equal(fnv32(Buffer.concat(k2.views())), fnv32(shmPattern(200000, 9)));
+		const from = b2.s.text.length;
+		vm2.write("release\n");
+		await b2.waitFor(/kwshm: released/, from);
+		assert.equal(await k2.closed, "released");
+	});
+
 	// Host file systems (js/core/9p.ts, mounts.ts; guest/src/kw9p.c): 9p over vsock, mounted through kwtty.
 	for (const { worker, name } of MODES) describe(`host file systems over 9p, one kernel (${name})`,
 		{ concurrency: 1, skip: (!kernelHasVsock && "the kernel under test has no kwvsock") || (!kernelHas9p && "the kernel under test has no 9p") }, () => {

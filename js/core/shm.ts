@@ -31,8 +31,26 @@
 // ShmDevice directly; in worker mode the calls cross as messages and run in
 // the worker (worker-serve.ts), where the kernel's memory is, and read()
 // returns the bytes transferred back. Either way read() and write() copy
-// once across the page list. views() (inline only) gives zero-copy views
-// of the page runs. No import suspends.
+// once across the page list. No import suspends.
+//
+// In place (readSync(), views(); ShmFile.inPlace): inline always. In worker
+// mode where the kernel's memory is a SharedArrayBuffer (an SMP kernel) and
+// the shared transport is on, the worker posts that memory and a slot table
+// (ShmShareServer, ShmInPlace below); each info reply then carries the
+// export's page runs, and reads and views run on the owner's thread with no
+// message. The slot table keeps that safe without the kernel's help: a slot
+// per export holds a token while its page list is current, and a pin the
+// owner sets while it touches the pages. The kernel frees an export's pages
+// only after its detach (or, for a refresh, the new list's attach) import
+// returned; in that import the worker clears the token and, if the owner
+// has the slot pinned, waits (Atomics.wait, at most PIN_WAIT_MS) for the
+// unpin. The owner pins, then checks the token (both sequentially
+// consistent), so either it sees the token gone (EAGAIN: take the message
+// path, which says what happened) or the worker sees the pin and waits. A
+// read pins for its copy; views() pins until the current task's microtasks
+// run. Elsewhere (the UP kernel's memory is not shared) the worker's
+// shared transport serves read() at the kernel's next clock read
+// (worker-shared.ts), and without the shared transport it is a message.
 
 /** kwshm's page size. */
 export const SHM_PAGE_SIZE = 4096;
@@ -106,12 +124,57 @@ export type ShmCall =
 /** What a ShmCall gives: an export's info (open, create, openId, refresh), a flag (check), bytes (read) or nothing. */
 export type ShmCallResult = ShmInfo | boolean | Uint8Array | undefined;
 
-interface Rec {
-	info: ShmInfo;
-	/** Runs of consecutive pages: start offset in the export, linear address, length (bytes). */
+/** Runs of consecutive pages: start offset in the export, linear address, length (bytes). */
+interface Runs {
 	runOff: Float64Array;
 	runAddr: Uint32Array;
 	runLen: Float64Array;
+}
+
+interface Rec extends Runs {
+	info: ShmInfo;
+}
+
+/**
+ * An export's page runs for the owner's thread (worker mode with a shared
+ * memory): its slot in ShmShareServer's table and the token the slot holds
+ * while these runs are current, and the bytes they cover.
+ */
+export interface ShmPlace extends Runs {
+	slot: number;
+	token: number;
+	size: number;
+	writable: boolean;
+}
+
+/** Visit the runs under [offset, offset + length): fn(linear address, position in the range, bytes). */
+function eachRun(r: Runs, offset: number, length: number, fn: (addr: number, pos: number, n: number) => void): void {
+	const off = r.runOff;
+	let lo = 0, hi = off.length - 1;
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (off[mid]! <= offset) lo = mid;
+		else hi = mid - 1;
+	}
+	for (let i = lo, pos = 0; pos < length; i++) {
+		const inRun = offset + pos - off[i]!;
+		const n = Math.min(r.runLen[i]! - inRun, length - pos);
+		fn(r.runAddr[i]! + inRun, pos, n);
+		pos += n;
+	}
+}
+
+function checkRange(id: number, size: number, offset: number, length: number, what: string): void {
+	if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 || offset + length > size)
+		throw new ShmError("EINVAL", `${what}: ${offset}+${length} is outside export ${id} (${size} bytes)`);
+}
+
+/** Copy [offset, offset + length) of runs `r` out of `mem` into `out` (or a new array). */
+function copyOut(mem: Uint8Array, r: Runs, offset: number, length: number, out: Uint8Array | undefined, what: string): Uint8Array {
+	const dst = out ?? new Uint8Array(length);
+	if (dst.length < length) throw new ShmError("EINVAL", `${what}: the buffer is smaller than ${length} bytes`);
+	eachRun(r, offset, length, (a, pos, n) => dst.set(mem.subarray(a, a + n), pos));
+	return dst;
 }
 
 /** Merge a page list into runs of consecutive pages. */
@@ -176,6 +239,13 @@ export class ShmDevice {
 	onAttach: ((info: ShmInfo) => void) | undefined;
 	/** An export is gone (inside the import). */
 	onDetach: ((id: number) => void) | undefined;
+	/**
+	 * Export `id`'s current page list stops being current: inside its detach
+	 * import, or the attach of a refreshed list, before the kernel may free
+	 * the old pages (they are still held while this runs); also for every
+	 * export at close(). ShmShareServer hooks it.
+	 */
+	onRetire: ((id: number) => void) | undefined;
 	stats: ShmDeviceStats = { requests: 0, failed: 0, attaches: 0, detaches: 0, exports: 0, bytesRead: 0, bytesWritten: 0 };
 	#recs = new Map<number, Rec>();
 	#queue: Uint8Array[] = [];
@@ -216,12 +286,15 @@ export class ShmDevice {
 					writable: !!(flags & FLAG_WRITABLE), guest: !!(flags & FLAG_GUEST),
 				};
 				if (!this.#recs.has(info.id)) this.stats.exports++;
+				else this.#retire(info.id);
 				this.#recs.set(info.id, { info, ...toRuns(list) });
 				this.stats.attaches++;
 				try { this.onAttach?.({ ...info }); } catch {}
 			},
 			wasm_driver_shm_detach: (id: number): void => {
-				if (!this.#recs.delete(id >>> 0)) return;
+				if (!this.#recs.has(id >>> 0)) return;
+				this.#retire(id >>> 0);
+				this.#recs.delete(id >>> 0);
 				this.stats.exports--;
 				this.stats.detaches++;
 				try { this.onDetach?.(id >>> 0); } catch {}
@@ -237,6 +310,21 @@ export class ShmDevice {
 				} else p.resolve(result);
 			},
 		};
+	}
+
+	#retire(id: number): void {
+		try { this.onRetire?.(id); } catch {}
+	}
+
+	/** Is there an export `id`? */
+	has(id: number): boolean {
+		return this.#recs.has(id);
+	}
+
+	/** Export `id`'s page runs and size (ShmShareServer), or undefined if there is no such export. */
+	runs(id: number): (Runs & { size: number; writable: boolean }) | undefined {
+		const r = this.#recs.get(id);
+		return r && { runOff: r.runOff, runAddr: r.runAddr, runLen: r.runLen, size: r.info.size, writable: r.info.writable };
 	}
 
 	/** Requests queued or waiting for the kernel's answer (a snapshot refuses then). */
@@ -262,6 +350,7 @@ export class ShmDevice {
 	 */
 	restoreState(s: ShmSnapshot): void {
 		this.probed = true;
+		for (const id of this.#recs.keys()) this.#retire(id);
 		this.#recs.clear();
 		for (const e of s.exports)
 			this.#recs.set(e.info.id, {
@@ -317,36 +406,11 @@ export class ShmDevice {
 		return r;
 	}
 
-	#check(r: Rec, offset: number, length: number, what: string): void {
-		if (!Number.isInteger(offset) || !Number.isInteger(length) || offset < 0 || length < 0 || offset + length > r.info.size)
-			throw new ShmError("EINVAL", `${what}: ${offset}+${length} is outside export ${r.info.id} (${r.info.size} bytes)`);
-	}
-
-	/** Visit the runs under [offset, offset + length): fn(linear address, position in the range, bytes). */
-	#each(r: Rec, offset: number, length: number, fn: (addr: number, pos: number, n: number) => void): void {
-		const off = r.runOff;
-		let lo = 0, hi = off.length - 1;
-		while (lo < hi) {
-			const mid = (lo + hi + 1) >> 1;
-			if (off[mid]! <= offset) lo = mid;
-			else hi = mid - 1;
-		}
-		for (let i = lo, pos = 0; pos < length; i++) {
-			const inRun = offset + pos - off[i]!;
-			const n = Math.min(r.runLen[i]! - inRun, length - pos);
-			fn(r.runAddr[i]! + inRun, pos, n);
-			pos += n;
-		}
-	}
-
 	/** Copy bytes out of export `id` (into `out` at 0 if given). Synchronous: call it on the kernel's thread. */
 	read(id: number, offset: number, length: number, out?: Uint8Array): Uint8Array {
 		const r = this.#rec(id, "read");
-		this.#check(r, offset, length, "read");
-		const dst = out ?? new Uint8Array(length);
-		if (dst.length < length) throw new ShmError("EINVAL", `read: the buffer is smaller than ${length} bytes`);
-		const mem = new Uint8Array(this.#memory().buffer);
-		this.#each(r, offset, length, (a, pos, n) => dst.set(mem.subarray(a, a + n), pos));
+		checkRange(id, r.info.size, offset, length, "read");
+		const dst = copyOut(new Uint8Array(this.#memory().buffer), r, offset, length, out, "read");
 		this.stats.bytesRead += length;
 		return dst;
 	}
@@ -355,9 +419,9 @@ export class ShmDevice {
 	write(id: number, offset: number, data: Uint8Array): void {
 		const r = this.#rec(id, "write");
 		if (!r.info.writable) throw new ShmError("EACCES", `write: export ${id} is read-only for the host`);
-		this.#check(r, offset, data.length, "write");
+		checkRange(id, r.info.size, offset, data.length, "write");
 		const mem = new Uint8Array(this.#memory().buffer);
-		this.#each(r, offset, data.length, (a, pos, n) => mem.set(data.subarray(pos, pos + n), a));
+		eachRun(r, offset, data.length, (a, pos, n) => mem.set(data.subarray(pos, pos + n), a));
 		this.stats.bytesWritten += data.length;
 	}
 
@@ -369,10 +433,10 @@ export class ShmDevice {
 	 */
 	views(id: number, offset: number, length: number): Uint8Array[] {
 		const r = this.#rec(id, "views");
-		this.#check(r, offset, length, "views");
+		checkRange(id, r.info.size, offset, length, "views");
 		const buf = this.#memory().buffer;
 		const out: Uint8Array[] = [];
-		this.#each(r, offset, length, (a, _pos, n) => out.push(new Uint8Array(buf, a, n)));
+		eachRun(r, offset, length, (a, _pos, n) => out.push(new Uint8Array(buf, a, n)));
 		return out;
 	}
 
@@ -428,8 +492,181 @@ export class ShmDevice {
 		this.#pending.clear();
 		this.#queue = [];
 		// No detach events: the API ends its handles with "exit" itself (ShmClient.shutdown).
+		for (const id of this.#recs.keys()) this.#retire(id);
 		this.#recs.clear();
 		this.stats.exports = 0;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// In place across threads (worker mode with a shared memory; see the top).
+
+/** Slots in the table: exports the owner has opened at once (more: those read by message). */
+const SHARE_SLOTS = 4096;
+/** How long a retiring export waits for the owner's pin (it pins only for a synchronous run of its own). */
+const PIN_WAIT_MS = 1000;
+
+/** The worker's side: the slot table, and the waits in the imports (ShmDevice.onRetire). */
+export class ShmShareServer {
+	/** TOKEN[SHARE_SLOTS], then PIN[SHARE_SLOTS] (Int32), for the owner. */
+	readonly table = new SharedArrayBuffer(SHARE_SLOTS * 8);
+	/** Retires that found the owner's pin and waited, and those that gave up waiting. */
+	readonly stats = { waits: 0, timeouts: 0 };
+	#tok = new Int32Array(this.table, 0, SHARE_SLOTS);
+	#pin = new Int32Array(this.table, SHARE_SLOTS * 4, SHARE_SLOTS);
+	#slots = new Map<number, number>();
+	#free: number[] = [];
+	#next = 0;
+	#token = 0;
+	#dev: ShmDevice;
+	#log: (msg: string) => void;
+
+	constructor(dev: ShmDevice, log: (msg: string) => void) {
+		this.#dev = dev;
+		this.#log = log;
+		dev.onRetire = (id) => this.#retire(id);
+	}
+
+	/** Export `id`'s runs for the owner, with a slot holding a token while they are current; undefined: no such export, or no slot free. */
+	place(id: number): ShmPlace | undefined {
+		const r = this.#dev.runs(id);
+		if (!r) return undefined;
+		let slot = this.#slots.get(id);
+		if (slot === undefined) {
+			slot = this.#free.pop() ?? (this.#next < SHARE_SLOTS ? this.#next++ : undefined);
+			if (slot === undefined) return undefined;
+			this.#token = (this.#token % 0x7fffffff) + 1;
+			Atomics.store(this.#tok, slot, this.#token);
+			this.#slots.set(id, slot);
+		}
+		return { slot, token: Atomics.load(this.#tok, slot), size: r.size, writable: r.writable, runOff: r.runOff, runAddr: r.runAddr, runLen: r.runLen };
+	}
+
+	/** Inside the import, before the kernel may free the pages: end the token, then wait out the owner's pin. */
+	#retire(id: number): void {
+		const slot = this.#slots.get(id);
+		if (slot === undefined) return;
+		this.#slots.delete(id);
+		Atomics.store(this.#tok, slot, 0);
+		if (Atomics.load(this.#pin, slot)) {
+			this.stats.waits++;
+			const end = performance.now() + PIN_WAIT_MS;
+			for (let left = PIN_WAIT_MS; Atomics.load(this.#pin, slot) && left > 0; left = end - performance.now())
+				Atomics.wait(this.#pin, slot, 1, left);
+			if (Atomics.load(this.#pin, slot)) {
+				this.stats.timeouts++;
+				this.#log(`[host] shm: export ${id} retired while the owner still had it pinned after ${PIN_WAIT_MS} ms`);
+			}
+		}
+		this.#free.push(slot);
+	}
+}
+
+/**
+ * The owner's side: the kernel's memory and the slot table from the worker,
+ * and the places of the exports it opened. read() and views() pin the slot
+ * and check its token (see the top); EAGAIN when the export has no current
+ * place here (never opened by id, refreshed or withdrawn since): the message
+ * path then answers.
+ */
+export class ShmInPlace {
+	#mem: Uint8Array;
+	#tok: Int32Array;
+	#pin: Int32Array;
+	#places = new Map<number, ShmPlace>();
+	/** Slots views() pinned in this task, unpinned by a microtask. */
+	#held = new Set<number>();
+	#closed = false;
+
+	constructor(memory: SharedArrayBuffer, table: SharedArrayBuffer) {
+		this.#mem = new Uint8Array(memory);
+		this.#tok = new Int32Array(table, 0, SHARE_SLOTS);
+		this.#pin = new Int32Array(table, SHARE_SLOTS * 4, SHARE_SLOTS);
+	}
+
+	/** An info reply's place for export `id`. */
+	set(id: number, place: ShmPlace): void {
+		if (!this.#closed) this.#places.set(id, place);
+	}
+
+	/** The export is gone. */
+	drop(id: number): void {
+		this.#places.delete(id);
+	}
+
+	/** Whether export `id` has a current place here (a later call may still find it gone). */
+	ready(id: number): boolean {
+		const p = this.#places.get(id);
+		return !!p && Atomics.load(this.#tok, p.slot) === p.token;
+	}
+
+	read(id: number, offset: number, length: number, out?: Uint8Array): Uint8Array {
+		const p = this.#place(id, offset, length, "read");
+		const held = this.#held.has(p.slot);
+		if (!held) Atomics.store(this.#pin, p.slot, 1);
+		try {
+			this.#current(id, p, "read");
+			return copyOut(this.#mem, p, offset, length, out, "read");
+		} finally {
+			if (!held) this.#unpin(p.slot);
+		}
+	}
+
+	write(id: number, offset: number, data: Uint8Array): void {
+		const p = this.#place(id, offset, data.length, "write");
+		if (!p.writable) throw new ShmError("EACCES", `write: export ${id} is read-only for the host`);
+		const held = this.#held.has(p.slot);
+		if (!held) Atomics.store(this.#pin, p.slot, 1);
+		try {
+			this.#current(id, p, "write");
+			eachRun(p, offset, data.length, (a, pos, n) => this.#mem.set(data.subarray(pos, pos + n), a));
+		} finally {
+			if (!held) this.#unpin(p.slot);
+		}
+	}
+
+	views(id: number, offset: number, length: number): Uint8Array[] {
+		const p = this.#place(id, offset, length, "views");
+		if (!this.#held.has(p.slot)) {
+			Atomics.store(this.#pin, p.slot, 1);
+			if (!this.#held.size) queueMicrotask(() => this.#release());
+			this.#held.add(p.slot);
+		}
+		this.#current(id, p, "views");
+		const out: Uint8Array[] = [];
+		eachRun(p, offset, length, (a, _pos, n) => out.push(this.#mem.subarray(a, a + n)));
+		return out;
+	}
+
+	/** The kernel exited: forget every place (the memory stays readable, but nothing in it is held). */
+	close(): void {
+		this.#closed = true;
+		this.#places.clear();
+		this.#release();
+	}
+
+	#place(id: number, offset: number, length: number, what: string): ShmPlace {
+		const p = this.#places.get(id);
+		if (!p) throw new ShmError("EAGAIN", `${what}: export ${id} has no page list on this thread`);
+		checkRange(id, p.size, offset, length, what);
+		return p;
+	}
+
+	/** After the pin: is the token still the one of these runs? */
+	#current(id: number, p: ShmPlace, what: string): void {
+		if (Atomics.load(this.#tok, p.slot) === p.token) return;
+		if (this.#places.get(id) === p) this.#places.delete(id);
+		throw new ShmError("EAGAIN", `${what}: export ${id}'s page list changed or went away`);
+	}
+
+	#unpin(slot: number): void {
+		Atomics.store(this.#pin, slot, 0);
+		Atomics.notify(this.#pin, slot);
+	}
+
+	#release(): void {
+		for (const s of this.#held) this.#unpin(s);
+		this.#held.clear();
 	}
 }
 
@@ -445,6 +682,8 @@ export interface ShmStats {
 	/** read() and write() calls, and their bytes. */
 	reads: number;
 	bytesRead: number;
+	/** Reads (read(), readSync()) that copied on this thread: inline, or in place in worker mode. */
+	inPlaceReads: number;
 	writes: number;
 	bytesWritten: number;
 }
@@ -465,10 +704,42 @@ export interface ShmFile {
 	readonly generation: number;
 	/**
 	 * Copy `length` bytes from `offset` (default: everything from offset).
-	 * Inline the copy happens at once; in worker mode the worker copies (when
-	 * the kernel next yields or idles) and transfers the bytes here.
+	 * In place (see inPlace) the copy happens at once. Otherwise the worker
+	 * copies and transfers the bytes here: with the shared transport at the
+	 * kernel's next clock read (about every 0.6 ms while the guest runs, at
+	 * once when it idles), else when the kernel next yields or idles (up to
+	 * 20 ms while the guest is busy).
 	 */
 	read(offset?: number, length?: number): Promise<Uint8Array>;
+	/**
+	 * Whether readSync() and views() work now: inline always; in worker mode
+	 * where the kernel's memory is shared with this thread (an SMP kernel,
+	 * the shared transport) while this thread has the export's current page
+	 * list (after a refresh, until its answer: no). False once the handle
+	 * ended. A true answer can still be followed by an EAGAIN from those two
+	 * if the guest withdraws the export meanwhile.
+	 */
+	readonly inPlace: boolean;
+	/**
+	 * read(), synchronously, into `out` (at 0) if given: the copy happens on
+	 * this thread. Throws a ShmError: EOPNOTSUPP where this thread cannot see
+	 * the kernel's memory, EAGAIN when inPlace is false for now (read()
+	 * answers then), EBADF on an ended handle, EINVAL outside the export.
+	 */
+	readSync(offset?: number, length?: number, out?: Uint8Array): Uint8Array;
+	/**
+	 * Views of the kernel's memory for [offset, offset + length), one per run
+	 * of consecutive pages (a shmem file's pages are scattered), no copy; the
+	 * same errors as readSync(). Use them synchronously: they are valid until
+	 * the calling code awaits or returns to the event loop (inline the kernel
+	 * cannot run before; in worker mode the export's pages stay held until
+	 * then: a guest release meanwhile waits for it). The guest may write the
+	 * pages meanwhile in worker mode (its other CPUs run), so a view can see a
+	 * frame being drawn, as inline between two yields. Over a shared memory
+	 * the views are shared: APIs that refuse those (TextDecoder, WebGL
+	 * uploads in some engines) need a copy.
+	 */
+	views(offset?: number, length?: number): Uint8Array[];
 	/** Copy `data` into the file at `offset` (it must fit within size; the export must be writable). */
 	write(offset: number, data: Uint8Array): Promise<void>;
 	/**
@@ -489,15 +760,8 @@ export interface ShmFile {
 	readonly closed: Promise<ShmCloseReason>;
 }
 
-/** Inline handles add zero-copy access. */
-export interface InlineShmFile extends ShmFile {
-	/**
-	 * Views of the kernel's memory for [offset, offset + length), one per run
-	 * of consecutive pages (a shmem file's pages are scattered). No copy.
-	 * Valid only until the kernel runs again: use them synchronously.
-	 */
-	views(offset?: number, length?: number): Uint8Array[];
-}
+/** @deprecated Every ShmFile has views() now (ShmFile.inPlace says where it works). */
+export type InlineShmFile = ShmFile;
 
 /** The surface both inline and worker mode give as `vm.shm`. */
 export interface Shm<F extends ShmFile = ShmFile> {
@@ -518,17 +782,32 @@ export interface Shm<F extends ShmFile = ShmFile> {
 	create(name: string, size: number, opts?: { mode?: number; timeout?: number }): Promise<F>;
 	/** A guest export, by the id KWSHM_IOC_EXPORT gave the guest. Rejects with ENOENT if there is none. */
 	openId(id: number): Promise<F>;
+	/**
+	 * Whether this thread can read exports in place (ShmFile.inPlace,
+	 * readSync(), views()): inline, and in worker mode once the worker
+	 * shared the kernel's memory (an SMP kernel with the shared transport).
+	 */
+	readonly inPlace: boolean;
 	readonly stats: ShmStats;
+}
+
+/** Synchronous access to the kernel's memory from this thread: ShmDevice inline, ShmInPlace in worker mode. */
+export interface ShmLocal {
+	/** Whether export `id` can be read in place now. */
+	ready(id: number): boolean;
+	read(id: number, offset: number, length: number, out?: Uint8Array): Uint8Array;
+	write(id: number, offset: number, data: Uint8Array): void;
+	views(id: number, offset: number, length: number): Uint8Array[];
 }
 
 /** How a ShmClient runs calls: on ShmDevice (inline) or across to the worker. */
 export interface ShmBackend {
 	run(call: ShmCall): Promise<ShmCallResult>;
-	/** Inline only. */
-	views?: (id: number, offset: number, length: number) => Uint8Array[];
+	/** In-place access where there is some (read at call time: in worker mode it comes after the start). */
+	readonly local?: ShmLocal;
 }
 
-class Handle implements InlineShmFile {
+class Handle implements ShmFile {
 	readonly id: number;
 	readonly name: string | undefined;
 	readonly origin: "host" | "guest";
@@ -568,13 +847,52 @@ class Handle implements InlineShmFile {
 	async read(offset = 0, length?: number): Promise<Uint8Array> {
 		this.#live("read");
 		const n = length ?? Math.max(0, this.info.size - offset);
+		const local = this.#client.backend.local;
+		if (local?.ready(this.id)) {
+			try {
+				const data = local.read(this.id, offset, n);
+				this.#client.count(true, data.length, true);
+				return data;
+			} catch (e) {
+				if ((e as ShmError).code !== "EAGAIN") throw e;
+			}
+		}
 		const data = await this.#client.backend.run({ op: "read", id: this.id, offset, length: n }) as Uint8Array;
 		this.#client.count(true, data.length);
 		return data;
 	}
 
+	get inPlace(): boolean {
+		return !this.done && !!this.#client.backend.local?.ready(this.id);
+	}
+
+	#local(what: string): ShmLocal {
+		this.#live(what);
+		const local = this.#client.backend.local;
+		if (!local) throw new ShmError("EOPNOTSUPP", `${what}: this thread cannot see the kernel's memory (worker mode without a shared memory: use read())`);
+		return local;
+	}
+
+	readSync(offset = 0, length?: number, out?: Uint8Array): Uint8Array {
+		const local = this.#local("readSync");
+		const n = length ?? Math.max(0, this.info.size - offset);
+		const data = local.read(this.id, offset, n, out);
+		this.#client.count(true, n, true);
+		return data;
+	}
+
 	async write(offset: number, data: Uint8Array): Promise<void> {
 		this.#live("write");
+		const local = this.#client.backend.local;
+		if (local?.ready(this.id)) {
+			try {
+				local.write(this.id, offset, data);
+				this.#client.count(false, data.length);
+				return;
+			} catch (e) {
+				if ((e as ShmError).code !== "EAGAIN") throw e;
+			}
+		}
 		await this.#client.backend.run({ op: "write", id: this.id, offset, data });
 		this.#client.count(false, data.length);
 	}
@@ -606,10 +924,7 @@ class Handle implements InlineShmFile {
 	}
 
 	views(offset = 0, length?: number): Uint8Array[] {
-		this.#live("views");
-		const v = this.#client.backend.views;
-		if (!v) throw new ShmError("EOPNOTSUPP", "views: zero-copy views exist only inline (the kernel's memory is in the worker)");
-		return v(this.id, offset, length ?? Math.max(0, this.info.size - offset));
+		return this.#local("views").views(this.id, offset, length ?? Math.max(0, this.info.size - offset));
 	}
 }
 
@@ -622,7 +937,7 @@ export class ShmClient<F extends ShmFile = ShmFile> implements Shm<F> {
 	readonly backend: ShmBackend;
 	#handles = new Map<number, Set<Handle>>();
 	#exited = false;
-	#stats: ShmStats = { open: 0, reads: 0, bytesRead: 0, writes: 0, bytesWritten: 0 };
+	#stats: ShmStats = { open: 0, reads: 0, bytesRead: 0, inPlaceReads: 0, writes: 0, bytesWritten: 0 };
 
 	constructor(backend: ShmBackend) {
 		this.backend = backend;
@@ -630,6 +945,10 @@ export class ShmClient<F extends ShmFile = ShmFile> implements Shm<F> {
 
 	get stats(): ShmStats {
 		return { ...this.#stats };
+	}
+
+	get inPlace(): boolean {
+		return !this.#exited && !!this.backend.local;
 	}
 
 	async open(name: string, opts: { timeout?: number } = {}): Promise<F> {
@@ -662,10 +981,11 @@ export class ShmClient<F extends ShmFile = ShmFile> implements Shm<F> {
 	}
 
 	/** @internal */
-	count(read: boolean, bytes: number): void {
+	count(read: boolean, bytes: number, inPlace = false): void {
 		if (read) {
 			this.#stats.reads++;
 			this.#stats.bytesRead += bytes;
+			if (inPlace) this.#stats.inPlaceReads++;
 		} else {
 			this.#stats.writes++;
 			this.#stats.bytesWritten += bytes;
@@ -690,10 +1010,15 @@ export class ShmClient<F extends ShmFile = ShmFile> implements Shm<F> {
 }
 
 /** The inline `vm.shm`: ShmClient straight on the kernel's ShmDevice. */
-export function inlineShm(dev: ShmDevice): ShmClient<InlineShmFile> {
-	const client = new ShmClient<InlineShmFile>({
+export function inlineShm(dev: ShmDevice): ShmClient {
+	const client = new ShmClient({
 		run: (call) => dev.run(call),
-		views: (id, offset, length) => dev.views(id, offset, length),
+		local: {
+			ready: (id) => dev.has(id),
+			read: (id, offset, length, out) => dev.read(id, offset, length, out),
+			write: (id, offset, data) => dev.write(id, offset, data),
+			views: (id, offset, length) => dev.views(id, offset, length),
+		},
 	});
 	dev.onAttach = (info) => client.update(info);
 	dev.onDetach = (id) => client.detached(id);

@@ -20,7 +20,8 @@
 // (frames queued at the sink) is answered from the owner's latest report.
 //
 // With the shared transport (spec.shared; worker-shared.ts) console and
-// evdev input and frame requests come through shared memory instead, read
+// evdev input, frame requests, shm reads and vsock packets for the guest
+// come through shared memory instead, read
 // in the kernel's clock import (SharedServer as Kernel.poller), and frames
 // go back through a shared triple buffer; "kick" messages wake an idle
 // kernel. The message handlers below stay, for the frames' fallback and for
@@ -35,6 +36,7 @@ import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundChunk, SoundSink } from "./sound.ts";
 import { sharedNow } from "./worker-devices.ts";
 import { SharedServer, applyEvdev } from "./worker-shared.ts";
+import { ShmShareServer, type ShmInfo } from "./shm.ts";
 import { VirglGpuBackend, type GpuInit, type GpuLink, type GpuReply, type GpuRequest } from "./gl-gpu.ts";
 import { SnapshotCommitError, awakeTimeout, receivedSnapshot, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
 import { type FromWorker, type ToWorker, type WorkerBootSpec, type WorkerExit, type WorkerPort } from "./worker-protocol.ts";
@@ -209,6 +211,8 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 	let displaySize: boolean | DisplaySize = false;
 	let sound: ReturnType<typeof soundSink> | undefined;
 	let shared: SharedServer | undefined;
+	/** kwshm reads in place on the owner's thread (a shared kernel memory with the shared transport). */
+	let shmShare: ShmShareServer | undefined;
 	const wants: Array<{ id: number; buf?: ArrayBuffer; now: boolean }> = [];
 	let spare: ArrayBuffer | undefined;
 	/** idles + yields and the display's attach count when the last frame was sent. */
@@ -318,12 +322,33 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 			return;
 		}
 		instance = vm;
+		const shmDev = vm.kernel.shm;
 		if (spec.shm) {
 			// The API (ShmClient) is the owner's; announcements go there (posted from inside the import).
-			vm.kernel.shm.onAttach = (info) => post({ t: "shm-attach", info });
-			vm.kernel.shm.onDetach = (id) => post({ t: "shm-detach", id });
+			shmDev.onAttach = (info) => post({ t: "shm-attach", info });
+			shmDev.onDetach = (id) => post({ t: "shm-detach", id });
+			// The owner can hold the kernel's memory itself: it then reads in place (shm.ts, at the top).
+			const mem = vm.kernel.memory.buffer;
+			if (shared && shmDev.enabled && typeof SharedArrayBuffer === "function" && mem instanceof SharedArrayBuffer) {
+				shmShare = new ShmShareServer(shmDev, (msg) => post({ t: "log", msg }));
+				post({ t: "shm-share", memory: mem, table: shmShare.table });
+			}
 		}
-		shared?.attach({ kernel: vm.kernel, write: (bytes) => vm.write(bytes), resize: (cols, rows) => vm.resize(cols, rows), evdev: vm.evdev });
+		shared?.attach({
+			kernel: vm.kernel, write: (bytes) => vm.write(bytes), resize: (cols, rows) => vm.resize(cols, rows), evdev: vm.evdev,
+			vsock: spec.vsock ? (pkt) => vm.kernel.vsock.deliver(pkt) : undefined,
+			shmRead: spec.shm ? (seq, id, offset, length) => {
+				// Inside the clock import (or a kick): a copy now, the bytes transferred.
+				let data: Uint8Array;
+				try {
+					data = shmDev.read(id, offset, length);
+				} catch (e) {
+					post({ t: "shm-read", seq, ok: false, code: (e as { code?: string })?.code ?? "EIO", message: (e as Error)?.message ?? String(e) });
+					return;
+				}
+				post({ t: "shm-read", seq, ok: true, data }, [data.buffer as ArrayBuffer]);
+			} : undefined,
+		});
 		const skippedAt = new Set(vm.skippedDisks.map((s) => s.index));
 		const built = vm.kernel.block.disks.slice(vm.distro ? 1 : 0); // the distro is not one of `disks`
 		byIndex = new Map(kinds.map((_, i) => i).filter((i) => !skippedAt.has(i)).map((i, n) => [i, built[n]!]));
@@ -514,8 +539,14 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				post({ t: "shm-result", rid, ok: false, code: "ENODEV", message: `${msg.call.op}: the kernel is not running` });
 				break;
 			}
+			// Reads the owner put in the ring before this message go first.
+			shared?.drainShm();
 			dev.run(msg.call).then(
-				(value) => post({ t: "shm-result", rid, ok: true, value }, value instanceof Uint8Array ? [value.buffer as ArrayBuffer] : undefined),
+				(value) => {
+					// An export's info: with its page runs when the owner reads in place.
+					const place = shmShare && value && typeof value === "object" && !(value instanceof Uint8Array) ? shmShare.place((value as ShmInfo).id) : undefined;
+					post({ t: "shm-result", rid, ok: true, value, ...(place && { place }) }, value instanceof Uint8Array ? [value.buffer as ArrayBuffer] : undefined);
+				},
 				(e: Error & { code?: string }) => post({ t: "shm-result", rid, ok: false, code: e?.code ?? "EIO", message: e?.message ?? String(e) }));
 			break;
 		}

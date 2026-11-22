@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // Worker mode's shared-memory transport (2026-11-14): console input, evdev
-// input and frames through SharedArrayBuffers instead of messages, where
+// input, frames, shm reads and vsock packets for the guest through
+// SharedArrayBuffers instead of messages, where
 // SharedArrayBuffer exists and can be posted (Node; browsers only when the
 // page is cross-origin isolated). The console size goes along with the
 // console input; everything else (sync, stop, disk operations, the display
@@ -40,6 +41,24 @@
 //               evdev calls as (op, a, b) Float64 triples (EVDEV_OP; moveTo
 //               takes fractions). Nothing is merged or reordered; what does
 //               not fit waits on the owner's side, in order, and is retried.
+//   SHM_HEAD/SHM_TAIL  a third such ring: ShmFile.read() calls as (seq, id,
+//               offset, length) Float64 quadruples, which the worker copies
+//               at once (ShmDevice.read) and answers with a "shm-read"
+//               message (bytes transferred), posted from inside the import:
+//               a read waits for the next clock read (or a kick), not for
+//               the kernel's yield. A full ring: the read goes as a message.
+//               Kept in order with the "shm" messages: the worker drains
+//               this ring before it runs one, and the owner sends reads as
+//               messages while one of its writes is on its way.
+//   VS_HEAD/VS_TAIL  a fourth one, of bytes: vsock packets for the guest
+//               (VsockHost's, header and payload) as records, a u32 length
+//               (little-endian) then the packet, which the worker queues in
+//               the VsockDevice at once (2026-11-22). As messages they waited
+//               for the kernel's yield, up to 20 ms while the guest is busy:
+//               a Wayland app's frame callback took 12 ms of a 75 ms frame on
+//               average (foot under `yes` output). A packet that does not fit
+//               waits on the owner's side with those after it (never a
+//               message: the order is the stream's), retried like the input.
 //
 // Frames (one SharedArrayBuffer per display size, made by the worker, sent
 // as "frame-buffer" before the "display" message of that mode): three slots
@@ -59,13 +78,19 @@ import { EVDEV_OP, type FromWorker, type ToWorker } from "./worker-protocol.ts";
 /** Which way the owner and the kernel talk: on one thread, or worker mode by messages or with shared memory. */
 export type KernelTransport = "inline" | "messages" | "shared";
 
-const BELL = 0, IDLE = 1, FRAME_WANT = 2, FRAME_NOW = 3, CON_HEAD = 4, CON_TAIL = 5, EV_HEAD = 6, EV_TAIL = 7, CON_SIZE = 8;
+const BELL = 0, IDLE = 1, FRAME_WANT = 2, FRAME_NOW = 3, CON_HEAD = 4, CON_TAIL = 5, EV_HEAD = 6, EV_TAIL = 7, CON_SIZE = 8, SHM_HEAD = 9, SHM_TAIL = 10, VS_HEAD = 11, VS_TAIL = 12;
 const CTL_BYTES = 64;
 /** Console ring, bytes (a power of two). */
 const CON_CAP = 1 << 16;
 /** Evdev ring, calls (a power of two); InputHost holds 4096 events. */
 const EV_CAP = 1 << 12;
-const CTL_SIZE = CTL_BYTES + CON_CAP + EV_CAP * 24;
+/** Shm read ring, reads (a power of two). */
+const SHM_CAP = 1 << 8;
+const SHM_AT = CTL_BYTES + CON_CAP + EV_CAP * 24;
+/** Vsock ring, bytes (a power of two; a packet is at most 64 KiB and 44 bytes, VsockHost.maxPayload). */
+const VS_CAP = 1 << 19;
+const VS_AT = SHM_AT + SHM_CAP * 32;
+const CTL_SIZE = VS_AT + VS_CAP;
 /** How soon the owner retries input that did not fit in a ring. */
 const RETRY_MS = 2;
 
@@ -103,9 +128,14 @@ export class SharedOwner {
 	#ctl: Int32Array;
 	#con: Uint8Array;
 	#ev: Float64Array;
+	#shm: Float64Array;
+	#vs: Uint8Array;
 	#post: (msg: ToWorker) => void;
+	#shmReads = new Map<number, { resolve: (data: Uint8Array) => void; reject: (e: Error) => void }>();
+	#shmSeq = 0;
 	#conPending: Uint8Array[] = [];
 	#evPending: number[] = [];
+	#vsPending: Uint8Array[] = [];
 	#retry: ReturnType<typeof setTimeout> | undefined;
 	#closed = false;
 	readonly frames = new SharedFrames();
@@ -114,7 +144,40 @@ export class SharedOwner {
 		this.#ctl = new Int32Array(buffer, 0, CTL_BYTES / 4);
 		this.#con = new Uint8Array(buffer, CTL_BYTES, CON_CAP);
 		this.#ev = new Float64Array(buffer, CTL_BYTES + CON_CAP, EV_CAP * 3);
+		this.#shm = new Float64Array(buffer, SHM_AT, SHM_CAP * 4);
+		this.#vs = new Uint8Array(buffer, VS_AT, VS_CAP);
 		this.#post = post;
+	}
+
+	/**
+	 * Copy bytes out of shm export `id` in the worker at the kernel's next
+	 * clock read; the "shm-read" answer goes to shmAnswer(). Null when the
+	 * ring is full or closed (send a message instead).
+	 */
+	shmRead(id: number, offset: number, length: number): Promise<Uint8Array> | null {
+		if (this.#closed) return null;
+		const c = this.#ctl;
+		const head = Atomics.load(c, SHM_HEAD);
+		if (((head - Atomics.load(c, SHM_TAIL)) | 0) >= SHM_CAP) return null;
+		const seq = this.#shmSeq = (this.#shmSeq % 0x7fffffff) + 1;
+		const at = (head & (SHM_CAP - 1)) * 4;
+		this.#shm[at] = seq;
+		this.#shm[at + 1] = id;
+		this.#shm[at + 2] = offset;
+		this.#shm[at + 3] = length;
+		Atomics.store(c, SHM_HEAD, (head + 1) | 0);
+		const p = new Promise<Uint8Array>((resolve, reject) => this.#shmReads.set(seq, { resolve, reject }));
+		this.#ring();
+		return p;
+	}
+
+	/** A "shm-read" message: the bytes, or the error. */
+	shmAnswer(seq: number, data: Uint8Array | null, error: Error | null): void {
+		const r = this.#shmReads.get(seq);
+		if (!r) return;
+		this.#shmReads.delete(seq);
+		if (data) r.resolve(data);
+		else r.reject(error ?? new Error("shm read failed"));
 	}
 
 	/** Console input, in order. */
@@ -128,6 +191,13 @@ export class SharedOwner {
 	evdev(op: number, a: number, b: number): void {
 		if (this.#closed) return;
 		this.#evPending.push(op, a, b);
+		this.#pump();
+	}
+
+	/** Vsock packets for the guest (VsockHost's), in order; they are copied, so the caller may reuse them. */
+	vsock(packets: Uint8Array[]): void {
+		if (this.#closed || !packets.length) return;
+		for (const p of packets) this.#vsPending.push(p);
 		this.#pump();
 	}
 
@@ -152,12 +222,15 @@ export class SharedOwner {
 		this.#ring();
 	}
 
-	/** The kernel exited: drop what waits. */
-	close(): void {
+	/** The kernel exited: drop what waits; shm reads on their way fail with `error()`. */
+	close(error?: () => Error): void {
 		this.#closed = true;
 		clearTimeout(this.#retry);
 		this.#conPending = [];
 		this.#evPending = [];
+		this.#vsPending = [];
+		for (const r of this.#shmReads.values()) r.reject(error?.() ?? new Error("the kernel exited"));
+		this.#shmReads.clear();
 	}
 
 	/** Move what waits into the rings, as far as it fits; retry the rest soon. */
@@ -204,8 +277,29 @@ export class SharedOwner {
 				wrote = true;
 			}
 		}
+		// Vsock packets: whole records only.
+		if (this.#vsPending.length) {
+			let head = Atomics.load(c, VS_HEAD);
+			let free = VS_CAP - ((head - Atomics.load(c, VS_TAIL)) | 0);
+			const q = this.#vsPending, ring = this.#vs;
+			let n = 0;
+			for (; n < q.length && 4 + q[n]!.length <= free; n++) {
+				const p = q[n]!, len = p.length;
+				for (let i = 0; i < 4; i++) ring[(head + i) & (VS_CAP - 1)] = (len >>> (i * 8)) & 255;
+				const at = (head + 4) & (VS_CAP - 1), first = Math.min(len, VS_CAP - at);
+				ring.set(p.subarray(0, first), at);
+				if (len > first) ring.set(p.subarray(first), 0);
+				head = (head + 4 + len) | 0;
+				free -= 4 + len;
+			}
+			if (n) {
+				q.splice(0, n);
+				Atomics.store(c, VS_HEAD, head);
+				wrote = true;
+			}
+		}
 		if (wrote) this.#ring();
-		if ((this.#conPending.length || this.#evPending.length) && this.#retry === undefined)
+		if ((this.#conPending.length || this.#evPending.length || this.#vsPending.length) && this.#retry === undefined)
 			this.#retry = setTimeout(() => {
 				this.#retry = undefined;
 				if (!this.#closed) this.#pump();
@@ -279,6 +373,10 @@ export interface SharedServerTarget {
 	resize(cols: number, rows: number): void;
 	/** The InputHost when the display is on. */
 	evdev: InputHost | undefined;
+	/** A shm read from the ring: copy and post the "shm-read" answer. */
+	shmRead?(seq: number, id: number, offset: number, length: number): void;
+	/** A vsock packet for the guest (VsockDevice.deliver); absent: the kernel has no vsock (packets are dropped). */
+	vsock?(pkt: Uint8Array): void;
 }
 
 /** Apply one evdev call (EVDEV_OP) to an InputHost; worker-serve.ts uses it for "evdev" messages too. */
@@ -304,6 +402,8 @@ export class SharedServer {
 	#ctl: Int32Array;
 	#con: Uint8Array;
 	#ev: Float64Array;
+	#shm: Float64Array;
+	#vs: Uint8Array;
 	#post: (msg: FromWorker, transfer?: ArrayBuffer[]) => void;
 	#log: (msg: string) => void;
 	#t: SharedServerTarget | null = null;
@@ -328,6 +428,8 @@ export class SharedServer {
 		this.#ctl = new Int32Array(buffer, 0, CTL_BYTES / 4);
 		this.#con = new Uint8Array(buffer, CTL_BYTES, CON_CAP);
 		this.#ev = new Float64Array(buffer, CTL_BYTES + CON_CAP, EV_CAP * 3);
+		this.#shm = new Float64Array(buffer, SHM_AT, SHM_CAP * 4);
+		this.#vs = new Uint8Array(buffer, VS_AT, VS_CAP);
 		this.#post = post;
 		this.#log = log;
 	}
@@ -415,7 +517,43 @@ export class SharedServer {
 			}
 			Atomics.store(c, EV_TAIL, et);
 		}
+		this.drainShm();
+		// Vsock packets.
+		const vh = Atomics.load(c, VS_HEAD);
+		let vt = Atomics.load(c, VS_TAIL);
+		if (vh !== vt) {
+			const ring = this.#vs;
+			while (vt !== vh) {
+				let len = 0;
+				for (let i = 0; i < 4; i++) len |= ring[(vt + i) & (VS_CAP - 1)]! << (i * 8);
+				const at = (vt + 4) & (VS_CAP - 1), first = Math.min(len, VS_CAP - at);
+				const pkt = new Uint8Array(len);
+				pkt.set(ring.subarray(at, at + first));
+				if (len > first) pkt.set(ring.subarray(0, len - first), first);
+				vt = (vt + 4 + len) | 0;
+				t.vsock?.(pkt);
+			}
+			Atomics.store(c, VS_TAIL, vt);
+		}
 		this.#serveFrames(t.kernel, running);
+	}
+
+	/** Serve the shm reads in the ring (also before a "shm" message runs, to keep the owner's order). */
+	drainShm(): void {
+		const t = this.#t;
+		if (!t) return;
+		const c = this.#ctl;
+		const head = Atomics.load(c, SHM_HEAD);
+		let tail = Atomics.load(c, SHM_TAIL);
+		for (; tail !== head; tail = (tail + 1) | 0) {
+			const at = (tail & (SHM_CAP - 1)) * 4;
+			const s = this.#shm;
+			const seq = s[at]!, id = s[at + 1]!, offset = s[at + 2]!, length = s[at + 3]!;
+			// Taken before the answer goes out, so that the owner may reuse the entry.
+			Atomics.store(c, SHM_TAIL, (tail + 1) | 0);
+			if (t.shmRead) t.shmRead(seq, id, offset, length);
+			else this.#post({ t: "shm-read", seq, ok: false, code: "ENODEV", message: "read: the kernel has no kwshm" });
+		}
 	}
 
 	#serveFrames(k: Kernel, running: boolean): void {

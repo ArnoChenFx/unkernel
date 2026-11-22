@@ -14,7 +14,7 @@ import type { JitStats, KwemuStats } from "./jit.ts";
 import type { ProfileOptions, ProfileReport, SamplerHandle, SamplerInit } from "./profile.ts";
 import type { SoundHost, SoundOption, SoundState, SoundStats } from "./sound.ts";
 import { VsockHost, type Vsock, type VsockStats } from "./vsock.ts";
-import { inlineShm, type InlineShmFile, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
+import { inlineShm, type Shm, type ShmClient, type ShmStats } from "./shm.ts";
 import type { GpuBackend, VirtioGpuStats } from "./virtio-gpu.ts";
 import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess, type TtySessionSnapshot } from "./tty.ts";
 import { fetchOver } from "./http.ts";
@@ -494,7 +494,10 @@ export interface KernelHandle {
 	/**
 	 * With the shm option: guest shmem files read and written in place
 	 * (open(), create(), openId(); ShmFile.read()/write()). In worker mode the
-	 * copies run in the worker, where the kernel's memory is.
+	 * copies run in the worker, where the kernel's memory is, except where
+	 * that memory is shared with this thread (an SMP kernel with the shared
+	 * transport): then, as inline, readSync() and views() work here
+	 * (Shm.inPlace).
 	 */
 	readonly shm: Shm | undefined;
 	/**
@@ -531,7 +534,7 @@ export class KernelInstance implements KernelHandle {
 	#input: WritableStream<Uint8Array | string> | undefined;
 	#compileMs: number;
 	#vsock: VsockHost | undefined;
-	#shm: ShmClient<InlineShmFile> | undefined;
+	#shm: ShmClient | undefined;
 	#mounts = new MountTable(undefined, () => {});
 	#commands = new CommandTable(undefined, () => {});
 	#gl: GlHost | undefined;
@@ -676,10 +679,10 @@ export class KernelInstance implements KernelHandle {
 	/**
 	 * With the shm option: open guest shmem files by name or by a guest
 	 * export's id and read and write their pages in place (shm.ts). Handles
-	 * have views() too: zero-copy views of the kernel's memory, valid until
-	 * the kernel runs again.
+	 * read in place here (readSync(), views(): zero-copy views of the
+	 * kernel's memory, valid until the kernel runs again).
 	 */
-	get shm(): ShmClient<InlineShmFile> | undefined {
+	get shm(): ShmClient | undefined {
 		return this.#shm;
 	}
 

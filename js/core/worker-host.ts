@@ -7,8 +7,9 @@
 // side is worker-devices.ts). Disks and the network cross as specs
 // (devices.ts) and are built in the worker. The kernel's memory is not shared;
 // everything is copied or transferred, except that where SharedArrayBuffer can
-// be posted (Node; cross-origin isolated pages) console and evdev input and
-// frames use the shared transport (worker-shared.ts) unless `shared: false`.
+// be posted (Node; cross-origin isolated pages) console and evdev input,
+// frames, shm reads and vsock packets for the guest use the shared transport
+// (worker-shared.ts) unless `shared: false`.
 // The platform starts the worker (Platform.spawnWorker: node/worker.ts,
 // web/worker.ts).
 
@@ -18,7 +19,7 @@ import type { DisplayFrame, DisplayMode, DisplayOption, DisplaySize } from "./di
 import type { Evdev, InputState } from "./input.ts";
 import type { SoundOption, SoundState } from "./sound.ts";
 import { VsockHost, type VsockStats } from "./vsock.ts";
-import { ShmClient, ShmError, type ShmCallResult } from "./shm.ts";
+import { ShmClient, ShmError, ShmInPlace, type ShmCall, type ShmCallResult, type ShmLocal } from "./shm.ts";
 import { attachOn, connectOn, execOn, spawnOn, ttySessions, type AttachOptions, type ConnectOptions, type ExecOptions, type ExecResult, type GuestSocket, type PipeOptions, type Pty, type PtyOptions, type Subprocess, type TtySessionSnapshot } from "./tty.ts";
 import { fetchOver } from "./http.ts";
 import { CommandTable, type HostCommand, type parseCommands } from "./commands.ts";
@@ -214,6 +215,12 @@ export class WorkerKernel implements KernelHandle {
 	/** profile() calls waiting for "profile-result", by id; the last report, from "exit". */
 	#profiles = new Map<number, (r: ProfileReport | undefined) => void>();
 	#nextProfile = 1;
+	/** shm writes on their way: reads go as messages meanwhile, behind them. */
+	#shmWrites = 0;
+	/** The kernel's memory, when the worker shared it ("shm-share"): reads in place. */
+	#shmInPlace: ShmInPlace | undefined;
+	/** It as the ShmClient's local backend. */
+	#shmLocal: ShmLocal | undefined;
 	#profile: ProfileReport | undefined;
 	/**
 	 * Snapshots asked of the worker, by id. With a commit: the snapshot the
@@ -254,11 +261,15 @@ export class WorkerKernel implements KernelHandle {
 			if (typeof sound === "object") this.#sound = new SoundBridge(sound, post, opts.log);
 		}
 		if (opts.vsock) {
-			// Packets for the guest, one message per burst (transferred).
+			// Packets for the guest, per burst: through the shared transport's
+			// ring (read at the kernel's next clock read), else one message
+			// (transferred), which the worker takes at the kernel's next yield.
 			const flush = () => {
 				const packets = this.#vsockOut;
 				this.#vsockOut = [];
-				if (packets.length) post({ t: "vsock", packets }, packets.map((p) => p.buffer as ArrayBuffer));
+				if (!packets.length) return;
+				if (this.#shared) this.#shared.vsock(packets);
+				else post({ t: "vsock", packets }, packets.map((p) => p.buffer as ArrayBuffer));
 			};
 			this.#vsock = new VsockHost({
 				send: (pkt) => {
@@ -277,18 +288,35 @@ export class WorkerKernel implements KernelHandle {
 				(e: unknown) => post({ t: "gpu-init", error: (e as Error)?.message ?? String(e) }));
 		}
 		if (opts.shm) {
-			// Each call is a round trip: the worker runs it on its ShmDevice (where the kernel's
-			// memory is) when the kernel next suspends, and a read's bytes come back transferred.
+			// Reads in place where the worker shared the kernel's memory ("shm-share"); other
+			// reads through the shared transport's ring (served at the kernel's next clock read);
+			// everything else, and every call without the shared transport, is a round trip the
+			// worker runs on its ShmDevice when the kernel next suspends (bytes transferred back).
+			const message = (call: ShmCall) => new Promise<ShmCallResult>((resolve, reject) => {
+				if (this.#result) {
+					reject(new ShmError("ECONNABORTED", `${call.op}: the kernel exited`));
+					return;
+				}
+				const rid = this.#nextShm++;
+				this.#shmCalls.set(rid, { resolve, reject });
+				post({ t: "shm", rid, call });
+			});
+			const inPlace = () => this.#shmLocal;
 			this.#shm = new ShmClient({
-				run: (call) => new Promise<ShmCallResult>((resolve, reject) => {
-					if (this.#result) {
-						reject(new ShmError("ECONNABORTED", `${call.op}: the kernel exited`));
-						return;
+				run: (call) => {
+					if (call.op === "read" && !this.#shmWrites && !this.#result) {
+						const ring = this.#shared?.shmRead(call.id, call.offset, call.length);
+						if (ring) return ring;
 					}
-					const rid = this.#nextShm++;
-					this.#shmCalls.set(rid, { resolve, reject });
-					post({ t: "shm", rid, call });
-				}),
+					if (call.op !== "write") return message(call);
+					this.#shmWrites++;
+					const done = message(call);
+					void done.then(() => this.#shmWrites--, () => this.#shmWrites--);
+					return done;
+				},
+				get local(): ShmLocal | undefined {
+					return inPlace();
+				},
 			});
 		}
 		this.exited = new Promise((r) => (this.#resolveExit = r));
@@ -412,14 +440,31 @@ export class WorkerKernel implements KernelHandle {
 			if (m.ok) c.resolve(m.value);
 			else c.reject(new ShmError(m.code, m.message));
 			break;
+			if (m.ok && m.place) this.#shmInPlace?.set((m.value as { id: number }).id, m.place);
 		}
 		case "shm-attach":
 			this.#shm?.update(m.info);
+			break;
+		case "shm-read":
+			this.#shared?.shmAnswer(m.seq, m.ok ? m.data : null, m.ok ? null : new ShmError(m.code, m.message));
+			break;
+		case "shm-share":
+			if (this.#shm && !this.#result) {
+				const ip = this.#shmInPlace = new ShmInPlace(m.memory, m.table);
+				// While a write goes as a message (no current place here) nothing is read in place, so reads stay behind it.
+				this.#shmLocal = {
+					ready: (id) => !this.#shmWrites && ip.ready(id),
+					read: (id, offset, length, out) => ip.read(id, offset, length, out),
+					write: (id, offset, data) => ip.write(id, offset, data),
+					views: (id, offset, length) => ip.views(id, offset, length),
+				};
+			}
 			break;
 		case "shm-detach":
 			this.#shm?.detached(m.id);
 			break;
 		case "snapshot-held":
+			this.#shmInPlace?.drop(m.id);
 			this.#commitHeld(m.id, this.#withTtys(m.snapshot));
 			break;
 		case "snapshot-result": {
@@ -480,7 +525,9 @@ export class WorkerKernel implements KernelHandle {
 		clearTimeout(this.#stopTimer);
 		this.#evdev?.close();
 		this.#frames?.close();
-		this.#shared?.close();
+		this.#shared?.close(() => new ShmError("ECONNABORTED", "read: the kernel exited"));
+		this.#shmInPlace?.close();
+		this.#shmLocal = undefined;
 		this.#gl?.shutdown();
 		this.#commands.shutdown();
 		this.#mounts.shutdown();
@@ -536,10 +583,11 @@ export class WorkerKernel implements KernelHandle {
 	}
 
 	/**
-	 * How console and evdev input and frames reach the worker: "shared"
-	 * (SharedArrayBuffers, read by the worker while the kernel runs, within
-	 * about a millisecond) or "messages" (handled when the kernel yields, up
-	 * to 20 ms while the guest is busy). Everything else is messages either way.
+	 * How console and evdev input, frames, shm reads and vsock packets for
+	 * the guest reach the worker: "shared" (SharedArrayBuffers, read by the
+	 * worker while the kernel runs, within about a millisecond) or "messages"
+	 * (handled when the kernel yields, up to 20 ms while the guest is busy).
+	 * Everything else is messages either way.
 	 */
 	get transport(): KernelTransport {
 		return this.#shared ? "shared" : "messages";
@@ -627,9 +675,12 @@ export class WorkerKernel implements KernelHandle {
 
 	/**
 	 * With the vsock option: listen() and connect() as inline (VsockHost).
-	 * The protocol runs on this thread; the packets cross to the worker as
-	 * messages, which it takes while the kernel is suspended (up to 20 ms
-	 * while the guest is busy, with either transport).
+	 * The protocol runs on this thread; the packets for the guest cross to
+	 * the worker through the shared transport's ring (taken at the kernel's
+	 * next clock read, about a millisecond) or, without it, as messages,
+	 * which it takes while the kernel is suspended (up to 20 ms while the
+	 * guest is busy); the guest's come back as messages, posted at the
+	 * kernel's next task switch or yield.
 	 */
 	get vsock(): VsockHost | undefined {
 		return this.#vsock;
@@ -722,8 +773,12 @@ export class WorkerKernel implements KernelHandle {
 	/**
 	 * With the shm option: open(), create() and openId() as inline. Each call
 	 * is a round trip to the worker, which runs it when the kernel next
-	 * suspends (up to 20 ms while the guest is busy); read() copies there and
-	 * transfers the bytes. No views(): the kernel's memory is the worker's.
+	 * suspends (up to 20 ms while the guest is busy), except reads: in place
+	 * on this thread where the worker shared the kernel's memory (an SMP
+	 * kernel with the shared transport: inPlace, readSync() and views() as
+	 * inline), else with the shared transport at the kernel's next clock read
+	 * (worker-shared.ts), else as a round trip; the worker copies and
+	 * transfers the bytes.
 	 */
 	get shm(): ShmClient | undefined {
 		return this.#shm;

@@ -52,8 +52,8 @@ export type { GlOption, GlOptions, GlRendererStatus, GlStats, VirglTotals } from
 export { Deframer, MUX, StreamHost, frame } from "./gl-stream.ts";
 export type { StreamHostStats, VtestRenderer } from "./gl-stream.ts";
 export type { CommandErrorCode, CommandsOption, HostCommand, HostCommandContext, HostCommandResult } from "./commands.ts";
-export { SHM_PAGE_SIZE, ShmClient, ShmDevice, ShmError, inlineShm } from "./shm.ts";
-export type { InlineShmFile, Shm, ShmBackend, ShmCall, ShmCallResult, ShmCloseReason, ShmDeviceOptions, ShmDeviceStats, ShmFile, ShmInfo, ShmStats } from "./shm.ts";
+export { SHM_PAGE_SIZE, ShmClient, ShmDevice, ShmError, ShmInPlace, ShmShareServer, inlineShm } from "./shm.ts";
+export type { InlineShmFile, Shm, ShmBackend, ShmCall, ShmCallResult, ShmCloseReason, ShmDeviceOptions, ShmDeviceStats, ShmFile, ShmInfo, ShmLocal, ShmPlace, ShmStats } from "./shm.ts";
 export { WorkerKernel } from "./worker-host.ts";
 export type { WorkerKernelOptions } from "./worker-host.ts";
 export { sharedMemoryAvailable } from "./worker-shared.ts";

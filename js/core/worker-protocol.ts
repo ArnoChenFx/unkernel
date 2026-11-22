@@ -15,7 +15,7 @@ import type { DiskSpec, DiskState, NetSpec, SkippedDisk } from "./devices.ts";
 import type { DistroInfo } from "./distro.ts";
 import type { DisplayMode, DisplaySize } from "./display.ts";
 import type { SoundEvent, SoundFormat, SoundState } from "./sound.ts";
-import type { ShmCall, ShmCallResult, ShmInfo } from "./shm.ts";
+import type { ShmCall, ShmCallResult, ShmInfo, ShmPlace } from "./shm.ts";
 import type { GpuInit, GpuReply, GpuRequest } from "./gl-gpu.ts";
 import type { ExitKind } from "./kernel.ts";
 import type { BootProgress, InstanceStats } from "./instance.ts";
@@ -141,7 +141,7 @@ export type ToWorker =
 	| { t: "sound-queued"; seq: number; frames: number; at: number }
 	/** Shared transport: the owner wrote into the control block while the kernel waited idle. */
 	| { t: "kick" }
-	/** vsock packets for the guest (header and payload each; transferred), in order. */
+	/** vsock packets for the guest (header and payload each; transferred), in order; the shared transport puts them in its ring instead (worker-shared.ts). */
 	| { t: "vsock"; packets: Uint8Array[] }
 	/** A kwshm call (shm.ts) for the worker's ShmDevice; answered by "shm-result" with the same rid. */
 	| { t: "shm"; rid: number; call: ShmCall }
@@ -210,8 +210,21 @@ export type FromWorker =
 	| { t: "gpu-reset" }
 	/** The kernel's kwvsock started (VsockDevice onInit). */
 	| { t: "vsock-ready"; guestCid: number; rxMax: number }
-	/** The answer to "shm": the result (read's bytes transferred), or the ShmError's code and message. */
-	| { t: "shm-result"; rid: number; ok: true; value: ShmCallResult } | { t: "shm-result"; rid: number; ok: false; code: string; message: string }
+	/**
+	 * The answer to "shm": the result (read's bytes transferred), or the
+	 * ShmError's code and message. After "shm-share", an info result also
+	 * carries the export's page runs for the owner (`place`; absent when no
+	 * slot was free).
+	 */
+	| { t: "shm-result"; rid: number; ok: true; value: ShmCallResult; place?: ShmPlace } | { t: "shm-result"; rid: number; ok: false; code: string; message: string }
+	/** Shared transport: the answer to a read from the control block's shm ring (worker-shared.ts), bytes transferred. */
+	| { t: "shm-read"; seq: number; ok: true; data: Uint8Array } | { t: "shm-read"; seq: number; ok: false; code: string; message: string }
+	/**
+	 * Shared transport with a shared kernel memory (an SMP kernel), before
+	 * "started": that memory and ShmShareServer's slot table, for reads in
+	 * place on the owner's thread (shm.ts, ShmInPlace).
+	 */
+	| { t: "shm-share"; memory: SharedArrayBuffer; table: SharedArrayBuffer }
 	/** kwshm announced an export's page list (new, or refreshed). */
 	| { t: "shm-attach"; info: ShmInfo }
 	/** kwshm withdrew an export. */

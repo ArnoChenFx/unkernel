@@ -661,8 +661,8 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   kind.
   Page flips are paced by virtio-gpu's emulated vblank (60 Hz).
 - **Display size**: the connector's preferred (and only) mode is the
-  display option's size (the page: its stage), from the device's EDID.
-  `vm.updateDisplaySize()` (the page calls it 300 ms after the stage last
+  display option's size (the page: its Display window's box), from the device's EDID.
+  `vm.updateDisplaySize()` (the page calls it 300 ms after that box last
   changed) gives a running guest a hotplug with the new mode
   (kernel/devices.md, js.md); the display and the page's canvas follow
   the mode a client sets, never the size asked. Who switches: KMS
@@ -670,8 +670,8 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   kmscube and glmark2-es2-drm at their next start; X only by `xrandr`
   (a plain `xrandr` probes, then `xrandr --output Virtual-1 --auto`; a
   bare `--auto` turned the output off, 2026-11-22), since its modesetting
-  driver hears hotplugs from udev, which the guest has not: the xglamor
-  demo runs a follower (perl on netlink, then those two). No fbdev
+  driver hears hotplugs from udev, which the guest has not: the X + glamor
+  app (`apps/xkms.ts`) runs a follower (perl on netlink, then those two). No fbdev
   emulation on DRM (DRM_FBDEV_EMULATION is off); kwfb takes a new size at
   its next first open.
 - **dmabuf**: PRIME export and import between openers of the device is the
@@ -1018,7 +1018,7 @@ kept contexts and two renewals against fake renderers.
 
 ## The page
 
-Guest GL (Options: Guest GL; on by default on Debian where the display
+Guest GL (Settings > Display and sound; on by default on Debian where the display
 is, `?gl=0` off; web.md, Guest GL) boots with `gl: true` and `gpu: true`,
 where the page's build has the renderer and the page's thread has WebGL2;
 otherwise the option is disabled with the reason. `?gpu=0` (this load
@@ -1035,7 +1035,7 @@ render node, so plain `eglinfo` or `glmark2-es2` uses virgl: through
 `/dev/dri` with the device, through the vtest link without (with the
 device, `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1 cmd` takes the
 vtest link for one program). KMS clients (kmscube, glmark2-es2-drm) show
-on the page's display (Display.tsx, `vm.gl.gpu.drawFrame()`). The Environment tab's Guest GL row says
+on the page's display (Display.tsx, `vm.gl.gpu.drawFrame()`). The Guest GL row in System > Environment says
 "on, not loaded yet" until the guest's first GL use, then names the
 WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
 is a warning and a toast) and how long the load took and `vm.gl.stats` with the per-readback
@@ -1074,7 +1074,7 @@ fbdev driver on kwfb, `sudo Xorg :0`, then `DISPLAY=:0 glmark2-es2`) and
 its frame rate (kwfb is read about 50 times a second, at most about 1M
 pixels); the device on several CPUs; packages
 kept across reloads on the data disk. By hand on GPUs (2026-11-22): the
-launcher's kmscube, glmark2 and X + glamor demos (web.md, Launcher) work
+launcher's kmscube, glmark2 and X + glamor apps (web.md, Launcher) work
 in Chrome, Safari and Firefox.
 
 ## Testing

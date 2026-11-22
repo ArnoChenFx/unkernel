@@ -1,0 +1,40 @@
+From 1901746a4ef076bd35f6806d56aadcf387e9a788 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Mon, 16 Nov 2026 13:12:25 +0000
+Subject: [PATCH] wasm: optional atomics and shared-memory builds (KW_ATOMICS,
+ KW_SHARED_MEMORY)
+
+---
+ arch/wasm/Makefile | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/arch/wasm/Makefile b/arch/wasm/Makefile
+index 4492361d97d..34e941e06b6 100644
+--- a/arch/wasm/Makefile
++++ b/arch/wasm/Makefile
+@@ -10,6 +10,22 @@ KCFLAGS += -march=wasm64
+ KAFLAGS += -march=wasm64
+ KBUILD_LDFLAGS += -mwasm64
+ 
++# Experimental (SMP groundwork; the kernel stays UP): KW_ATOMICS=1 builds
++# with the wasm atomics feature, so the __atomic_* builtins behind
++# atomic.h, cmpxchg.h and barrier.h become real atomic instructions.
++# KW_SHARED_MEMORY=1 (implies KW_ATOMICS=1) also links vmlinux against a
++# shared imported memory: every data segment becomes passive and
++# __wasm_init_memory (the start function) initialises them once. kwemu
++# (KWEMU=) must be built with atomics too (zig build -Dkwemu-atomics=true).
++ifeq ($(KW_SHARED_MEMORY),1)
++KW_ATOMICS := 1
++LDFLAGS_vmlinux += --shared-memory
++endif
++ifeq ($(KW_ATOMICS),1)
++KCFLAGS += -matomics -mbulk-memory
++KAFLAGS += -matomics -mbulk-memory
++endif
++
+ core-y += arch/wasm/kernel/
+ core-y += arch/wasm/mm/
+ libs-y += arch/wasm/lib/
+-- 
+2.56.0
+

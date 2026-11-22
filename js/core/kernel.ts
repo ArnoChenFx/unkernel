@@ -65,6 +65,8 @@ const IRQ_SHM = 7;
 const IRQ_SNAPSHOT = 8;
 /** kwvirtio: used buffers or a config change (virtio.ts). */
 const IRQ_VIRTIO = 10;
+/** With IRQ_SNAPSHOT: sync and drop the file caches before that snapshot (SnapshotOptions.dropCaches). */
+const IRQ_DROP_CACHES = 11;
 const EBUSY = 16;
 const ENOSYS = 38;
 
@@ -821,7 +823,7 @@ export class Kernel {
 	 * waits on for the caller's decision); a failed commit lets it go on
 	 * (SnapshotCommitError).
 	 */
-	snapshot({ stop = false, commit, commitTimeoutMs = SNAPSHOT_COMMIT_TIMEOUT_MS, hold }: SnapshotOptions = {}): Promise<KernelSnapshot> {
+	snapshot({ stop = false, commit, commitTimeoutMs = SNAPSHOT_COMMIT_TIMEOUT_MS, hold, dropCaches = stop || !!commit }: SnapshotOptions = {}): Promise<KernelSnapshot> {
 		if (this.irqAddr === undefined || this.result) return Promise.reject(new Error("snapshot: the kernel is not running"));
 		if (this.snapshotWaiter || this.snapshotHeld) return Promise.reject(new Error("snapshot: one is in progress"));
 		if (commit !== undefined && typeof commit !== "function") return Promise.reject(new TypeError("snapshot: commit must be a function"));
@@ -841,7 +843,9 @@ export class Kernel {
 		const p = new Promise<KernelSnapshot>((resolve, reject) => (this.snapshotWaiter = {
 			resolve, reject, stop: stop || !!commit, commit, commitTimeoutMs: Math.max(0, Number(commitTimeoutMs) || 0), hold,
 		}));
-		this.raiseIrq(IRQ_SNAPSHOT);
+		// Both bits at once: the kernel takes them together (one it does not know is ignored).
+		this.setIrqBits(1 << IRQ_SNAPSHOT | (dropCaches ? 1 << IRQ_DROP_CACHES : 0));
+		this.wake();
 		return p;
 	}
 
@@ -853,7 +857,8 @@ export class Kernel {
 			throw new Error(`snapshot: saved by another kernel build ("${s.fingerprint}", this one is "${this.fingerprint}")`);
 		// Overwrites the data segments that instantiation applied; the
 		// kernel then enters at kw_resume, never at _start.
-		restoreSnapshotMemory(this.u8(), s.memory);
+		const end = this.exports._end;
+		restoreSnapshotMemory(this.u8(), s.memory, end instanceof WebAssembly.Global ? Number(end.value) : undefined);
 		// Requests raised before the snapshot are gone; a console of another
 		// size makes hvc_wasm read the new one.
 		const resized = !!this.consoleSize && this.consoleSize !== s.consoleSize;

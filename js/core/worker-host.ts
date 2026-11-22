@@ -35,7 +35,7 @@ import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput } from "./output.ts";
-import { SnapshotCommitError, receivedSnapshot, restoreSnapshotMemory, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { SnapshotCommitError, receivedSnapshot, restoreSnapshotMemory, sentSnapshot, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
 /** How long stop() waits for the worker to confirm (it first lets saves in flight commit, up to 10 s) before it ends the worker anyway. */
@@ -89,11 +89,11 @@ function toWorkerRestore(s: KernelSnapshot | undefined, transfer: boolean): [Ker
 	if (!s) return [undefined, []];
 	const m = s.memory;
 	const whole = m.buffer instanceof ArrayBuffer && m.byteOffset === 0 && m.byteLength === m.buffer.byteLength;
-	if (transfer && whole) return [{ ...s, memory: m }, [m.buffer as ArrayBuffer]];
+	if (transfer && whole) return [sentSnapshot(s), [m.buffer as ArrayBuffer]];
 	// A sparse copy: the snapshot's zero pages stay untouched in it.
 	const memory = new Uint8Array(m.byteLength);
-	restoreSnapshotMemory(memory, m);
-	return [{ ...s, memory }, [memory.buffer as ArrayBuffer]];
+	restoreSnapshotMemory(memory, m, 0);
+	return [sentSnapshot({ ...s, memory }), [memory.buffer as ArrayBuffer]];
 }
 
 function hasScheme(s: string): boolean {
@@ -827,7 +827,8 @@ export class WorkerKernel implements KernelHandle {
 		const id = this.#nextSync++;
 		return new Promise((resolve, reject) => {
 			this.#snapshots.set(id, { resolve, reject, commit, hold });
-			this.#endpoint.post(commit ? { t: "snapshot", id, commit: true, commitTimeoutMs: opts.commitTimeoutMs, ...(hold ? { hold: true } : {}) } : { t: "snapshot", id, stop: opts.stop });
+			const drop = opts.dropCaches === undefined ? {} : { dropCaches: opts.dropCaches };
+			this.#endpoint.post(commit ? { t: "snapshot", id, commit: true, commitTimeoutMs: opts.commitTimeoutMs, ...(hold ? { hold: true } : {}), ...drop } : { t: "snapshot", id, stop: opts.stop, ...drop });
 		});
 	}
 

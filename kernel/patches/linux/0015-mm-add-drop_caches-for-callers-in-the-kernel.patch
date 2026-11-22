@@ -1,0 +1,81 @@
+From 62e09ef2a71a77cd6d066111d3ea579d235f3827 Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Sun, 22 Nov 2026 10:04:18 +0000
+Subject: [PATCH] mm: add drop_caches() for callers in the kernel
+
+Writing to /proc/sys/vm/drop_caches is the only way to drop the clean page
+cache and the reclaimable slab objects. Move what the sysctl handler does
+into drop_caches(), so that kernel code can do the same: arch/wasm drops
+the caches before a snapshot of its memory that the host stores.
+---
+ fs/drop_caches.c   | 30 +++++++++++++++++++++---------
+ include/linux/mm.h |  5 +++++
+ 2 files changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+index 49f56a598ec..6624c49a012 100644
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -48,6 +48,26 @@ static void drop_pagecache_sb(struct super_block *sb, void *unused)
+ 	iput(toput_inode);
+ }
+ 
++/**
++ * drop_caches - drop clean page cache and reclaimable slab objects
++ * @what: 1 for the page cache, 2 for slab objects (dentries and inodes),
++ *        3 for both, as written to /proc/sys/vm/drop_caches
++ *
++ * Dirty pages and objects in use stay: sync first to drop more.
++ */
++void drop_caches(int what)
++{
++	if (what & 1) {
++		lru_add_drain_all();
++		iterate_supers(drop_pagecache_sb, NULL);
++		count_vm_event(DROP_PAGECACHE);
++	}
++	if (what & 2) {
++		drop_slab();
++		count_vm_event(DROP_SLAB);
++	}
++}
++
+ static int drop_caches_sysctl_handler(const struct ctl_table *table, int write,
+ 		void *buffer, size_t *length, loff_t *ppos)
+ {
+@@ -59,15 +79,7 @@ static int drop_caches_sysctl_handler(const struct ctl_table *table, int write,
+ 	if (write) {
+ 		static int stfu;
+ 
+-		if (sysctl_drop_caches & 1) {
+-			lru_add_drain_all();
+-			iterate_supers(drop_pagecache_sb, NULL);
+-			count_vm_event(DROP_PAGECACHE);
+-		}
+-		if (sysctl_drop_caches & 2) {
+-			drop_slab();
+-			count_vm_event(DROP_SLAB);
+-		}
++		drop_caches(sysctl_drop_caches);
+ 		if (!stfu) {
+ 			pr_info("%s (%d): drop_caches: %d\n",
+ 				current->comm, task_pid_nr(current),
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index dd09c438fa2..4fbbdee8eb0 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -5124,6 +5124,11 @@ static inline int in_gate_area(struct mm_struct *mm, unsigned long addr)
+ bool process_shares_mm(const struct task_struct *p, const struct mm_struct *mm);
+ 
+ void drop_slab(void);
++#ifdef CONFIG_SYSCTL
++void drop_caches(int what);
++#else
++static inline void drop_caches(int what) { }
++#endif
+ 
+ #ifndef CONFIG_MMU
+ #define randomize_va_space 0
+-- 
+2.56.0
+

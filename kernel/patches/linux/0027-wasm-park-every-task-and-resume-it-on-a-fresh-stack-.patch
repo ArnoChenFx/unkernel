@@ -1,0 +1,824 @@
+From 46621158b3f43239ae371e73e072bf64b338ede9 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 15 Nov 2026 13:43:35 +0000
+Subject: [PATCH] wasm: park every task and resume it on a fresh stack, and
+ snapshots
+
+A sleeping task's continuation lives on its Wasm stack, which the host
+engine keeps (JSPI) and nothing can save. Add parking: every task stops
+at a point where its whole state is in guest memory, and each resumes on
+a fresh stack. That is what a snapshot of the machine needs, and the
+resume path is exercised on every cycle, with no snapshot taken.
+
+kwparkd runs a cycle on request (a write to /proc/kwpark):
+
+ - User tasks get TIF_NOTIFY_SIGNAL, which ends interruptible sleeps; the
+   syscall restarts or, for the few that do not restart after a stop
+   either (epoll_wait, socket timeouts), returns -EINTR. The task parks at
+   the top of user_mode_loop(), after the exit work, in TASK_IDLE, so
+   signals do not wake it.
+ - Then kernel threads are woken if they sleep interruptibly or idle, and
+   park at their kw_park_point() (linux/kw_park.h).
+ - kwparkd parks last. The idle loop then sees kw_park_final and, with
+   interrupts off and nothing runnable, checks that every task is parked,
+   a zombie or not yet started: the consistent point. It marks every
+   parked task KW_PARK_RESUMING and TIF_NEVER_RUN and wakes it, so the
+   next switch starts it through ret_from_fork, which calls
+   kw_park_resume(): finish the switch as schedule() would (without
+   storing the child TID again), then fn(arg) for a kernel thread, or the
+   interrupt exit work and user_mode_loop() for a user task. The host
+   drops the old stack.
+
+A task that does not park within two seconds (stopped, traced, in a
+D-state sleep, a kernel thread without a park point) ends the cycle with
+-EBUSY, naming it, after resuming everything.
+
+Snapshots: the host raises WASM_IRQ_SNAPSHOT for a cycle and gets the new
+import wasm_snapshot_point() at its end; on success the call is made at
+the consistent point, and the host copies the memory during it. A
+restored snapshot enters at the new export kw_resume instead of _start,
+as the idle task on a fresh stack: __kw_resume() calls kw_host_reset() so
+that kwemu forgets the JIT slots of the old instance, and resumes kwparkd
+alone, which steps the realtime clock to the host's, reseeds the RNG with
+add_vmfork_randomness() and then resumes every other task.
+---
+ arch/wasm/Kconfig                 |   4 +
+ arch/wasm/include/asm/irq.h       |   2 +
+ arch/wasm/include/asm/park.h      |  32 ++
+ arch/wasm/include/asm/processor.h |   4 +
+ arch/wasm/include/asm/wasm.h      |  13 +
+ arch/wasm/kernel/Makefile         |   1 +
+ arch/wasm/kernel/entry.S          |  20 ++
+ arch/wasm/kernel/irq.c            |  12 +
+ arch/wasm/kernel/park.c           | 510 ++++++++++++++++++++++++++++++
+ arch/wasm/kernel/process.c        |  12 +-
+ arch/wasm/kernel/traps.c          |   8 +
+ 11 files changed, 617 insertions(+), 1 deletion(-)
+ create mode 100644 arch/wasm/include/asm/park.h
+ create mode 100644 arch/wasm/kernel/park.c
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index a84bec4a18a..1ed6743adce 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -46,6 +46,10 @@ config MMU
+ config SMP
+ 	bool
+ 
++# Parking every task on demand (arch/wasm/kernel/park.c, linux/kw_park.h).
++config KW_PARK
++	def_bool y
++
+ config 64BIT
+ 	def_bool y
+ 
+diff --git a/arch/wasm/include/asm/irq.h b/arch/wasm/include/asm/irq.h
+index 97330d57a21..8614e54fe17 100644
+--- a/arch/wasm/include/asm/irq.h
++++ b/arch/wasm/include/asm/irq.h
+@@ -13,7 +13,9 @@
+ #define WASM_IRQ_INPUT			5	/* host: kwinput events queued */
+ #define WASM_IRQ_VSOCK			6	/* host: kwvsock packets queued, or room again */
+ #define WASM_IRQ_SHM			7	/* host: kwshm requests queued */
++#define WASM_IRQ_SNAPSHOT		8	/* host: park every task, then wasm_snapshot_point() */
+ #define WASM_IRQ_VIRTIO			10	/* host: kwvirtio used buffers or a config change */
++#define WASM_IRQ_DROP_CACHES		11	/* host: with WASM_IRQ_SNAPSHOT, drop the caches first (park.c) */
+ 
+ #include <asm-generic/irq.h>
+ 
+diff --git a/arch/wasm/include/asm/park.h b/arch/wasm/include/asm/park.h
+new file mode 100644
+index 00000000000..2aa5ffd70d1
+--- /dev/null
++++ b/arch/wasm/include/asm/park.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _ASM_WASM_PARK_H
++#define _ASM_WASM_PARK_H
++
++#include <linux/compiler.h>
++#include <linux/linkage.h>
++
++/* thread_struct.park_state */
++#define KW_PARK_NONE		0
++#define KW_PARK_PARKED		1	/* asleep in kw_park_self(), stack not needed */
++#define KW_PARK_RESUMING	2	/* resumes in kw_park_resume() on a fresh stack */
++
++struct task_struct;
++
++/* Set while user tasks are asked to park at the top of user_mode_loop(). */
++extern int kw_park_users;
++/* Set once every task but the idle tasks is parked: arch_cpu_idle() finishes. */
++extern int kw_park_final;
++
++/* Request a park cycle (any context). */
++void kw_park_request(void);
++/* user_mode_loop(), interrupts disabled: park this user task. */
++void kw_park_user(void);
++/* __ret_from_fork() of a task whose park_state is KW_PARK_RESUMING. */
++void __noreturn kw_park_resume(struct task_struct *prev);
++/* arch_cpu_idle(), within irqentry_enter(), once kw_park_final is set. */
++void kw_park_idle(void);
++/* kw_resume (entry.S): a restored snapshot starts here. */
++asmlinkage void __noreturn __kw_resume(void);
++
++#endif /* _ASM_WASM_PARK_H */
+diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
+index 648e1c367b3..da9befa9706 100644
+--- a/arch/wasm/include/asm/processor.h
++++ b/arch/wasm/include/asm/processor.h
+@@ -30,6 +30,10 @@ struct pt_regs;
+ struct thread_struct {
+ 	int (*fn)(void *);	/* kernel thread entry (until first run) */
+ 	void *fn_arg;
++	/* Parking (kernel/park.c): how the task resumes on a fresh stack. */
++	int (*park_fn)(void *);	/* kernel thread: re-enters its loop */
++	void *park_arg;
++	int park_state;		/* KW_PARK_* (asm/park.h) */
+ };
+ 
+ #define INIT_THREAD { }
+diff --git a/arch/wasm/include/asm/wasm.h b/arch/wasm/include/asm/wasm.h
+index d78af949ec5..f317d3f6710 100644
+--- a/arch/wasm/include/asm/wasm.h
++++ b/arch/wasm/include/asm/wasm.h
+@@ -53,6 +53,19 @@ void __init wasm_load_initrd(void);
+ void wasm_dump_stacktrace(char *buffer, unsigned long max_size)
+ 	__unkernel_import(wasm_dump_stacktrace);
+ 
++/*
++ * A snapshot the host asked for (WASM_IRQ_SNAPSHOT) reached its end:
++ * result 0 means every task is parked and this is the consistent point
++ * (park.c), where the host copies the memory during the call; otherwise
++ * it is the error, with @blocker naming the task that did not park. At
++ * the consistent point, @free_map (or NULL) has a bit set for each free
++ * pfn below @free_bits, pages the host may leave out (they restore as
++ * zeros). The host returns 0 if it saved the snapshot, or a negative errno.
++ */
++int wasm_snapshot_point(int result, const char *blocker,
++			const unsigned long *free_map, unsigned long free_bits)
++	__unkernel_import(wasm_snapshot_point);
++
+ /*
+  * Console window size, rows << 16 | cols, or 0 if unknown. hvc_wasm reads it
+  * when the tty is opened and on each input poll; the host raises
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index c269b3e69de..9e24c876077 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -7,6 +7,7 @@ obj-y += entry.o
+ obj-y += head.o
+ obj-y += irq.o
+ obj-y += irqflags.o
++obj-y += park.o
+ obj-y += process.o
+ obj-y += ptrace.o
+ obj-y += random.o
+diff --git a/arch/wasm/kernel/entry.S b/arch/wasm/kernel/entry.S
+index 6d254367603..b1f3e265fcb 100644
+--- a/arch/wasm/kernel/entry.S
++++ b/arch/wasm/kernel/entry.S
+@@ -52,6 +52,26 @@ wasm_arch_switch:
+ 	local.get 5
+ 	end_function
+ 
++/*
++ * kw_resume(): entry point of a restored snapshot, called by the host on a
++ * fresh Wasm stack (JSPI "promising" export) instead of _start, after it
++ * copied the saved memory into the new instance's. Runs the idle task.
++ */
++.functype __kw_resume() -> ()
++.globl kw_resume
++kw_resume:
++	.functype kw_resume() -> ()
++
++	iLONG.const init_task
++	global.set current
++
++	iLONG.const init_stack+THREAD_STACK_START
++	global.set __stack_pointer
++
++	call __kw_resume
++	unreachable
++	end_function
++
+ /*
+  * ret_from_fork(prev, next): entry point of every new task, called by the
+  * host on a fresh Wasm stack (JSPI "promising" export). Never returns.
+diff --git a/arch/wasm/kernel/irq.c b/arch/wasm/kernel/irq.c
+index 5715be576e8..fa7551ee9e9 100644
+--- a/arch/wasm/kernel/irq.c
++++ b/arch/wasm/kernel/irq.c
+@@ -13,6 +13,7 @@
+ #include <linux/sched.h>
+ #include <asm/irq.h>
+ #include <asm/irq_regs.h>
++#include <asm/park.h>
+ #include <asm/time.h>
+ #include <asm/wasm.h>
+ 
+@@ -89,6 +90,17 @@ void arch_cpu_idle(void)
+ 	irqentry_state_t state;
+ 	long long timeout = wasm_timer_timeout();
+ 
++	/*
++	 * Every other task is parked (park.c). Nothing is runnable, and with
++	 * interrupts off nothing can become so: this is the consistent point.
++	 */
++	if (unlikely(READ_ONCE(kw_park_final))) {
++		state = irqentry_enter(&regs);
++		kw_park_idle();
++		irqentry_exit(&regs, state);
++		return;
++	}
++
+ 	if (!READ_ONCE(wasm_host_irqs) && timeout != 0)
+ 		wasm_idle(timeout);
+ 
+diff --git a/arch/wasm/kernel/park.c b/arch/wasm/kernel/park.c
+new file mode 100644
+index 00000000000..4478fdad969
+--- /dev/null
++++ b/arch/wasm/kernel/park.c
+@@ -0,0 +1,510 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Parking: bring every task to a point where all of its state is in guest
++ * memory, then resume each one on a fresh Wasm stack.
++ *
++ * A sleeping task's continuation normally lives on its Wasm stack, which the
++ * host engine keeps (JSPI) and nobody can save. A parked task's does not:
++ *
++ *  - A user task parks at the top of user_mode_loop(), after the exit work.
++ *    Its state is pt_regs (and the restart block, signal state and so on in
++ *    task_struct). To get it there, kwparkd sets TIF_NOTIFY_SIGNAL, which
++ *    ends interruptible sleeps like a signal does; the syscall then restarts
++ *    (-ERESTARTSYS and friends) or, for the few calls that do not restart
++ *    after a stop either (epoll_wait, sigtimedwait, socket timeouts),
++ *    returns -EINTR, as after SIGSTOP and SIGCONT.
++ *  - A kernel thread parks at a kw_park_point() in its main loop
++ *    (linux/kw_park.h), after kwparkd wakes it. It resumes in fn(arg).
++ *
++ * Phases: user tasks first, while kernel threads still run (a user task in
++ * a D-state wait for a journal commit or a writeback finishes it), then
++ * kernel threads, then kwparkd itself. The idle loop then sees kw_park_final
++ * and, with interrupts off, checks that every task is parked, a zombie or
++ * not yet started (TIF_NEVER_RUN). That is the consistent point; a
++ * snapshot would be taken there. It then marks every parked task
++ * KW_PARK_RESUMING and TIF_NEVER_RUN and wakes it, so the next switch to it
++ * starts a fresh stack (ret_from_fork, then kw_park_resume()), and the host
++ * drops the old one.
++ *
++ * A task that does not park within KW_PARK_TIMEOUT (stopped or traced, in a
++ * D-state sleep, a kernel thread without a park point, a FUSE request whose
++ * daemon is parked) ends the cycle: everything is resumed and the result is
++ * -EBUSY, naming the task.
++ *
++ * /proc/kwpark: write anything to request a cycle (asynchronous: the writer
++ * parks too); read for the counters and the last result.
++ *
++ * Snapshots: the host raises WASM_IRQ_SNAPSHOT for a cycle and gets
++ * wasm_snapshot_point() at its end; on success that call is made at the
++ * consistent point, and the host copies the memory during it. A restored
++ * snapshot enters at kw_resume (entry.S) instead of _start, on a fresh
++ * stack as the idle task: __kw_resume() tells kwemu that the host changed
++ * and resumes kwparkd alone, which steps the realtime clock, reseeds the
++ * RNG (two restores of one snapshot must not share its output) and then
++ * resumes everything else.
++ *
++ * Free pages: at the consistent point the kernel also hands the host a
++ * bitmap of the free pages (one bit per pfn), after draining this CPU's
++ * per-cpu lists into the buddy allocator, as hibernation does. The host
++ * leaves those pages out, and a restore brings them back as zeros. Nothing
++ * reads a free page's contents (no page poisoning; init_on_free expects
++ * zeros); the free lists are linked through struct page, which is saved.
++ * The bitmap is allocated on the first snapshot and kept.
++ *
++ * Caches: a snapshot the host asked for with WASM_IRQ_DROP_CACHES too (one
++ * it stores and stops the machine at) first writes back what is dirty
++ * (sync, before anything parks: a parked FUSE daemon would never answer)
++ * and, once the user tasks are parked and write nothing more, drops the
++ * clean page cache and the unused dentries and inodes, which are then free
++ * pages the host leaves out. A resumed machine reads them again.
++ *
++ * UP only for now. For SMP: kw_park_final must become a count of CPUs in
++ * the idle loop with interrupts off (the last one finishes); kw_unpark_all()
++ * must not mark a task whose old stack is still running on another CPU
++ * (wait_task_inactive()); and idle must re-enter RCU (it does, through
++ * irqentry_enter(), but TREE_RCU then matters). The free-page walk then
++ * needs every CPU's per-cpu lists drained (they are idle, so the last CPU
++ * can drain them all, or each drains its own before it counts itself).
++ */
++
++#include <linux/bitmap.h>
++#include <linux/cpu.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/interrupt.h>
++#include <linux/irq-entry-common.h>
++#include <linux/jiffies.h>
++#include <linux/mm.h>
++#include <linux/kthread.h>
++#include <linux/kw_park.h>
++#include <linux/memblock.h>
++#include <linux/mmzone.h>
++#include <linux/proc_fs.h>
++#include <linux/random.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/timekeeping.h>
++#include <linux/wait.h>
++#include <asm/entry.h>
++#include <asm/irq.h>
++#include <asm/kw_emu.h>
++#include <asm/park.h>
++#include <asm/wasi.h>
++#include <asm/wasm.h>
++
++#define KW_PARK_TIMEOUT	(2 * HZ)
++
++int kw_park_users;
++int kw_park_kthreads;
++EXPORT_SYMBOL_GPL(kw_park_kthreads);
++int kw_park_final;
++
++static struct task_struct *kw_parkd;
++static DECLARE_WAIT_QUEUE_HEAD(kw_park_wait);
++static unsigned int kw_park_req, kw_park_done, kw_park_cur;
++static int kw_park_result;
++static unsigned int kw_park_nr_users, kw_park_nr_kthreads;
++static u64 kw_park_t0, kw_park_us;
++static char kw_park_blocker[TASK_COMM_LEN + 16] = "-";
++/* The host asked for a snapshot (WASM_IRQ_SNAPSHOT); this cycle is one. */
++static int kw_park_snap_req, kw_park_snap;
++/* ... and for the caches to be dropped first (WASM_IRQ_DROP_CACHES). */
++static int kw_park_drop_req, kw_park_drop;
++/* The last cycle's sync and cache drop, which kw_park_us leaves out. */
++static u64 kw_park_drop_us;
++/* Resumed from a snapshot: kwparkd finishes the resume. */
++static int kw_park_restored;
++/* Free pages at the snapshot point, one bit per pfn (kw_park_mark_free). */
++static unsigned long *kw_park_free_map;
++static unsigned long kw_park_free_bits, kw_park_nr_free;
++/* In the kernel image: below 4 GiB, as WASI needs (asm/wasi.h). */
++static u8 kw_park_seed[32];
++
++extern struct kw_cpu *const wasm_kw_cpu;
++
++static int kw_parkd_fn(void *unused);
++
++static void kw_park_record(struct task_struct *t)
++{
++	snprintf(kw_park_blocker, sizeof(kw_park_blocker), "%s[%d]:%c",
++		 t->comm, task_pid_nr(t), task_state_to_char(t));
++}
++
++static void kw_park_finish(int result)
++{
++	if (kw_park_snap && result) {
++		kw_park_snap = 0;
++		wasm_snapshot_point(result, kw_park_blocker, NULL, 0);
++	}
++	kw_park_result = result;
++	kw_park_us = div_u64(ktime_get_ns() - kw_park_t0, NSEC_PER_USEC);
++	WRITE_ONCE(kw_park_done, kw_park_cur);
++}
++
++/*
++ * Sleep until resumed on a fresh stack. Wakeups only land back here
++ * (queue_work() kicking an idle worker, a commit timer, a spurious one);
++ * kw_unpark_all() is what ends the park.
++ */
++static void __noreturn kw_park_self(int (*fn)(void *), void *arg)
++{
++	struct thread_struct *th = &current->thread;
++
++	th->park_fn = fn;
++	th->park_arg = arg;
++	WRITE_ONCE(th->park_state, KW_PARK_PARKED);
++	if (current == kw_parkd)
++		WRITE_ONCE(kw_park_final, 1);
++	else
++		wake_up_process(kw_parkd);	/* recount */
++	for (;;) {
++		set_current_state(TASK_IDLE);
++		schedule();
++	}
++}
++
++void kw_park_user(void)
++{
++	local_irq_enable();
++	kw_park_self(NULL, NULL);
++}
++
++void kw_park_kthread(int (*fn)(void *), void *arg)
++{
++	if (WARN_ON_ONCE(!(current->flags & PF_KTHREAD) || !fn))
++		return;
++	kw_park_self(fn, arg);
++}
++EXPORT_SYMBOL_GPL(kw_park_kthread);
++
++void __noreturn kw_park_resume(struct task_struct *prev)
++{
++	struct thread_struct *th = &current->thread;
++	int (*fn)(void *) = th->park_fn;
++	void *arg = th->park_arg;
++	int __user *tid = current->set_child_tid;
++	struct pt_regs *regs = current_pt_regs();
++
++	th->park_fn = NULL;
++	th->park_arg = NULL;
++	WRITE_ONCE(th->park_state, KW_PARK_NONE);
++
++	/*
++	 * Finish the switch as the schedule() call that parked would have.
++	 * schedule_tail() also stores the child TID; that happened at the
++	 * first run and must not be redone.
++	 */
++	current->set_child_tid = NULL;
++	schedule_tail(prev);
++	current->set_child_tid = tid;
++
++	if (fn)
++		kthread_exit(fn(arg));
++
++	/* Signals that arrived while parked are delivered here. */
++	local_irq_disable();
++	irqentry_exit_to_user_mode(regs);
++	user_mode_loop(regs);
++}
++
++/* Resume a parked task on a fresh stack at its next switch. */
++static void kw_unpark(struct task_struct *t)
++{
++	if (READ_ONCE(t->thread.park_state) != KW_PARK_PARKED)
++		return;
++	WRITE_ONCE(t->thread.park_state, KW_PARK_RESUMING);
++	set_tsk_thread_flag(t, TIF_NEVER_RUN);
++	wake_up_process(t);
++}
++
++static void kw_unpark_all(void)
++{
++	struct task_struct *g, *t;
++
++	rcu_read_lock();
++	for_each_process_thread(g, t)
++		kw_unpark(t);
++	rcu_read_unlock();
++}
++
++/*
++ * Ask every task of one kind that has not parked to park: user tasks get
++ * TIF_NOTIFY_SIGNAL, kernel threads sleeping interruptibly or idle are woken
++ * (other sleeps, such as kthread()'s wait for its first wakeup, may not be
++ * woken early). Returns how many are left and names the first.
++ */
++static int kw_park_kick(bool kthreads)
++{
++	struct task_struct *g, *t;
++	int left = 0;
++
++	rcu_read_lock();
++	for_each_process_thread(g, t) {
++		if (t == current || t->exit_state ||
++		    !!(t->flags & PF_KTHREAD) != kthreads ||
++		    READ_ONCE(t->thread.park_state) != KW_PARK_NONE)
++			continue;
++		if (kthreads)
++			wake_up_state(t, TASK_INTERRUPTIBLE | TASK_NOLOAD);
++		else
++			set_notify_signal(t);
++		if (!left++)
++			kw_park_record(t);
++	}
++	rcu_read_unlock();
++	return left;
++}
++
++static int kw_park_phase(int *flag, bool kthreads, unsigned long deadline)
++{
++	int left;
++
++	WRITE_ONCE(*flag, 1);
++	while ((left = kw_park_kick(kthreads)) && time_before(jiffies, deadline))
++		schedule_timeout_idle(1);	/* each parking task wakes us */
++	return left;
++}
++
++/*
++ * A snapshot that drops the caches, with the user tasks parked and the
++ * kernel threads running: nothing dirties or reads a file meanwhile. The
++ * cycle's time limit and its time (kw_park_t0) do not count this.
++ */
++static unsigned long kw_park_drop_caches(unsigned long deadline)
++{
++	unsigned long j = jiffies;
++	u64 t = ktime_get_ns();
++
++	drop_caches(3);
++	t = ktime_get_ns() - t;
++	kw_park_t0 += t;
++	kw_park_drop_us += div_u64(t, NSEC_PER_USEC);
++	return deadline + (jiffies - j);
++}
++
++static void kw_park_cycle(void)
++{
++	unsigned long deadline;
++
++	kw_park_drop_us = 0;
++	if (kw_park_drop) {
++		/* While everything runs, as sync(2): dirty pages cannot be dropped. */
++		kw_park_t0 = ktime_get_ns();
++		ksys_sync();
++		kw_park_drop_us = div_u64(ktime_get_ns() - kw_park_t0, NSEC_PER_USEC);
++	}
++	deadline = jiffies + KW_PARK_TIMEOUT;
++	kw_park_t0 = ktime_get_ns();
++	kw_park_nr_users = kw_park_nr_kthreads = 0;
++	if (!kw_park_phase(&kw_park_users, false, deadline) &&
++	    !kw_park_phase(&kw_park_kthreads, true,
++			   kw_park_drop ? kw_park_drop_caches(deadline) : deadline)) {
++		strscpy(kw_park_blocker, "-");
++		kw_park_self(kw_parkd_fn, NULL);	/* the idle loop finishes */
++	}
++	WRITE_ONCE(kw_park_users, 0);
++	WRITE_ONCE(kw_park_kthreads, 0);
++	kw_unpark_all();
++	kw_park_finish(-EBUSY);
++}
++
++/*
++ * Set a bit for each free page, at the consistent point (interrupts off).
++ * Draining the per-cpu lists first puts the pages freed last back on the
++ * buddy lists, where this finds them. Returns the number of free pages, or
++ * 0 without a bitmap.
++ */
++static unsigned long kw_park_mark_free(void)
++{
++	struct list_head *list;
++	struct page *page;
++	struct zone *zone;
++	unsigned long flags, n = 0;
++	unsigned int order;
++
++	if (!kw_park_free_map)
++		return 0;
++	bitmap_zero(kw_park_free_map, kw_park_free_bits);
++	drain_local_pages(NULL);
++	for_each_populated_zone(zone) {
++		spin_lock_irqsave(&zone->lock, flags);
++		for_each_free_list(list, zone, order) {
++			list_for_each_entry(page, list, buddy_list) {
++				unsigned long pfn = page_to_pfn(page);
++
++				if (pfn + (1UL << order) > kw_park_free_bits)
++					continue;
++				bitmap_set(kw_park_free_map, pfn, 1U << order);
++				n += 1UL << order;
++			}
++		}
++		spin_unlock_irqrestore(&zone->lock, flags);
++	}
++	return n;
++}
++
++/*
++ * The consistent point: interrupts are off, nothing is runnable, and only
++ * the idle task runs. Count what is parked, then resume it all.
++ */
++void kw_park_idle(void)
++{
++	struct task_struct *g, *t;
++	unsigned int users = 0, kthreads = 0, bad = 0;
++
++	WRITE_ONCE(kw_park_final, 0);
++	rcu_read_lock();
++	for_each_process_thread(g, t) {
++		if (t->exit_state ||
++		    test_tsk_thread_flag(t, TIF_NEVER_RUN))
++			continue;
++		if (READ_ONCE(t->thread.park_state) == KW_PARK_PARKED &&
++		    !READ_ONCE(t->on_rq)) {
++			if (t->flags & PF_KTHREAD)
++				kthreads++;
++			else
++				users++;
++			continue;
++		}
++		if (!bad++)
++			kw_park_record(t);
++	}
++	rcu_read_unlock();
++	kw_park_nr_users = users;
++	kw_park_nr_kthreads = kthreads;
++	WRITE_ONCE(kw_park_users, 0);
++	WRITE_ONCE(kw_park_kthreads, 0);
++	if (!bad && kw_park_snap) {
++		/* The snapshot: a restored one continues in __kw_resume(). */
++		kw_park_snap = 0;
++		kw_park_nr_free = kw_park_mark_free();
++		bad = wasm_snapshot_point(0, kw_park_blocker,
++					  kw_park_nr_free ? kw_park_free_map : NULL,
++					  kw_park_nr_free ? kw_park_free_bits : 0);
++		if (bad)
++			strscpy(kw_park_blocker, "host");
++	}
++	kw_unpark_all();
++	kw_park_finish(bad ? (bad < 0 ? bad : -EBUSY) : 0);
++}
++
++/* kw_resume (entry.S): the idle task on a fresh stack, in a new instance. */
++asmlinkage void __noreturn __kw_resume(void)
++{
++	kw_host_reset(wasm_kw_cpu);
++	WRITE_ONCE(kw_park_restored, 1);
++	kw_unpark(kw_parkd);
++	cpu_startup_entry(CPUHP_ONLINE);
++}
++
++/* kwparkd, first thing after a restore: then nothing else has run yet. */
++static void kw_park_after_restore(void)
++{
++	struct timespec64 ts = ns_to_timespec64(wasm_clock_get_realtime());
++
++	do_settimeofday64(&ts);
++	if (!wasi_random_get(wasi_ptr(kw_park_seed), sizeof(kw_park_seed)))
++		add_vmfork_randomness(kw_park_seed, sizeof(kw_park_seed));
++	memzero_explicit(kw_park_seed, sizeof(kw_park_seed));
++	WRITE_ONCE(kw_park_restored, 0);
++	kw_unpark_all();
++	kw_park_finish(0);
++}
++
++static int kw_parkd_fn(void *unused)
++{
++	if (unlikely(READ_ONCE(kw_park_restored)))
++		kw_park_after_restore();
++	for (;;) {
++		wait_event_idle(kw_park_wait,
++				READ_ONCE(kw_park_req) != READ_ONCE(kw_park_done));
++		kw_park_cur = READ_ONCE(kw_park_req);
++		kw_park_snap = READ_ONCE(kw_park_snap_req);
++		WRITE_ONCE(kw_park_snap_req, 0);
++		kw_park_drop = kw_park_snap && READ_ONCE(kw_park_drop_req);
++		WRITE_ONCE(kw_park_drop_req, 0);
++		if (kw_park_snap && !kw_park_free_map) {
++			/* Without it the host saves the free pages too. */
++			kw_park_free_bits = max_pfn;
++			kw_park_free_map = kvcalloc(BITS_TO_LONGS(max_pfn),
++						    sizeof(long), GFP_KERNEL);
++		}
++		kw_park_cycle();
++	}
++	return 0;
++}
++
++/* Request a cycle; any context. Requests made before it starts coalesce. */
++void kw_park_request(void)
++{
++	WRITE_ONCE(kw_park_req, kw_park_req + 1);
++	wake_up(&kw_park_wait);
++}
++
++static int kw_park_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "requests %u done %u result %d users %u kthreads %u us %llu blocker %s free %lu drop %llu\n",
++		   READ_ONCE(kw_park_req), READ_ONCE(kw_park_done),
++		   kw_park_result, kw_park_nr_users, kw_park_nr_kthreads,
++		   kw_park_us, kw_park_blocker, kw_park_nr_free, kw_park_drop_us);
++	return 0;
++}
++
++static int kw_park_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, kw_park_show, NULL);
++}
++
++static ssize_t kw_park_write(struct file *file, const char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	kw_park_request();
++	return count;
++}
++
++static const struct proc_ops kw_park_proc_ops = {
++	.proc_open	= kw_park_open,
++	.proc_read	= seq_read,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++	.proc_write	= kw_park_write,
++};
++
++static irqreturn_t kw_park_snapshot_irq(int irq, void *dev_id)
++{
++	WRITE_ONCE(kw_park_snap_req, 1);
++	kw_park_request();
++	return IRQ_HANDLED;
++}
++
++/*
++ * The host sets this bit together with WASM_IRQ_SNAPSHOT, so both are
++ * taken before kwparkd runs; alone it does nothing.
++ */
++static irqreturn_t kw_park_drop_irq(int irq, void *dev_id)
++{
++	WRITE_ONCE(kw_park_drop_req, 1);
++	return IRQ_HANDLED;
++}
++
++static int __init kw_park_init(void)
++{
++	struct task_struct *t = kthread_run(kw_parkd_fn, NULL, "kwparkd");
++	int err;
++
++	if (IS_ERR(t))
++		return PTR_ERR(t);
++	kw_parkd = t;
++	proc_create("kwpark", 0600, NULL, &kw_park_proc_ops);
++	err = request_irq(WASM_IRQ_DROP_CACHES, kw_park_drop_irq, 0,
++			  "drop-caches", NULL);
++	if (err)
++		return err;
++	return request_irq(WASM_IRQ_SNAPSHOT, kw_park_snapshot_irq, 0,
++			   "snapshot", NULL);
++}
++device_initcall(kw_park_init);
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index d0ea9b5ac07..3cad124e5cb 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -19,6 +19,7 @@
+ #include <linux/slab.h>
+ #include <asm/entry.h>
+ #include <asm/kw_emu.h>
++#include <asm/park.h>
+ #include <asm/wasm.h>
+ 
+ extern struct kw_cpu *const wasm_kw_cpu;
+@@ -40,11 +41,17 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
+ 				READ_ONCE(prev->__state) == TASK_DEAD);
+ }
+ 
+-/* Called from ret_from_fork (entry.S) on the new task's fresh Wasm stack. */
++/*
++ * Called from ret_from_fork (entry.S) on the new task's fresh Wasm stack:
++ * a task's first run, or a parked task resuming (park.c).
++ */
+ asmlinkage void __ret_from_fork(struct task_struct *prev)
+ {
+ 	struct pt_regs *regs = current_pt_regs();
+ 
++	if (unlikely(READ_ONCE(current->thread.park_state) == KW_PARK_RESUMING))
++		kw_park_resume(prev);
++
+ 	schedule_tail(prev);
+ 
+ 	if (current->thread.fn) {
+@@ -84,6 +91,9 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 	}
+ 	childregs->kernel = 0;
+ 	childregs->cause = PT_CAUSE_NONE;
++	p->thread.park_fn = NULL;
++	p->thread.park_arg = NULL;
++	p->thread.park_state = KW_PARK_NONE;
+ 
+ 	return 0;
+ }
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index dd66e3abbf2..f1deec5f5b3 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -16,6 +16,7 @@
+ #include <asm/entry.h>
+ #include <asm/irq.h>
+ #include <asm/kw_emu.h>
++#include <asm/park.h>
+ #include <asm/syscall.h>
+ #include <asm/wasm.h>
+ 
+@@ -113,6 +114,13 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 	for (;;) {
+ 		regs->cause = PT_CAUSE_NONE;
+ 
++		/*
++		 * The exit work is done: the task's whole state is in *regs, and
++		 * it can park here (park.c) to resume on a fresh stack.
++		 */
++		if (unlikely(READ_ONCE(kw_park_users)))
++			kw_park_user();
++
+ 		/* "sret": user mode runs with interrupts enabled. */
+ 		local_irq_enable();
+ 		ev = kw_run(cpu, &regs->user);
+-- 
+2.56.0
+

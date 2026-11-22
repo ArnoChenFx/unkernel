@@ -43,7 +43,8 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
   LLVM, `VMALLOC_FLAT`, 9p `metatimeout`, the kthread park points, the
   random vmfork reseed, the switches for NET_DEVMEM, DRM_PANEL_BRIDGE,
   DRM_DDC and DRM_HDMI_INFOFRAMES, the virtio-gpu damage-clip backports
-  and capset wait); the arch; the ISA; each driver (kwblk, kwnet,
+  and capset wait, `drop_caches()` for callers in the kernel); the arch;
+  the ISA; each driver (kwblk, kwnet,
   kwfb, kwinput, sysrq, kwsnd, kwvsock, kwshm, kwvirtio); parking; kwvsock's reset
   after a restore; `kw_defconfig`; then the SMP series (the atomics and
   shared-memory build, the atomic tweaks, the generic mm, sched, kthread,
@@ -286,7 +287,9 @@ Node's `node:wasi`.
   `wasm_snapshot_point`; host `Kernel.snapshot()`), profile = 9 (a time
   sample, prof.c; the host's sampler sets it in every CPU's word, without
   a notify: kwemu.md, Measuring), virtio = 10 (kwvirtio: used buffers or a
-  config change; on SMP also another CPU's queue notifications for CPU 0).
+  config change; on SMP also another CPU's queue notifications for CPU 0),
+  drop caches = 11 (set with snapshot: sync and drop the file caches
+  before it; parking.md).
   Bits without a handler are cleared and
   ignored. SMP adds a word per CPU and IPI bits 24-27
   (smp.md).

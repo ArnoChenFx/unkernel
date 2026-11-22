@@ -105,6 +105,10 @@ parts that are easy to get wrong.
   console input, the CPU count (`cpus`), each disk's `DiskSnapshotState`,
   the other devices' `DeviceSnapshots` and the host's detachable terminal
   sessions, `ttys`) once the disks are durable.
+  With `dropCaches` (the default with `stop` or `commit`, so for every
+  snapshot the machine stops at; false for one it runs on from) it raises
+  IRQ 11 in the same write, and the kernel syncs and drops its file caches
+  on the way, so they are not saved (parking.md, Caches).
   Without `stop` the guest keeps running; `stop: true` calls
   `Kernel.stop()` inside the import, so no task runs after the copy on
   CPU 0; with several CPUs the others run on until their threads end, but

@@ -38,7 +38,7 @@ import { sharedNow } from "./worker-devices.ts";
 import { SharedServer, applyEvdev } from "./worker-shared.ts";
 import { ShmShareServer, type ShmInfo } from "./shm.ts";
 import { VirglGpuBackend, type GpuInit, type GpuLink, type GpuReply, type GpuRequest } from "./gl-gpu.ts";
-import { SnapshotCommitError, awakeTimeout, receivedSnapshot, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
+import { SnapshotCommitError, awakeTimeout, receivedSnapshot, sentSnapshot, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
 import { type FromWorker, type ToWorker, type WorkerBootSpec, type WorkerExit, type WorkerPort } from "./worker-protocol.ts";
 
 export interface ServeKernelOptions {
@@ -449,7 +449,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 					reject(signal.reason as Error);
 				}, { once: true });
 				try {
-					post({ t: "snapshot-held", id, snapshot: snap }, [snap.memory.buffer as ArrayBuffer]);
+					post({ t: "snapshot-held", id, snapshot: sentSnapshot(snap) }, [snap.memory.buffer as ArrayBuffer]);
 				} catch (e) {
 					commits.delete(id);
 					reject(new Error(`the snapshot could not be posted: ${(e as Error)?.message ?? e}`));
@@ -467,8 +467,9 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				signal.addEventListener("abort", () => holds.delete(id), { once: true });
 			}) : undefined;
 			const opts: SnapshotOptions = commit ? { commit, commitTimeoutMs: msg.commitTimeoutMs, ...(hold ? { hold } : {}) } : { stop: msg.stop };
+			if (msg.dropCaches !== undefined) opts.dropCaches = msg.dropCaches;
 			snapshots.set(id, instance.snapshot(opts).then(
-				(snapshot) => commit ? answer({ t: "snapshot-result", id, ok: true }) : answer({ t: "snapshot-result", id, ok: true, snapshot }, [snapshot.memory.buffer as ArrayBuffer]),
+				(snapshot) => commit ? answer({ t: "snapshot-result", id, ok: true }) : answer({ t: "snapshot-result", id, ok: true, snapshot: sentSnapshot(snapshot) }, [snapshot.memory.buffer as ArrayBuffer]),
 				(e) => answer({
 					t: "snapshot-result", id, ok: false, error: (e as Error)?.message ?? String(e),
 					...(e instanceof SnapshotCommitError ? { commitFailed: true, timedOut: e.timedOut } : {}),

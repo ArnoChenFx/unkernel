@@ -12,10 +12,11 @@ kernel (SMP, below).
 
 - **Trigger**: a write to `/proc/kwpark` (asynchronous: the writer parks
   too) wakes `kwparkd`. Reading it gives `requests N done N result R users
-  U kthreads K us T blocker comm[pid]:state free F` (the last cycle's
+  U kthreads K us T blocker comm[pid]:state free F drop D` (the last cycle's
   counts, request-to-resume time, for a restore from kwparkd's restore
-  work on, the task that blocked it, `-` if none, and the free pages its
-  snapshot left out, 0 if it took none).
+  work on, the task that blocked it, `-` if none, the free pages its
+  snapshot left out, 0 if it took none, and the µs its sync and cache drop
+  took, which T leaves out; 0 without them).
 - **Phases**: user tasks first (`kw_park_users`), while kernel threads still
   run, so a user task in a D-state wait for a journal commit or writeback
   finishes it; then kernel threads (`kw_park_kthreads`); then kwparkd parks
@@ -90,10 +91,27 @@ kernel (SMP, below).
   those pages out (`copySnapshotMemory()`, js.md) and a restore gives them
   zeros. Nothing reads a free page's contents (no PAGE_POISONING;
   `init_on_free` expects zeros), and the free lists link through `struct
-  page`, which is saved. Dropping clean page cache first gains nothing with
-  the initramfs root, whose files are tmpfs (28.6 MiB with `drop_caches`
-  against 28.4 MiB without, 2026-11-15); an overlay root on a data disk has
-  cache that could be dropped.
+  page`, which is saved.
+- **Caches**: a snapshot the host asks for with IRQ 11 (drop caches) set
+  together with IRQ 8 (`SnapshotOptions.dropCaches`: by default one the
+  machine stops at, `stop` or `commit`; js.md) does not save the file
+  cache. kwparkd first calls `ksys_sync()` while everything still runs
+  (dirty pages cannot be dropped; with the user tasks parked a FUSE daemon
+  would never answer), and once the user tasks are parked, with the kernel
+  threads still running, `drop_caches(3)` (fs/drop_caches.c: clean page
+  cache, unused dentries and inodes), whose pages are free at the snapshot
+  point. Neither counts against the cycle's 2 s. A kernel without the IRQ
+  ignores the bit. It gains nothing with the initramfs root, whose files
+  are tmpfs (28.6 MiB with `drop_caches` against 28.4 MiB without,
+  2026-11-15). Debian with an overlay root on a data disk, 2048 MiB, Node,
+  after reading every file under /usr and writing 300 MiB (2026-11-22):
+  593.0 MiB without, 65.1 MiB with (74.9 MiB on 2 CPUs), sync and drop
+  33 ms (64 ms on 2 CPUs); with the 300 MiB still dirty 371.3 MiB without,
+  56.9 MiB with, in 278 ms. The restored machine reads what it needs
+  again: its first commands (ls, apt, dpkg, perl, a login shell) took 0.32
+  s instead of 0.25 s, with the image over HTTP 0.46 s instead of 0.30 s
+  (11 more Range requests, 4.8 MiB), and it answered its first command
+  0.27 s sooner (a smaller file to read).
 - **Restore**: instantiate the same build (`linux_banner` must match; the
   build id in it makes every differing module differ, kernel.md, Two
   kernels), copy the memory over the fresh instance's, clear

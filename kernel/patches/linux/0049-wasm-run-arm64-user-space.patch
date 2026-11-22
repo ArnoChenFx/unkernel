@@ -1,0 +1,3704 @@
+From 2d08825e49bb1b371f55b4c0a50e5f9b75955bdd Mon Sep 17 00:00:00 2001
+From: kernel-wasm <kernel-wasm@localhost>
+Date: Wed, 18 Nov 2026 21:04:24 +0000
+Subject: [PATCH] wasm: run arm64 user space
+
+kwemu's guest CPU is AArch64 (kwemu ABI 2: struct kw_regs holds
+x0..x30, sp, pc, nzcv, fpcr, fpsr, tpidr_el0 and v0..v31). Present the
+arm64 user ABI instead of riscv64's, mirroring arch/arm64 without compat
+and without a vDSO:
+
+- syscalls: x8 = number, x0..x5 = arguments, x0 = return; the generic
+  table with arm64's ABIs (renameat rlimit memfd_secret), arm64's mmap
+  and personality (PER_LINUX32 is refused); riscv_hwprobe and
+  riscv_flush_icache are gone (user space flushes with IC IVAU);
+- uapi: arm64's fcntl, signal (SA_RESTORER, MINSIGSTKSZ 5120), mman,
+  param, posix_types, statfs, auxvec, ptrace, sigcontext, sve_context,
+  ucontext and hwcap headers;
+- ELF: EM_AARCH64, AT_PLATFORM "aarch64", AT_HWCAP2/3 = 0,
+  AT_MINSIGSTKSZ, uname -m aarch64;
+- clone: child x0 = 0, CLONE_SETTLS sets TPIDR_EL0 (CLONE_BACKWARDS as
+  before); exec zeroes every register including TPIDR_EL0 and FPCR;
+- signals: arm64's rt_sigframe with an fpsimd_context record and a
+  frame record; handlers return to sa_restorer when SA_RESTORER is set,
+  else to the [sigpage] trampoline (mov x8, #139; svc #0);
+- exclusives: every entry to user mode clears the exclusive monitor
+  (user_mode_loop(), before each kw_run()), as ERET does on arm64 and
+  qemu-user does too, so an STXR after a syscall, a fault, an interrupt
+  or a task switch fails and a LDXR/STXR loop retries; that is the only
+  place that clears it;
+- features: AT_HWCAP is FP | ASIMD | CPUID | the KW_ISA_* features
+  kw_set_isa() enables: AES, PMULL, SHA1, SHA2, CRC32, ATOMICS (LSE),
+  SHA3 and SHA512 (SHA512 only together with SHA2). kwemu answers the
+  MRS of the ID registers itself (ID_AA64ISAR0_EL1 from the enabled
+  features), so the kernel emulates none. /proc/cpuinfo is in arm64's
+  format for kwemu's MIDR_EL1 (0x000f0000), with the Features line in
+  HWCAP bit order. kw.isa= takes armv8, -feat and +feat, with the
+  Features names (and "lse" for atomics).
+
+kw_emu.h also states what kwemu's decoded-code cache asks of the kernel:
+the flushes it already does (a page that maps rewritten code,
+kw_flush_tlb_all(), kw_set_pgd()) make kwemu check decoded blocks again;
+*irq_pending is polled at every block end, at least every 64
+instructions; IC IVAU on one CPU reaches the others through kwemu's own
+code epoch.
+
+The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
+---
+ arch/wasm/Kconfig                        |  13 +-
+ arch/wasm/Makefile                       |   4 +-
+ arch/wasm/configs/kw_defconfig           |   2 +-
+ arch/wasm/include/asm/elf.h              |  42 ++-
+ arch/wasm/include/asm/futex.h            |   6 +-
+ arch/wasm/include/asm/hwcap.h            |  15 +-
+ arch/wasm/include/asm/kw_emu.h           | 252 +++++++------
+ arch/wasm/include/asm/processor.h        |  11 +-
+ arch/wasm/include/asm/ptrace.h           |  25 +-
+ arch/wasm/include/asm/syscall.h          |  42 +--
+ arch/wasm/include/asm/syscall_wrapper.h  |   7 +-
+ arch/wasm/include/asm/tlbflush.h         |   3 -
+ arch/wasm/include/asm/unistd.h           |   4 +-
+ arch/wasm/include/uapi/asm/auxvec.h      |  52 +--
+ arch/wasm/include/uapi/asm/bitsperlong.h |   6 +-
+ arch/wasm/include/uapi/asm/byteorder.h   |   6 +-
+ arch/wasm/include/uapi/asm/elf.h         | 100 ------
+ arch/wasm/include/uapi/asm/fcntl.h       |  30 ++
+ arch/wasm/include/uapi/asm/hwcap.h       | 171 ++++++++-
+ arch/wasm/include/uapi/asm/hwprobe.h     | 131 -------
+ arch/wasm/include/uapi/asm/mman.h        |  19 +
+ arch/wasm/include/uapi/asm/param.h       |  24 ++
+ arch/wasm/include/uapi/asm/posix_types.h |  11 +
+ arch/wasm/include/uapi/asm/ptrace.h      | 440 ++++++++++++++++-------
+ arch/wasm/include/uapi/asm/sigcontext.h  | 375 +++++++++++++++++--
+ arch/wasm/include/uapi/asm/signal.h      |  28 ++
+ arch/wasm/include/uapi/asm/statfs.h      |  24 ++
+ arch/wasm/include/uapi/asm/sve_context.h |  64 ++++
+ arch/wasm/include/uapi/asm/ucontext.h    |  39 +-
+ arch/wasm/kernel/Makefile                |   2 +-
+ arch/wasm/kernel/Makefile.syscalls       |   6 +-
+ arch/wasm/kernel/cpu.c                   | 194 +++++-----
+ arch/wasm/kernel/process.c               |  30 +-
+ arch/wasm/kernel/ptrace.c                |   4 +-
+ arch/wasm/kernel/signal.c                | 280 ++++++++++-----
+ arch/wasm/kernel/sys.c                   |  27 ++
+ arch/wasm/kernel/sys_riscv.c             | 113 ------
+ arch/wasm/kernel/syscall_table.c         |   5 +-
+ arch/wasm/kernel/traps.c                 |  26 +-
+ arch/wasm/mm/fault.c                     |   6 +-
+ arch/wasm/mm/sigpage.c                   |   7 +-
+ arch/wasm/mm/tlb.c                       |  11 -
+ 42 files changed, 1596 insertions(+), 1061 deletions(-)
+ delete mode 100644 arch/wasm/include/uapi/asm/elf.h
+ create mode 100644 arch/wasm/include/uapi/asm/fcntl.h
+ delete mode 100644 arch/wasm/include/uapi/asm/hwprobe.h
+ create mode 100644 arch/wasm/include/uapi/asm/mman.h
+ create mode 100644 arch/wasm/include/uapi/asm/param.h
+ create mode 100644 arch/wasm/include/uapi/asm/posix_types.h
+ create mode 100644 arch/wasm/include/uapi/asm/signal.h
+ create mode 100644 arch/wasm/include/uapi/asm/statfs.h
+ create mode 100644 arch/wasm/include/uapi/asm/sve_context.h
+ create mode 100644 arch/wasm/kernel/sys.c
+ delete mode 100644 arch/wasm/kernel/sys_riscv.c
+
+diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
+index 27dd1dde5cd..38d7504a761 100644
+--- a/arch/wasm/Kconfig
++++ b/arch/wasm/Kconfig
+@@ -5,16 +5,19 @@ menu "Wasm-specific options"
+ #
+ # Execution model (unkernel): the kernel is a single Wasm instance running
+ # on one host thread. Kernel tasks are separate Wasm stacks switched with JSPI
+-# (JavaScript Promise Integration). User mode is not Wasm: unmodified riscv64
+-# Linux ELF programs run on a software CPU ("kwemu", see include/kw_emu.h in
+-# the unkernel repository) that walks the kernel's Sv39-format page tables.
++# (JavaScript Promise Integration). User mode is not Wasm: unmodified arm64
++# (AArch64) Linux ELF programs run on a software CPU ("kwemu", see
++# include/kw_emu.h in the unkernel repository) that walks the kernel's
++# Sv39-format page tables.
+ #
+ 
+ config WASM
+ 	bool
+ 	default y
+ 	select ARCH_NO_PREEMPT
+-	# riscv64 user ABI: clone(flags, newsp, ptid, tls, ctid), as on riscv.
++	# arm64 user ABI: clone(flags, newsp, ptid, tls, ctid), as on arm64.
++	# arm64's other ABI selects are for compat (AArch32) or BTI/GNU
++	# property notes, which this port does not have.
+ 	select CLONE_BACKWARDS
+ 	select HAVE_VIRT_CPU_ACCOUNTING_GEN
+ 	select HAVE_CONTEXT_TRACKING_USER
+@@ -40,7 +43,7 @@ config WASM
+ 	select ARCH_USE_QUEUED_RWLOCKS if SMP
+ 	select ARCH_TASKS_STAY_ON_CPU if SMP
+ 
+-# riscv64 ELF userspace runs on the kwemu software CPU with real page tables
++# arm64 ELF userspace runs on the kwemu software CPU with real page tables
+ # (fork, mmap, copy-on-write). The original linux-wasm NOMMU mode (programs
+ # as Wasm modules) is not supported by this port.
+ config MMU
+diff --git a/arch/wasm/Makefile b/arch/wasm/Makefile
+index 49049055794..8512b7e3cae 100644
+--- a/arch/wasm/Makefile
++++ b/arch/wasm/Makefile
+@@ -2,8 +2,8 @@
+ 
+ KBUILD_DEFCONFIG := kw_defconfig
+ 
+-# User mode is riscv64.
+-UTS_MACHINE := riscv64
++# User mode is arm64.
++UTS_MACHINE := aarch64
+ 
+ KCFLAGS += -nostdlib -fno-builtin
+ KCFLAGS += -march=wasm64
+diff --git a/arch/wasm/configs/kw_defconfig b/arch/wasm/configs/kw_defconfig
+index 2a56e54aa1d..f3ab19e2338 100644
+--- a/arch/wasm/configs/kw_defconfig
++++ b/arch/wasm/configs/kw_defconfig
+@@ -1,4 +1,4 @@
+-# unkernel: wasm64 kernel, emulated riscv64 user mode (kwemu)
++# unkernel: wasm64 kernel, emulated arm64 user mode (kwemu)
+ # CONFIG_LOCALVERSION_AUTO is not set
+ CONFIG_DEFAULT_HOSTNAME="unkernel"
+ CONFIG_SYSVIPC=y
+diff --git a/arch/wasm/include/asm/elf.h b/arch/wasm/include/asm/elf.h
+index c2d1742a3c0..3034d5e59d8 100644
+--- a/arch/wasm/include/asm/elf.h
++++ b/arch/wasm/include/asm/elf.h
+@@ -3,28 +3,43 @@
+ #ifndef _ASM_WASM_ELF_H
+ #define _ASM_WASM_ELF_H
+ 
+-/* User mode is riscv64 (rv64gc, LP64D): this mirrors arch/riscv. */
++/*
++ * User mode is arm64 (AArch64, little-endian, LP64): this mirrors
++ * arch/arm64/include/asm/elf.h without compat (AArch32) and without a vDSO.
++ */
+ 
+ #include <uapi/linux/elf.h>
+-#include <uapi/asm/elf.h>
+ #include <asm/auxvec.h>
+ #include <asm/byteorder.h>
+ #include <asm/hwcap.h>
++#include <asm/ptrace.h>
+ 
+-#define ELF_ARCH	EM_RISCV
++typedef unsigned long elf_greg_t;
++
++#define ELF_NGREG (sizeof(struct user_pt_regs) / sizeof(elf_greg_t))
++typedef elf_greg_t elf_gregset_t[ELF_NGREG];
++typedef struct user_fpsimd_state elf_fpregset_t;
++
++#define ELF_ARCH	EM_AARCH64
+ #define ELF_CLASS	ELFCLASS64
+ #define ELF_DATA	ELFDATA2LSB
+ 
+-#define elf_check_arch(x) (((x)->e_machine == EM_RISCV) && \
++#define elf_check_arch(x) (((x)->e_machine == EM_AARCH64) && \
+ 			   ((x)->e_ident[EI_CLASS] == ELF_CLASS))
+ 
+ #define ELF_EXEC_PAGESIZE	(PAGE_SIZE)
+ #define ELF_ET_DYN_BASE		((DEFAULT_MAP_WINDOW / 3) * 2)
+ #define STACK_RND_MASK		(0x3ffff >> (PAGE_SHIFT - 12))
+ 
+-#define ELF_HWCAP		(KW_RISCV_HWCAP)
+-#define ELF_PLATFORM		(NULL)
++#define ELF_PLATFORM_SIZE	16
++#define ELF_PLATFORM		("aarch64")
+ 
++/* cpu.c: FP, ASIMD and what kw_set_isa() enabled; nothing in HWCAP2/3. */
++#define ELF_HWCAP		(kw_elf_hwcap)
++#define ELF_HWCAP2		(0UL)
++#define ELF_HWCAP3		(0UL)
++
++/* No vDSO, so no AT_SYSINFO_EHDR: musl and glibc fall back to syscalls. */
+ #define ARCH_DLINFO						\
+ do {								\
+ 	NEW_AUX_ENT(AT_MINSIGSTKSZ, signal_minsigstksz);	\
+@@ -37,13 +52,14 @@ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 				       int uses_interp);
+ 
+-#define ELF_CORE_COPY_REGS(dest, regs)				\
+-do {								\
+-	unsigned long *__d = (unsigned long *)&(dest);		\
+-	int __i;						\
+-	__d[0] = (regs)->user.pc;				\
+-	for (__i = 1; __i < 32; __i++)				\
+-		__d[__i] = (regs)->user.x[__i];			\
++/* struct user_pt_regs: x0..x30, sp, pc, pstate (NZCV, EL0t). */
++#define ELF_CORE_COPY_REGS(dest, regs)					\
++do {									\
++	struct user_pt_regs *__d = (struct user_pt_regs *)&(dest);	\
++	memcpy(__d->regs, (regs)->user.x, sizeof(__d->regs));		\
++	__d->sp = (regs)->user.sp;					\
++	__d->pc = (regs)->user.pc;					\
++	__d->pstate = (regs)->user.nzcv;				\
+ } while (0);
+ 
+ #define SET_PERSONALITY(ex) \
+diff --git a/arch/wasm/include/asm/futex.h b/arch/wasm/include/asm/futex.h
+index 295105b9d6b..43789f3d607 100644
+--- a/arch/wasm/include/asm/futex.h
++++ b/arch/wasm/include/asm/futex.h
+@@ -10,9 +10,9 @@
+ /*
+  * Read-modify-write of a user word through its kernel address
+  * (kw_user_addr(), valid until the next poll point). On SMP user code on
+- * other CPUs updates the same word with AMOs and LR/SC (kwemu's atomics
+- * are wasm atomics on the same memory), so these are wasm atomics too,
+- * fully ordered as riscv's amo*.aqrl and lr/sc.aqrl. Without wasm atomics
++ * other CPUs updates the same word with exclusives (LDXR/STXR; kwemu's
++ * atomics are wasm atomics on the same memory), so these are wasm atomics
++ * too, fully ordered as arm64's LDAXR/STLXR loops with a DMB. Without wasm atomics
+  * (UP) the compiler makes them plain loads and stores, which suffices:
+  * one CPU, no preemption, and user code only runs inside kw_run().
+  */
+diff --git a/arch/wasm/include/asm/hwcap.h b/arch/wasm/include/asm/hwcap.h
+index e116408e5c1..4fc957f3bba 100644
+--- a/arch/wasm/include/asm/hwcap.h
++++ b/arch/wasm/include/asm/hwcap.h
+@@ -5,26 +5,21 @@
+ 
+ #include <uapi/asm/hwcap.h>
+ 
+-/* rv64imafdc ("rv64gc" minus Zicsr/Zifencei, which have no bits). */
+-#define KW_RISCV_HWCAP	(COMPAT_HWCAP_ISA_I | COMPAT_HWCAP_ISA_M | \
+-			 COMPAT_HWCAP_ISA_A | COMPAT_HWCAP_ISA_F | \
+-			 COMPAT_HWCAP_ISA_D | COMPAT_HWCAP_ISA_C)
+-
+ #ifndef __ASSEMBLY__
+ #include <linux/types.h>
+ 
+ struct kw_cpu;
+ 
+ /*
+- * The multi-letter extensions user space sees (cpu.c): kw.isa= masks them,
+- * kw_isa_init() picks the effective set once at boot, and /proc/cpuinfo and
+- * riscv_hwprobe report it.
++ * The arm64 features user space sees (cpu.c): kw.isa= masks kwemu's
++ * optional ones, kw_isa_init() picks the effective set once at boot, and
++ * AT_HWCAP and the /proc/cpuinfo "Features" line report it.
+  */
+ void kw_isa_init(struct kw_cpu *cpu);
+ /* The KW_ISA_* set kw_isa_init() enabled (for the other CPUs' kwemu). */
+ u64 kw_isa_enabled(void);
+-u64 kw_isa_hwprobe_ext0(void);
+-u64 kw_isa_hwprobe_ext1(void);
++/* AT_HWCAP. */
++extern unsigned long kw_elf_hwcap;
+ #endif
+ 
+ #endif /* _ASM_WASM_HWCAP_H */
+diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
+index 3308c54e1fe..f717e59b25f 100644
+--- a/arch/wasm/include/asm/kw_emu.h
++++ b/arch/wasm/include/asm/kw_emu.h
+@@ -1,21 +1,28 @@
+ /* SPDX-License-Identifier: GPL-2.0-or-later */
+ /*
+  * Contract between the wasm Linux kernel (arch side) and the guest CPU
+- * emulator ("kwemu", Zig, src/emu). The emulator is a freestanding library
+- * with no allocator and no global mutable state: everything lives in the
+- * kernel-owned struct kw_cpu, and guest registers in a kernel-owned
+- * struct kw_regs (normally inside the task's pt_regs).
++ * emulator ("kwemu", Zig, src/a64 on top of the MMU in src/emu). The
++ * emulator is a freestanding library with no allocator and no global
++ * mutable state: everything lives in the kernel-owned struct kw_cpu, and
++ * guest registers in a kernel-owned struct kw_regs (normally inside the
++ * task's pt_regs).
+  *
+- * Guest ISA: riscv64 (rv64gc), user mode only, plus the optional
+- * extensions below (KW_ISA_*) that kwemu implements and the kernel enables.
++ * Guest ISA: AArch64, A64 instruction set, ARMv8.0-A user mode (EL0),
++ * little-endian, with FP and AdvSIMD. No SVE, pointer authentication or
++ * MTE; the PAC and BTI encodings in the hint space run as NOPs. The crypto
++ * extensions, LSE atomics, SHA-512 and SHA-3 are optional features
++ * (KW_ISA_*, below), enabled only when this build implements them.
++ * .agents/a64.md lists which instructions are implemented; every other
++ * encoding raises KW_EV_ILLEGAL.
+  *
+  * Memory model: kernel and emulator share one wasm64 linear memory. A
+  * "physical address" is a linear-memory address minus cpu->phys_base.
+  * The emulator walks the kernel's user page tables itself, like hardware:
+  * the kernel writes PTEs and calls the flush hooks below.
+  *
+- * Page-table format (RISC-V Sv39 layout, 4 KiB pages, 3 levels, 512
+- * entries per level, 8-byte little-endian PTEs):
++ * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
++ * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
++ * user virtual addresses below 2^38):
+  *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
+  *   bits 10..53 PPN (physical address >> 12).
+  * A valid PTE with R=W=X=0 points to the next level. Leaves are only
+@@ -23,42 +30,41 @@
+  * The emulator never writes PTEs: an access with A=0, or a store with
+  * D=0, raises KW_EV_FAULT so the kernel can set the bits.
+  *
+- * Decoded-code cache (ABI 2): the emulator keeps predecoded basic blocks
+- * in struct kw_cpu, keyed by virtual pc and physical address and checked
+- * against the raw instruction bits. Coherence rules:
+- *  - guest stores (any mapping, incl. AMOs) are tracked exactly: code
+- *    rewritten by the guest is seen by the next instruction;
+- *  - code rewritten by the kernel (page reuse, COW copy, file data,
+- *    ptrace) is seen after kw_flush_tlb_range() of a page that maps it,
+- *    kw_flush_tlb_all(), kw_set_pgd(), or a guest FENCE.I -- i.e. the
+- *    flushes the kernel already does when it changes a mapping or flushes
+- *    the icache. (Rewriting a currently mapped exec page in place with no
+- *    flush at all may keep running the old code until one of those, as an
+- *    incoherent icache would.)
++ * Decoded-code cache: kw_run decodes guest code into blocks of up
++ * to 64 instructions inside one page (src/a64/tier.zig) and keeps them in
++ * struct kw_cpu, keyed by virtual pc and trusted only under the exec-TLB
++ * fill they were checked against. Every flush below (kw_flush_tlb_range()
++ * of a page that maps the code, kw_flush_tlb_all(), kw_set_pgd()) makes
++ * each block be checked again (same physical page, same instruction
++ * words) before it runs; kw_set_isa() and kw_host_reset() drop them all.
++ * So:
++ *  - Stores by this CPU's guest code into decoded code are tracked exactly
++ *    and take effect at the next instruction (self-modifying code needs no
++ *    flush), including stores through another virtual alias of the page.
++ *  - Code the kernel writes (or another CPU's guest writes) is seen after
++ *    a flush of a page that maps it on this CPU, or after IC IVAU of the
++ *    line by any guest on any CPU (+ ISB), as on hardware with
++ *    CTR_EL0.DIC = IDC = 0. A kernel that rewrites code in place must
++ *    therefore flush the page (it already must when it changes a mapping).
++ *  - Several CPUs: IC IVAU on one CPU is seen by every other CPU at its
++ *    next decoded-block boundary (at most 64 instructions later) or kw_run
++ *    entry, through a code epoch in kwemu's static data; no kernel action
++ *    is needed.
++ * Decoded blocks hold no state the kernel must save: a task's registers
++ * are in struct kw_regs whenever kw_run returns.
+  *
+- * Several CPUs (ABI 7): an SMP kernel gives each CPU its own struct
++ * Several CPUs: an SMP kernel gives each CPU its own struct
+  * kw_cpu, used only by that CPU's thread, on one shared memory. kwemu
+- * built with wasm atomics (zig build -Dkwemu-atomics) makes guest AMOs
+- * atomic read-modify-writes, SC a compare-and-swap against the value LR
+- * read, and FENCE a full barrier; without atomics they assume one hart.
+- * Guest stores are tracked only by the struct kw_cpu that runs them: code
+- * another CPU rewrites is seen after a flush on this one (riscv's
+- * flush_icache syscall, FENCE.I alone is local), as on hardware.
++ * built with wasm atomics (zig build -Dkwemu-atomics) makes barriers (DMB,
++ * DSB) full barriers, exclusives and LSE atomics atomic, and IC IVAU
++ * visible to every CPU (above); without atomics everything assumes one CPU.
+  *
+- * Flushes during a JIT compile (ABI 8): a compile takes a few hundred
+- * microseconds, and the CPU answers no interrupt meanwhile. Around each
+- * (choosing the blocks, emitting the module, kw_host_jit_compile()) kwemu
+- * sets jit_busy (below) to 1 and back to 0; in between it runs no guest
+- * instruction and touches no guest memory and no page table. Another CPU that needs this one's TLB flushed may then
+- * skip waiting for it: it sets flush_all to 1, issues a full barrier and
+- * reads jit_busy with acquire semantics; only if it reads 1 may it go on
+- * without this CPU's answer. When the call returns, kwemu stores 0 to
+- * jit_busy, issues a full barrier, takes flush_all (atomic exchange with
+- * 0) and, if it was set, does what kw_flush_tlb_all() does before it runs
+- * any guest code. So either the flusher sees the window closed (and waits
+- * as usual), or kwemu sees the request. Guest stores before the window are
+- * ordered before its jit_busy = 1 (a release store). Only kwemu clears
+- * flush_all; a kwemu built without atomics (one hart) never sees it set.
++ * jit_busy / flush_all: the window in which a CPU compiles JIT code and
++ * another CPU may skip waiting for its TLB flush. kwemu sets jit_busy while
++ * it compiles (with the JIT built in), a window in which it reads no guest
++ * memory or page table; a CPU that finds it set may set flush_all instead
++ * of waiting for this CPU's TLB flush, and kwemu then flushes its whole TLB
++ * when the compile ends, before it runs guest code again.
+  */
+ #ifndef KW_EMU_H
+ #define KW_EMU_H
+@@ -73,23 +79,42 @@
+ extern "C" {
+ #endif
+ 
+-#define KW_ABI_VERSION 8
++#define KW_ABI_VERSION 3
+ 
++/*
++ * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
++ * at 0, sp 248, pc 256, nzcv 264, fpcr 268, fpsr 272, tpidr_el0 280, and
++ * the 32 128-bit V registers at 288 (16-byte aligned; each is two
++ * little-endian 64-bit halves, low half first, i.e. the memory image of a
++ * little-endian __uint128_t). Register number 31 is SP or XZR depending on
++ * the instruction, as in the architecture; there is no x[31].
++ */
+ struct kw_regs {
+-	uint64_t x[32];   /* x[0] is ignored and reads as zero */
++	uint64_t x[31];
++	uint64_t sp;       /* SP_EL0 */
+ 	uint64_t pc;
+-	uint64_t f[32];   /* raw 64-bit FP registers (NaN-boxed singles) */
+-	uint32_t fcsr;
++	uint32_t nzcv;     /* PSTATE.{N,Z,C,V} in bits 31..28 (as MRS NZCV
++			      reads them); the other bits are zero */
++	uint32_t fpcr;     /* FPCR as MSR/MRS see it */
++	uint32_t fpsr;     /* FPSR (cumulative exception flags, QC) */
+ 	uint32_t _pad;
+-};
++	uint64_t tpidr_el0;
++	uint64_t v[32][2] __attribute__((aligned(16)));
++} __attribute__((aligned(16)));
+ 
+ enum kw_event_kind {
+ 	KW_EV_BUDGET = 0,      /* instruction budget used up (timer tick point) */
+-	KW_EV_SYSCALL = 1,     /* ecall; pc already advanced past it */
++	KW_EV_SYSCALL = 1,     /* SVC #imm (any imm); pc already past it; the
++				  number is in x8, the arguments in x0..x5 */
+ 	KW_EV_FAULT = 2,       /* page fault; pc at the faulting instruction */
+-	KW_EV_ILLEGAL = 3,     /* illegal instruction; pc at it */
+-	KW_EV_BREAKPOINT = 4,  /* ebreak; pc at it */
+-	KW_EV_MISALIGNED = 5,  /* misaligned fetch/atomic; pc at it */
++	KW_EV_ILLEGAL = 3,     /* unallocated or unimplemented encoding, UDF,
++				  HLT, HVC, SMC, a system register EL0 may not
++				  access; pc at it, ev.insn = the raw word */
++	KW_EV_BREAKPOINT = 4,  /* BRK #imm; pc at it, ev.insn = the raw word */
++	KW_EV_MISALIGNED = 5,  /* pc not 4-byte aligned (ev.addr = pc), or an
++				  exclusive or acquire/release access that is
++				  not naturally aligned (ev.addr = the
++				  address); pc at the instruction */
+ 	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
+ };
+ 
+@@ -105,29 +130,29 @@ struct kw_event {
+ 	uint64_t addr;    /* faulting guest virtual address (FAULT: any byte of
+ 			     the faulting page; MISALIGNED: the address;
+ 			     ILLEGAL/BREAKPOINT: the pc) */
+-	uint64_t insn;    /* raw instruction, for KW_EV_ILLEGAL (16 bits if
+-			     compressed) */
++	uint64_t insn;    /* raw instruction, for KW_EV_ILLEGAL and
++			     KW_EV_BREAKPOINT */
+ };
+ 
+ /*
+- * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned).
+- * ABI 5: 8 MiB (a 3x larger op arena); ABI 2 to 4: 4 MiB (TLBs +
+- * decoded-block cache); ABI 1 was 64 KiB.
++ * Bytes the kernel must reserve for a struct kw_cpu (8-byte aligned): TLBs,
++ * the decoded-block cache and its op arena, JIT bookkeeping.
+  */
+-#define KW_CPU_SIZE (8 * 1024 * 1024)
++#define KW_CPU_SIZE (9 * 1024 * 1024)
+ 
+ /*
+  * Only the leading fields are public. The rest of the KW_CPU_SIZE bytes
+- * (TLBs, decoded-block cache, LR/SC reservation) belong to the emulator.
++ * (TLBs, exclusive monitor, caches) belong to the emulator.
+  */
+ struct kw_cpu {
+ 	uint64_t phys_base;            /* linear address of physical address 0 */
+ 	uint64_t pgd;                  /* physical address of the root table */
+-	const volatile uint32_t *irq_pending; /* polled at block boundaries; may be NULL */
++	const volatile uint32_t *irq_pending; /* polled at least every 64
++						 instructions; may be NULL */
+ 	uint64_t budget;               /* instructions kw_run may execute */
+ 	uint64_t icount;               /* total instructions executed (stats) */
+ 	struct kw_event ev;            /* details of the last event */
+-	/* ABI 8, see "Flushes during a JIT compile" above */
++	/* see "jit_busy / flush_all" above */
+ 	uint32_t jit_busy;             /* written by kwemu only */
+ 	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
+ };
+@@ -138,112 +163,79 @@ void kw_cpu_init(struct kw_cpu *cpu);
+ /*
+  * Run guest code from regs until an event. Returns enum kw_event_kind and
+  * fills cpu->ev. Never blocks, never re-enters the kernel.
+- * cpu->budget is decremented per retired instruction (ecall retires;
++ * cpu->budget is decremented per retired instruction (SVC retires;
+  * faulting/illegal instructions do not) and cpu->icount advanced by the
+  * same amount; KW_EV_BUDGET when it reaches exactly 0 (returns at once if
+  * 0 on entry). *irq_pending is checked on entry and at the end of every
+- * decoded block, i.e. at least every 64 instructions (ABI 1: after every
+- * taken branch/jump). The cycle/time/instret CSRs read cpu->icount.
+- * Every event leaves regs (incl. pc) exactly at an instruction boundary.
++ * decoded block, which is at least every 64 instructions and at every
++ * taken branch out of a block (a branch the decoder followed
++ * inside a page is not a check point). Every event leaves regs (incl. pc)
++ * exactly at an instruction boundary. Data accesses may be unaligned
++ * (SCTLR_EL1.A = 0); SP alignment is not checked.
+  */
+ uint32_t kw_run(struct kw_cpu *cpu, struct kw_regs *regs);
+ 
+-/* Switch address space: sets cpu->pgd, drops the TLB and LR/SC reservation. */
++/* Switch address space: sets cpu->pgd, drops the TLB and the exclusive monitor. */
+ void kw_set_pgd(struct kw_cpu *cpu, uint64_t pgd);
+ 
+ void kw_flush_tlb_all(struct kw_cpu *cpu);
+ void kw_flush_tlb_range(struct kw_cpu *cpu, uint64_t start, uint64_t end);
+ 
+-/* Drop the LR/SC reservation (call on every context switch / trap return). */
++/*
++ * Clear the exclusive monitor (LDXR/STXR; call on every context switch /
++ * trap return, as exception entry and return clear it on hardware).
++ */
+ void kw_clear_reservation(struct kw_cpu *cpu);
+ 
+ uint32_t kw_abi_version(void);
+ 
+ /*
+- * Optional ISA extensions (ABI 3; ABI 4 added bits 10..18). RV64GC is
+- * always there; these are the extensions beyond it that a kwemu build may
+- * implement, one bit each. Bits 19..63 are reserved for more. An
+- * instruction of an extension that is not implemented, or not enabled,
+- * raises KW_EV_ILLEGAL like any other unknown encoding. (Hints such as
+- * PAUSE, the NTL hints and the Zicbop prefetches are plain RV64GC
+- * encodings that run as no-ops: always there, no bit.)
++ * Optional ISA features beyond ARMv8.0-A with FP and AdvSIMD, one bit each
++ * (they map to the AT_HWCAP bits the kernel reports). Bits 8..63 are
++ * reserved. An instruction of a feature that is not implemented, or not
++ * enabled, raises KW_EV_ILLEGAL like any other unknown encoding.
++ * kw_isa_supported() says which ones this build implements.
+  */
+-#define KW_ISA_ZBA	(1ULL << 0)	/* address generation */
+-#define KW_ISA_ZBB	(1ULL << 1)	/* basic bit manipulation */
+-#define KW_ISA_ZBC	(1ULL << 2)	/* carry-less multiplication */
+-#define KW_ISA_ZBS	(1ULL << 3)	/* single-bit instructions */
+-#define KW_ISA_ZBKB	(1ULL << 4)	/* bit manipulation for cryptography */
+-#define KW_ISA_ZBKC	(1ULL << 5)	/* carry-less multiplication for cryptography */
+-#define KW_ISA_ZBKX	(1ULL << 6)	/* crossbar permutations */
+-#define KW_ISA_ZKND	(1ULL << 7)	/* AES decryption (aes64ds, aes64dsm, aes64im, aes64ks1i, aes64ks2) */
+-#define KW_ISA_ZKNE	(1ULL << 8)	/* AES encryption (aes64es, aes64esm, aes64ks1i, aes64ks2) */
+-#define KW_ISA_ZICOND	(1ULL << 9)	/* czero.eqz, czero.nez */
+-#define KW_ISA_ZCB	(1ULL << 10)	/* c.lbu, c.lhu, c.lh, c.sb, c.sh, c.mul, c.zext.*, c.sext.*, c.not */
+-#define KW_ISA_ZIMOP	(1ULL << 11)	/* mop.r.N, mop.rr.N (rd = 0) */
+-#define KW_ISA_ZCMOP	(1ULL << 12)	/* c.mop.N (no effect) */
+-#define KW_ISA_ZICBOM	(1ULL << 13)	/* cbo.clean, cbo.flush (64-byte blocks; cbo.inval stays illegal) */
+-#define KW_ISA_ZICBOZ	(1ULL << 14)	/* cbo.zero (64-byte blocks) */
+-#define KW_ISA_ZAWRS	(1ULL << 15)	/* wrs.nto, wrs.sto (no-ops) */
+-#define KW_ISA_ZFA	(1ULL << 16)	/* fli, fminm/fmaxm, fround(nx), fcvtmod.w.d, fleq/fltq (S and D) */
+-#define KW_ISA_ZFHMIN	(1ULL << 17)	/* flh, fsh, fmv.x.h, fmv.h.x, fcvt between H and S/D */
+-#define KW_ISA_ZIHPM	(1ULL << 18)	/* hpmcounter3..31 (read as 0) */
++#define KW_ISA_AES	(1ULL << 0)	/* AESE, AESD, AESMC, AESIMC (HWCAP_AES) */
++#define KW_ISA_PMULL	(1ULL << 1)	/* PMULL/PMULL2 with 64-bit elements (HWCAP_PMULL) */
++#define KW_ISA_SHA1	(1ULL << 2)	/* SHA1C, SHA1P, SHA1M, SHA1H, SHA1SU0/1 (HWCAP_SHA1) */
++#define KW_ISA_SHA2	(1ULL << 3)	/* SHA256H, SHA256H2, SHA256SU0/1 (HWCAP_SHA2) */
++#define KW_ISA_CRC32	(1ULL << 4)	/* CRC32B/H/W/X, CRC32CB/H/W/X (HWCAP_CRC32) */
++#define KW_ISA_LSE	(1ULL << 5)	/* LSE atomics: CAS, CASP, SWP, LDADD, LDCLR,
++					   LDEOR, LDSET, LD{S,U}{MAX,MIN} (HWCAP_ATOMICS) */
++#define KW_ISA_SHA512	(1ULL << 6)	/* SHA512H, SHA512H2, SHA512SU0/1 (HWCAP_SHA512);
++					   needs KW_ISA_SHA2: kw_set_isa drops it without */
++#define KW_ISA_SHA3	(1ULL << 7)	/* EOR3, BCAX, RAX1, XAR (HWCAP_SHA3) */
+ 
+-/* The KW_ISA_* extensions this kwemu build implements. */
++/* The KW_ISA_* features this kwemu build implements. */
+ uint64_t kw_isa_supported(void);
+ 
+ /*
+- * Enable the extensions in `isa` that are implemented (isa &
++ * Enable the features in `isa` that are implemented (isa &
+  * kw_isa_supported()) and disable all others; returns the enabled set.
+- * kw_cpu_init enables every implemented extension. This drops all decoded
+- * (and compiled) code, so call it once at boot, after kw_cpu_init and
+- * before the first kw_run; it is correct, only slow, at any other time
+- * between kw_run calls. The kernel advertises exactly the returned set to
+- * user space.
++ * kw_cpu_init enables every implemented feature. Call it once at boot,
++ * after kw_cpu_init and before the first kw_run. The kernel advertises
++ * exactly the returned set to user space (AT_HWCAP).
+  */
+ uint64_t kw_set_isa(struct kw_cpu *cpu, uint64_t isa);
+ 
+ /*
+  * The host changed under a live struct kw_cpu: the kernel's memory was
+- * restored into a new module instance (a snapshot). Forget every compiled
+- * slot without calling kw_host_jit_free (the instance that held them is
+- * gone, and its table slots hold their stubs again), ask kw_host_jit_caps
+- * again (the new host may have no JIT) and drop all decoded code. Call it
+- * before the first kw_run on the new instance.
++ * restored into a new module instance (a snapshot). Drop everything that
++ * belongs to the old instance (compiled code, if a JIT is built in) and
++ * all decoded code. Call it before the first kw_run on the new instance.
+  */
+ void kw_host_reset(struct kw_cpu *cpu);
+ 
+ /*
+- * Optional JIT tier (emulator built with -Dkwemu-jit; wasm64 only; not part
+- * of the ABI version). Without it the object has no such imports. With it,
+- * the object imports these from wasm module "unkernel", and hot decoded
+- * blocks are compiled to wasm and entered through call_indirect. kwemu owns
+- * a fixed pool of stub functions in the module's function table; their
+- * table indices are the "slots" below, and the table never grows. See
+- * src/emu/jit.zig and docs/kwemu.md.
+- *
++ * Optional JIT tier (-Dkwemu-jit; not part of the ABI version): hot decoded
++ * blocks are compiled to wasm (src/a64/jit on the ISA-neutral core in
++ * src/emu/jitcore.zig). A library built with it imports these from wasm
++ * module "unkernel" (see src/emu/jitcore.zig for their contract):
+  *   uint32_t kw_host_jit_caps(void);
+- *     bit 0: JIT available (0: kwemu never compiles);
+- *     bit 1: memory is 32-bit (module lowered with --memory64-lowering:
+- *            generated code imports a 32-bit memory);
+- *     bit 2: eager, compile blocks on first entry (tests).
+- *     Called from kw_cpu_init and kw_host_reset.
+  *   int32_t kw_host_jit_compile(const uint8_t *module, size_t len, uint32_t slot,
+  *                               uint32_t flags);
+- *     Synchronously compile the module (it imports "env" "memory", i.e.
+- *     this memory, and exports function "f", type (i64 i64 i64 i64) -> i64)
+- *     and install "f" into table slot `slot`. 0 = installed; < 0 = failed,
+- *     slot untouched. flags bit 0 (ABI 8; older kwemu passes no flags): f
+- *     called with a second argument of 0 returns 0 at once and touches
+- *     nothing, so a host whose engine compiles a function only at its first
+- *     call can have it compiled here, inside the jit_busy window, by
+- *     calling f(0, 0, 0, 0).
+  *   void kw_host_jit_free(uint32_t slot);
+- *     Restore the function the slot held before its first compile and drop
+- *     the module.
+- * kw_cpu_init forgets installed slots without freeing them; a compile into
+- * a slot that is still installed must replace its function. Only one
+- * struct kw_cpu per module instance may use the JIT (the slots are
+- * per-table).
+  */
+ 
+ #ifdef __cplusplus
+diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
+index 67d9ec0deed..cb9aea05732 100644
+--- a/arch/wasm/include/asm/processor.h
++++ b/arch/wasm/include/asm/processor.h
+@@ -9,9 +9,12 @@
+ #define STACK_ALIGN 16
+ 
+ /*
+- * User address space: Sv39 lower half, as on riscv64 (256 GiB). User and
+- * kernel addresses overlap numerically; they are different address spaces
+- * (user memory is only reachable through page-table walks).
++ * User address space: the lower half of Sv39 (256 GiB, 38 bits), the
++ * page-table format kwemu walks for every guest ISA (kw_emu.h). arm64 with
++ * 39-bit VAs gives user space 512 GiB; here mmap hints and fixed mappings
++ * at or above 1 << 38 fail or move down. User and kernel addresses overlap
++ * numerically; they are different address spaces (user memory is only
++ * reachable through page-table walks).
+  */
+ #define TASK_SIZE		(_AC(1, UL) << 38)
+ #define TASK_SIZE_MAX		TASK_SIZE
+@@ -81,7 +84,7 @@ static inline unsigned long __get_wchan(struct task_struct *p)
+ 	((struct pt_regs *)(task_stack_page(task) + THREAD_SIZE) - 1)
+ 
+ #define KSTK_EIP(tsk)	(task_pt_regs(tsk)->user.pc)
+-#define KSTK_ESP(tsk)	(task_pt_regs(tsk)->user.x[2])
++#define KSTK_ESP(tsk)	(task_pt_regs(tsk)->user.sp)
+ 
+ #endif /* __ASSEMBLER__ */
+ 
+diff --git a/arch/wasm/include/asm/ptrace.h b/arch/wasm/include/asm/ptrace.h
+index d905f6c9ff5..c0093dcba37 100644
+--- a/arch/wasm/include/asm/ptrace.h
++++ b/arch/wasm/include/asm/ptrace.h
+@@ -5,21 +5,18 @@
+ 
+ #include <uapi/asm/ptrace.h>
+ 
+-#define PTRACE_SYSEMU			0x1f
+-#define PTRACE_SYSEMU_SINGLESTEP	0x20
+-
+ #ifndef __ASSEMBLER__
+ 
+ #include <asm/kw_emu.h>
+ 
+ /*
+  * Kernel entry frame. For user tasks it sits at the top of the kernel stack
+- * and holds the riscv64 user context run by kwemu. Frames for interrupts
++ * and holds the arm64 user context run by kwemu. Frames for interrupts
+  * taken while in the kernel (idle) are built on the stack with kernel=1.
+  */
+ struct pt_regs {
+-	struct kw_regs user;	/* x0..x31, pc, f0..f31, fcsr */
+-	unsigned long orig_a0;
++	struct kw_regs user;	/* x0..x30, sp, pc, nzcv, fpcr, fpsr, tpidr_el0, v0..v31 */
++	unsigned long orig_x0;
+ 	unsigned long cause;	/* PT_CAUSE_* */
+ 	unsigned long badaddr;
+ 	unsigned long kernel;	/* non-zero: frame interrupted kernel code */
+@@ -27,19 +24,11 @@ struct pt_regs {
+ };
+ 
+ #define PT_CAUSE_NONE		(-1UL)
+-#define PT_CAUSE_SYSCALL	8UL	/* like riscv EXC_SYSCALL */
+-
+-/* Register accessors (riscv ABI names). */
+-#define REG_RA	1
+-#define REG_SP	2
+-#define REG_GP	3
+-#define REG_TP	4
+-#define REG_A0	10
+-#define REG_A7	17
++#define PT_CAUSE_SYSCALL	0x15UL	/* like arm64 ESR_ELx_EC_SVC64 */
+ 
+ #define user_mode(regs)			(!(regs)->kernel)
+ #define instruction_pointer(regs)	((regs)->user.pc)
+-#define user_stack_pointer(regs)	((regs)->user.x[REG_SP])
++#define user_stack_pointer(regs)	((regs)->user.sp)
+ #define profile_pc(regs)		instruction_pointer(regs)
+ 
+ static inline void instruction_pointer_set(struct pt_regs *regs,
+@@ -50,13 +39,13 @@ static inline void instruction_pointer_set(struct pt_regs *regs,
+ 
+ static inline unsigned long regs_return_value(struct pt_regs *regs)
+ {
+-	return regs->user.x[REG_A0];
++	return regs->user.x[0];
+ }
+ 
+ static inline void regs_set_return_value(struct pt_regs *regs,
+ 					 unsigned long val)
+ {
+-	regs->user.x[REG_A0] = val;
++	regs->user.x[0] = val;
+ }
+ 
+ #define current_pt_regs()		task_pt_regs(current)
+diff --git a/arch/wasm/include/asm/syscall.h b/arch/wasm/include/asm/syscall.h
+index f5156cf1731..597055ad55f 100644
+--- a/arch/wasm/include/asm/syscall.h
++++ b/arch/wasm/include/asm/syscall.h
+@@ -8,32 +8,32 @@
+ #include <linux/err.h>
+ #include <asm/ptrace.h>
+ 
+-/* riscv64 syscall convention: a7 = nr, a0..a5 = args, a0 = return. */
++/* arm64 syscall convention: x8 = nr, x0..x5 = args, x0 = return. */
+ 
+ typedef long (*syscall_t)(const struct pt_regs *);
+ extern void * const sys_call_table[];
+ 
+ static inline int syscall_get_nr(struct task_struct *task, struct pt_regs *regs)
+ {
+-	return regs->user.x[REG_A7];
++	return regs->user.x[8];
+ }
+ 
+ static inline void syscall_set_nr(struct task_struct *task,
+ 				  struct pt_regs *regs, int sysno)
+ {
+-	regs->user.x[REG_A7] = sysno;
++	regs->user.x[8] = sysno;
+ }
+ 
+ static inline void syscall_rollback(struct task_struct *task,
+ 				    struct pt_regs *regs)
+ {
+-	regs->user.x[REG_A0] = regs->orig_a0;
++	regs->user.x[0] = regs->orig_x0;
+ }
+ 
+ static inline long syscall_get_error(struct task_struct *task,
+ 				     struct pt_regs *regs)
+ {
+-	unsigned long error = regs->user.x[REG_A0];
++	unsigned long error = regs->user.x[0];
+ 
+ 	return IS_ERR_VALUE(error) ? error : 0;
+ }
+@@ -41,44 +41,44 @@ static inline long syscall_get_error(struct task_struct *task,
+ static inline long syscall_get_return_value(struct task_struct *task,
+ 					    struct pt_regs *regs)
+ {
+-	return regs->user.x[REG_A0];
++	return regs->user.x[0];
+ }
+ 
+ static inline void syscall_set_return_value(struct task_struct *task,
+ 					    struct pt_regs *regs,
+ 					    int error, long val)
+ {
+-	regs->user.x[REG_A0] = (long)error ?: val;
++	regs->user.x[0] = (long)error ?: val;
+ }
+ 
+ static inline void syscall_get_arguments(struct task_struct *task,
+ 					 struct pt_regs *regs,
+ 					 unsigned long *args)
+ {
+-	args[0] = regs->orig_a0;
+-	args[1] = regs->user.x[11];
+-	args[2] = regs->user.x[12];
+-	args[3] = regs->user.x[13];
+-	args[4] = regs->user.x[14];
+-	args[5] = regs->user.x[15];
++	args[0] = regs->orig_x0;
++	args[1] = regs->user.x[1];
++	args[2] = regs->user.x[2];
++	args[3] = regs->user.x[3];
++	args[4] = regs->user.x[4];
++	args[5] = regs->user.x[5];
+ }
+ 
+ static inline void syscall_set_arguments(struct task_struct *task,
+ 					 struct pt_regs *regs,
+ 					 const unsigned long *args)
+ {
+-	regs->orig_a0 = args[0];
+-	regs->user.x[10] = args[0];
+-	regs->user.x[11] = args[1];
+-	regs->user.x[12] = args[2];
+-	regs->user.x[13] = args[3];
+-	regs->user.x[14] = args[4];
+-	regs->user.x[15] = args[5];
++	regs->orig_x0 = args[0];
++	regs->user.x[0] = args[0];
++	regs->user.x[1] = args[1];
++	regs->user.x[2] = args[2];
++	regs->user.x[3] = args[3];
++	regs->user.x[4] = args[4];
++	regs->user.x[5] = args[5];
+ }
+ 
+ static inline int syscall_get_arch(struct task_struct *task)
+ {
+-	return AUDIT_ARCH_RISCV64;
++	return AUDIT_ARCH_AARCH64;
+ }
+ 
+ static inline bool arch_syscall_is_vdso_sigreturn(struct pt_regs *regs)
+diff --git a/arch/wasm/include/asm/syscall_wrapper.h b/arch/wasm/include/asm/syscall_wrapper.h
+index 7333b572ab6..70d2ae0bac5 100644
+--- a/arch/wasm/include/asm/syscall_wrapper.h
++++ b/arch/wasm/include/asm/syscall_wrapper.h
+@@ -2,7 +2,8 @@
+ /*
+  * Syscall wrappers: every syscall gets a uniform (const struct pt_regs *)
+  * entry point, so the table can be called through one Wasm function type.
+- * Based on arch/riscv/include/asm/syscall_wrapper.h.
++ * Based on arch/riscv/include/asm/syscall_wrapper.h; the registers are
++ * arm64's (arguments in x0..x5).
+  */
+ 
+ #ifndef __ASM_SYSCALL_WRAPPER_H
+@@ -18,8 +19,8 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *);
+ 
+ #define SC_WASM_REGS_TO_ARGS(nargs, ...)						\
+ 	__MAP(nargs,__SC_ARGS								\
+-	      ,,regs->orig_a0,,regs->user.x[11],,regs->user.x[12]			\
+-	      ,,regs->user.x[13],,regs->user.x[14],,regs->user.x[15],,regs->user.x[16])
++	      ,,regs->orig_x0,,regs->user.x[1],,regs->user.x[2]			\
++	      ,,regs->user.x[3],,regs->user.x[4],,regs->user.x[5],,regs->user.x[6])
+ 
+ #define __SYSCALL_DEFINEx(x, name, ...)						\
+ 	asmlinkage long __wasm_sys##name(const struct pt_regs *regs);		\
+diff --git a/arch/wasm/include/asm/tlbflush.h b/arch/wasm/include/asm/tlbflush.h
+index 6573bbd7f01..d1fea6e5767 100644
+--- a/arch/wasm/include/asm/tlbflush.h
++++ b/arch/wasm/include/asm/tlbflush.h
+@@ -15,9 +15,6 @@ void flush_tlb_page(struct vm_area_struct *vma, unsigned long addr);
+ void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		     unsigned long end);
+ 
+-/* riscv_flush_icache(): drop decoded code (every CPU's on SMP). */
+-void kw_flush_icache_all(void);
+-
+ /* wasm_yield() from user mode; SMP: flushes do not wait for it (tlb.c). */
+ #ifdef CONFIG_SMP
+ void kw_yield_to_host(void);
+diff --git a/arch/wasm/include/asm/unistd.h b/arch/wasm/include/asm/unistd.h
+index 16ebc94ca9a..0c377ee8f8e 100644
+--- a/arch/wasm/include/asm/unistd.h
++++ b/arch/wasm/include/asm/unistd.h
+@@ -2,11 +2,9 @@
+ #ifndef _ASM_WASM_UNISTD_H
+ #define _ASM_WASM_UNISTD_H
+ 
+-/* Same set of wants as riscv64: user mode sees the riscv64 syscall ABI. */
++/* Same set of wants as arm64 (no compat): user mode sees the arm64 syscall ABI. */
+ #define __ARCH_WANT_SYS_CLONE
+ #define __ARCH_WANT_NEW_STAT
+-#define __ARCH_WANT_SET_GET_RLIMIT
+-#define __ARCH_WANT_MEMFD_SECRET
+ 
+ #include <uapi/asm/unistd.h>
+ 
+diff --git a/arch/wasm/include/uapi/asm/auxvec.h b/arch/wasm/include/uapi/asm/auxvec.h
+index 95050ebe9ad..743c0b84fd3 100644
+--- a/arch/wasm/include/uapi/asm/auxvec.h
++++ b/arch/wasm/include/uapi/asm/auxvec.h
+@@ -1,40 +1,26 @@
+-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+ /*
+  * Copyright (C) 2012 ARM Ltd.
+- * Copyright (C) 2015 Regents of the University of California
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+-
+-#ifndef _UAPI_ASM_RISCV_AUXVEC_H
+-#define _UAPI_ASM_RISCV_AUXVEC_H
++#ifndef __ASM_AUXVEC_H
++#define __ASM_AUXVEC_H
+ 
+ /* vDSO location */
+-#define AT_SYSINFO_EHDR 33
++#define AT_SYSINFO_EHDR	33
++#define AT_MINSIGSTKSZ	51	/* stack needed for signal delivery */
+ 
+-/*
+- * The set of entries below represent more extensive information
+- * about the caches, in the form of two entry per cache type,
+- * one entry containing the cache size in bytes, and the other
+- * containing the cache line size in bytes in the bottom 16 bits
+- * and the cache associativity in the next 16 bits.
+- *
+- * The associativity is such that if N is the 16-bit value, the
+- * cache is N way set associative. A value if 0xffff means fully
+- * associative, a value of 1 means directly mapped.
+- *
+- * For all these fields, a value of 0 means that the information
+- * is not known.
+- */
+-#define AT_L1I_CACHESIZE	40
+-#define AT_L1I_CACHEGEOMETRY	41
+-#define AT_L1D_CACHESIZE	42
+-#define AT_L1D_CACHEGEOMETRY	43
+-#define AT_L2_CACHESIZE		44
+-#define AT_L2_CACHEGEOMETRY	45
+-#define AT_L3_CACHESIZE		46
+-#define AT_L3_CACHEGEOMETRY	47
++#define AT_VECTOR_SIZE_ARCH 2 /* entries in ARCH_DLINFO */
+ 
+-/* entries in ARCH_DLINFO */
+-#define AT_VECTOR_SIZE_ARCH	10
+-#define AT_MINSIGSTKSZ		51
+-
+-#endif /* _UAPI_ASM_RISCV_AUXVEC_H */
++#endif
+diff --git a/arch/wasm/include/uapi/asm/bitsperlong.h b/arch/wasm/include/uapi/asm/bitsperlong.h
+index 7d0b32e3b70..4b88a27775a 100644
+--- a/arch/wasm/include/uapi/asm/bitsperlong.h
++++ b/arch/wasm/include/uapi/asm/bitsperlong.h
+@@ -4,11 +4,11 @@
+  * Copyright (C) 2015 Regents of the University of California
+  */
+ 
+-#ifndef _UAPI_ASM_RISCV_BITSPERLONG_H
+-#define _UAPI_ASM_RISCV_BITSPERLONG_H
++#ifndef _UAPI_ASM_WASM_BITSPERLONG_H
++#define _UAPI_ASM_WASM_BITSPERLONG_H
+ 
+ #define __BITS_PER_LONG (__SIZEOF_POINTER__ * 8)
+ 
+ #include <asm-generic/bitsperlong.h>
+ 
+-#endif /* _UAPI_ASM_RISCV_BITSPERLONG_H */
++#endif /* _UAPI_ASM_WASM_BITSPERLONG_H */
+diff --git a/arch/wasm/include/uapi/asm/byteorder.h b/arch/wasm/include/uapi/asm/byteorder.h
+index f671e16bf6a..9d0c5444c83 100644
+--- a/arch/wasm/include/uapi/asm/byteorder.h
++++ b/arch/wasm/include/uapi/asm/byteorder.h
+@@ -4,9 +4,9 @@
+  * Copyright (C) 2015 Regents of the University of California
+  */
+ 
+-#ifndef _UAPI_ASM_RISCV_BYTEORDER_H
+-#define _UAPI_ASM_RISCV_BYTEORDER_H
++#ifndef _UAPI_ASM_WASM_BYTEORDER_H
++#define _UAPI_ASM_WASM_BYTEORDER_H
+ 
+ #include <linux/byteorder/little_endian.h>
+ 
+-#endif /* _UAPI_ASM_RISCV_BYTEORDER_H */
++#endif /* _UAPI_ASM_WASM_BYTEORDER_H */
+diff --git a/arch/wasm/include/uapi/asm/elf.h b/arch/wasm/include/uapi/asm/elf.h
+deleted file mode 100644
+index 032083d8b99..00000000000
+--- a/arch/wasm/include/uapi/asm/elf.h
++++ /dev/null
+@@ -1,100 +0,0 @@
+-/*
+- * Copyright (C) 2003 Matjaz Breskvar <phoenix@bsemi.com>
+- * Copyright (C) 2010-2011 Jonas Bonn <jonas@southpole.se>
+- * Copyright (C) 2012 Regents of the University of California
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- */
+-
+-#ifndef _UAPI_ASM_RISCV_ELF_H
+-#define _UAPI_ASM_RISCV_ELF_H
+-
+-#include <asm/ptrace.h>
+-
+-/* ELF register definitions */
+-typedef unsigned long elf_greg_t;
+-typedef struct user_regs_struct elf_gregset_t;
+-#define ELF_NGREG (sizeof(elf_gregset_t) / sizeof(elf_greg_t))
+-
+-/* We don't support f without d, or q.  */
+-typedef __u64 elf_fpreg_t;
+-typedef union __riscv_fp_state elf_fpregset_t;
+-#define ELF_NFPREG (sizeof(struct __riscv_d_ext_state) / sizeof(elf_fpreg_t))
+-
+-/*
+- * User mode is always riscv64, and this header is also built into the wasm
+- * kernel, where __riscv_xlen is not defined: do not test it.
+- */
+-#define ELF_RISCV_R_SYM(r_info)		ELF64_R_SYM(r_info)
+-#define ELF_RISCV_R_TYPE(r_info)	ELF64_R_TYPE(r_info)
+-
+-/*
+- * RISC-V relocation types
+- */
+-
+-/* Relocation types used by the dynamic linker */
+-#define R_RISCV_NONE		0
+-#define R_RISCV_32		1
+-#define R_RISCV_64		2
+-#define R_RISCV_RELATIVE	3
+-#define R_RISCV_COPY		4
+-#define R_RISCV_JUMP_SLOT	5
+-#define R_RISCV_TLS_DTPMOD32	6
+-#define R_RISCV_TLS_DTPMOD64	7
+-#define R_RISCV_TLS_DTPREL32	8
+-#define R_RISCV_TLS_DTPREL64	9
+-#define R_RISCV_TLS_TPREL32	10
+-#define R_RISCV_TLS_TPREL64	11
+-#define R_RISCV_IRELATIVE	58
+-
+-/* Relocation types not used by the dynamic linker */
+-#define R_RISCV_BRANCH		16
+-#define R_RISCV_JAL		17
+-#define R_RISCV_CALL		18
+-#define R_RISCV_CALL_PLT	19
+-#define R_RISCV_GOT_HI20	20
+-#define R_RISCV_TLS_GOT_HI20	21
+-#define R_RISCV_TLS_GD_HI20	22
+-#define R_RISCV_PCREL_HI20	23
+-#define R_RISCV_PCREL_LO12_I	24
+-#define R_RISCV_PCREL_LO12_S	25
+-#define R_RISCV_HI20		26
+-#define R_RISCV_LO12_I		27
+-#define R_RISCV_LO12_S		28
+-#define R_RISCV_TPREL_HI20	29
+-#define R_RISCV_TPREL_LO12_I	30
+-#define R_RISCV_TPREL_LO12_S	31
+-#define R_RISCV_TPREL_ADD	32
+-#define R_RISCV_ADD8		33
+-#define R_RISCV_ADD16		34
+-#define R_RISCV_ADD32		35
+-#define R_RISCV_ADD64		36
+-#define R_RISCV_SUB8		37
+-#define R_RISCV_SUB16		38
+-#define R_RISCV_SUB32		39
+-#define R_RISCV_SUB64		40
+-#define R_RISCV_GNU_VTINHERIT	41
+-#define R_RISCV_GNU_VTENTRY	42
+-#define R_RISCV_ALIGN		43
+-#define R_RISCV_RVC_BRANCH	44
+-#define R_RISCV_RVC_JUMP	45
+-#define R_RISCV_GPREL_I		47
+-#define R_RISCV_GPREL_S		48
+-#define R_RISCV_TPREL_I		49
+-#define R_RISCV_TPREL_S		50
+-#define R_RISCV_RELAX		51
+-#define R_RISCV_SUB6		52
+-#define R_RISCV_SET6		53
+-#define R_RISCV_SET8		54
+-#define R_RISCV_SET16		55
+-#define R_RISCV_SET32		56
+-#define R_RISCV_32_PCREL	57
+-#define R_RISCV_PLT32		59
+-#define R_RISCV_SET_ULEB128	60
+-#define R_RISCV_SUB_ULEB128	61
+-
+-
+-#endif /* _UAPI_ASM_RISCV_ELF_H */
+diff --git a/arch/wasm/include/uapi/asm/fcntl.h b/arch/wasm/include/uapi/asm/fcntl.h
+new file mode 100644
+index 00000000000..e503fdb74ec
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/fcntl.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef __ASM_FCNTL_H
++#define __ASM_FCNTL_H
++
++/*
++ * Using our own definitions for AArch32 (compat) support.
++ */
++#define O_DIRECTORY	(1 << 14)	/* must be a directory */
++#define O_NOFOLLOW	(1 << 15)	/* don't follow links */
++#define O_DIRECT	(1 << 16)	/* direct disk access hint - currently ignored */
++#define O_LARGEFILE	(1 << 17)
++
++#include <asm-generic/fcntl.h>
++
++#endif
+diff --git a/arch/wasm/include/uapi/asm/hwcap.h b/arch/wasm/include/uapi/asm/hwcap.h
+index c52bb7bbbab..10272ddb4d6 100644
+--- a/arch/wasm/include/uapi/asm/hwcap.h
++++ b/arch/wasm/include/uapi/asm/hwcap.h
+@@ -1,26 +1,159 @@
+-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+ /*
+- * Copied from arch/arm64/include/asm/hwcap.h
+- *
+  * Copyright (C) 2012 ARM Ltd.
+- * Copyright (C) 2017 SiFive
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+-#ifndef _UAPI_ASM_RISCV_HWCAP_H
+-#define _UAPI_ASM_RISCV_HWCAP_H
++#ifndef _UAPI__ASM_HWCAP_H
++#define _UAPI__ASM_HWCAP_H
+ 
+ /*
+- * Linux saves the floating-point registers according to the ISA Linux is
+- * executing on, as opposed to the ISA the user program is compiled for.  This
+- * is necessary for a handful of esoteric use cases: for example, userspace
+- * threading libraries must be able to examine the actual machine state in
+- * order to fully reconstruct the state of a thread.
++ * HWCAP flags - for AT_HWCAP
++ *
++ * Bits 62 and 63 are reserved for use by libc.
++ * Bits 33-61 are unallocated for potential use by libc.
+  */
+-#define COMPAT_HWCAP_ISA_I	(1 << ('I' - 'A'))
+-#define COMPAT_HWCAP_ISA_M	(1 << ('M' - 'A'))
+-#define COMPAT_HWCAP_ISA_A	(1 << ('A' - 'A'))
+-#define COMPAT_HWCAP_ISA_F	(1 << ('F' - 'A'))
+-#define COMPAT_HWCAP_ISA_D	(1 << ('D' - 'A'))
+-#define COMPAT_HWCAP_ISA_C	(1 << ('C' - 'A'))
+-#define COMPAT_HWCAP_ISA_V	(1 << ('V' - 'A'))
++#define HWCAP_FP		(1 << 0)
++#define HWCAP_ASIMD		(1 << 1)
++#define HWCAP_EVTSTRM		(1 << 2)
++#define HWCAP_AES		(1 << 3)
++#define HWCAP_PMULL		(1 << 4)
++#define HWCAP_SHA1		(1 << 5)
++#define HWCAP_SHA2		(1 << 6)
++#define HWCAP_CRC32		(1 << 7)
++#define HWCAP_ATOMICS		(1 << 8)
++#define HWCAP_FPHP		(1 << 9)
++#define HWCAP_ASIMDHP		(1 << 10)
++#define HWCAP_CPUID		(1 << 11)
++#define HWCAP_ASIMDRDM		(1 << 12)
++#define HWCAP_JSCVT		(1 << 13)
++#define HWCAP_FCMA		(1 << 14)
++#define HWCAP_LRCPC		(1 << 15)
++#define HWCAP_DCPOP		(1 << 16)
++#define HWCAP_SHA3		(1 << 17)
++#define HWCAP_SM3		(1 << 18)
++#define HWCAP_SM4		(1 << 19)
++#define HWCAP_ASIMDDP		(1 << 20)
++#define HWCAP_SHA512		(1 << 21)
++#define HWCAP_SVE		(1 << 22)
++#define HWCAP_ASIMDFHM		(1 << 23)
++#define HWCAP_DIT		(1 << 24)
++#define HWCAP_USCAT		(1 << 25)
++#define HWCAP_ILRCPC		(1 << 26)
++#define HWCAP_FLAGM		(1 << 27)
++#define HWCAP_SSBS		(1 << 28)
++#define HWCAP_SB		(1 << 29)
++#define HWCAP_PACA		(1 << 30)
++#define HWCAP_PACG		(1UL << 31)
++#define HWCAP_GCS		(1UL << 32)
++#define HWCAP_CMPBR		(1UL << 33)
++#define HWCAP_FPRCVT		(1UL << 34)
++#define HWCAP_F8MM8		(1UL << 35)
++#define HWCAP_F8MM4		(1UL << 36)
++#define HWCAP_SVE_F16MM		(1UL << 37)
++#define HWCAP_SVE_ELTPERM	(1UL << 38)
++#define HWCAP_SVE_AES2		(1UL << 39)
++#define HWCAP_SVE_BFSCALE	(1UL << 40)
++#define HWCAP_SVE2P2		(1UL << 41)
++#define HWCAP_SME2P2		(1UL << 42)
++#define HWCAP_SME_SBITPERM	(1UL << 43)
++#define HWCAP_SME_AES		(1UL << 44)
++#define HWCAP_SME_SFEXPA	(1UL << 45)
++#define HWCAP_SME_STMOP		(1UL << 46)
++#define HWCAP_SME_SMOP4		(1UL << 47)
+ 
+-#endif /* _UAPI_ASM_RISCV_HWCAP_H */
++/*
++ * HWCAP2 flags - for AT_HWCAP2
++ */
++#define HWCAP2_DCPODP		(1 << 0)
++#define HWCAP2_SVE2		(1 << 1)
++#define HWCAP2_SVEAES		(1 << 2)
++#define HWCAP2_SVEPMULL		(1 << 3)
++#define HWCAP2_SVEBITPERM	(1 << 4)
++#define HWCAP2_SVESHA3		(1 << 5)
++#define HWCAP2_SVESM4		(1 << 6)
++#define HWCAP2_FLAGM2		(1 << 7)
++#define HWCAP2_FRINT		(1 << 8)
++#define HWCAP2_SVEI8MM		(1 << 9)
++#define HWCAP2_SVEF32MM		(1 << 10)
++#define HWCAP2_SVEF64MM		(1 << 11)
++#define HWCAP2_SVEBF16		(1 << 12)
++#define HWCAP2_I8MM		(1 << 13)
++#define HWCAP2_BF16		(1 << 14)
++#define HWCAP2_DGH		(1 << 15)
++#define HWCAP2_RNG		(1 << 16)
++#define HWCAP2_BTI		(1 << 17)
++#define HWCAP2_MTE		(1 << 18)
++#define HWCAP2_ECV		(1 << 19)
++#define HWCAP2_AFP		(1 << 20)
++#define HWCAP2_RPRES		(1 << 21)
++#define HWCAP2_MTE3		(1 << 22)
++#define HWCAP2_SME		(1 << 23)
++#define HWCAP2_SME_I16I64	(1 << 24)
++#define HWCAP2_SME_F64F64	(1 << 25)
++#define HWCAP2_SME_I8I32	(1 << 26)
++#define HWCAP2_SME_F16F32	(1 << 27)
++#define HWCAP2_SME_B16F32	(1 << 28)
++#define HWCAP2_SME_F32F32	(1 << 29)
++#define HWCAP2_SME_FA64		(1 << 30)
++#define HWCAP2_WFXT		(1UL << 31)
++#define HWCAP2_EBF16		(1UL << 32)
++#define HWCAP2_SVE_EBF16	(1UL << 33)
++#define HWCAP2_CSSC		(1UL << 34)
++#define HWCAP2_RPRFM		(1UL << 35)
++#define HWCAP2_SVE2P1		(1UL << 36)
++#define HWCAP2_SME2		(1UL << 37)
++#define HWCAP2_SME2P1		(1UL << 38)
++#define HWCAP2_SME_I16I32	(1UL << 39)
++#define HWCAP2_SME_BI32I32	(1UL << 40)
++#define HWCAP2_SME_B16B16	(1UL << 41)
++#define HWCAP2_SME_F16F16	(1UL << 42)
++#define HWCAP2_MOPS		(1UL << 43)
++#define HWCAP2_HBC		(1UL << 44)
++#define HWCAP2_SVE_B16B16	(1UL << 45)
++#define HWCAP2_LRCPC3		(1UL << 46)
++#define HWCAP2_LSE128		(1UL << 47)
++#define HWCAP2_FPMR		(1UL << 48)
++#define HWCAP2_LUT		(1UL << 49)
++#define HWCAP2_FAMINMAX		(1UL << 50)
++#define HWCAP2_F8CVT		(1UL << 51)
++#define HWCAP2_F8FMA		(1UL << 52)
++#define HWCAP2_F8DP4		(1UL << 53)
++#define HWCAP2_F8DP2		(1UL << 54)
++#define HWCAP2_F8E4M3		(1UL << 55)
++#define HWCAP2_F8E5M2		(1UL << 56)
++#define HWCAP2_SME_LUTV2	(1UL << 57)
++#define HWCAP2_SME_F8F16	(1UL << 58)
++#define HWCAP2_SME_F8F32	(1UL << 59)
++#define HWCAP2_SME_SF8FMA	(1UL << 60)
++#define HWCAP2_SME_SF8DP4	(1UL << 61)
++#define HWCAP2_SME_SF8DP2	(1UL << 62)
++#define HWCAP2_POE		(1UL << 63)
++
++/*
++ * HWCAP3 flags - for AT_HWCAP3
++ */
++#define HWCAP3_MTE_FAR		(1UL << 0)
++#define HWCAP3_MTE_STORE_ONLY		(1UL << 1)
++#define HWCAP3_LSFE		(1UL << 2)
++#define HWCAP3_LS64		(1UL << 3)
++#define HWCAP3_SVE_B16MM	(1UL << 4)
++#define HWCAP3_SVE2P3		(1UL << 5)
++#define HWCAP3_SME_LUT6		(1UL << 6)
++#define HWCAP3_SME2P3		(1UL << 7)
++#define HWCAP3_F16MM		(1UL << 8)
++#define HWCAP3_F16F32DOT	(1UL << 9)
++#define HWCAP3_F16F32MM		(1UL << 10)
++#define HWCAP3_SVE_LUT6		(1UL << 11)
++
++#endif /* _UAPI__ASM_HWCAP_H */
+diff --git a/arch/wasm/include/uapi/asm/hwprobe.h b/arch/wasm/include/uapi/asm/hwprobe.h
+deleted file mode 100644
+index e6a394fbe7f..00000000000
+--- a/arch/wasm/include/uapi/asm/hwprobe.h
++++ /dev/null
+@@ -1,131 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+-/*
+- * Copyright 2023-2024 Rivos, Inc
+- */
+-
+-#ifndef _UAPI_ASM_HWPROBE_H
+-#define _UAPI_ASM_HWPROBE_H
+-
+-#include <linux/types.h>
+-#include <linux/const.h>
+-
+-/*
+- * Interface for probing hardware capabilities from userspace, see
+- * Documentation/arch/riscv/hwprobe.rst for more information.
+- */
+-struct riscv_hwprobe {
+-	__s64 key;
+-	__u64 value;
+-};
+-
+-#define RISCV_HWPROBE_KEY_MVENDORID	0
+-#define RISCV_HWPROBE_KEY_MARCHID	1
+-#define RISCV_HWPROBE_KEY_MIMPID	2
+-#define RISCV_HWPROBE_KEY_BASE_BEHAVIOR	3
+-#define		RISCV_HWPROBE_BASE_BEHAVIOR_IMA	_BITULL(0)
+-#define RISCV_HWPROBE_KEY_IMA_EXT_0	4
+-#define		RISCV_HWPROBE_IMA_FD		_BITULL(0)
+-#define		RISCV_HWPROBE_IMA_C		_BITULL(1)
+-#define		RISCV_HWPROBE_IMA_V		_BITULL(2)
+-#define		RISCV_HWPROBE_EXT_ZBA		_BITULL(3)
+-#define		RISCV_HWPROBE_EXT_ZBB		_BITULL(4)
+-#define		RISCV_HWPROBE_EXT_ZBS		_BITULL(5)
+-#define		RISCV_HWPROBE_EXT_ZICBOZ	_BITULL(6)
+-#define		RISCV_HWPROBE_EXT_ZBC		_BITULL(7)
+-#define		RISCV_HWPROBE_EXT_ZBKB		_BITULL(8)
+-#define		RISCV_HWPROBE_EXT_ZBKC		_BITULL(9)
+-#define		RISCV_HWPROBE_EXT_ZBKX		_BITULL(10)
+-#define		RISCV_HWPROBE_EXT_ZKND		_BITULL(11)
+-#define		RISCV_HWPROBE_EXT_ZKNE		_BITULL(12)
+-#define		RISCV_HWPROBE_EXT_ZKNH		_BITULL(13)
+-#define		RISCV_HWPROBE_EXT_ZKSED		_BITULL(14)
+-#define		RISCV_HWPROBE_EXT_ZKSH		_BITULL(15)
+-#define		RISCV_HWPROBE_EXT_ZKT		_BITULL(16)
+-#define		RISCV_HWPROBE_EXT_ZVBB		_BITULL(17)
+-#define		RISCV_HWPROBE_EXT_ZVBC		_BITULL(18)
+-#define		RISCV_HWPROBE_EXT_ZVKB		_BITULL(19)
+-#define		RISCV_HWPROBE_EXT_ZVKG		_BITULL(20)
+-#define		RISCV_HWPROBE_EXT_ZVKNED	_BITULL(21)
+-#define		RISCV_HWPROBE_EXT_ZVKNHA	_BITULL(22)
+-#define		RISCV_HWPROBE_EXT_ZVKNHB	_BITULL(23)
+-#define		RISCV_HWPROBE_EXT_ZVKSED	_BITULL(24)
+-#define		RISCV_HWPROBE_EXT_ZVKSH		_BITULL(25)
+-#define		RISCV_HWPROBE_EXT_ZVKT		_BITULL(26)
+-#define		RISCV_HWPROBE_EXT_ZFH		_BITULL(27)
+-#define		RISCV_HWPROBE_EXT_ZFHMIN	_BITULL(28)
+-#define		RISCV_HWPROBE_EXT_ZIHINTNTL	_BITULL(29)
+-#define		RISCV_HWPROBE_EXT_ZVFH		_BITULL(30)
+-#define		RISCV_HWPROBE_EXT_ZVFHMIN	_BITULL(31)
+-#define		RISCV_HWPROBE_EXT_ZFA		_BITULL(32)
+-#define		RISCV_HWPROBE_EXT_ZTSO		_BITULL(33)
+-#define		RISCV_HWPROBE_EXT_ZACAS		_BITULL(34)
+-#define		RISCV_HWPROBE_EXT_ZICOND	_BITULL(35)
+-#define		RISCV_HWPROBE_EXT_ZIHINTPAUSE	_BITULL(36)
+-#define		RISCV_HWPROBE_EXT_ZVE32X	_BITULL(37)
+-#define		RISCV_HWPROBE_EXT_ZVE32F	_BITULL(38)
+-#define		RISCV_HWPROBE_EXT_ZVE64X	_BITULL(39)
+-#define		RISCV_HWPROBE_EXT_ZVE64F	_BITULL(40)
+-#define		RISCV_HWPROBE_EXT_ZVE64D	_BITULL(41)
+-#define		RISCV_HWPROBE_EXT_ZIMOP		_BITULL(42)
+-#define		RISCV_HWPROBE_EXT_ZCA		_BITULL(43)
+-#define		RISCV_HWPROBE_EXT_ZCB		_BITULL(44)
+-#define		RISCV_HWPROBE_EXT_ZCD		_BITULL(45)
+-#define		RISCV_HWPROBE_EXT_ZCF		_BITULL(46)
+-#define		RISCV_HWPROBE_EXT_ZCMOP		_BITULL(47)
+-#define		RISCV_HWPROBE_EXT_ZAWRS		_BITULL(48)
+-#define		RISCV_HWPROBE_EXT_SUPM		_BITULL(49)
+-#define		RISCV_HWPROBE_EXT_ZICNTR	_BITULL(50)
+-#define		RISCV_HWPROBE_EXT_ZIHPM		_BITULL(51)
+-#define		RISCV_HWPROBE_EXT_ZFBFMIN	_BITULL(52)
+-#define		RISCV_HWPROBE_EXT_ZVFBFMIN	_BITULL(53)
+-#define		RISCV_HWPROBE_EXT_ZVFBFWMA	_BITULL(54)
+-#define		RISCV_HWPROBE_EXT_ZICBOM	_BITULL(55)
+-#define		RISCV_HWPROBE_EXT_ZAAMO		_BITULL(56)
+-#define		RISCV_HWPROBE_EXT_ZALRSC	_BITULL(57)
+-#define		RISCV_HWPROBE_EXT_ZABHA		_BITULL(58)
+-#define		RISCV_HWPROBE_EXT_ZALASR	_BITULL(59)
+-#define		RISCV_HWPROBE_EXT_ZICBOP	_BITULL(60)
+-#define		RISCV_HWPROBE_EXT_ZILSD		_BITULL(61)
+-#define		RISCV_HWPROBE_EXT_ZCLSD		_BITULL(62)
+-#define		RISCV_HWPROBE_EXT_ZICFILP	_BITULL(63)
+-
+-#define RISCV_HWPROBE_KEY_CPUPERF_0	5
+-#define		RISCV_HWPROBE_MISALIGNED_UNKNOWN	0
+-#define		RISCV_HWPROBE_MISALIGNED_EMULATED	1
+-#define		RISCV_HWPROBE_MISALIGNED_SLOW		2
+-#define		RISCV_HWPROBE_MISALIGNED_FAST		3
+-#define		RISCV_HWPROBE_MISALIGNED_UNSUPPORTED	4
+-#define		RISCV_HWPROBE_MISALIGNED_MASK		7
+-#define RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE	6
+-#define RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS	7
+-#define RISCV_HWPROBE_KEY_TIME_CSR_FREQ	8
+-#define RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF	9
+-#define		RISCV_HWPROBE_MISALIGNED_SCALAR_UNKNOWN		0
+-#define		RISCV_HWPROBE_MISALIGNED_SCALAR_EMULATED	1
+-#define		RISCV_HWPROBE_MISALIGNED_SCALAR_SLOW		2
+-#define		RISCV_HWPROBE_MISALIGNED_SCALAR_FAST		3
+-#define		RISCV_HWPROBE_MISALIGNED_SCALAR_UNSUPPORTED	4
+-#define RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF	10
+-#define		RISCV_HWPROBE_MISALIGNED_VECTOR_UNKNOWN		0
+-#define		RISCV_HWPROBE_MISALIGNED_VECTOR_SLOW		2
+-#define		RISCV_HWPROBE_MISALIGNED_VECTOR_FAST		3
+-#define		RISCV_HWPROBE_MISALIGNED_VECTOR_UNSUPPORTED	4
+-#define RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0	11
+-#define RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE	12
+-#define RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0	13
+-#define RISCV_HWPROBE_KEY_VENDOR_EXT_MIPS_0	14
+-#define RISCV_HWPROBE_KEY_ZICBOP_BLOCK_SIZE	15
+-#define RISCV_HWPROBE_KEY_IMA_EXT_1		16
+-#define		RISCV_HWPROBE_EXT_ZICFISS	_BITULL(0)
+-#define		RISCV_HWPROBE_EXT_ZICCLSM	_BITULL(1)
+-#define		RISCV_HWPROBE_EXT_ZICCAMOA	_BITULL(2)
+-#define		RISCV_HWPROBE_EXT_ZICCIF	_BITULL(3)
+-#define		RISCV_HWPROBE_EXT_ZICCRSE	_BITULL(4)
+-#define		RISCV_HWPROBE_EXT_ZA64RS	_BITULL(5)
+-
+-/* Increase RISCV_HWPROBE_MAX_KEY when adding items. */
+-
+-/* Flags */
+-#define RISCV_HWPROBE_WHICH_CPUS	_BITUL(0)
+-
+-#endif
+diff --git a/arch/wasm/include/uapi/asm/mman.h b/arch/wasm/include/uapi/asm/mman.h
+new file mode 100644
+index 00000000000..e7e0c821624
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/mman.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI__ASM_MMAN_H
++#define _UAPI__ASM_MMAN_H
++
++#include <asm-generic/mman.h>
++
++#define PROT_BTI	0x10		/* BTI guarded page */
++#define PROT_MTE	0x20		/* Normal Tagged mapping */
++
++/* Override any generic PKEY permission defines */
++#define PKEY_DISABLE_EXECUTE	0x4
++#define PKEY_DISABLE_READ	0x8
++#undef PKEY_ACCESS_MASK
++#define PKEY_ACCESS_MASK       (PKEY_DISABLE_ACCESS |\
++				PKEY_DISABLE_WRITE  |\
++				PKEY_DISABLE_READ   |\
++				PKEY_DISABLE_EXECUTE)
++
++#endif /* ! _UAPI__ASM_MMAN_H */
+diff --git a/arch/wasm/include/uapi/asm/param.h b/arch/wasm/include/uapi/asm/param.h
+new file mode 100644
+index 00000000000..b115c555778
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/param.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef __ASM_PARAM_H
++#define __ASM_PARAM_H
++
++#define EXEC_PAGESIZE	65536
++
++#include <asm-generic/param.h>
++
++#endif
+diff --git a/arch/wasm/include/uapi/asm/posix_types.h b/arch/wasm/include/uapi/asm/posix_types.h
+new file mode 100644
+index 00000000000..b1c2e0df92d
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/posix_types.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef __ASM_POSIX_TYPES_H
++#define __ASM_POSIX_TYPES_H
++
++typedef unsigned short __kernel_old_uid_t;
++typedef unsigned short __kernel_old_gid_t;
++#define __kernel_old_uid_t __kernel_old_uid_t
++
++#include <asm-generic/posix_types.h>
++
++#endif /*  __ASM_POSIX_TYPES_H */
+diff --git a/arch/wasm/include/uapi/asm/ptrace.h b/arch/wasm/include/uapi/asm/ptrace.h
+index 3de2b7124af..15649a253a5 100644
+--- a/arch/wasm/include/uapi/asm/ptrace.h
++++ b/arch/wasm/include/uapi/asm/ptrace.h
+@@ -1,169 +1,337 @@
+-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+ /*
+- * Copyright (C) 2012 Regents of the University of California
++ * Based on arch/arm/include/asm/ptrace.h
++ *
++ * Copyright (C) 1996-2003 Russell King
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
++#ifndef _UAPI__ASM_PTRACE_H
++#define _UAPI__ASM_PTRACE_H
+ 
+-#ifndef _UAPI_ASM_RISCV_PTRACE_H
+-#define _UAPI_ASM_RISCV_PTRACE_H
++#include <linux/types.h>
++
++#include <asm/hwcap.h>
++#include <asm/sve_context.h>
++
++
++/*
++ * PSR bits
++ */
++#define PSR_MODE_EL0t	0x00000000
++#define PSR_MODE_EL1t	0x00000004
++#define PSR_MODE_EL1h	0x00000005
++#define PSR_MODE_EL2t	0x00000008
++#define PSR_MODE_EL2h	0x00000009
++#define PSR_MODE_EL3t	0x0000000c
++#define PSR_MODE_EL3h	0x0000000d
++#define PSR_MODE_MASK	0x0000000f
++
++/* AArch32 CPSR bits */
++#define PSR_MODE32_BIT		0x00000010
++
++/* AArch64 SPSR bits */
++#define PSR_F_BIT	0x00000040
++#define PSR_I_BIT	0x00000080
++#define PSR_A_BIT	0x00000100
++#define PSR_D_BIT	0x00000200
++#define PSR_BTYPE_MASK	0x00000c00
++#define PSR_SSBS_BIT	0x00001000
++#define PSR_PAN_BIT	0x00400000
++#define PSR_UAO_BIT	0x00800000
++#define PSR_DIT_BIT	0x01000000
++#define PSR_TCO_BIT	0x02000000
++#define PSR_V_BIT	0x10000000
++#define PSR_C_BIT	0x20000000
++#define PSR_Z_BIT	0x40000000
++#define PSR_N_BIT	0x80000000
++
++#define PSR_BTYPE_SHIFT		10
++
++/*
++ * Groups of PSR bits
++ */
++#define PSR_f		0xff000000	/* Flags		*/
++#define PSR_s		0x00ff0000	/* Status		*/
++#define PSR_x		0x0000ff00	/* Extension		*/
++#define PSR_c		0x000000ff	/* Control		*/
++
++/* Convenience names for the values of PSTATE.BTYPE */
++#define PSR_BTYPE_NONE		(0b00 << PSR_BTYPE_SHIFT)
++#define PSR_BTYPE_JC		(0b01 << PSR_BTYPE_SHIFT)
++#define PSR_BTYPE_C		(0b10 << PSR_BTYPE_SHIFT)
++#define PSR_BTYPE_J		(0b11 << PSR_BTYPE_SHIFT)
++
++/* syscall emulation path in ptrace */
++#define PTRACE_SYSEMU		  31
++#define PTRACE_SYSEMU_SINGLESTEP  32
++/* MTE allocation tag access */
++#define PTRACE_PEEKMTETAGS	  33
++#define PTRACE_POKEMTETAGS	  34
+ 
+ #ifndef __ASSEMBLER__
+ 
+-#include <linux/types.h>
+-#include <linux/const.h>
++/*
++ * User structures for general purpose, floating point and debug registers.
++ */
++struct user_pt_regs {
++	__u64		regs[31];
++	__u64		sp;
++	__u64		pc;
++	__u64		pstate;
++};
+ 
+-#define PTRACE_GETFDPIC		33
++struct user_fpsimd_state {
++	__u128		vregs[32];
++	__u32		fpsr;
++	__u32		fpcr;
++	__u32		__reserved[2];
++};
+ 
+-#define PTRACE_GETFDPIC_EXEC	0
+-#define PTRACE_GETFDPIC_INTERP	1
++struct user_hwdebug_state {
++	__u32		dbg_info;
++	__u32		pad;
++	struct {
++		__u64	addr;
++		__u32	ctrl;
++		__u32	pad;
++	}		dbg_regs[16];
++};
++
++/* SVE/FP/SIMD state (NT_ARM_SVE & NT_ARM_SSVE) */
++
++struct user_sve_header {
++	__u32 size; /* total meaningful regset content in bytes */
++	__u32 max_size; /* maxmium possible size for this thread */
++	__u16 vl; /* current vector length */
++	__u16 max_vl; /* maximum possible vector length */
++	__u16 flags;
++	__u16 __reserved;
++};
++
++/* Definitions for user_sve_header.flags: */
++#define SVE_PT_REGS_MASK		(1 << 0)
++
++#define SVE_PT_REGS_FPSIMD		0
++#define SVE_PT_REGS_SVE			SVE_PT_REGS_MASK
+ 
+ /*
+- * User-mode register state for core dumps, ptrace, sigcontext
++ * Common SVE_PT_* flags:
++ * These must be kept in sync with prctl interface in <linux/prctl.h>
++ */
++#define SVE_PT_VL_INHERIT		((1 << 17) /* PR_SVE_VL_INHERIT */ >> 16)
++#define SVE_PT_VL_ONEXEC		((1 << 18) /* PR_SVE_SET_VL_ONEXEC */ >> 16)
++
++
++/*
++ * The remainder of the SVE state follows struct user_sve_header.  The
++ * total size of the SVE state (including header) depends on the
++ * metadata in the header:  SVE_PT_SIZE(vq, flags) gives the total size
++ * of the state in bytes, including the header.
+  *
+- * This decouples struct pt_regs from the userspace ABI.
+- * struct user_regs_struct must form a prefix of struct pt_regs.
++ * Refer to <asm/sigcontext.h> for details of how to pass the correct
++ * "vq" argument to these macros.
+  */
+-struct user_regs_struct {
+-	unsigned long pc;
+-	unsigned long ra;
+-	unsigned long sp;
+-	unsigned long gp;
+-	unsigned long tp;
+-	unsigned long t0;
+-	unsigned long t1;
+-	unsigned long t2;
+-	unsigned long s0;
+-	unsigned long s1;
+-	unsigned long a0;
+-	unsigned long a1;
+-	unsigned long a2;
+-	unsigned long a3;
+-	unsigned long a4;
+-	unsigned long a5;
+-	unsigned long a6;
+-	unsigned long a7;
+-	unsigned long s2;
+-	unsigned long s3;
+-	unsigned long s4;
+-	unsigned long s5;
+-	unsigned long s6;
+-	unsigned long s7;
+-	unsigned long s8;
+-	unsigned long s9;
+-	unsigned long s10;
+-	unsigned long s11;
+-	unsigned long t3;
+-	unsigned long t4;
+-	unsigned long t5;
+-	unsigned long t6;
++
++/* Offset from the start of struct user_sve_header to the register data */
++#define SVE_PT_REGS_OFFSET						\
++	((sizeof(struct user_sve_header) + (__SVE_VQ_BYTES - 1))	\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
++
++/*
++ * The register data content and layout depends on the value of the
++ * flags field.
++ */
++
++/*
++ * (flags & SVE_PT_REGS_MASK) == SVE_PT_REGS_FPSIMD case:
++ *
++ * The payload starts at offset SVE_PT_FPSIMD_OFFSET, and is of type
++ * struct user_fpsimd_state.  Additional data might be appended in the
++ * future: use SVE_PT_FPSIMD_SIZE(vq, flags) to compute the total size.
++ * SVE_PT_FPSIMD_SIZE(vq, flags) will never be less than
++ * sizeof(struct user_fpsimd_state).
++ */
++
++#define SVE_PT_FPSIMD_OFFSET		SVE_PT_REGS_OFFSET
++
++#define SVE_PT_FPSIMD_SIZE(vq, flags)	(sizeof(struct user_fpsimd_state))
++
++/*
++ * (flags & SVE_PT_REGS_MASK) == SVE_PT_REGS_SVE case:
++ *
++ * The payload starts at offset SVE_PT_SVE_OFFSET, and is of size
++ * SVE_PT_SVE_SIZE(vq, flags).
++ *
++ * Additional macros describe the contents and layout of the payload.
++ * For each, SVE_PT_SVE_x_OFFSET(args) is the start offset relative to
++ * the start of struct user_sve_header, and SVE_PT_SVE_x_SIZE(args) is
++ * the size in bytes:
++ *
++ *	x	type				description
++ *	-	----				-----------
++ *	ZREGS		\
++ *	ZREG		|
++ *	PREGS		| refer to <asm/sigcontext.h>
++ *	PREG		|
++ *	FFR		/
++ *
++ *	FPSR	uint32_t			FPSR
++ *	FPCR	uint32_t			FPCR
++ *
++ * Additional data might be appended in the future.
++ *
++ * The Z-, P- and FFR registers are represented in memory in an endianness-
++ * invariant layout which differs from the layout used for the FPSIMD
++ * V-registers on big-endian systems: see sigcontext.h for more explanation.
++ */
++
++#define SVE_PT_SVE_ZREG_SIZE(vq)	__SVE_ZREG_SIZE(vq)
++#define SVE_PT_SVE_PREG_SIZE(vq)	__SVE_PREG_SIZE(vq)
++#define SVE_PT_SVE_FFR_SIZE(vq)		__SVE_FFR_SIZE(vq)
++#define SVE_PT_SVE_FPSR_SIZE		sizeof(__u32)
++#define SVE_PT_SVE_FPCR_SIZE		sizeof(__u32)
++
++#define SVE_PT_SVE_OFFSET		SVE_PT_REGS_OFFSET
++
++#define SVE_PT_SVE_ZREGS_OFFSET \
++	(SVE_PT_REGS_OFFSET + __SVE_ZREGS_OFFSET)
++#define SVE_PT_SVE_ZREG_OFFSET(vq, n) \
++	(SVE_PT_REGS_OFFSET + __SVE_ZREG_OFFSET(vq, n))
++#define SVE_PT_SVE_ZREGS_SIZE(vq) \
++	(SVE_PT_SVE_ZREG_OFFSET(vq, __SVE_NUM_ZREGS) - SVE_PT_SVE_ZREGS_OFFSET)
++
++#define SVE_PT_SVE_PREGS_OFFSET(vq) \
++	(SVE_PT_REGS_OFFSET + __SVE_PREGS_OFFSET(vq))
++#define SVE_PT_SVE_PREG_OFFSET(vq, n) \
++	(SVE_PT_REGS_OFFSET + __SVE_PREG_OFFSET(vq, n))
++#define SVE_PT_SVE_PREGS_SIZE(vq) \
++	(SVE_PT_SVE_PREG_OFFSET(vq, __SVE_NUM_PREGS) - \
++		SVE_PT_SVE_PREGS_OFFSET(vq))
++
++/* For streaming mode SVE (SSVE) FFR must be read and written as zero */
++#define SVE_PT_SVE_FFR_OFFSET(vq) \
++	(SVE_PT_REGS_OFFSET + __SVE_FFR_OFFSET(vq))
++
++#define SVE_PT_SVE_FPSR_OFFSET(vq)				\
++	((SVE_PT_SVE_FFR_OFFSET(vq) + SVE_PT_SVE_FFR_SIZE(vq) +	\
++			(__SVE_VQ_BYTES - 1))			\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
++#define SVE_PT_SVE_FPCR_OFFSET(vq) \
++	(SVE_PT_SVE_FPSR_OFFSET(vq) + SVE_PT_SVE_FPSR_SIZE)
++
++/*
++ * Any future extension appended after FPCR must be aligned to the next
++ * 128-bit boundary.
++ */
++
++#define SVE_PT_SVE_SIZE(vq, flags)					\
++	((SVE_PT_SVE_FPCR_OFFSET(vq) + SVE_PT_SVE_FPCR_SIZE		\
++			- SVE_PT_SVE_OFFSET + (__SVE_VQ_BYTES - 1))	\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
++
++#define SVE_PT_SIZE(vq, flags)						  \
++	 (((flags) & SVE_PT_REGS_MASK) == SVE_PT_REGS_SVE ?		  \
++		  SVE_PT_SVE_OFFSET + SVE_PT_SVE_SIZE(vq, flags)	  \
++		: ((((flags) & SVE_PT_REGS_MASK) == SVE_PT_REGS_FPSIMD ?  \
++		    SVE_PT_FPSIMD_OFFSET + SVE_PT_FPSIMD_SIZE(vq, flags) \
++		  : SVE_PT_REGS_OFFSET)))
++
++/* pointer authentication masks (NT_ARM_PAC_MASK) */
++
++struct user_pac_mask {
++	__u64		data_mask;
++	__u64		insn_mask;
+ };
+ 
+-struct __riscv_f_ext_state {
+-	__u32 f[32];
+-	__u32 fcsr;
++/* pointer authentication keys (NT_ARM_PACA_KEYS, NT_ARM_PACG_KEYS) */
++
++struct user_pac_address_keys {
++	__u128	apiakey;
++	__u128	apibkey;
++	__u128	apdakey;
++	__u128	apdbkey;
+ };
+ 
+-struct __riscv_d_ext_state {
+-	__u64 f[32];
+-	__u32 fcsr;
++struct user_pac_generic_keys {
++	__u128	apgakey;
+ };
+ 
+-struct __riscv_q_ext_state {
+-	__u64 f[64] __attribute__((aligned(16)));
+-	__u32 fcsr;
+-	/*
+-	 * Reserved for expansion of sigcontext structure.  Currently zeroed
+-	 * upon signal, and must be zero upon sigreturn.
+-	 */
+-	__u32 reserved[3];
+-};
++/* ZA state (NT_ARM_ZA) */
+ 
+-struct __riscv_ctx_hdr {
+-	__u32 magic;
+-	__u32 size;
+-};
+-
+-struct __riscv_extra_ext_header {
+-	__u32 __padding[129] __attribute__((aligned(16)));
+-	/*
+-	 * Reserved for expansion of sigcontext structure.  Currently zeroed
+-	 * upon signal, and must be zero upon sigreturn.
+-	 */
+-	__u32 reserved;
+-	struct __riscv_ctx_hdr hdr;
+-};
+-
+-union __riscv_fp_state {
+-	struct __riscv_f_ext_state f;
+-	struct __riscv_d_ext_state d;
+-	struct __riscv_q_ext_state q;
+-};
+-
+-struct __riscv_v_ext_state {
+-	unsigned long vstart;
+-	unsigned long vl;
+-	unsigned long vtype;
+-	unsigned long vcsr;
+-	unsigned long vlenb;
+-	void *datap;
+-	/*
+-	 * In signal handler, datap will be set a correct user stack offset
+-	 * and vector registers will be copied to the address of datap
+-	 * pointer.
+-	 */
+-};
+-
+-struct __riscv_v_regset_state {
+-	unsigned long vstart;
+-	unsigned long vl;
+-	unsigned long vtype;
+-	unsigned long vcsr;
+-	unsigned long vlenb;
+-	char vreg[];
++struct user_za_header {
++	__u32 size; /* total meaningful regset content in bytes */
++	__u32 max_size; /* maxmium possible size for this thread */
++	__u16 vl; /* current vector length */
++	__u16 max_vl; /* maximum possible vector length */
++	__u16 flags;
++	__u16 __reserved;
+ };
+ 
+ /*
+- * According to spec: The number of bits in a single vector register,
+- * VLEN >= ELEN, which must be a power of 2, and must be no greater than
+- * 2^16 = 65536bits = 8192bytes
++ * Common ZA_PT_* flags:
++ * These must be kept in sync with prctl interface in <linux/prctl.h>
+  */
+-#define RISCV_MAX_VLENB (8192)
++#define ZA_PT_VL_INHERIT		((1 << 17) /* PR_SME_VL_INHERIT */ >> 16)
++#define ZA_PT_VL_ONEXEC			((1 << 18) /* PR_SME_SET_VL_ONEXEC */ >> 16)
+ 
+-struct __sc_riscv_cfi_state {
+-	unsigned long ss_ptr;   /* shadow stack pointer */
+-};
+ 
+-#define PTRACE_CFI_BRANCH_LANDING_PAD_EN_BIT		0
+-#define PTRACE_CFI_BRANCH_LANDING_PAD_LOCK_BIT		1
+-#define PTRACE_CFI_BRANCH_EXPECTED_LANDING_PAD_BIT	2
+-#define PTRACE_CFI_SHADOW_STACK_EN_BIT			3
+-#define PTRACE_CFI_SHADOW_STACK_LOCK_BIT		4
+-#define PTRACE_CFI_SHADOW_STACK_PTR_BIT			5
++/*
++ * The remainder of the ZA state follows struct user_za_header.  The
++ * total size of the ZA state (including header) depends on the
++ * metadata in the header:  ZA_PT_SIZE(vq, flags) gives the total size
++ * of the state in bytes, including the header.
++ *
++ * Refer to <asm/sigcontext.h> for details of how to pass the correct
++ * "vq" argument to these macros.
++ */
+ 
+-#define PTRACE_CFI_BRANCH_LANDING_PAD_EN_STATE		_BITUL(PTRACE_CFI_BRANCH_LANDING_PAD_EN_BIT)
+-#define PTRACE_CFI_BRANCH_LANDING_PAD_LOCK_STATE	\
+-	_BITUL(PTRACE_CFI_BRANCH_LANDING_PAD_LOCK_BIT)
+-#define PTRACE_CFI_BRANCH_EXPECTED_LANDING_PAD_STATE	\
+-	_BITUL(PTRACE_CFI_BRANCH_EXPECTED_LANDING_PAD_BIT)
+-#define PTRACE_CFI_SHADOW_STACK_EN_STATE		_BITUL(PTRACE_CFI_SHADOW_STACK_EN_BIT)
+-#define PTRACE_CFI_SHADOW_STACK_LOCK_STATE		_BITUL(PTRACE_CFI_SHADOW_STACK_LOCK_BIT)
+-#define PTRACE_CFI_SHADOW_STACK_PTR_STATE		_BITUL(PTRACE_CFI_SHADOW_STACK_PTR_BIT)
++/* Offset from the start of struct user_za_header to the register data */
++#define ZA_PT_ZA_OFFSET						\
++	((sizeof(struct user_za_header) + (__SVE_VQ_BYTES - 1))	\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
+ 
+-#define PTRACE_CFI_STATE_INVALID_MASK	~(PTRACE_CFI_BRANCH_LANDING_PAD_EN_STATE | \
+-					  PTRACE_CFI_BRANCH_LANDING_PAD_LOCK_STATE | \
+-					  PTRACE_CFI_BRANCH_EXPECTED_LANDING_PAD_STATE | \
+-					  PTRACE_CFI_SHADOW_STACK_EN_STATE | \
+-					  PTRACE_CFI_SHADOW_STACK_LOCK_STATE | \
+-					  PTRACE_CFI_SHADOW_STACK_PTR_STATE)
++/*
++ * The payload starts at offset ZA_PT_ZA_OFFSET, and is of size
++ * ZA_PT_ZA_SIZE(vq, flags).
++ *
++ * The ZA array is stored as a sequence of horizontal vectors ZAV of SVL/8
++ * bytes each, starting from vector 0.
++ *
++ * Additional data might be appended in the future.
++ *
++ * The ZA matrix is represented in memory in an endianness-invariant layout
++ * which differs from the layout used for the FPSIMD V-registers on big-endian
++ * systems: see sigcontext.h for more explanation.
++ */
+ 
+-struct __cfi_status {
+-	__u64 cfi_state;
+-};
++#define ZA_PT_ZAV_OFFSET(vq, n) \
++	(ZA_PT_ZA_OFFSET + ((vq * __SVE_VQ_BYTES) * n))
+ 
+-struct user_cfi_state {
+-	struct __cfi_status	cfi_status;
+-	__u64 shstk_ptr;
++#define ZA_PT_ZA_SIZE(vq) ((vq * __SVE_VQ_BYTES) * (vq * __SVE_VQ_BYTES))
++
++#define ZA_PT_SIZE(vq)						\
++	(ZA_PT_ZA_OFFSET + ZA_PT_ZA_SIZE(vq))
++
++/* GCS state (NT_ARM_GCS) */
++
++struct user_gcs {
++	__u64 features_enabled;
++	__u64 features_locked;
++	__u64 gcspr_el0;
+ };
+ 
+ #endif /* __ASSEMBLER__ */
+ 
+-#endif /* _UAPI_ASM_RISCV_PTRACE_H */
++#endif /* _UAPI__ASM_PTRACE_H */
+diff --git a/arch/wasm/include/uapi/asm/sigcontext.h b/arch/wasm/include/uapi/asm/sigcontext.h
+index d22d0815d60..d250ca7a1d4 100644
+--- a/arch/wasm/include/uapi/asm/sigcontext.h
++++ b/arch/wasm/include/uapi/asm/sigcontext.h
+@@ -1,41 +1,358 @@
+-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+ /*
+- * Copyright (C) 2012 Regents of the University of California
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+-
+-#ifndef _UAPI_ASM_RISCV_SIGCONTEXT_H
+-#define _UAPI_ASM_RISCV_SIGCONTEXT_H
+-
+-#include <asm/ptrace.h>
+-
+-/* The Magic number for signal context frame header. */
+-#define RISCV_V_MAGIC	0x53465457
+-#define RISCV_ZICFISS_MAGIC		0x9487
+-#define END_MAGIC	0x0
+-
+-/* The size of END signal context header. */
+-#define END_HDR_SIZE	0x0
++#ifndef _UAPI__ASM_SIGCONTEXT_H
++#define _UAPI__ASM_SIGCONTEXT_H
+ 
+ #ifndef __ASSEMBLER__
+ 
+-struct __sc_riscv_v_state {
+-	struct __riscv_v_ext_state v_state;
+-} __attribute__((aligned(16)));
++#include <linux/types.h>
+ 
+ /*
+- * Signal context structure
+- *
+- * This contains the context saved before a signal handler is invoked;
+- * it is restored by sys_rt_sigreturn.
++ * Signal context structure - contains all info to do with the state
++ * before the signal handler was invoked.
+  */
+ struct sigcontext {
+-	struct user_regs_struct sc_regs;
+-	union {
+-		union __riscv_fp_state sc_fpregs;
+-		struct __riscv_extra_ext_header sc_extdesc;
+-	};
++	__u64 fault_address;
++	/* AArch64 registers */
++	__u64 regs[31];
++	__u64 sp;
++	__u64 pc;
++	__u64 pstate;
++	/* 4K reserved for FP/SIMD state and future expansion */
++	__u8 __reserved[4096] __attribute__((__aligned__(16)));
+ };
+ 
+-#endif /*!__ASSEMBLER__*/
++/*
++ * Allocation of __reserved[]:
++ * (Note: records do not necessarily occur in the order shown here.)
++ *
++ *	size		description
++ *
++ *	0x210		fpsimd_context
++ *	 0x10		esr_context
++ *	0x8a0		sve_context (vl <= 64) (optional)
++ *	 0x20		extra_context (optional)
++ *	 0x10		terminator (null _aarch64_ctx)
++ *
++ *	0x510		(reserved for future allocation)
++ *
++ * New records that can exceed this space need to be opt-in for userspace, so
++ * that an expanded signal frame is not generated unexpectedly.  The mechanism
++ * for opting in will depend on the extension that generates each new record.
++ * The above table documents the maximum set and sizes of records than can be
++ * generated when userspace does not opt in for any such extension.
++ */
+ 
+-#endif /* _UAPI_ASM_RISCV_SIGCONTEXT_H */
++/*
++ * Header to be used at the beginning of structures extending the user
++ * context. Such structures must be placed after the rt_sigframe on the stack
++ * and be 16-byte aligned. The last structure must be a dummy one with the
++ * magic and size set to 0.
++ *
++ * Note that the values allocated for use as magic should be chosen to
++ * be meaningful in ASCII to aid manual parsing, ZA doesn't follow this
++ * convention due to oversight but it should be observed for future additions.
++ */
++struct _aarch64_ctx {
++	__u32 magic;
++	__u32 size;
++};
++
++#define FPSIMD_MAGIC	0x46508001
++
++struct fpsimd_context {
++	struct _aarch64_ctx head;
++	__u32 fpsr;
++	__u32 fpcr;
++	__u128 vregs[32];
++};
++
++/*
++ * Note: similarly to all other integer fields, each V-register is stored in an
++ * endianness-dependent format, with the byte at offset i from the start of the
++ * in-memory representation of the register value containing
++ *
++ *    bits [(7 + 8 * i) : (8 * i)] of the register on little-endian hosts; or
++ *    bits [(127 - 8 * i) : (120 - 8 * i)] on big-endian hosts.
++ */
++
++/* ESR_EL1 context */
++#define ESR_MAGIC	0x45535201
++
++struct esr_context {
++	struct _aarch64_ctx head;
++	__u64 esr;
++};
++
++#define POE_MAGIC	0x504f4530
++
++struct poe_context {
++	struct _aarch64_ctx head;
++	__u64 por_el0;
++};
++
++/*
++ * extra_context: describes extra space in the signal frame for
++ * additional structures that don't fit in sigcontext.__reserved[].
++ *
++ * Note:
++ *
++ * 1) fpsimd_context, esr_context and extra_context must be placed in
++ * sigcontext.__reserved[] if present.  They cannot be placed in the
++ * extra space.  Any other record can be placed either in the extra
++ * space or in sigcontext.__reserved[], unless otherwise specified in
++ * this file.
++ *
++ * 2) There must not be more than one extra_context.
++ *
++ * 3) If extra_context is present, it must be followed immediately in
++ * sigcontext.__reserved[] by the terminating null _aarch64_ctx.
++ *
++ * 4) The extra space to which datap points must start at the first
++ * 16-byte aligned address immediately after the terminating null
++ * _aarch64_ctx that follows the extra_context structure in
++ * __reserved[].  The extra space may overrun the end of __reserved[],
++ * as indicated by a sufficiently large value for the size field.
++ *
++ * 5) The extra space must itself be terminated with a null
++ * _aarch64_ctx.
++ */
++#define EXTRA_MAGIC	0x45585401
++
++struct extra_context {
++	struct _aarch64_ctx head;
++	__u64 datap; /* 16-byte aligned pointer to extra space cast to __u64 */
++	__u32 size; /* size in bytes of the extra space */
++	__u32 __reserved[3];
++};
++
++#define SVE_MAGIC	0x53564501
++
++struct sve_context {
++	struct _aarch64_ctx head;
++	__u16 vl;
++	__u16 flags;
++	__u16 __reserved[2];
++};
++
++#define SVE_SIG_FLAG_SM	0x1	/* Context describes streaming mode */
++
++/* TPIDR2_EL0 context */
++#define TPIDR2_MAGIC	0x54504902
++
++struct tpidr2_context {
++	struct _aarch64_ctx head;
++	__u64 tpidr2;
++};
++
++/* FPMR context */
++#define FPMR_MAGIC	0x46504d52
++
++struct fpmr_context {
++	struct _aarch64_ctx head;
++	__u64 fpmr;
++};
++
++#define ZA_MAGIC	0x54366345
++
++struct za_context {
++	struct _aarch64_ctx head;
++	__u16 vl;
++	__u16 __reserved[3];
++};
++
++#define ZT_MAGIC	0x5a544e01
++
++struct zt_context {
++	struct _aarch64_ctx head;
++	__u16 nregs;
++	__u16 __reserved[3];
++};
++
++#define GCS_MAGIC	0x47435300
++
++struct gcs_context {
++	struct _aarch64_ctx head;
++	__u64 gcspr;
++	__u64 features_enabled;
++	__u64 reserved;
++};
++
++#endif /* !__ASSEMBLER__ */
++
++#include <asm/sve_context.h>
++
++/*
++ * The SVE architecture leaves space for future expansion of the
++ * vector length beyond its initial architectural limit of 2048 bits
++ * (16 quadwords).
++ *
++ * See linux/Documentation/arch/arm64/sve.rst for a description of the VL/VQ
++ * terminology.
++ */
++#define SVE_VQ_BYTES		__SVE_VQ_BYTES	/* bytes per quadword */
++
++#define SVE_VQ_MIN		__SVE_VQ_MIN
++#define SVE_VQ_MAX		__SVE_VQ_MAX
++
++#define SVE_VL_MIN		__SVE_VL_MIN
++#define SVE_VL_MAX		__SVE_VL_MAX
++
++#define SVE_NUM_ZREGS		__SVE_NUM_ZREGS
++#define SVE_NUM_PREGS		__SVE_NUM_PREGS
++
++#define sve_vl_valid(vl)	__sve_vl_valid(vl)
++#define sve_vq_from_vl(vl)	__sve_vq_from_vl(vl)
++#define sve_vl_from_vq(vq)	__sve_vl_from_vq(vq)
++
++/*
++ * If the SVE registers are currently live for the thread at signal delivery,
++ * sve_context.head.size >=
++ *	SVE_SIG_CONTEXT_SIZE(sve_vq_from_vl(sve_context.vl))
++ * and the register data may be accessed using the SVE_SIG_*() macros.
++ *
++ * If sve_context.head.size <
++ *	SVE_SIG_CONTEXT_SIZE(sve_vq_from_vl(sve_context.vl)),
++ * the SVE registers were not live for the thread and no register data
++ * is included: in this case, the SVE_SIG_*() macros should not be
++ * used except for this check.
++ *
++ * The same convention applies when returning from a signal: a caller
++ * will need to remove or resize the sve_context block if it wants to
++ * make the SVE registers live when they were previously non-live or
++ * vice-versa.  This may require the caller to allocate fresh
++ * memory and/or move other context blocks in the signal frame.
++ *
++ * Changing the vector length during signal return is not permitted:
++ * sve_context.vl must equal the thread's current vector length when
++ * doing a sigreturn.
++ *
++ * On systems with support for SME the SVE register state may reflect either
++ * streaming or non-streaming mode.  In streaming mode the streaming mode
++ * vector length will be used and the flag SVE_SIG_FLAG_SM will be set in
++ * the flags field. It is permitted to enter or leave streaming mode in
++ * a signal return, applications should take care to ensure that any difference
++ * in vector length between the two modes is handled, including any resizing
++ * and movement of context blocks.
++ *
++ * Note: for all these macros, the "vq" argument denotes the vector length
++ * in quadwords (i.e., units of 128 bits).
++ *
++ * The correct way to obtain vq is to use sve_vq_from_vl(vl).  The
++ * result is valid if and only if sve_vl_valid(vl) is true.  This is
++ * guaranteed for a struct sve_context written by the kernel.
++ *
++ *
++ * Additional macros describe the contents and layout of the payload.
++ * For each, SVE_SIG_x_OFFSET(args) is the start offset relative to
++ * the start of struct sve_context, and SVE_SIG_x_SIZE(args) is the
++ * size in bytes:
++ *
++ *	x	type				description
++ *	-	----				-----------
++ *	REGS					the entire SVE context
++ *
++ *	ZREGS	__u128[SVE_NUM_ZREGS][vq]	all Z-registers
++ *	ZREG	__u128[vq]			individual Z-register Zn
++ *
++ *	PREGS	uint16_t[SVE_NUM_PREGS][vq]	all P-registers
++ *	PREG	uint16_t[vq]			individual P-register Pn
++ *
++ *	FFR	uint16_t[vq]			first-fault status register
++ *
++ * Additional data might be appended in the future.
++ *
++ * Unlike vregs[] in fpsimd_context, each SVE scalable register (Z-, P- or FFR)
++ * is encoded in memory in an endianness-invariant format, with the byte at
++ * offset i from the start of the in-memory representation containing bits
++ * [(7 + 8 * i) : (8 * i)] of the register value.
++ */
++
++#define SVE_SIG_ZREG_SIZE(vq)	__SVE_ZREG_SIZE(vq)
++#define SVE_SIG_PREG_SIZE(vq)	__SVE_PREG_SIZE(vq)
++#define SVE_SIG_FFR_SIZE(vq)	__SVE_FFR_SIZE(vq)
++
++#define SVE_SIG_REGS_OFFSET					\
++	((sizeof(struct sve_context) + (__SVE_VQ_BYTES - 1))	\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
++
++#define SVE_SIG_ZREGS_OFFSET \
++		(SVE_SIG_REGS_OFFSET + __SVE_ZREGS_OFFSET)
++#define SVE_SIG_ZREG_OFFSET(vq, n) \
++		(SVE_SIG_REGS_OFFSET + __SVE_ZREG_OFFSET(vq, n))
++#define SVE_SIG_ZREGS_SIZE(vq) __SVE_ZREGS_SIZE(vq)
++
++#define SVE_SIG_PREGS_OFFSET(vq) \
++		(SVE_SIG_REGS_OFFSET + __SVE_PREGS_OFFSET(vq))
++#define SVE_SIG_PREG_OFFSET(vq, n) \
++		(SVE_SIG_REGS_OFFSET + __SVE_PREG_OFFSET(vq, n))
++#define SVE_SIG_PREGS_SIZE(vq) __SVE_PREGS_SIZE(vq)
++
++#define SVE_SIG_FFR_OFFSET(vq) \
++		(SVE_SIG_REGS_OFFSET + __SVE_FFR_OFFSET(vq))
++
++#define SVE_SIG_REGS_SIZE(vq) \
++		(__SVE_FFR_OFFSET(vq) + __SVE_FFR_SIZE(vq))
++
++#define SVE_SIG_CONTEXT_SIZE(vq) \
++		(SVE_SIG_REGS_OFFSET + SVE_SIG_REGS_SIZE(vq))
++
++/*
++ * If the ZA register is enabled for the thread at signal delivery then,
++ * za_context.head.size >= ZA_SIG_CONTEXT_SIZE(sve_vq_from_vl(za_context.vl))
++ * and the register data may be accessed using the ZA_SIG_*() macros.
++ *
++ * If za_context.head.size < ZA_SIG_CONTEXT_SIZE(sve_vq_from_vl(za_context.vl))
++ * then ZA was not enabled and no register data was included in which case
++ * ZA register was not enabled for the thread and no register data
++ * the ZA_SIG_*() macros should not be used except for this check.
++ *
++ * The same convention applies when returning from a signal: a caller
++ * will need to remove or resize the za_context block if it wants to
++ * enable the ZA register when it was previously non-live or vice-versa.
++ * This may require the caller to allocate fresh memory and/or move other
++ * context blocks in the signal frame.
++ *
++ * Changing the vector length during signal return is not permitted:
++ * za_context.vl must equal the thread's current SME vector length when
++ * doing a sigreturn.
++ */
++
++#define ZA_SIG_REGS_OFFSET					\
++	((sizeof(struct za_context) + (__SVE_VQ_BYTES - 1))	\
++		/ __SVE_VQ_BYTES * __SVE_VQ_BYTES)
++
++#define ZA_SIG_REGS_SIZE(vq) (((vq) * __SVE_VQ_BYTES) * ((vq) * __SVE_VQ_BYTES))
++
++#define ZA_SIG_ZAV_OFFSET(vq, n) (ZA_SIG_REGS_OFFSET + \
++				  (SVE_SIG_ZREG_SIZE(vq) * (n)))
++
++#define ZA_SIG_CONTEXT_SIZE(vq) \
++		(ZA_SIG_REGS_OFFSET + ZA_SIG_REGS_SIZE(vq))
++
++#define ZT_SIG_REG_SIZE 512
++
++#define ZT_SIG_REG_BYTES (ZT_SIG_REG_SIZE / 8)
++
++#define ZT_SIG_REGS_OFFSET sizeof(struct zt_context)
++
++#define ZT_SIG_REGS_SIZE(n) (ZT_SIG_REG_BYTES * (n))
++
++#define ZT_SIG_CONTEXT_SIZE(n) \
++	(sizeof(struct zt_context) + ZT_SIG_REGS_SIZE(n))
++
++#endif /* _UAPI__ASM_SIGCONTEXT_H */
+diff --git a/arch/wasm/include/uapi/asm/signal.h b/arch/wasm/include/uapi/asm/signal.h
+new file mode 100644
+index 00000000000..bdf0cfb046c
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/signal.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef __ASM_SIGNAL_H
++#define __ASM_SIGNAL_H
++
++/* Required for AArch32 compatibility. */
++#define SA_RESTORER	0x04000000
++
++#define MINSIGSTKSZ 5120
++#define SIGSTKSZ    16384
++
++#include <asm-generic/signal.h>
++
++#endif
+diff --git a/arch/wasm/include/uapi/asm/statfs.h b/arch/wasm/include/uapi/asm/statfs.h
+new file mode 100644
+index 00000000000..615357b6ba8
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/statfs.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2012 ARM Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#ifndef __ASM_STATFS_H
++#define __ASM_STATFS_H
++
++#define ARCH_PACK_COMPAT_STATFS64 __attribute__((packed,aligned(4)))
++
++#include <asm-generic/statfs.h>
++
++#endif
+diff --git a/arch/wasm/include/uapi/asm/sve_context.h b/arch/wasm/include/uapi/asm/sve_context.h
+new file mode 100644
+index 00000000000..72aefc08106
+--- /dev/null
++++ b/arch/wasm/include/uapi/asm/sve_context.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/* Copyright (C) 2017-2018 ARM Limited */
++
++/*
++ * For use by other UAPI headers only.
++ * Do not make direct use of header or its definitions.
++ */
++
++#ifndef _UAPI__ASM_SVE_CONTEXT_H
++#define _UAPI__ASM_SVE_CONTEXT_H
++
++#include <linux/types.h>
++
++#define __SVE_VQ_BYTES		16	/* number of bytes per quadword */
++
++/*
++ * Yes, __SVE_VQ_MAX is 512 QUADWORDS.
++ *
++ * To help ensure forward portability, this is much larger than the
++ * current maximum value defined by the SVE architecture.  While arrays
++ * or static allocations can be sized based on this value, watch out!
++ * It will waste a surprisingly large amount of memory.
++ *
++ * Dynamic sizing based on the actual runtime vector length is likely to
++ * be preferable for most purposes.
++ */
++#define __SVE_VQ_MIN		1
++#define __SVE_VQ_MAX		512
++
++#define __SVE_VL_MIN		(__SVE_VQ_MIN * __SVE_VQ_BYTES)
++#define __SVE_VL_MAX		(__SVE_VQ_MAX * __SVE_VQ_BYTES)
++
++#define __SVE_NUM_ZREGS		32
++#define __SVE_NUM_PREGS		16
++
++#define __sve_vl_valid(vl)			\
++	((vl) % __SVE_VQ_BYTES == 0 &&		\
++	 (vl) >= __SVE_VL_MIN &&		\
++	 (vl) <= __SVE_VL_MAX)
++
++#define __sve_vq_from_vl(vl)	((vl) / __SVE_VQ_BYTES)
++#define __sve_vl_from_vq(vq)	((vq) * __SVE_VQ_BYTES)
++
++#define __SVE_ZREG_SIZE(vq)	((__u32)(vq) * __SVE_VQ_BYTES)
++#define __SVE_PREG_SIZE(vq)	((__u32)(vq) * (__SVE_VQ_BYTES / 8))
++#define __SVE_FFR_SIZE(vq)	__SVE_PREG_SIZE(vq)
++
++#define __SVE_ZREGS_OFFSET	0
++#define __SVE_ZREG_OFFSET(vq, n) \
++	(__SVE_ZREGS_OFFSET + __SVE_ZREG_SIZE(vq) * (n))
++#define __SVE_ZREGS_SIZE(vq) \
++	(__SVE_ZREG_OFFSET(vq, __SVE_NUM_ZREGS) - __SVE_ZREGS_OFFSET)
++
++#define __SVE_PREGS_OFFSET(vq) \
++	(__SVE_ZREGS_OFFSET + __SVE_ZREGS_SIZE(vq))
++#define __SVE_PREG_OFFSET(vq, n) \
++	(__SVE_PREGS_OFFSET(vq) + __SVE_PREG_SIZE(vq) * (n))
++#define __SVE_PREGS_SIZE(vq) \
++	(__SVE_PREG_OFFSET(vq, __SVE_NUM_PREGS) - __SVE_PREGS_OFFSET(vq))
++
++#define __SVE_FFR_OFFSET(vq) \
++	(__SVE_PREGS_OFFSET(vq) + __SVE_PREGS_SIZE(vq))
++
++#endif /* ! _UAPI__ASM_SVE_CONTEXT_H */
+diff --git a/arch/wasm/include/uapi/asm/ucontext.h b/arch/wasm/include/uapi/asm/ucontext.h
+index 516bd0bb0da..ee02721a704 100644
+--- a/arch/wasm/include/uapi/asm/ucontext.h
++++ b/arch/wasm/include/uapi/asm/ucontext.h
+@@ -1,12 +1,21 @@
+-/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+ /*
+  * Copyright (C) 2012 ARM Ltd.
+- * Copyright (C) 2017 SiFive, Inc.
+  *
+- * This file was copied from arch/arm64/include/uapi/asm/ucontext.h
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+-#ifndef _UAPI_ASM_RISCV_UCONTEXT_H
+-#define _UAPI_ASM_RISCV_UCONTEXT_H
++#ifndef _UAPI__ASM_UCONTEXT_H
++#define _UAPI__ASM_UCONTEXT_H
+ 
+ #include <linux/types.h>
+ 
+@@ -15,24 +24,10 @@ struct ucontext {
+ 	struct ucontext	 *uc_link;
+ 	stack_t		  uc_stack;
+ 	sigset_t	  uc_sigmask;
+-	/*
+-	 * There's some padding here to allow sigset_t to be expanded in the
+-	 * future.  Though this is unlikely, other architectures put uc_sigmask
+-	 * at the end of this structure and explicitly state it can be
+-	 * expanded, so we didn't want to box ourselves in here.
+-	 */
++	/* glibc uses a 1024-bit sigset_t */
+ 	__u8		  __unused[1024 / 8 - sizeof(sigset_t)];
+-	/*
+-	 * We can't put uc_sigmask at the end of this structure because we need
+-	 * to be able to expand sigcontext in the future.  For example, the
+-	 * vector ISA extension will almost certainly add ISA state.  We want
+-	 * to ensure all user-visible ISA state can be saved and restored via a
+-	 * ucontext, so we're putting this at the end in order to allow for
+-	 * infinite extensibility.  Since we know this will be extended and we
+-	 * assume sigset_t won't be extended an extreme amount, we're
+-	 * prioritizing this.
+-	 */
++	/* last for future expansion */
+ 	struct sigcontext uc_mcontext;
+ };
+ 
+-#endif /* _UAPI_ASM_RISCV_UCONTEXT_H */
++#endif /* _UAPI__ASM_UCONTEXT_H */
+diff --git a/arch/wasm/kernel/Makefile b/arch/wasm/kernel/Makefile
+index f1ad3ba5e00..9f398f70b37 100644
+--- a/arch/wasm/kernel/Makefile
++++ b/arch/wasm/kernel/Makefile
+@@ -16,7 +16,7 @@ obj-y += setup.o
+ obj-$(CONFIG_SMP) += smp.o wait.o
+ obj-y += signal.o
+ obj-y += sync.o
+-obj-y += sys_riscv.o
++obj-y += sys.o
+ obj-y += syscall_table.o
+ obj-y += time.o
+ obj-y += traps.o
+diff --git a/arch/wasm/kernel/Makefile.syscalls b/arch/wasm/kernel/Makefile.syscalls
+index 7544043aa12..1f43de8537c 100644
+--- a/arch/wasm/kernel/Makefile.syscalls
++++ b/arch/wasm/kernel/Makefile.syscalls
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+-# unkernel presents the riscv64 Linux syscall ABI to user mode.
+-syscall_abis_64 += riscv rlimit memfd_secret
++# unkernel presents the arm64 Linux syscall ABI to user mode
++# (arch/arm64/kernel/Makefile.syscalls; arm64's syscall_64.tbl is
++# scripts/syscall.tbl).
++syscall_abis_64 += renameat rlimit memfd_secret
+diff --git a/arch/wasm/kernel/cpu.c b/arch/wasm/kernel/cpu.c
+index f81622e213d..ef54fc24620 100644
+--- a/arch/wasm/kernel/cpu.c
++++ b/arch/wasm/kernel/cpu.c
+@@ -2,97 +2,62 @@
+ 
+ #include <linux/bits.h>
+ #include <linux/cpu.h>
++#include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/printk.h>
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+ #include <asm/hwcap.h>
+-#include <asm/hwprobe.h>
+ #include <asm/kw_emu.h>
+ 
+ /*
+- * The riscv ISA extensions user space can detect, in the canonical order of
+- * riscv_isa_ext[] (arch/riscv/kernel/cpufeature.c), which is also the order
+- * of the "isa" line of /proc/cpuinfo. One effective set feeds both that line
+- * and riscv_hwprobe's IMA_EXT_0 and IMA_EXT_1; AT_HWCAP has single letters
+- * only and stays IMAFDC.
++ * The arm64 features user space can detect: AT_HWCAP and the "Features"
++ * line of /proc/cpuinfo, in HWCAP bit order (arm64's hwcap_str[]). FP and
++ * ASIMD are part of what every kwemu runs (ARMv8.0-A with FP and AdvSIMD).
++ * The optional ones are kwemu's KW_ISA_* features: listed only if kwemu
++ * implements them (kw_set_isa) and kw.isa= leaves them on. Never listed:
++ * SVE, SM3/SM4, RNG, PAC, BTI and the rest of v8.1+ that kwemu does
++ * not run (OpenSSL and gcc's outline atomics pick code paths from these
++ * bits).
+  *
+- * kw is the kwemu bit (KW_ISA_*): the extension is on only if kwemu
+- * implements it (kw_set_isa). kw = 0 marks one that every kwemu has: part of
+- * RV64GC (zicntr, zaamo, zalrsc, zca, zcd), hints that run as no-ops
+- * (zicbop, zihintntl, zihintpause) or a property of the platform, which
+- * holds in the interpreter and the JIT alike:
+- *  - ziccamoa: every AMO and LR/SC works on all of user memory (misaligned
+- *    ones raise SIGBUS, which the property allows);
+- *  - ziccif: instructions run from any executable page, a naturally
+- *    aligned one is fetched with a single load, and a store into code is
+- *    seen by the next instruction;
+- *  - zicclsm: misaligned scalar and FP loads and stores work, also across
+- *    pages, without a trap;
+- *  - ziccrse: an LR/SC loop of the constrained kind eventually succeeds, as
+- *    the single hart's reservation is only dropped by a context switch, a
+- *    signal or sigreturn;
+- *  - za64rs: the reservation set is the one address of the LR, so within a
+- *    naturally aligned 64-byte block.
+- * Masking one of those only stops advertising it. Base entries are part of
+- * rv64gc and always on.
++ * CPUID (HWCAP bit 11) says that EL0 may read the ID registers
++ * (MIDR_EL1, MPIDR_EL1, REVIDR_EL1 and the ID_AA64* space, which Linux
++ * emulates on hardware). kwemu answers those MRS itself, with Linux's EL0
++ * view and ID_AA64ISAR0_EL1 built from the enabled KW_ISA_* bits
++ * (.agents/a64.md), so the kernel never emulates MRS: an MRS kwemu
++ * refuses is an illegal instruction, SIGILL. Set KW_HWCAP_CPUID to 0 for a
++ * kwemu that does not answer them.
+  */
++#define KW_HWCAP_CPUID	1
++
+ struct kw_isa_ext {
+ 	const char *name;
+-	u64 kw;
+-	u64 ext0;	/* bit in RISCV_HWPROBE_KEY_IMA_EXT_0, or 0 */
+-	u64 ext1;	/* bit in RISCV_HWPROBE_KEY_IMA_EXT_1, or 0 */
+-	bool base;
++	unsigned long hwcap;
++	u64 kw;		/* KW_ISA_* bit; 0 for one that is always there */
++	const char *alias;	/* another name kw.isa= takes */
+ };
+ 
+-#define KW_EXT(n, k, h)	{ #n, k, h, 0, false }
+-#define KW_EXT1(n, h)	{ #n, 0, 0, h, false }
+-#define KW_BASE(n)	{ #n, 0, 0, 0, true }
+-
++/* In HWCAP bit order, as the Features line lists them. */
+ static const struct kw_isa_ext kw_isa_exts[] = {
+-	KW_EXT(zicbom, KW_ISA_ZICBOM, RISCV_HWPROBE_EXT_ZICBOM),
+-	KW_EXT(zicbop, 0, RISCV_HWPROBE_EXT_ZICBOP),
+-	KW_EXT(zicboz, KW_ISA_ZICBOZ, RISCV_HWPROBE_EXT_ZICBOZ),
+-	KW_EXT1(ziccamoa, RISCV_HWPROBE_EXT_ZICCAMOA),
+-	KW_EXT1(ziccif, RISCV_HWPROBE_EXT_ZICCIF),
+-	KW_EXT1(zicclsm, RISCV_HWPROBE_EXT_ZICCLSM),
+-	KW_EXT1(ziccrse, RISCV_HWPROBE_EXT_ZICCRSE),
+-	KW_EXT(zicntr, 0, RISCV_HWPROBE_EXT_ZICNTR),
+-	KW_EXT(zicond, KW_ISA_ZICOND, RISCV_HWPROBE_EXT_ZICOND),
+-	KW_BASE(zicsr),
+-	KW_BASE(zifencei),
+-	KW_EXT(zihintntl, 0, RISCV_HWPROBE_EXT_ZIHINTNTL),
+-	KW_EXT(zihintpause, 0, RISCV_HWPROBE_EXT_ZIHINTPAUSE),
+-	KW_EXT(zihpm, KW_ISA_ZIHPM, RISCV_HWPROBE_EXT_ZIHPM),
+-	KW_EXT(zimop, KW_ISA_ZIMOP, RISCV_HWPROBE_EXT_ZIMOP),
+-	KW_EXT1(za64rs, RISCV_HWPROBE_EXT_ZA64RS),
+-	KW_EXT(zaamo, 0, RISCV_HWPROBE_EXT_ZAAMO),
+-	KW_EXT(zalrsc, 0, RISCV_HWPROBE_EXT_ZALRSC),
+-	KW_EXT(zawrs, KW_ISA_ZAWRS, RISCV_HWPROBE_EXT_ZAWRS),
+-	KW_EXT(zfa, KW_ISA_ZFA, RISCV_HWPROBE_EXT_ZFA),
+-	KW_EXT(zfhmin, KW_ISA_ZFHMIN, RISCV_HWPROBE_EXT_ZFHMIN),
+-	KW_EXT(zca, 0, RISCV_HWPROBE_EXT_ZCA),
+-	KW_EXT(zcb, KW_ISA_ZCB, RISCV_HWPROBE_EXT_ZCB),
+-	KW_EXT(zcd, 0, RISCV_HWPROBE_EXT_ZCD),
+-	KW_EXT(zcmop, KW_ISA_ZCMOP, RISCV_HWPROBE_EXT_ZCMOP),
+-	KW_EXT(zba, KW_ISA_ZBA, RISCV_HWPROBE_EXT_ZBA),
+-	KW_EXT(zbb, KW_ISA_ZBB, RISCV_HWPROBE_EXT_ZBB),
+-	KW_EXT(zbc, KW_ISA_ZBC, RISCV_HWPROBE_EXT_ZBC),
+-	KW_EXT(zbkb, KW_ISA_ZBKB, RISCV_HWPROBE_EXT_ZBKB),
+-	KW_EXT(zbkc, KW_ISA_ZBKC, RISCV_HWPROBE_EXT_ZBKC),
+-	KW_EXT(zbkx, KW_ISA_ZBKX, RISCV_HWPROBE_EXT_ZBKX),
+-	KW_EXT(zbs, KW_ISA_ZBS, RISCV_HWPROBE_EXT_ZBS),
+-	KW_EXT(zknd, KW_ISA_ZKND, RISCV_HWPROBE_EXT_ZKND),
+-	KW_EXT(zkne, KW_ISA_ZKNE, RISCV_HWPROBE_EXT_ZKNE),
++	{ "fp",		HWCAP_FP,	0 },
++	{ "asimd",	HWCAP_ASIMD,	0 },
++	{ "aes",	HWCAP_AES,	KW_ISA_AES },
++	{ "pmull",	HWCAP_PMULL,	KW_ISA_PMULL },
++	{ "sha1",	HWCAP_SHA1,	KW_ISA_SHA1 },
++	{ "sha2",	HWCAP_SHA2,	KW_ISA_SHA2 },
++	{ "crc32",	HWCAP_CRC32,	KW_ISA_CRC32 },
++	{ "atomics",	HWCAP_ATOMICS,	KW_ISA_LSE,	"lse" },
++	{ "cpuid",	HWCAP_CPUID,	0 },	/* only if KW_HWCAP_CPUID */
++	{ "sha3",	HWCAP_SHA3,	KW_ISA_SHA3 },
++	{ "sha512",	HWCAP_SHA512,	KW_ISA_SHA512 },
+ };
+ 
+-/* Entries (bit i = kw_isa_exts[i]) the command line leaves on. */
+-static u64 kw_isa_want __initdata = ~0ULL;
+-/* What user space sees; the defaults are RV64GC alone. */
+-static char kw_isa_str[256] __ro_after_init = "rv64imafdc_zicsr_zifencei";
+-static u64 kw_isa_ext0 __ro_after_init = RISCV_HWPROBE_IMA_FD | RISCV_HWPROBE_IMA_C;
+-static u64 kw_isa_ext1 __ro_after_init;
++/* The KW_ISA_* features the command line leaves on (all of them). */
++static u64 kw_isa_want __initdata = ~(u64)0;
++/* What user space sees; the defaults are ARMv8.0-A with FP and AdvSIMD. */
++static char kw_isa_str[128] __ro_after_init = "fp asimd";
++unsigned long kw_elf_hwcap __ro_after_init = HWCAP_FP | HWCAP_ASIMD;
+ static u64 kw_isa_got __ro_after_init;
+ 
+ u64 kw_isa_enabled(void)
+@@ -101,10 +66,14 @@ u64 kw_isa_enabled(void)
+ }
+ 
+ /*
+- * kw.isa=LIST: a comma-separated list applied from left to right.
+- * "rv64gc" turns every extension beyond RV64GC off, "-ext" turns one off,
+- * "+ext" (or "ext") turns one back on if kwemu implements it. For example
+- * kw.isa=rv64gc, kw.isa=-zbc,-zkne or kw.isa=rv64gc,+zbb.
++ * kw.isa=LIST: a comma-separated list applied from left to right. "armv8"
++ * turns every optional feature off (ARMv8.0-A with FP and AdvSIMD only),
++ * "-feat" turns one off, "+feat" (or "feat") turns one back on if kwemu
++ * implements it; the names are those of the Features line (aes, pmull,
++ * sha1, sha2, crc32, atomics, sha3, sha512; "lse" is atomics too). For example
++ * kw.isa=armv8, kw.isa=-pmull, kw.isa=-lse or kw.isa=armv8,+crc32.
++ * kwemu runs SHA512 only together with SHA2 (kw_set_isa drops it
++ * otherwise), so -sha2 turns both off.
+  */
+ static int __init kw_isa_param(char *arg)
+ {
+@@ -118,25 +87,24 @@ static int __init kw_isa_param(char *arg)
+ 
+ 		if (!*tok)
+ 			continue;
+-		if (!strcmp(tok, "rv64gc")) {
+-			for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++)
+-				if (!kw_isa_exts[i].base)
+-					kw_isa_want &= ~BIT_ULL(i);
++		if (!strcmp(tok, "armv8")) {
++			kw_isa_want = 0;
+ 			continue;
+ 		}
+ 		if (*tok == '-' || *tok == '+')
+ 			on = *tok++ == '+';
+ 		for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++)
+-			if (!strcmp(tok, kw_isa_exts[i].name))
++			if (!strcmp(tok, kw_isa_exts[i].name) ||
++			    (kw_isa_exts[i].alias && !strcmp(tok, kw_isa_exts[i].alias)))
+ 				break;
+-		if (i == ARRAY_SIZE(kw_isa_exts) || kw_isa_exts[i].base) {
++		if (i == ARRAY_SIZE(kw_isa_exts) || !kw_isa_exts[i].kw) {
+ 			pr_warn("kw.isa: ignoring '%s'\n", tok);
+ 			continue;
+ 		}
+ 		if (on)
+-			kw_isa_want |= BIT_ULL(i);
++			kw_isa_want |= kw_isa_exts[i].kw;
+ 		else
+-			kw_isa_want &= ~BIT_ULL(i);
++			kw_isa_want &= ~kw_isa_exts[i].kw;
+ 	}
+ 	return 0;
+ }
+@@ -146,44 +114,38 @@ early_param("kw.isa", kw_isa_param);
+ void __init kw_isa_init(struct kw_cpu *cpu)
+ {
+ 	char *p = kw_isa_str, *end = kw_isa_str + sizeof(kw_isa_str);
+-	u64 want = 0, got;
++	unsigned long hwcap = 0;
++	u64 got;
+ 	int i;
+ 
+-	BUILD_BUG_ON(ARRAY_SIZE(kw_isa_exts) > 64);
+-	for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++)
+-		if (kw_isa_want & BIT_ULL(i))
+-			want |= kw_isa_exts[i].kw;
+-	got = kw_set_isa(cpu, want);
++	got = kw_set_isa(cpu, kw_isa_want);
+ 	kw_isa_got = got;
+ 
+-	p += scnprintf(p, end - p, "rv64imafdc");
+-	kw_isa_ext0 = RISCV_HWPROBE_IMA_FD | RISCV_HWPROBE_IMA_C;
+-	kw_isa_ext1 = 0;
++	*p = 0;
+ 	for (i = 0; i < ARRAY_SIZE(kw_isa_exts); i++) {
+ 		const struct kw_isa_ext *e = &kw_isa_exts[i];
+ 
+-		if (!e->base && (!(kw_isa_want & BIT_ULL(i)) || (e->kw & ~got)))
++		if (e->kw & ~got)
+ 			continue;
+-		p += scnprintf(p, end - p, "_%s", e->name);
+-		kw_isa_ext0 |= e->ext0;
+-		kw_isa_ext1 |= e->ext1;
++		if (e->hwcap == HWCAP_CPUID && !KW_HWCAP_CPUID)
++			continue;
++		hwcap |= e->hwcap;
++		p += scnprintf(p, end - p, "%s%s", p == kw_isa_str ? "" : " ",
++			       e->name);
+ 	}
+-	pr_info("kwemu: isa %s (kwemu implements %#llx, enabled %#llx)\n",
++	kw_elf_hwcap = hwcap;
++	pr_info("kwemu: features %s (kwemu implements %#llx, enabled %#llx)\n",
+ 		kw_isa_str, kw_isa_supported(), got);
+ }
+ 
+-u64 kw_isa_hwprobe_ext0(void)
+-{
+-	return kw_isa_ext0;
+-}
+-
+-u64 kw_isa_hwprobe_ext1(void)
+-{
+-	return kw_isa_ext1;
+-}
+-
+ #ifdef CONFIG_PROC_FS
+ 
++/*
++ * MIDR_EL1 as kwemu answers MRS (src/a64/branch.zig): implementer 0, so
++ * nothing picks code for a particular core.
++ */
++#define KW_MIDR	0x000f0000U
++
+ static void *c_start(struct seq_file *m, loff_t *pos)
+ {
+ 	if (*pos == nr_cpu_ids)
+@@ -209,11 +171,17 @@ static int c_show(struct seq_file *m, void *v)
+ {
+ 	unsigned long cpu_id = (unsigned long)v - 1;
+ 
++	/* arm64's format (arch/arm64/kernel/cpuinfo.c), for kwemu's MIDR_EL1. */
+ 	seq_printf(m, "processor\t: %lu\n", cpu_id);
+-	seq_printf(m, "hart\t\t: %lu\n", cpu_id);
+-	seq_printf(m, "isa\t\t: %s\n", kw_isa_str);
+-	seq_printf(m, "mmu\t\t: sv39\n");
+-	seq_printf(m, "uarch\t\t: unkernel,kwemu\n\n");
++	seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
++		   loops_per_jiffy / (500000UL / HZ),
++		   loops_per_jiffy / (5000UL / HZ) % 100);
++	seq_printf(m, "Features\t: %s\n", kw_isa_str);
++	seq_printf(m, "CPU implementer\t: 0x%02x\n", (KW_MIDR >> 24) & 0xff);
++	seq_puts(m, "CPU architecture: 8\n");
++	seq_printf(m, "CPU variant\t: 0x%x\n", (KW_MIDR >> 20) & 0xf);
++	seq_printf(m, "CPU part\t: 0x%03x\n", (KW_MIDR >> 4) & 0xfff);
++	seq_printf(m, "CPU revision\t: %d\n\n", KW_MIDR & 0xf);
+ 
+ 	return 0;
+ }
+diff --git a/arch/wasm/kernel/process.c b/arch/wasm/kernel/process.c
+index 2a860cf0e7e..98b3ef59d17 100644
+--- a/arch/wasm/kernel/process.c
++++ b/arch/wasm/kernel/process.c
+@@ -206,9 +206,6 @@ __switch_to(struct task_struct *prev, struct task_struct *next)
+ 	}
+ #endif
+ 
+-	/* Threads sharing an mm must not inherit an LR/SC reservation. */
+-	kw_clear_reservation(wasm_kw_cpu);
+-
+ 	return wasm_arch_switch(prev, next, is_new,
+ 				READ_ONCE(prev->__state) == TASK_DEAD);
+ }
+@@ -309,7 +306,7 @@ void arch_stay_move_to(struct task_struct *p, int cpu)
+  * notify-resume work, another reschedule) is in the TIF flags, which only
+  * the task itself clears; its system call's exit work (tracing, a ptrace
+  * stop, audit) came before the reschedule and is not repeated; pt_regs
+- * (cause, a0 for a restart) are as the old pass left them.
++ * (cause, x0 for a restart) are as the old pass left them.
+  */
+ static void __noreturn kw_user_resume(struct task_struct *prev)
+ {
+@@ -429,11 +426,12 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 		p->thread.fn_arg = args->fn_arg;
+ 	} else {
+ 		*childregs = *current_pt_regs();
+-		childregs->user.x[REG_A0] = 0; /* child returns 0 */
++		childregs->user.x[0] = 0; /* child returns 0 */
+ 		if (args->stack)
+-			childregs->user.x[REG_SP] = args->stack;
++			childregs->user.sp = args->stack;
++		/* Otherwise the child keeps the parent's TPIDR_EL0, as on arm64. */
+ 		if (args->flags & CLONE_SETTLS)
+-			childregs->user.x[REG_TP] = args->tls;
++			childregs->user.tpidr_el0 = args->tls;
+ 		p->thread.fn = NULL;
+ 		p->thread.fn_arg = NULL;
+ 	}
+@@ -459,11 +457,15 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 	return 0;
+ }
+ 
++/*
++ * exec: every register zero (also TPIDR_EL0, FPCR and FPSR, as arm64's
++ * flush_thread() leaves them), PSTATE EL0t with NZCV clear.
++ */
+ void start_thread(struct pt_regs *regs, unsigned long pc, unsigned long sp)
+ {
+ 	memset(&regs->user, 0, sizeof(regs->user));
+ 	regs->user.pc = pc;
+-	regs->user.x[REG_SP] = sp;
++	regs->user.sp = sp;
+ 	regs->kernel = 0;
+ }
+ 
+@@ -472,13 +474,13 @@ void show_regs(struct pt_regs *regs)
+ 	int i;
+ 
+ 	show_regs_print_info(KERN_DEFAULT);
+-	pr_cont("pc: %016llx ra: %016llx sp: %016llx\n",
+-		regs->user.pc, regs->user.x[1], regs->user.x[2]);
+-	for (i = 3; i < 32; i += 3)
++	pr_cont("pc : %016llx lr : %016llx sp : %016llx nzcv: %08x\n",
++		regs->user.pc, regs->user.x[30], regs->user.sp,
++		regs->user.nzcv);
++	for (i = 0; i < 30; i += 3)
+ 		pr_cont(" x%-2d %016llx x%-2d %016llx x%-2d %016llx\n",
+-			i, regs->user.x[i], i + 1,
+-			i + 1 < 32 ? regs->user.x[i + 1] : 0ULL,
+-			i + 2, i + 2 < 32 ? regs->user.x[i + 2] : 0ULL);
++			i, regs->user.x[i], i + 1, regs->user.x[i + 1],
++			i + 2, regs->user.x[i + 2]);
+ }
+ 
+ void show_stack(struct task_struct *task, unsigned long *stack,
+diff --git a/arch/wasm/kernel/ptrace.c b/arch/wasm/kernel/ptrace.c
+index 69965b3776b..2e3a46c4655 100644
+--- a/arch/wasm/kernel/ptrace.c
++++ b/arch/wasm/kernel/ptrace.c
+@@ -7,8 +7,8 @@
+ 
+ /* No regsets yet: PTRACE_GETREGSET etc. fail with -EIO. */
+ static const struct user_regset_view wasm_user_view = {
+-	.name = "riscv64",
+-	.e_machine = EM_RISCV,
++	.name = "aarch64",
++	.e_machine = EM_AARCH64,
+ 	.regsets = NULL,
+ 	.n = 0,
+ };
+diff --git a/arch/wasm/kernel/signal.c b/arch/wasm/kernel/signal.c
+index 5df45d42d6e..216fc53ef94 100644
+--- a/arch/wasm/kernel/signal.c
++++ b/arch/wasm/kernel/signal.c
+@@ -1,11 +1,19 @@
+-// SPDX-License-Identifier: GPL-2.0-or-later
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * Signal delivery with the riscv64 rt_sigframe/ucontext layout (no V
+- * extension state). Based on arch/riscv/kernel/signal.c.
++ * Signal delivery with arm64's rt_sigframe. Based on
++ * arch/arm64/kernel/signal.c.
+  *
+- * There is no vDSO: handlers return through a two-instruction trampoline
+- * ("li a7, __NR_rt_sigreturn; ecall") on a special page mapped into every
+- * process at exec (see arch/wasm/mm/sigpage.c).
++ * The frame: siginfo, then a ucontext whose sigcontext holds x0..x30, sp,
++ * pc and pstate (NZCV, EL0t) and, in __reserved[], an fpsimd_context record
++ * (FPSR, FPCR, V0..V31) followed by the null terminator; above the frame a
++ * frame record {x29, x30} that the handler's x29 points to. There is no SVE,
++ * SME, GCS, POE, TPIDR2 or FPMR state, and no ESR record (kwemu reports no
++ * syndrome). With nothing else in __reserved[] the frame has a fixed size.
++ *
++ * There is no vDSO: a handler returns (x30) to sa_restorer when SA_RESTORER
++ * is set (musl and glibc always set it), else to the [sigpage] trampoline
++ * mapped into every process at exec ("mov x8, #139; svc #0",
++ * arch/wasm/mm/sigpage.c).
+  */
+ 
+ #include <linux/signal.h>
+@@ -15,6 +23,7 @@
+ #include <linux/linkage.h>
+ #include <linux/entry-common.h>
+ #include <linux/rseq.h>
++#include <asm/sigcontext.h>
+ #include <asm/ucontext.h>
+ #include <asm/syscall.h>
+ #include <asm/kw_emu.h>
+@@ -25,39 +34,113 @@ struct rt_sigframe {
+ 	struct ucontext uc;
+ };
+ 
++struct frame_record {
++	u64 fp;
++	u64 lr;
++};
++
++/* The FPCR and FPSR bits kwemu keeps (src/a64/common.zig, FPCR_MASK, FPSR_MASK). */
++#define KW_FPCR_MASK	((1U << 26) | (1U << 25) | (1U << 24) | (3U << 22) | (1U << 19))
++#define KW_FPSR_MASK	((1U << 27) | (1U << 7) | 0x1fU)
++
++/* Records in uc.uc_mcontext.__reserved[]: FPSIMD at 0, then the terminator. */
++#define KW_SIG_END_OFFSET	round_up(sizeof(struct fpsimd_context), 16)
++
+ unsigned long signal_minsigstksz __ro_after_init;
+ 
+-static size_t get_rt_frame_size(void)
++static size_t sigframe_size(void)
+ {
+ 	return round_up(sizeof(struct rt_sigframe), 16);
+ }
+ 
+-static long restore_sigcontext(struct pt_regs *regs,
+-			       struct sigcontext __user *sc)
++/*
++ * Walk __reserved[] as arm64's parse_user_sigframe() does: 16-byte aligned
++ * records within the area, exactly one FPSIMD record of the right size, ESR
++ * ignored, a zero terminator. Everything else (SVE, ZA, ZT, TPIDR2, FPMR,
++ * POE, GCS, EXTRA) is state this CPU does not have: invalid.
++ */
++static int parse_user_sigframe(struct sigcontext __user *sc,
++			       struct fpsimd_context __user **fpsimd)
+ {
+-	struct user_regs_struct uregs;
+-	struct __riscv_d_ext_state fstate;
+-	__u32 rsvd, magic, size;
+-	unsigned long *r = (unsigned long *)&uregs;
+-	long err;
+-	int i;
++	char __user *base = (char __user *)&sc->__reserved;
++	size_t limit = sizeof(sc->__reserved);
++	size_t offset = 0;
+ 
+-	err = __copy_from_user(&uregs, &sc->sc_regs, sizeof(uregs));
+-	err |= __copy_from_user(&fstate, &sc->sc_fpregs.d, sizeof(fstate));
+-	err |= __get_user(rsvd, &sc->sc_extdesc.reserved);
+-	err |= __get_user(magic, &sc->sc_extdesc.hdr.magic);
+-	err |= __get_user(size, &sc->sc_extdesc.hdr.size);
+-	if (err)
++	*fpsimd = NULL;
++	for (;;) {
++		struct _aarch64_ctx __user *head;
++		u32 magic, size;
++
++		if (limit - offset < sizeof(*head) || !IS_ALIGNED(offset, 16))
++			return -EINVAL;
++		head = (struct _aarch64_ctx __user *)(base + offset);
++		if (__get_user(magic, &head->magic) ||
++		    __get_user(size, &head->size))
++			return -EFAULT;
++		if (limit - offset < size)
++			return -EINVAL;
++
++		switch (magic) {
++		case 0:
++			if (size)
++				return -EINVAL;
++			return *fpsimd ? 0 : -EINVAL;
++		case FPSIMD_MAGIC:
++			if (*fpsimd || size != sizeof(struct fpsimd_context))
++				return -EINVAL;
++			*fpsimd = (struct fpsimd_context __user *)head;
++			break;
++		case ESR_MAGIC:
++			break;
++		default:
++			return -EINVAL;
++		}
++		if (size < sizeof(*head))
++			return -EINVAL;
++		offset += size;
++	}
++}
++
++static int restore_sigframe(struct pt_regs *regs,
++			    struct rt_sigframe __user *sf)
++{
++	struct sigcontext __user *sc = &sf->uc.uc_mcontext;
++	struct fpsimd_context __user *fpsimd;
++	u64 x[31], sp, pc, pstate, v[32][2];
++	u32 fpsr, fpcr;
++	sigset_t set;
++	int err;
++
++	BUILD_BUG_ON(sizeof(x) != sizeof(sc->regs));
++	BUILD_BUG_ON(sizeof(v) != sizeof(fpsimd->vregs));
++	BUILD_BUG_ON(sizeof(v) != sizeof(regs->user.v));
++
++	if (__copy_from_user(&set, &sf->uc.uc_sigmask, sizeof(set)))
+ 		return -EFAULT;
+-	if (rsvd || magic != END_MAGIC || size != END_HDR_SIZE)
++	set_current_blocked(&set);
++
++	if (__copy_from_user(x, sc->regs, sizeof(x)) ||
++	    __get_user(sp, &sc->sp) || __get_user(pc, &sc->pc) ||
++	    __get_user(pstate, &sc->pstate))
++		return -EFAULT;
++	/* valid_user_regs(): AArch64 EL0t only; kwemu keeps NZCV alone. */
++	if (pstate & (PSR_MODE32_BIT | PSR_MODE_MASK))
+ 		return -EINVAL;
+ 
+-	/* user_regs_struct is { pc, x1..x31 } */
+-	regs->user.pc = r[0];
+-	for (i = 1; i < 32; i++)
+-		regs->user.x[i] = r[i];
+-	memcpy(regs->user.f, fstate.f, sizeof(regs->user.f));
+-	regs->user.fcsr = fstate.fcsr;
++	err = parse_user_sigframe(sc, &fpsimd);
++	if (err)
++		return err;
++	if (__get_user(fpsr, &fpsimd->fpsr) || __get_user(fpcr, &fpsimd->fpcr) ||
++	    __copy_from_user(v, fpsimd->vregs, sizeof(v)))
++		return -EFAULT;
++
++	memcpy(regs->user.x, x, sizeof(x));
++	regs->user.sp = sp;
++	regs->user.pc = pc;
++	regs->user.nzcv = pstate & (PSR_N_BIT | PSR_Z_BIT | PSR_C_BIT | PSR_V_BIT);
++	regs->user.fpsr = fpsr & KW_FPSR_MASK;
++	regs->user.fpcr = fpcr & KW_FPCR_MASK;
++	memcpy(regs->user.v, v, sizeof(v));
+ 	return 0;
+ }
+ 
+@@ -65,115 +148,114 @@ SYSCALL_DEFINE0(rt_sigreturn)
+ {
+ 	struct pt_regs *regs = current_pt_regs();
+ 	struct rt_sigframe __user *frame;
+-	sigset_t set;
+ 
+ 	/* Always make any pending restarted system calls return -EINTR */
+ 	current->restart_block.fn = do_no_restart_syscall;
+ 
+-	frame = (struct rt_sigframe __user *)regs->user.x[REG_SP];
+-
+-	if (!access_ok(frame, get_rt_frame_size()))
++	/*
++	 * Since we stacked the signal on a 128-bit boundary, then 'sp' should
++	 * be word aligned here.
++	 */
++	if (regs->user.sp & 15)
+ 		goto badframe;
+ 
+-	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
++	frame = (struct rt_sigframe __user *)regs->user.sp;
++
++	if (!access_ok(frame, sizeof(*frame)))
+ 		goto badframe;
+ 
+-	set_current_blocked(&set);
+-
+-	if (restore_sigcontext(regs, &frame->uc.uc_mcontext))
++	if (restore_sigframe(regs, frame))
+ 		goto badframe;
+ 
+ 	if (restore_altstack(&frame->uc.uc_stack))
+ 		goto badframe;
+ 
++	/* Avoid sys_rt_sigreturn() restarting. */
+ 	regs->cause = PT_CAUSE_NONE;
+-	kw_clear_reservation(wasm_kw_cpu);
+ 
+-	return regs->user.x[REG_A0];
++	return regs->user.x[0];
+ 
+ badframe:
+ 	if (show_unhandled_signals)
+ 		pr_info_ratelimited("%s[%d]: bad frame in %s: frame=%p pc=%llx sp=%llx\n",
+ 				    current->comm, task_pid_nr(current), __func__,
+-				    frame, regs->user.pc, regs->user.x[REG_SP]);
++				    frame, regs->user.pc, regs->user.sp);
+ 	force_sig(SIGSEGV);
+ 	return 0;
+ }
+ 
+-static long setup_sigcontext(struct rt_sigframe __user *frame,
+-			     struct pt_regs *regs)
++static int setup_sigframe(struct rt_sigframe __user *sf, struct pt_regs *regs,
++			  sigset_t *set)
+ {
+-	struct sigcontext __user *sc = &frame->uc.uc_mcontext;
+-	struct user_regs_struct uregs;
+-	struct __riscv_d_ext_state fstate;
+-	unsigned long *r = (unsigned long *)&uregs;
+-	long err;
+-	int i;
++	struct sigcontext __user *sc = &sf->uc.uc_mcontext;
++	struct fpsimd_context __user *fpsimd =
++		(struct fpsimd_context __user *)&sc->__reserved;
++	struct _aarch64_ctx __user *end =
++		(struct _aarch64_ctx __user *)(sc->__reserved + KW_SIG_END_OFFSET);
++	int err = 0;
+ 
+-	r[0] = regs->user.pc;
+-	for (i = 1; i < 32; i++)
+-		r[i] = regs->user.x[i];
+-	memcpy(fstate.f, regs->user.f, sizeof(fstate.f));
+-	fstate.fcsr = regs->user.fcsr;
++	err |= __copy_to_user(sc->regs, regs->user.x, sizeof(sc->regs));
++	err |= __put_user(regs->user.sp, &sc->sp);
++	err |= __put_user(regs->user.pc, &sc->pc);
++	err |= __put_user((u64)regs->user.nzcv, &sc->pstate);
++	/* The last user fault's address, as arm64's thread.fault_address. */
++	err |= __put_user(regs->badaddr, &sc->fault_address);
++	err |= __copy_to_user(&sf->uc.uc_sigmask, set, sizeof(*set));
+ 
+-	err = __copy_to_user(&sc->sc_regs, &uregs, sizeof(uregs));
+-	err |= __copy_to_user(&sc->sc_fpregs.d, &fstate, sizeof(fstate));
+-	/* Write zero to fp-reserved space and check it on restore_sigcontext */
+-	err |= __put_user(0, &sc->sc_extdesc.reserved);
+-	/* And put END __riscv_ctx_hdr at the end. */
+-	err |= __put_user(END_MAGIC, &sc->sc_extdesc.hdr.magic);
+-	err |= __put_user(END_HDR_SIZE, &sc->sc_extdesc.hdr.size);
++	err |= __put_user(FPSIMD_MAGIC, &fpsimd->head.magic);
++	err |= __put_user(sizeof(struct fpsimd_context), &fpsimd->head.size);
++	err |= __put_user(regs->user.fpsr, &fpsimd->fpsr);
++	err |= __put_user(regs->user.fpcr, &fpsimd->fpcr);
++	err |= __copy_to_user(fpsimd->vregs, regs->user.v, sizeof(regs->user.v));
+ 
+-	return err;
+-}
++	err |= __put_user(0, &end->magic);
++	err |= __put_user(0, &end->size);
+ 
+-static inline void __user *get_sigframe(struct ksignal *ksig,
+-					struct pt_regs *regs, size_t framesize)
+-{
+-	unsigned long sp = regs->user.x[REG_SP];
+-
+-	/*
+-	 * If we are on the alternate signal stack and would overflow it, don't.
+-	 * Return an always-bogus address instead so we will die with SIGSEGV.
+-	 */
+-	if (on_sig_stack(sp) && !likely(on_sig_stack(sp - framesize)))
+-		return (void __user __force *)(-1UL);
+-
+-	sp = sigsp(sp, ksig) - framesize;
+-	sp &= ~0xfUL;
+-	return (void __user *)sp;
++	return err ? -EFAULT : 0;
+ }
+ 
+ static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+ 			  struct pt_regs *regs)
+ {
+ 	struct rt_sigframe __user *frame;
+-	size_t frame_size = get_rt_frame_size();
+-	long err = 0;
++	struct frame_record __user *next_frame;
++	unsigned long sp, sp_top, sigtramp;
++	int err = 0;
+ 
+-	frame = get_sigframe(ksig, regs, frame_size);
+-	if (!access_ok(frame, frame_size))
++	/* get_sigframe(): the frame record, then the frame below it. */
++	sp = sp_top = sigsp(regs->user.sp, ksig);
++	sp = round_down(sp - sizeof(struct frame_record), 16);
++	next_frame = (struct frame_record __user *)sp;
++	sp = round_down(sp, 16) - sigframe_size();
++	frame = (struct rt_sigframe __user *)sp;
++	if (!access_ok(frame, sp_top - sp))
+ 		return -EFAULT;
+ 
+-	err |= copy_siginfo_to_user(&frame->info, &ksig->info);
+-
+ 	err |= __put_user(0, &frame->uc.uc_flags);
+ 	err |= __put_user(NULL, &frame->uc.uc_link);
+-	err |= __save_altstack(&frame->uc.uc_stack, regs->user.x[REG_SP]);
+-	err |= setup_sigcontext(frame, regs);
+-	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
++	err |= __save_altstack(&frame->uc.uc_stack, regs->user.sp);
++	err |= setup_sigframe(frame, regs, set);
++	err |= __put_user(regs->user.x[29], &next_frame->fp);
++	err |= __put_user(regs->user.x[30], &next_frame->lr);
++	if (ksig->ka.sa.sa_flags & SA_SIGINFO)
++		err |= copy_siginfo_to_user(&frame->info, &ksig->info);
+ 	if (err)
+ 		return -EFAULT;
+ 
+-	/* A handler must not complete an interrupted LR/SC sequence. */
+-	kw_clear_reservation(wasm_kw_cpu);
++	if (ksig->ka.sa.sa_flags & SA_RESTORER)
++		sigtramp = (unsigned long)ksig->ka.sa.sa_restorer;
++	else
++		sigtramp = current->mm->context.sigpage;
+ 
+-	regs->user.x[REG_RA] = current->mm->context.sigpage;
++	regs->user.x[0] = ksig->sig;
++	if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
++		regs->user.x[1] = (unsigned long)&frame->info;
++		regs->user.x[2] = (unsigned long)&frame->uc;
++	}
++	regs->user.sp = (unsigned long)frame;
++	regs->user.x[29] = (unsigned long)&next_frame->fp;
++	regs->user.x[30] = sigtramp;
+ 	regs->user.pc = (unsigned long)ksig->ka.sa.sa_handler;
+-	regs->user.x[REG_SP] = (unsigned long)frame;
+-	regs->user.x[REG_A0] = ksig->sig;
+-	regs->user.x[11] = (unsigned long)&frame->info;
+-	regs->user.x[12] = (unsigned long)&frame->uc;
+ 
+ 	return 0;
+ }
+@@ -197,8 +279,8 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+ 
+ 	if (syscall) {
+ 		continue_addr = regs->user.pc;
+-		restart_addr = continue_addr - 4;
+-		retval = regs->user.x[REG_A0];
++		restart_addr = continue_addr - 4;	/* SVC */
++		retval = regs->user.x[0];
+ 
+ 		/* Avoid additional syscall restarting */
+ 		regs->cause = PT_CAUSE_NONE;
+@@ -208,7 +290,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+ 		case -ERESTARTSYS:
+ 		case -ERESTARTNOINTR:
+ 		case -ERESTART_RESTARTBLOCK:
+-			regs->user.x[REG_A0] = regs->orig_a0;
++			regs->user.x[0] = regs->orig_x0;
+ 			regs->user.pc = restart_addr;
+ 			break;
+ 		}
+@@ -220,7 +302,7 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+ 		     retval == -ERESTART_RESTARTBLOCK ||
+ 		     (retval == -ERESTARTSYS &&
+ 		      !(ksig.ka.sa.sa_flags & SA_RESTART)))) {
+-			regs->user.x[REG_A0] = -EINTR;
++			regs->user.x[0] = -EINTR;
+ 			regs->user.pc = continue_addr;
+ 		}
+ 
+@@ -230,14 +312,16 @@ void arch_do_signal_or_restart(struct pt_regs *regs)
+ 
+ 	if (syscall && regs->user.pc == restart_addr &&
+ 	    retval == -ERESTART_RESTARTBLOCK)
+-		regs->user.x[REG_A7] = __NR_restart_syscall;
++		regs->user.x[8] = __NR_restart_syscall;
+ 
+ 	restore_saved_sigmask();
+ }
+ 
++/* AT_MINSIGSTKSZ: the frame, the frame record and alignment padding. */
+ static int __init init_signal_minsigstksz(void)
+ {
+-	signal_minsigstksz = get_rt_frame_size();
++	signal_minsigstksz = sigframe_size() +
++		round_up(sizeof(struct frame_record), 16) + 16;
+ 	return 0;
+ }
+ arch_initcall(init_signal_minsigstksz);
+diff --git a/arch/wasm/kernel/sys.c b/arch/wasm/kernel/sys.c
+new file mode 100644
+index 00000000000..f72cbd38461
+--- /dev/null
++++ b/arch/wasm/kernel/sys.c
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * The arm64 system calls with an arch-specific implementation, as user
++ * mode sees them. Based on arch/arm64/kernel/sys.c.
++ */
++
++#include <linux/mm.h>
++#include <linux/personality.h>
++#include <linux/syscalls.h>
++
++SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
++		unsigned long, prot, unsigned long, flags,
++		unsigned long, fd, unsigned long, off)
++{
++	if (offset_in_page(off) != 0)
++		return -EINVAL;
++
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
++}
++
++/* There is no AArch32 at EL0 (syscall_table.c maps personality here). */
++SYSCALL_DEFINE1(arm64_personality, unsigned int, personality)
++{
++	if (personality(personality) == PER_LINUX32)
++		return -EINVAL;
++	return ksys_personality(personality);
++}
+diff --git a/arch/wasm/kernel/sys_riscv.c b/arch/wasm/kernel/sys_riscv.c
+deleted file mode 100644
+index 775eae39dbe..00000000000
+--- a/arch/wasm/kernel/sys_riscv.c
++++ /dev/null
+@@ -1,113 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/* riscv64-specific syscalls, as seen by user mode. */
+-
+-#include <linux/syscalls.h>
+-#include <linux/uaccess.h>
+-#include <asm/hwcap.h>
+-#include <asm/hwprobe.h>
+-
+-#define SYS_RISCV_FLUSH_ICACHE_ALL 1UL
+-#include <asm/tlbflush.h>
+-
+-SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+-		unsigned long, prot, unsigned long, flags,
+-		unsigned long, fd, unsigned long, offset)
+-{
+-	if (unlikely(offset & (~PAGE_MASK)))
+-		return -EINVAL;
+-
+-	return ksys_mmap_pgoff(addr, len, prot, flags, fd, offset >> PAGE_SHIFT);
+-}
+-
+-SYSCALL_DEFINE3(riscv_flush_icache, uintptr_t, start, uintptr_t, end,
+-		uintptr_t, flags)
+-{
+-	if (flags & ~SYS_RISCV_FLUSH_ICACHE_ALL)
+-		return -EINVAL;
+-	/* Drop translations; the emulator re-decodes from memory. */
+-	kw_flush_icache_all();
+-	return 0;
+-}
+-
+-static void hwprobe_one(struct riscv_hwprobe *pair)
+-{
+-	switch (pair->key) {
+-	case RISCV_HWPROBE_KEY_MVENDORID:
+-	case RISCV_HWPROBE_KEY_MARCHID:
+-	case RISCV_HWPROBE_KEY_MIMPID:
+-		pair->value = 0;
+-		break;
+-	case RISCV_HWPROBE_KEY_BASE_BEHAVIOR:
+-		pair->value = RISCV_HWPROBE_BASE_BEHAVIOR_IMA;
+-		break;
+-	case RISCV_HWPROBE_KEY_IMA_EXT_0:
+-		pair->value = kw_isa_hwprobe_ext0();
+-		break;
+-	case RISCV_HWPROBE_KEY_IMA_EXT_1:
+-		pair->value = kw_isa_hwprobe_ext1();
+-		break;
+-	/*
+-	 * kwemu runs a misaligned load or store like an aligned one (one
+-	 * unaligned host access; only page-straddling ones take a slower
+-	 * path), so it is several times faster than the same bytes one by
+-	 * one: what upstream measures for FAST. No V, so no vector accesses.
+-	 */
+-	case RISCV_HWPROBE_KEY_CPUPERF_0:
+-	case RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF:
+-		pair->value = RISCV_HWPROBE_MISALIGNED_SCALAR_FAST;
+-		break;
+-	case RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF:
+-		pair->value = RISCV_HWPROBE_MISALIGNED_VECTOR_UNSUPPORTED;
+-		break;
+-	/* kwemu's cache blocks are 64 bytes (cbo.zero zeroes that many). */
+-	case RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE:
+-		pair->value = kw_isa_hwprobe_ext0() & RISCV_HWPROBE_EXT_ZICBOZ ? 64 : 0;
+-		break;
+-	case RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE:
+-		pair->value = kw_isa_hwprobe_ext0() & RISCV_HWPROBE_EXT_ZICBOM ? 64 : 0;
+-		break;
+-	case RISCV_HWPROBE_KEY_ZICBOP_BLOCK_SIZE:
+-		/* The prefetches are no-ops. */
+-		pair->value = kw_isa_hwprobe_ext0() & RISCV_HWPROBE_EXT_ZICBOP ? 64 : 0;
+-		break;
+-	/* As riscv: the end of the user address space (Sv39). */
+-	case RISCV_HWPROBE_KEY_HIGHEST_VIRT_ADDRESS:
+-		pair->value = STACK_TOP_MAX;
+-		break;
+-	/* Not a T-Head, SiFive or MIPS hart: no vendor extensions. */
+-	case RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0:
+-	case RISCV_HWPROBE_KEY_VENDOR_EXT_SIFIVE_0:
+-	case RISCV_HWPROBE_KEY_VENDOR_EXT_MIPS_0:
+-		pair->value = 0;
+-		break;
+-	/*
+-	 * TIME_CSR_FREQ stays unknown: the time CSR counts instructions
+-	 * (icount), so it has no frequency.
+-	 */
+-	default:
+-		pair->key = -1;
+-		pair->value = 0;
+-		break;
+-	}
+-}
+-
+-SYSCALL_DEFINE5(riscv_hwprobe, struct riscv_hwprobe __user *, pairs,
+-		size_t, pair_count, size_t, cpusetsize,
+-		unsigned long __user *, cpus_user, unsigned int, flags)
+-{
+-	size_t i;
+-
+-	if (flags & ~RISCV_HWPROBE_WHICH_CPUS)
+-		return -EINVAL;
+-
+-	for (i = 0; i < pair_count; i++) {
+-		struct riscv_hwprobe pair;
+-
+-		if (copy_from_user(&pair.key, &pairs[i].key, sizeof(pair.key)))
+-			return -EFAULT;
+-		hwprobe_one(&pair);
+-		if (copy_to_user(&pairs[i], &pair, sizeof(pair)))
+-			return -EFAULT;
+-	}
+-	return 0;
+-}
+diff --git a/arch/wasm/kernel/syscall_table.c b/arch/wasm/kernel/syscall_table.c
+index 51e05d3b9f8..ae0e91d3201 100644
+--- a/arch/wasm/kernel/syscall_table.c
++++ b/arch/wasm/kernel/syscall_table.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+-/* riscv64 syscall table (generated from scripts/syscall.tbl, abi "riscv"). */
++/* arm64 syscall table (generated from scripts/syscall.tbl, abis as arm64). */
+ 
+ #include <linux/linkage.h>
+ #include <linux/syscalls.h>
+@@ -8,6 +8,9 @@
+ 
+ #define __SYSCALL_WITH_COMPAT(nr, native, compat) __SYSCALL(nr, native)
+ 
++/* arm64 rejects PER_LINUX32 (no AArch32 at EL0): sys.c. */
++#define __wasm_sys_personality __wasm_sys_arm64_personality
++
+ #undef __SYSCALL
+ #define __SYSCALL(nr, call)	asmlinkage long __wasm_##call(const struct pt_regs *);
+ #include <asm/syscall_table_64.h>
+diff --git a/arch/wasm/kernel/traps.c b/arch/wasm/kernel/traps.c
+index 017d8284512..9b2e701ea82 100644
+--- a/arch/wasm/kernel/traps.c
++++ b/arch/wasm/kernel/traps.c
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+  * User mode: the "return to user" path of every user task is a loop around
+- * kw_run(), which executes riscv64 user code until it traps back into the
++ * kw_run(), which executes arm64 user code until it traps back into the
+  * kernel (syscall, page fault, illegal instruction, budget/interrupt).
+  */
+ 
+@@ -54,18 +54,18 @@ asmlinkage long __wasm_sys_ni_syscall(const struct pt_regs *__unused)
+ 
+ static void do_syscall(struct pt_regs *regs)
+ {
+-	long nr = regs->user.x[REG_A7];
++	long nr = regs->user.x[8];
+ 
+-	regs->orig_a0 = regs->user.x[REG_A0];
++	regs->orig_x0 = regs->user.x[0];
+ 	regs->cause = PT_CAUSE_SYSCALL;
+ 
+-	regs->user.x[REG_A0] = -ENOSYS;
++	regs->user.x[0] = -ENOSYS;
+ 
+-	/* False: skip the call and keep a0 (a tracer or seccomp may have set it). */
++	/* False: skip the call and keep x0 (a tracer or seccomp may have set it). */
+ 	if (syscall_enter_from_user_mode_randomize_stack(regs, &nr) &&
+ 	    nr >= 0 && nr < NR_syscalls) {
+ 		nr = array_index_nospec(nr, NR_syscalls);
+-		regs->user.x[REG_A0] = ((syscall_t)sys_call_table[nr])(regs);
++		regs->user.x[0] = ((syscall_t)sys_call_table[nr])(regs);
+ 	}
+ 
+ 	syscall_exit_to_user_mode(regs);
+@@ -142,8 +142,18 @@ void __noreturn user_mode_loop(struct pt_regs *regs)
+ 			kw_park_user();
+ 
+ 		/*
+-		 * "sret": user mode runs with interrupts enabled. On SMP without
+-		 * taking what is pending here: kw_run() sees it at once
++		 * Each entry to user mode is an exception return, and on arm64
++		 * ERET clears the local exclusive monitor (qemu-user does the
++		 * same): an STXR after a syscall, a fault, an interrupt or a
++		 * task switch fails, whatever the kernel ran meanwhile. This is
++		 * the only call of kw_run() and nothing runs in between, so a
++		 * task switch, signal delivery or sigreturn need not clear it.
++		 */
++		kw_clear_reservation(cpu);
++
++		/*
++		 * As after ERET, user mode runs with interrupts enabled. On SMP
++		 * without taking what is pending here: kw_run() sees it at once
+ 		 * (KW_EV_INTERRUPT), and do_user_interrupt() then takes it on
+ 		 * the way to user mode, where a reschedule is honoured.
+ 		 */
+diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
+index 959f2396685..fd26889ddab 100644
+--- a/arch/wasm/mm/fault.c
++++ b/arch/wasm/mm/fault.c
+@@ -193,10 +193,10 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
+ 		force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)addr);
+ 	else {
+ 		if (show_unhandled_signals && unhandled_signal(current, SIGSEGV))
+-			pr_info_ratelimited("%s[%d]: segfault at %lx pc %llx sp %llx ra %llx (%s)\n",
++			pr_info_ratelimited("%s[%d]: segfault at %lx pc %llx sp %llx lr %llx (%s)\n",
+ 					    current->comm, task_pid_nr(current),
+-					    addr, regs->user.pc, regs->user.x[2],
+-					    regs->user.x[1],
++					    addr, regs->user.pc, regs->user.sp,
++					    regs->user.x[30],
+ 					    access == KW_ACCESS_WRITE ? "write" :
+ 					    access == KW_ACCESS_EXEC ? "exec" : "read");
+ 		force_sig_fault(SIGSEGV, code, (void __user *)addr);
+diff --git a/arch/wasm/mm/sigpage.c b/arch/wasm/mm/sigpage.c
+index 51408f5cd0b..09c4dc2492b 100644
+--- a/arch/wasm/mm/sigpage.c
++++ b/arch/wasm/mm/sigpage.c
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * The signal return trampoline page (there is no vDSO). Mapped read+exec
+- * into every process at exec; signal handlers return to it via ra.
++ * into every process at exec; a handler whose sigaction has no
++ * SA_RESTORER returns to it through x30 (signal.c).
+  */
+ 
+ #include <linux/binfmts.h>
+@@ -26,8 +27,8 @@ static int __init sigpage_init(void)
+ 	if (!sigpage)
+ 		return -ENOMEM;
+ 	insn = page_address(sigpage);
+-	insn[0] = 0x08b00893;	/* li a7, 139 (__NR_rt_sigreturn) */
+-	insn[1] = 0x00000073;	/* ecall */
++	insn[0] = 0xd2801168;	/* mov x8, #139 (__NR_rt_sigreturn) */
++	insn[1] = 0xd4000001;	/* svc #0 */
+ 	return 0;
+ }
+ arch_initcall(sigpage_init);
+diff --git a/arch/wasm/mm/tlb.c b/arch/wasm/mm/tlb.c
+index 671411d43d2..2cc8cd12a5d 100644
+--- a/arch/wasm/mm/tlb.c
++++ b/arch/wasm/mm/tlb.c
+@@ -312,12 +312,6 @@ int ptep_set_access_flags(struct vm_area_struct *vma, unsigned long address,
+ 	kw_flush_tlb_fix_spurious_fault(vma, address);
+ 	return 1;
+ }
+-
+-/* riscv_flush_icache(): every CPU drops its decoded code. */
+-void kw_flush_icache_all(void)
+-{
+-	flush_tlb_all();
+-}
+ #else
+ void flush_tlb_all(void)
+ {
+@@ -351,11 +345,6 @@ void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
+ 		kw_flush_tlb_range(wasm_kw_cpu, addr,
+ 				   addr + (unsigned long)nr * PAGE_SIZE);
+ }
+-
+-void kw_flush_icache_all(void)
+-{
+-	kw_flush_tlb_all(wasm_kw_cpu);
+-}
+ #endif
+ 
+ /* mm teardown: never leave the emulator pointing at a freed page table. */
+-- 
+2.56.0
+

@@ -157,7 +157,7 @@ export type ToWorker =
 	 * `hold` also, after a successful commit, until "snapshot-release" (no
 	 * timeout: a page frozen for hours meanwhile changes nothing).
 	 */
-	| { t: "snapshot"; id: number; stop?: boolean; commit?: boolean; commitTimeoutMs?: number; hold?: boolean }
+	| { t: "snapshot"; id: number; stop?: boolean; commit?: boolean; commitTimeoutMs?: number; hold?: boolean; dropCaches?: boolean }
 	/** The owner's commit of "snapshot-held" `id` succeeded (the kernel then stops, or with `hold` waits on) or failed (it goes on). */
 	| { t: "snapshot-commit"; id: number; ok: boolean; error?: string }
 	/** The owner's hold decision for snapshot `id` (after a successful commit): stop at the snapshot, or go on. */

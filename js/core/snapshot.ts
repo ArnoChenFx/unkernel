@@ -132,6 +132,15 @@ export interface SnapshotOptions {
 	commitTimeoutMs?: number;
 	/** After a successful commit: keep the kernel at its consistent point until this decides (above). */
 	hold?: (snapshot: KernelSnapshot, signal: AbortSignal) => SnapshotHoldDecision | PromiseLike<SnapshotHoldDecision>;
+	/**
+	 * Have the guest write back its dirty file data and drop its clean file
+	 * cache (page cache, unused dentries and inodes) on the way to the
+	 * snapshot, so that the cache is not saved: the pages are free then and
+	 * left out. The guest reads the files again when it next needs them.
+	 * Default: true with `stop` or `commit` (a snapshot the machine stops
+	 * at), false for one it runs on from. A kernel that cannot ignores it.
+	 */
+	dropCaches?: boolean;
 }
 
 /** How a snapshot({ commit, hold }) hold ends: the kernel goes on, or stops at the snapshot. */
@@ -244,6 +253,28 @@ export function snapshotDiskMismatch(saved: DiskSnapshotState[], disks: BlockDev
 }
 
 const PAGE = 4096;
+const CHUNK = 65536;
+
+/**
+ * For a snapshot memory this module filled (copySnapshotMemory,
+ * decodeSnapshot, a copy for a worker): one byte per 64 KiB chunk, 0 where
+ * the chunk is known to be zero. Encoding and restoring then look at the
+ * used chunks only instead of scanning the machine's whole size (about
+ * 250 ms per scan of 2 GiB, Node 24, 2026-11-22). Snapshot memories are
+ * not written after they are made.
+ */
+const usedChunks = new WeakMap<Uint8Array, Uint8Array>();
+
+function usedOf(mem: Uint8Array): Uint8Array | undefined {
+	const used = usedChunks.get(mem);
+	return used && used.length === Math.ceil(mem.byteLength / CHUNK) ? used : undefined;
+}
+
+/** A snapshot to post to another thread: with its used chunks, which receivedSnapshot() takes back. */
+export function sentSnapshot(s: KernelSnapshot): KernelSnapshot {
+	const used = usedOf(s.memory);
+	return used ? { ...s, usedChunks: used } as KernelSnapshot : s;
+}
 
 /**
  * Copy the kernel's memory for a snapshot, leaving out the pages the kernel
@@ -255,10 +286,14 @@ const PAGE = 4096;
 export function copySnapshotMemory(mem: Uint8Array, free: Uint8Array | null, bits: number): { memory: Uint8Array; freeBytes: number } {
 	if (!free || !bits) return { memory: mem.slice(), freeBytes: 0 };
 	const out = new Uint8Array(mem.byteLength); // zero, and untouched pages cost nothing
+	const used = new Uint8Array(Math.ceil(mem.byteLength / CHUNK));
 	const pages = Math.min(bits, Math.floor(mem.byteLength / PAGE), free.length * 8);
 	let runStart = -1, skipped = 0;
 	const flush = (end: number) => {
-		if (runStart >= 0) out.set(mem.subarray(runStart * PAGE, end * PAGE), runStart * PAGE);
+		if (runStart >= 0) {
+			out.set(mem.subarray(runStart * PAGE, end * PAGE), runStart * PAGE);
+			used.fill(1, Math.floor((runStart * PAGE) / CHUNK), Math.ceil((end * PAGE) / CHUNK));
+		}
 		runStart = -1;
 	};
 	for (let p = 0; p < pages;) {
@@ -272,12 +307,15 @@ export function copySnapshotMemory(mem: Uint8Array, free: Uint8Array | null, bit
 		p++;
 	}
 	flush(pages);
-	if (pages * PAGE < mem.byteLength) out.set(mem.subarray(pages * PAGE), pages * PAGE);
+	if (pages * PAGE < mem.byteLength) {
+		out.set(mem.subarray(pages * PAGE), pages * PAGE);
+		used.fill(1, Math.floor((pages * PAGE) / CHUNK));
+	}
+	usedChunks.set(out, used);
 	return { memory: out, freeBytes: skipped * PAGE };
 }
 
 const MAGIC = "KWSNAP1\n";
-const CHUNK = 65536;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
@@ -294,8 +332,11 @@ function isZero(u8: Uint8Array, off: number): boolean {
  * 2026-11-22): take the buffer's length then.
  */
 export function receivedSnapshot(s: KernelSnapshot): KernelSnapshot {
+	const { usedChunks: used, ...rest } = s as KernelSnapshot & { usedChunks?: Uint8Array };
 	const m = s.memory;
-	return m.byteLength === 0 && m.buffer.byteLength > 0 ? { ...s, memory: new Uint8Array(m.buffer) } : s;
+	const memory = m.byteLength === 0 && m.buffer.byteLength > 0 ? new Uint8Array(m.buffer) : m;
+	if (used instanceof Uint8Array) usedChunks.set(memory, used);
+	return memory === m && used === undefined ? s : { ...rest, memory };
 }
 
 /**
@@ -304,27 +345,33 @@ export function receivedSnapshot(s: KernelSnapshot): KernelSnapshot {
  * either buffer stays uncommitted, so a restore costs the host the
  * snapshot's used memory, not the machine's size. A chunk that is zero in
  * the snapshot and not in `dst` (a data segment instantiation applied) is
- * cleared.
+ * cleared; `dstUsedEnd` is the end of what `dst` may hold (the kernel
+ * image's `_end`; 0 for a new buffer), everything above it being zero.
+ * `dst` gets the snapshot's used chunks, as a snapshot memory of its own.
  */
-export function restoreSnapshotMemory(dst: Uint8Array, src: Uint8Array): void {
+export function restoreSnapshotMemory(dst: Uint8Array, src: Uint8Array, dstUsedEnd = dst.byteLength): void {
 	if (dst.byteLength !== src.byteLength || src.byteLength % CHUNK || src.byteOffset % 4 || dst.byteOffset % 4) {
 		dst.set(src);
 		return;
 	}
+	const known = usedOf(src);
+	const used = new Uint8Array(src.byteLength / CHUNK);
 	let runStart = -1;
 	const flush = (end: number) => {
 		if (runStart >= 0) dst.set(src.subarray(runStart, end), runStart);
 		runStart = -1;
 	};
-	for (let off = 0; off < src.byteLength; off += CHUNK) {
-		if (!isZero(src, off)) {
+	for (let off = 0, c = 0; off < src.byteLength; off += CHUNK, c++) {
+		if ((!known || known[c]) && !isZero(src, off)) {
 			if (runStart < 0) runStart = off;
+			used[c] = 1;
 			continue;
 		}
 		flush(off);
-		if (!isZero(dst, off)) dst.fill(0, off, off + CHUNK);
+		if (off < dstUsedEnd && !isZero(dst, off)) dst.fill(0, off, off + CHUNK);
 	}
 	flush(src.byteLength);
+	usedChunks.set(dst, used);
 }
 
 /**
@@ -337,7 +384,8 @@ export function encodeSnapshot(s: KernelSnapshot): Uint8Array {
 	const mem = s.memory;
 	if (mem.byteLength % CHUNK || mem.byteOffset % 4) throw new Error("snapshot memory must be whole 64 KiB pages");
 	const chunks: number[] = [];
-	for (let off = 0; off < mem.byteLength; off += CHUNK) if (!isZero(mem, off)) chunks.push(off / CHUNK);
+	const known = usedOf(mem);
+	for (let off = 0, c = 0; off < mem.byteLength; off += CHUNK, c++) if ((!known || known[c]) && !isZero(mem, off)) chunks.push(c);
 	const header = encoder.encode(JSON.stringify({
 		version: s.version, fingerprint: s.fingerprint, cpus: s.cpus ?? 1, memory64: s.memory64, memoryBytes: mem.byteLength,
 		freeBytes: s.freeBytes ?? 0, monotonicMs: s.monotonicMs, consoleSize: s.consoleSize, inputBytes: s.input.length, chunks: chunks.length,
@@ -374,11 +422,14 @@ export function decodeSnapshot(bytes: Uint8Array): KernelSnapshot {
 	const input = bytes.slice(p, p + h.inputBytes);
 	p += h.inputBytes;
 	const memory = new Uint8Array(h.memoryBytes);
+	const used = new Uint8Array(Math.ceil(h.memoryBytes / CHUNK));
 	for (let i = 0; i < h.chunks; i++) {
 		const c = dv.getUint32(p, true);
 		memory.set(bytes.subarray(p + 4, p + 4 + CHUNK), c * CHUNK);
+		used[c] = 1;
 		p += 4 + CHUNK;
 	}
+	usedChunks.set(memory, used);
 	const ttys = Array.isArray(h.ttys) ? (h.ttys as TtySessionSnapshot[]).filter((t) => t && typeof t.id === "string") : [];
 	return { version: 1, fingerprint: h.fingerprint, cpus: Number.isInteger(h.cpus) && h.cpus > 1 ? h.cpus : 1, memory64: h.memory64, memory, freeBytes: h.freeBytes ?? 0, monotonicMs: h.monotonicMs, consoleSize: h.consoleSize, input,
 		disks: Array.isArray(h.disks) ? h.disks : [], devices: h.devices && typeof h.devices === "object" ? h.devices : {}, ...(ttys.length ? { ttys } : {}) };

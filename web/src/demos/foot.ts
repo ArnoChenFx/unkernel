@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // foot: a Wayland terminal as a window on the page's Wayland desktop
-// (wayland.ts): `wland foot` runs it against wland's relay in the guest (the
-// kw layer's /usr/lib/kw/bin/wland starts it unless the boot did), whose
-// compositor runs on the page and
+// (wayland.ts): it connects to wland's relay in the guest (started at boot,
+// the session is in every shell), whose compositor runs on the page and
 // reads foot's buffers in place through kwshm (Debian).
 import type { Demo } from "../launcher.ts";
 
@@ -17,16 +16,16 @@ export default {
 	needs: { net: true, wayland: true },
 	packages: { debian: ["foot", "fonts-dejavu-core", "fontconfig"] },
 	files: {
-		README: "wland CMD runs a Wayland app (CMD) as a window on this page: it starts wland's\n" +
-			"relay in the guest unless it runs (its log is $XDG_RUNTIME_DIR/wlandr.log) and\n" +
-			"sets XDG_RUNTIME_DIR and WAYLAND_DISPLAY for CMD. Where the relay runs from boot\n" +
-			"(echo $WAYLAND_DISPLAY says wayland-0), apps also start without it: foot.\n" +
+		README: "Wayland apps open as windows on this page: just run them (foot). wland's relay\n" +
+			"runs in the guest from boot (its log is $XDG_RUNTIME_DIR/wlandr.log) and every\n" +
+			"shell has the session (echo $WAYLAND_DISPLAY says wayland-0). Where it is not\n" +
+			"(a session saved before, a killed relay), wland CMD starts it and runs CMD.\n" +
 			"The status line's desktop icon (Ctrl-A w) switches between the windows and the\n" +
 			"terminal; Alt+drag moves a window, Alt+F10 maximizes it. More to try:\n" +
 			"  sudo apt-get install wl-clipboard wayland-utils\n" +
-			"  wland wayland-info;  echo hi | wland wl-copy;  wland wl-paste\n" +
-			"GTK 3 apps work too (systemd- keeps apt from swapping the init system for dbus):\n" +
-			"  sudo apt-get install --no-install-recommends l3afpad systemd-;  wland l3afpad\n",
+			"  wayland-info;  echo hi | wl-copy;  wl-paste\n" +
+			"GTK 3 apps work too:\n" +
+			"  sudo apt-get install --no-install-recommends l3afpad;  l3afpad\n",
 	},
-	commands: ["cat README", "wland foot"],
+	commands: ["cat README", "foot"],
 } satisfies Demo;

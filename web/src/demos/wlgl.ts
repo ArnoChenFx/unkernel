@@ -18,15 +18,15 @@ export default {
 	needs: { net: true, wayland: true },
 	packages: { debian: ["mesa-utils"] },
 	files: {
-		README: "wland CMD runs a Wayland app as a window on this page (see the foot demo).\n" +
+		README: "Wayland apps open as windows on this page (see the foot demo).\n" +
 			"With guest GL on (Options), Mesa renders GL apps on the guest's virtio-gpu,\n" +
 			"which is the page's WebGL2, and the page shows each frame from there: the\n" +
 			"relay's log ($XDG_RUNTIME_DIR/wlandr.log) names the first buffer of each kind\n" +
 			"(virtgpu: ... -> resource N). Without guest GL they render in software.\n" +
 			"More to try:\n" +
-			"  sudo apt-get install glmark2-es2-wayland;  wland glmark2-es2-wayland\n" +
-			"  sudo apt-get install --no-install-recommends gtk-4-examples systemd-\n" +
-			"  wland gtk4-widget-factory        (GTK 4 with its GL renderer)\n",
+			"  sudo apt-get install glmark2-es2-wayland;  glmark2-es2-wayland\n" +
+			"  sudo apt-get install --no-install-recommends gtk-4-examples\n" +
+			"  gtk4-widget-factory              (GTK 4 with its GL renderer)\n",
 	},
-	commands: ["cat README", "wland eglinfo -B -p wayland | grep -iE 'renderer|version' || true", "wland es2gears_wayland"],
+	commands: ["cat README", "eglinfo -B -p wayland | grep -iE 'renderer|version' || true", "es2gears_wayland"],
 } satisfies Demo;

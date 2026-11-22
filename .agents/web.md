@@ -729,9 +729,9 @@ answered at the kernel's next yield.
   a pnpm store link (a swapped package broke a running dev server's page).
 - The launcher's foot demo (`demos/foot.ts`, Debian: foot,
   fonts-dejavu-core, fontconfig; `needs.wayland`: dimmed without the
-  desktop) runs `wland foot`; its README suggests wl-clipboard,
-  wayland-info and a GTK 3 app (l3afpad, installed with `systemd-`: GTK's
-  dbus would otherwise make apt swap sysv-rc for systemd). The GL windows
+  desktop) runs plain `foot` (the session is in every shell, the relay
+  runs from boot); its README suggests wl-clipboard, wayland-info and a
+  GTK 3 app (l3afpad). The GL windows
   demo (`demos/wlgl.ts`, Debian: mesa-utils; `needs.wayland`) runs `wland
   es2gears_wayland` after `eglinfo -B -p wayland`; its README suggests
   glmark2-es2-wayland and gtk4-widget-factory (GTK 4).

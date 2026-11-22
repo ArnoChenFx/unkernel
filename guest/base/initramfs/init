@@ -42,7 +42,7 @@
 export PATH=/bin
 umask 022
 msg=/run/kw-overlay.msg
-mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mount -t devtmpfs devtmpfs /dev
 mount -t proc -o nosuid,nodev,noexec proc /proc
 mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
 mount -t tmpfs -o nosuid,nodev,mode=755 tmpfs /run
@@ -80,9 +80,12 @@ esac
 # in $found, and which of the two in $ft. Not findfs or blkid: busybox tries
 # every format it knows, one of them (a RAID superblock) near the end of the
 # device, and on a distro image read over HTTP that is a request of its own.
+# Only kwblk's disks and their partitions (wd*): the host attaches no other
+# kind.
 bylabel() {
 	local b
-	for b in /sys/class/block/*; do
+	for b in /sys/class/block/wd*; do
+		[ -e "$b" ] || continue
 		b=/dev/${b##*/}
 		[ "$(dd if="$b" bs=8 skip=143 count=2 2>/dev/null | tr -d '\0')" = "$1" ] && { found=$b ft=ext4; return 0; }
 		[ "$(dd if="$b" bs=8 skip=136 count=2 2>/dev/null | tr -d '\0')" = "$1" ] && { found=$b ft=erofs; return 0; }
@@ -112,13 +115,13 @@ for t in $ft erofs ext4; do
 	mount -t "$t" -o ro "$dev" /kw/distro 2>/dev/null && { fstype=$t; break; }
 done
 [ -n "$fstype" ] || base_shell "the distro image $dev (LABEL=kwroot) does not mount as erofs or ext4"
-name=$(head -n1 /kw/distro/usr/lib/kw-distro 2>/dev/null)
+IFS= read -r name 2>/dev/null < /kw/distro/usr/lib/kw-distro
 case $name in
 '' | *[!a-z0-9]*)
 	say "kw-overlay: the image has no valid /usr/lib/kw-distro ('$name'), so its changes cannot be kept"
 	name= ;;
 esac
-img=$(head -n1 /kw/distro/usr/lib/kw-image 2>/dev/null)
+IFS= read -r img 2>/dev/null < /kw/distro/usr/lib/kw-image
 
 # safe REASON: this boot on a tmpfs upper.
 safe() {

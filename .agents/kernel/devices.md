@@ -157,7 +157,7 @@ lives in virtio_transport.c, so kwvsock has its own).
 - Guest tools (guest.md): `kwvsock`, `kwtty` (terminal sessions, programs
   on pipes and TCP relays for the host, port 1022), `kw9p`, the guest
   GL forwarder `/usr/lib/kw/vtest-bridge` (connects to host port 1019;
-  gl.md), and wland's relay `/usr/lib/kw/wlandr` (connects to host port
+  gl.md), and wland's relay `/usr/lib/kw/wlandr` (the Debian image's; connects to host port
   1023, the page's `WAYLAND_PORT`; its buffers are kwshm exports, below;
   web.md, Wayland desktop).
 

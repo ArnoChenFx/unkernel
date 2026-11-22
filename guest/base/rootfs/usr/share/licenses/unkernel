@@ -18,6 +18,6 @@ Public License for more details: https://www.gnu.org/licenses/gpl-2.0.html
 The source, including how the images are built, is at
 https://github.com/pithings/unkernel (guest/).
 
-/usr/lib/kw/wlandr is not unkernel's: it is the relay of wland
+/usr/lib/kw/wlandr (in the Debian image) is not unkernel's: it is the relay of wland
 (https://github.com/pithings/wland), a release binary, under the Mozilla
 Public License 2.0 and the MIT License; its source is in that repository.

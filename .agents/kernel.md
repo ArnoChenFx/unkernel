@@ -422,9 +422,9 @@ the quick loop and never builds SMP.
 
 - **The bundle** (`kernel/tools/bundle.mjs`, `kernel/build.sh base`:
   `vendor/build/bundle/unkernel.wasm`): `vmlinux32.wasm` with
-  `base.cpio` (gzipped), its command line and the data disk template in
-  custom sections (`unkernel.initrd`, `unkernel.cmdline`,
-  `unkernel.datadisk`), and `unkernel.kernel.smp.kwpatch`, a patch from the
+  `base.cpio` (uncompressed: `--no-gzip` in `bundle_base`), its command
+  line and the data disk template in custom sections (`unkernel.initrd`,
+  `unkernel.cmdline`, `unkernel.datadisk`), and `unkernel.kernel.smp.kwpatch`, a patch from the
   UP kernel to the SMP one (`tools/kwdiff.mjs`, 1.3 MiB) that the runtime
   applies when asked for more than one CPU (js.md, CPU threads). There is
   no wasm64 bundle. bundle.mjs refuses two kernels that are not the UP and

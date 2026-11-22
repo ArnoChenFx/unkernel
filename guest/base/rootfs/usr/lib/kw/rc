@@ -32,7 +32,8 @@ m tmpfs /dev/shm nosuid,nodev,mode=1777
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
 for f in 0:stdin 1:stdout 2:stderr; do [ -e /dev/${f#*:} ] || ln -s /proc/self/fd/${f%:*} /dev/${f#*:}; done
 mkdir -p -m 1777 /run/lock
-h=$(head -n1 /etc/hostname 2>/dev/null)
+h=
+IFS= read -r h 2>/dev/null < /etc/hostname
 case $h in '' | localhost | localhost.*) h=unkernel ;; esac
 hostname "$h"
 d=/proc/sys/fs/binfmt_misc

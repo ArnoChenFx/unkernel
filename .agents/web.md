@@ -566,8 +566,10 @@ page boots with `createKernel({ shm: true })` (kwshm; js.md, shm) and
 `kw.wayland=1` on the command line (with kwshm only, as `kw.gl=1` with
 GL; a resume keeps the saved kernel's command line) and, once the kernel
 runs, listens on vsock port 1023 (`WAYLAND_PORT`). Wayland is always
-there in the guest (with a relay that has `--link-on-demand`: wland after
-the pinned release, below): with `kw.wayland=1` the kw layer's rc starts the relay
+there in a Debian guest (its image carries the relay, kernel/guest.md;
+Alpine and the base shell have none, so nothing starts and `wland` says
+why; with a relay that has `--link-on-demand`: wland after the pinned
+release, below): with `kw.wayland=1` the kw layer's rc starts the relay
 `/usr/lib/kw/wlandr --link vsock:2:1023 --buffers kwshm --link-on-demand`
 for the image's user (with `--dmabuf virtgpu:/dev/dri/renderD128
 --no-fence-wait` where guest GL's render node is: GL apps, below), which
@@ -714,8 +716,11 @@ answered at the kernel's next yield.
   offset 0, stride width x 4. GTK 4.18 draws with GskGLRenderer (no Vulkan
   driver installed), which needed renderer patch 14 (gl.md, Patches).
 - One wland release on both sides: the npm version in `web/package.json`
-  and the relay's `WLANDR_VERSION` (guest/base/pins.sh) change together
-  (the link protocol is theirs). The page needs wland 0.1.0-261122 or
+  and the relay's `WLANDR_VERSION` (guest/distro/debian/pins.sh) change
+  together (the link protocol is theirs). The relay comes with the Debian
+  image, so it matches the page only where the image is the same
+  release's (the page's own images are); nothing checks the link's
+  version, and `wland` reads only the relay's features for its own flags. The page needs wland 0.1.0-261122 or
   later (the `gpu` source, `view`, `readv`, the clipboard bridge); with
   the first 0.1.0 package it still runs, wland ignoring what it does not
   know (a read per span, no GL windows by resource, no bridge). The
@@ -727,10 +732,11 @@ answered at the kernel's next yield.
   starts none and shells get no session (plain apps fail as outside the
   page; `wland CMD` works as before). A new release: `WLANDR_VERSION` and
   `WLANDR_SHA256` in pins.sh and the npm version in `web/package.json`
-  (and the lockfile), then `kernel/build.sh base`
+  (and the lockfile), then `kernel/build.sh distro debian`
   without `KW_WLANDR`. To try a local wland build:
   `KW_WLANDR=<wland>/zig-out/release/wlandr-link-linux-arm64 kernel/build.sh
-  base` (guest/base/build.sh; refused with `KW_RELEASE=1`), and for the
+  distro debian` (guest/distro/debian/build.sh; refused with
+  `KW_RELEASE=1`), and for the
   page a build against that checkout's package: copy its `package.json`,
   `LICENSE`, `README.md` and `dist/` to a directory of their own, then
   `KW_WLAND_PKG=<dir> node node_modules/vite/bin/vite.js build` in `web/`

@@ -1,4 +1,4 @@
-From 25ce613d6738040e43634bc3404e0ed99078dded Mon Sep 17 00:00:00 2001
+From 7a0fec6304e1af18bb2703cff32c6c6ebaac456a Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 16 Nov 2026 16:06:57 +0000
 Subject: [PATCH] mm: allow percpu-km on SMP with a flat vmalloc

@@ -38,6 +38,9 @@
 #                             --network host; its runtime is
 #                             /usr/local/libexec/kw-docker-runtime (crun
 #                             without a device cgroup)
+#   /usr/lib/kw/wlandr        wland's relay, a release binary pinned in
+#                             pins.sh, which the kw layer's bin/wland starts
+#                             (Wayland apps as windows in the page)
 #   user                      the default user of the console and kwtty
 #                             sessions (uid 1000, bash, /home/user with
 #                             /etc/skel's files and the README), in sudo,
@@ -60,12 +63,16 @@
 # the warm set fetched after the boot (below). iconv to other charsets works as on Debian.
 # DEBIAN_TARBALL=file overrides the pinned image (pins.sh);
 # KW_DEBIAN_APT_CACHE=0 leaves the cache out (no boot at build time).
+# KW_WLANDR=<file>: a local static aarch64 wlandr (e.g. a wland checkout's
+# zig-out/release/wlandr-link-linux-arm64) instead of the pinned release's,
+# for development against an unreleased wland (.agents/web.md, Wayland
+# desktop); refused with KW_RELEASE=1.
 set -euo pipefail
 
 . "$(dirname "$0")/../../lib/env.sh"   # root, build, guest, dl, base_bundle, fetch_verified
 . "$guest/lib/stage.sh"                # distro_unpack, install_tree, install_common
 . "$guest/lib/image.sh"                # distro_images, distro_out
-. "$guest/distro/debian/pins.sh"       # DEBIAN_*
+. "$guest/distro/debian/pins.sh"       # DEBIAN_*, WLANDR_*
 umask 022
 here="$guest/distro/debian"
 
@@ -194,6 +201,20 @@ printf '127.0.0.1\tlocalhost\n127.0.1.1\tunkernel\n::1\tlocalhost ip6-localhost 
 install_tree "$here/rootfs" "$stage"
 chmod 440 "$stage/etc/sudoers.d/kw-user"
 install_common "$stage"
+# wland's relay (pins.sh), for the kw layer's /usr/lib/kw/bin/wland: Wayland
+# apps as windows in the page. The layer has no /usr/lib/kw/wlandr, so this
+# one shows through its /usr/lib/kw in the merged root.
+mkdir -p "$stage/usr/lib/kw"
+if [ -n "${KW_WLANDR:-}" ]; then
+	[ "${KW_RELEASE:-}" != 1 ] || { echo "KW_WLANDR is for development: a release carries the pinned relay (pins.sh)" >&2; exit 1; }
+	[ -f "$KW_WLANDR" ] || { echo "KW_WLANDR=$KW_WLANDR: no such file" >&2; exit 1; }
+	echo "debian: wlandr from KW_WLANDR=$KW_WLANDR (not the pinned $WLANDR_VERSION)" >&2
+	cp "$KW_WLANDR" "$stage/usr/lib/kw/wlandr"
+else
+	fetch_verified "$WLANDR_URL" "$dl/$WLANDR_TARBALL" "$WLANDR_SHA256"
+	tar -xzf "$dl/$WLANDR_TARBALL" -O wlandr > "$stage/usr/lib/kw/wlandr"
+fi
+chmod 755 "$stage/usr/lib/kw/wlandr"
 
 # --- in the image: apt's source cache, the baked packages ----------------------------
 # The packages the image comes with, on top of the tarball's (with their

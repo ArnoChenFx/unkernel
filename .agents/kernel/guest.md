@@ -15,7 +15,7 @@ overlay root are in data-disk.md.
 `vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
 rdinit=/init`, the data disk template, the SMP patch) and copies that to
 `web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
-2293 KiB (1147 KiB gzipped; wlandr, the kw layer below, is 586 KiB of it), bundle 10.7 MiB (2026-11-22).
+1717 KiB (959 KiB gzipped), bundle 11.2 MiB with base.cpio uncompressed (2026-11-22).
 
 - Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
   with its own Alpine release), every applet linked in `/bin` (names from
@@ -55,13 +55,15 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
 - `/usr/lib/kw/vtest-bridge` (Guest tools, below): the guest GL forwarder,
   in the layer for the same reason (its link protocol belongs to the SDK's
   `gl` option).
-- `/usr/lib/kw/wlandr` and `/usr/lib/kw/bin/wland`: Wayland apps as
-  windows on the page (web.md, Wayland desktop). `wlandr` is wland's relay
-  (https://github.com/pithings/wland, MPL-2.0 and MIT), the static aarch64
-  release binary pinned in `guest/base/pins.sh` (`WLANDR_*`; about 590 KB,
-  its HTTP server included: the release has no smaller build;
-  `KW_WLANDR=<file>` builds the base with a local one instead, web.md,
-  Wayland desktop). One relay per user (`setsid`, its pid in
+- `/usr/lib/kw/bin/wland`: Wayland apps as windows on the page (web.md,
+  Wayland desktop) through wland's relay `/usr/lib/kw/wlandr`
+  (https://github.com/pithings/wland, MPL-2.0 and MIT), which only the
+  Debian image carries (Distro images, below), not the layer: the static
+  aarch64 release binary pinned in `guest/distro/debian/pins.sh`
+  (`WLANDR_*`; the `--link`-only build, 341 KB; `KW_WLANDR=<file>` builds
+  the image with a local one instead, web.md, Wayland desktop). Without it
+  (Alpine, the base shell, a Debian image older than the base) `wland
+  --boot` does nothing and `wland` fails saying so. One relay per user (`setsid`, its pid in
   `$XDG_RUNTIME_DIR/wlandr.pid`, its log `wlandr.log` there, afresh for
   each relay) with `--link vsock:2:1023 --buffers kwshm`, plus what its
   `wlandr --version` features line has (a relay without `--version`, the
@@ -117,7 +119,14 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   then `/run/kw-overlay.msg` in yellow on a terminal.
 - `/usr/lib/kw/net`: lo, and eth0 by DHCP with busybox udhcpc (lease
   script `/usr/lib/kw/udhcpc`, which writes `/etc/resolv.conf` only when
-  it changes) on every distro.
+  it changes) on every distro. `net background` (the base shell, Debian's
+  kw-init; not Alpine's inittab) leaves DHCP to a job holding
+  `/run/kw-net.lock`, so the console's prompt can come before the lease;
+  `net wait` waits for that job (with its failure, kept in
+  `/run/kw-net.msg` instead of the console, it prints it and exits 1).
+  `kwtty serve` starts after `net wait`, so programs the host starts find
+  the network; a command typed at the console the moment the prompt shows
+  may not (`/usr/lib/kw/net wait` first).
 - `/usr/lib/kw/shutdown`: with `/data` mounted, stop every process, then
   `/usr/lib/kw/data-stop` (data-disk.md); then sync. When
   `/run/kw-shutdown` names the action (Alpine's `poweroff`, `reboot` and
@@ -155,7 +164,7 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   (busybox init's console is vt102, without colours: TERM becomes
   xterm-256color), the X.Org fbdev/evdev config (below), and
   `/usr/share/licenses/unkernel` (the GPL notice for these files, which
-  names wlandr's own licences).
+  names the Debian image's wlandr's own licences).
 - `/usr/lib/kw/shrc`: the `/etc/profile.d/kw-*.sh` files (PATH, TERM, the
   prompt, command not found, the package manager through sudo) for
   interactive shells that are not login
@@ -316,7 +325,7 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   everything, runs the layer's shutdown and calls reboot(2) through the
   base's busybox. Services are Debian's init scripts under sysv-rc (with
   insserv and startpar, in `DEBIAN_PACKAGES`): kw-init runs runlevel 2
-  after net and 0 or 6 before it stops everything, only when that rc
+  once DHCP is done (`net wait`) and 0 or 6 before it stops everything, only when that rc
   directory has links to run; runlevel S (rcS.d) never runs, the layer's
   rc does early boot. `/usr/sbin/runlevel` prints what kw-init writes to
   `/run/kw-runlevel` (`N 2`), so that a package's invoke-rc.d starts its
@@ -338,6 +347,9 @@ layer: boot to a prompt 0.25 s (Alpine) and 0.32 s (Debian) from
   (`guest/tools/vm-run.ts` on the base bundle), so `apt-get install`
   works with no `apt-get update` first. The image's `policy-rc.d`
   (docker's `exit 101`) is removed after the build's own install.
+  wland's relay `/usr/lib/kw/wlandr` (the kw layer, above) is in this
+  image only; a boot without `kw.wayland=1` does not read it, so it is
+  not in the boot set.
   `DEBIAN_PACKAGES` in build.sh (curl, ca-certificates, unzip) are
   installed at build time by the image's apt in the same build VM, from
   .debs the host fetches from snapshot.debian.org (checked against the

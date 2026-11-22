@@ -542,7 +542,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			const { s, waitFor } = screen(vm);
 			await waitFor(PROMPT);
 			const at = s.text.length;
-			vm.write("wget -q -T 3 -O /dev/null http://echo.test/; echo wisp-tried\n");
+			vm.write("/usr/lib/kw/net wait; wget -q -T 3 -O /dev/null http://echo.test/; echo wisp-tried\n"); // the prompt can come before the lease
 			await waitFor(/^wisp-tried/m, at);
 			assert.ok(seen.hosts.includes("echo.test:80"), JSON.stringify(seen));
 			vm.write("poweroff\n");
@@ -557,7 +557,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const { s, waitFor } = screen(vm);
 		await waitFor(PROMPT);
 		const at = s.text.length;
-		vm.write("wget -q -O - http://example.com/ | grep -o '<title>.*</title>'; echo wisp-done\n");
+		vm.write("/usr/lib/kw/net wait; wget -q -O - http://example.com/ | grep -o '<title>.*</title>'; echo wisp-done\n");
 		await waitFor(/wisp-done/, at, 90000);
 		assert.match(s.text.slice(at), /<title>Example Domain<\/title>/, logs.join("\n"));
 		vm.write("poweroff\n");
@@ -631,7 +631,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 				const { vm, s, waitFor } = k;
 				await waitFor(PROMPT);
 				const at = s.text.length;
-				vm.write(`wget -q -O - http://10.0.2.2:${port}/ && echo fetch-ok\n`);
+				vm.write(`/usr/lib/kw/net wait; wget -q -O - http://10.0.2.2:${port}/ && echo fetch-ok\n`); // the prompt can come before the lease
 				await waitFor(/hello from the host[\s\S]*fetch-ok/, at);
 				if (net instanceof NetStack) assert.ok(net.stats.tcpOpened >= 1);
 				else {

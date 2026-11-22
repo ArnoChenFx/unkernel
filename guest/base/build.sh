@@ -23,12 +23,11 @@
 #                           interactive shells that are not login shells;
 #                           vtest-bridge: gl/bridge/vtest-bridge.c, stream
 #                           link only, the guest GL forwarder that the SDK's
-#                           `gl` option starts; wlandr: wland's relay,
-#                           a release binary pinned in pins.sh, which
-#                           bin/wland starts;
+#                           `gl` option starts;
 #                           shim and bin/: fx, claude, opencode, node,
 #                           npm, npx, bun, bunx, uv, uvx on first use;
-#                           bin/wland: Wayland apps in the page),
+#                           bin/wland: Wayland apps in the page, through
+#                           the relay the Debian image carries),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh,kw-gl.sh,kw-wayland.sh},
 #                           etc/chromium.d/kw-wayland, the X.Org
 #                           fbdev/evdev config, usr/share/licenses/unkernel,
@@ -42,16 +41,11 @@
 # archive (rdinit=/usr/bin/kwtest, abitest, kwbench): base-test.cpio always
 # has them, base.cpio too unless KW_RELEASE=1. Outputs go to
 # vendor/build/initramfs, or to $KW_BASE_OUT (guest/lib/env.sh).
-#
-# KW_WLANDR=<file>: a local static aarch64 wlandr (e.g. a wland checkout's
-# zig-out/release/wlandr-link-linux-arm64) instead of the pinned release's,
-# for development against an unreleased wland (.agents/web.md, Wayland
-# desktop); refused with KW_RELEASE=1.
 set -euo pipefail
 
 . "$(dirname "$0")/../lib/env.sh"     # root, zig, dl, base_out, cc_guest, fetch_verified, need_zig
 . "$guest/lib/stage.sh"               # install_tree
-. "$guest/base/pins.sh"               # BUSYBOX_STATIC_*, WLANDR_*
+. "$guest/base/pins.sh"               # BUSYBOX_STATIC_*
 need_zig
 umask 022
 out="$base_out"
@@ -59,13 +53,6 @@ src="$guest/base"
 mkdir -p "$out" "$dl"
 
 fetch_verified "$BUSYBOX_STATIC_URL" "$dl/$BUSYBOX_STATIC_APK" "$BUSYBOX_STATIC_SHA256"
-if [ -n "${KW_WLANDR:-}" ]; then
-	[ "${KW_RELEASE:-}" != 1 ] || { echo "KW_WLANDR is for development: a release carries the pinned relay (pins.sh)" >&2; exit 1; }
-	[ -f "$KW_WLANDR" ] || { echo "KW_WLANDR=$KW_WLANDR: no such file" >&2; exit 1; }
-	echo "base: wlandr from KW_WLANDR=$KW_WLANDR (not the pinned $WLANDR_VERSION)" >&2
-else
-	fetch_verified "$WLANDR_URL" "$dl/$WLANDR_TARBALL" "$WLANDR_SHA256"
-fi
 stage="$out/base-root"
 rm -rf "$stage" "$out/base-apk"
 mkdir -p "$stage/bin" "$out/base-apk"
@@ -120,13 +107,6 @@ for t in kwvsock kwshm kwtty kw9p kwwasi kwcmd; do
 done
 # The guest GL forwarder (.agents/gl.md): vtest clients to the host's renderer over kwvsock.
 "${cc_guest[@]}" -DVTEST_BRIDGE_STREAM_ONLY -o "$layer/usr/lib/kw/vtest-bridge" "$root/gl/bridge/vtest-bridge.c"
-# wland's relay (pins.sh), for /usr/lib/kw/bin/wland: Wayland apps as windows in the page.
-if [ -n "${KW_WLANDR:-}" ]; then
-	cp "$KW_WLANDR" "$layer/usr/lib/kw/wlandr"
-else
-	tar -xzf "$dl/$WLANDR_TARBALL" -O wlandr > "$layer/usr/lib/kw/wlandr"
-fi
-chmod 755 "$layer/usr/lib/kw/wlandr"
 install_tree "$src/rootfs" "$layer"
 ln -s /kw/layer/usr/sbin/kw-overlay "$stage/usr/sbin/kw-overlay"
 ln -s /kw/layer/usr/lib/kw "$stage/usr/lib/kw"

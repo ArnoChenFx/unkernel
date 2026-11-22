@@ -3,7 +3,7 @@
 // Wayland apps in the guest as windows on the page: wland
 // (https://github.com/pithings/wland), its compositor (wasm) on this
 // thread, in the desktop view (components/Desktop.tsx). The guest runs
-// wland's relay (/usr/lib/kw/wlandr, the base's kw layer: started at boot
+// wland's relay (/usr/lib/kw/wlandr, in the Debian image: started at boot
 // where the command line has kw.wayland=1, which boot.ts adds with kwshm,
 // else by `wland CMD`): apps speak Wayland to it over its unix socket, and
 // it connects to the page over vsock port WAYLAND_PORT when the first app

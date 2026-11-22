@@ -41,7 +41,7 @@ import { Profiler, profileOff, type ProfileOptions, type SamplerHandle, type Sam
 import { JIT_MIRROR_WORDS, JitHost, jitBufFromMirror, jitStatsFromMirror, sumJitStats, type JitStats, type KwemuStats } from "./jit.ts";
 import { SoundHost, type SoundOption } from "./sound.ts";
 import { ShmDevice } from "./shm.ts";
-import { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, awakeTimeout, copySnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, awakeTimeout, copySnapshotMemory, restoreSnapshotMemory, snapshotCpuMismatch, snapshotDeviceMismatch, snapshotDiskMismatch, type DeviceSnapshots, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import { VirtioHost } from "./virtio.ts";
 import { VirtioGpu, type GpuBackend } from "./virtio-gpu.ts";
 import { VsockDevice } from "./vsock.ts";
@@ -853,7 +853,7 @@ export class Kernel {
 			throw new Error(`snapshot: saved by another kernel build ("${s.fingerprint}", this one is "${this.fingerprint}")`);
 		// Overwrites the data segments that instantiation applied; the
 		// kernel then enters at kw_resume, never at _start.
-		this.u8().set(s.memory);
+		restoreSnapshotMemory(this.u8(), s.memory);
 		// Requests raised before the snapshot are gone; a console of another
 		// size makes hvc_wasm read the new one.
 		const resized = !!this.consoleSize && this.consoleSize !== s.consoleSize;

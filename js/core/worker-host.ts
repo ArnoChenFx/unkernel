@@ -34,7 +34,7 @@ import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput } from "./output.ts";
-import { SnapshotCommitError, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { SnapshotCommitError, receivedSnapshot, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
 /** How long stop() waits for the worker to confirm (it first lets saves in flight commit, up to 10 s) before it ends the worker anyway. */
@@ -653,7 +653,8 @@ export class WorkerKernel implements KernelHandle {
 	 * point or stopped there, and the exit that ends these Ptys comes after
 	 * the snapshot's answer, so they are the ones it has.
 	 */
-	#withTtys(snap: KernelSnapshot): KernelSnapshot {
+	#withTtys(received: KernelSnapshot): KernelSnapshot {
+		const snap = receivedSnapshot(received);
 		const ttys = ttySessions(this.#vsock);
 		if (ttys.length) snap.ttys = ttys;
 		return snap;

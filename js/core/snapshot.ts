@@ -284,8 +284,47 @@ const decoder = new TextDecoder();
 // Int32 words: about 4x faster than BigUint64 (no BigInt per word).
 function isZero(u8: Uint8Array, off: number): boolean {
 	const w = new Int32Array(u8.buffer, u8.byteOffset + off, CHUNK / 4);
-	for (let i = 0; i < w.length; i++) if (w[i] !== 0) return false;
+	for (let i = 0; i < w.length; i += 8) if (w[i]! | w[i + 1]! | w[i + 2]! | w[i + 3]! | w[i + 4]! | w[i + 5]! | w[i + 6]! | w[i + 7]!) return false;
 	return true;
+}
+
+/**
+ * A snapshot as it arrived from another thread. Node 24's structured clone
+ * gives a view of exactly 4 GiB a length of 0 (its buffer arrives whole,
+ * 2026-11-22): take the buffer's length then.
+ */
+export function receivedSnapshot(s: KernelSnapshot): KernelSnapshot {
+	const m = s.memory;
+	return m.byteLength === 0 && m.buffer.byteLength > 0 ? { ...s, memory: new Uint8Array(m.buffer) } : s;
+}
+
+/**
+ * Copy a snapshot's memory over a fresh instance's (the same size), leaving
+ * alone every 64 KiB chunk that is zero on both sides: an untouched page of
+ * either buffer stays uncommitted, so a restore costs the host the
+ * snapshot's used memory, not the machine's size. A chunk that is zero in
+ * the snapshot and not in `dst` (a data segment instantiation applied) is
+ * cleared.
+ */
+export function restoreSnapshotMemory(dst: Uint8Array, src: Uint8Array): void {
+	if (dst.byteLength !== src.byteLength || src.byteLength % CHUNK || src.byteOffset % 4 || dst.byteOffset % 4) {
+		dst.set(src);
+		return;
+	}
+	let runStart = -1;
+	const flush = (end: number) => {
+		if (runStart >= 0) dst.set(src.subarray(runStart, end), runStart);
+		runStart = -1;
+	};
+	for (let off = 0; off < src.byteLength; off += CHUNK) {
+		if (!isZero(src, off)) {
+			if (runStart < 0) runStart = off;
+			continue;
+		}
+		flush(off);
+		if (!isZero(dst, off)) dst.fill(0, off, off + CHUNK);
+	}
+	flush(src.byteLength);
 }
 
 /**

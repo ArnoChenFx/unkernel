@@ -36,7 +36,7 @@ import type { SoundChunk, SoundSink } from "./sound.ts";
 import { sharedNow } from "./worker-devices.ts";
 import { SharedServer, applyEvdev } from "./worker-shared.ts";
 import { VirglGpuBackend, type GpuInit, type GpuLink, type GpuReply, type GpuRequest } from "./gl-gpu.ts";
-import { SnapshotCommitError, awakeTimeout, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
+import { SnapshotCommitError, awakeTimeout, receivedSnapshot, type KernelSnapshot, type SnapshotHoldDecision, type SnapshotOptions } from "./snapshot.ts";
 import { type FromWorker, type ToWorker, type WorkerBootSpec, type WorkerExit, type WorkerPort } from "./worker-protocol.ts";
 
 export interface ServeKernelOptions {
@@ -290,7 +290,7 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 				consoleRing: spec.console,
 				flushOutput: flush,
 				consoleSize: spec.consoleSize,
-				restore: spec.restore,
+				restore: spec.restore && receivedSnapshot(spec.restore),
 				profile: spec.profile,
 				// The owner sends the size its display function returns; the kernel asks at the first open.
 				display: typeof displaySize === "object" ? () => displaySize as DisplaySize : displaySize,

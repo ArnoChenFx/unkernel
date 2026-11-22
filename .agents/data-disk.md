@@ -127,9 +127,19 @@ kernel/guest.md (Distro images).
 - The store `kwdisk:kwdata-v1` is keyed by the format version, not by the
   template or an ETag. It is never cleared or reseeded implicitly, and a
   new template does not touch saved disks. A layout change needs a new version, plus a migration or the user's
-  export/import. If the identity
-  (format, size) does not match, the page runs a fresh in-memory disk and
-  says why.
+  export/import. If the identity's format does not match, the page runs
+  a fresh in-memory disk and says why.
+- Its size is in the identity. The template is 4 GiB; Settings' Disk size
+  (`?datasize=`, GiB) makes a new disk larger, or grows a saved one at the
+  next boot without a suspended session that has the data disk to resume
+  (its kernel knows the old size), clamped to the browser's quota for
+  the page (a larger disk would fail its writes with EIO once the quota
+  is used up): `openDataDisk({ size })` relabels the
+  identity, the new space reads as zeros, and a disk never shrinks. The
+  base's `/init` grows the file system to the device after mounting
+  `/data` (`kwbox growfs`, `EXT4_IOC_RESIZE_FS`; 4 to 16 GiB in 40 ms,
+  2026-11-22), so a CLI `--data` file made larger with `truncate` grows
+  too. An import takes an image of any size.
 - On first use the template's blocks are copied into the store in one
   transaction, which also marks the store initialized.
 - The disk has a volatile write cache. Each guest flush saves every block

@@ -19,6 +19,12 @@
  *                         programs (/usr/lib/kw/rc registers this path,
  *                         and the kernel passes it as argv[0]; it cannot
  *                         pass a TOOL), a link to kwbox
+ *   kwbox growfs DEV DIR  grow the ext4 file system on DEV, mounted at DIR,
+ *                         to DEV's size (EXT4_IOC_RESIZE_FS, online); says
+ *                         so on stdout when it grew it, nothing when it
+ *                         already fills DEV. The base's /init runs it on
+ *                         /data, whose disk the host may have made larger
+ *                         (the page's Disk size setting)
  *   any other name        kwcmd's host command of that name: the links
  *                         /run/kw/bin/NAME -> /usr/bin/kwbox that
  *                         `kwbox cmd sync` makes (kwcmd.c)
@@ -27,9 +33,19 @@
  * (js/core/commands.ts checkCommandName(), kwcmd.c valid_name()), the
  * tools' names included.
  */
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
+
+#ifndef EXT4_IOC_RESIZE_FS
+#define EXT4_IOC_RESIZE_FS _IOW('f', 16, uint64_t)
+#endif
 
 typedef int tool_main(int argc, char **argv);
 tool_main kwtty_main, kw9p_main, kwvsock_main, kwshm_main, kwwasi_main, kwcmd_main, vtest_bridge_main;
@@ -41,6 +57,50 @@ static const struct { const char *name, *prog; tool_main *main; } tools[] = {
 	{ "wasi", "kwwasi", kwwasi_main }, { "cmd", "kwcmd", kwcmd_main },
 	{ "vtest", "vtest-bridge", vtest_bridge_main },
 };
+
+static uint32_t le32(const unsigned char *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* kwbox growfs DEV DIR: the superblock (offset 1024 on DEV) gives the
+ * block size and count, BLKGETSIZE64 the device's size. */
+static int growfs_main(int argc, char **argv)
+{
+	unsigned char sb[1024];
+	uint64_t bytes, old, n;
+	uint32_t bs;
+	int dev, dir;
+
+	if (argc != 3) {
+		fprintf(stderr, "usage: kwbox growfs DEV DIR\n");
+		return 2;
+	}
+	dev = open(argv[1], O_RDONLY | O_CLOEXEC);
+	if (dev < 0 || ioctl(dev, BLKGETSIZE64, &bytes) < 0 || pread(dev, sb, sizeof(sb), 1024) != sizeof(sb)) {
+		fprintf(stderr, "growfs: %s: %s\n", argv[1], strerror(errno));
+		return 1;
+	}
+	close(dev);
+	if (sb[56] != 0x53 || sb[57] != 0xef || le32(sb + 24) > 6) {
+		fprintf(stderr, "growfs: %s: not an ext4 file system\n", argv[1]);
+		return 1;
+	}
+	bs = 1024u << le32(sb + 24);
+	old = le32(sb + 4) | (le32(sb + 96) & 0x80 /* INCOMPAT_64BIT */ ? (uint64_t)le32(sb + 0x150) << 32 : 0);
+	n = bytes / bs;
+	if (n <= old)
+		return 0;
+	dir = open(argv[2], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dir < 0 || ioctl(dir, EXT4_IOC_RESIZE_FS, &n) < 0) {
+		fprintf(stderr, "growfs: %s: %s\n", argv[2], strerror(errno));
+		return 1;
+	}
+	close(dir);
+	printf("grew %s from %llu MiB to %llu MiB\n", argv[2],
+	       (unsigned long long)(old * bs >> 20), (unsigned long long)(n * bs >> 20));
+	return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -59,6 +119,8 @@ int main(int argc, char **argv)
 			return tools[i].main(argc - 1, argv + 1);
 		}
 	}
-	fprintf(stderr, "usage: kwbox TOOL [ARG...], TOOL one of tty 9p vsock shm wasi cmd vtest\n");
+	if (argc >= 2 && !strcmp(argv[1], "growfs"))
+		return growfs_main(argc - 1, argv + 1);
+	fprintf(stderr, "usage: kwbox TOOL [ARG...], TOOL one of tty 9p vsock shm wasi cmd vtest growfs\n");
 	return 2;
 }

@@ -9,7 +9,8 @@
 # /sbin/init.
 #
 #   1. devtmpfs, proc, sysfs and a tmpfs on /run;
-#   2. /data: the data disk (ext4 labelled kwdata), if the host attached one;
+#   2. /data: the data disk (ext4 labelled kwdata), if the host attached one,
+#      its file system grown to the device (kwbox growfs);
 #   3. the distro: the block device labelled kwroot (erofs or ext4), mounted
 #      read-only at /kw/distro; /usr/lib/kw-distro names it. None, one that
 #      does not mount or boot, or kw.root=base: the base shell (busybox
@@ -102,6 +103,9 @@ if bylabel kwdata; then
 	if mount -t ext4 -o $o "$d" /data; then
 		data=1
 		[ "$(stat -c %u:%g /data)" = 0:0 ] || chown 0:0 /data
+		# A disk the host made larger (the page's Disk size): the file system fills it.
+		g=$(/usr/bin/kwbox growfs "$d" /data 2>&1)
+		[ -z "$g" ] || say "kw-data: $g"
 		sysctl -q -w vm.dirty_expire_centisecs=100 vm.dirty_writeback_centisecs=100
 	else
 		say "kw-data: cannot mount $d (LABEL=kwdata) on /data"

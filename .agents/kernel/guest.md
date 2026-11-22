@@ -531,7 +531,8 @@ builds alone, as `test/wasi-binfmt.ts` and `gl/bridge/build-guest.sh` do).
 KB alone; 2026-11-22). Callers name it: `kwbox TOOL ARGS` with TOOL `tty`,
 `9p`, `vsock`, `shm`, `wasi`, `cmd` or `vtest` (the GL forwarder, which
 serves Mesa's vtest socket; `gl` would also name virtio-gpu's path, which
-has no forwarder). The tool runs with argv[0] and the process name (comm)
+has no forwarder), or `growfs DEV DIR` (in `kwbox.c`: grows the ext4 on
+DEV mounted at DIR to DEV's size; the base's `/init` runs it on `/data`). The tool runs with argv[0] and the process name (comm)
 its program's own (`kwtty`, `kw9p`, ..., `vtest-bridge`): ps shows
 `{kwtty} /usr/bin/kwbox tty serve`, busybox `pidof kwtty` finds it
 (Debian's procps `pidof` matches argv[0], so there only `pidof kwbox`),

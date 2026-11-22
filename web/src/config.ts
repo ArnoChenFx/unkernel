@@ -6,11 +6,11 @@
 //
 // The settings below are kept in localStorage (SETTINGS_KEY: {name: value},
 // only those that differ from the defaults). Each one except ?simulate,
-// ?showcase and ?routes has a control under Options in the status panel; Reboot saves
+// ?showcase, ?routes and ?autohide has a control in Settings (Options.tsx); Reboot saves
 // them there (ui.ts nextSettings()) and loads the page's bare URL. A URL
 // parameter of the same name overrides the saved one for that load (links,
-// the browser tests); the page never writes the URL. ?simulate, ?showcase
-// and ?routes are read from the URL only.
+// the browser tests); the page never writes the URL. ?simulate, ?showcase,
+// ?routes and ?autohide are read from the URL only.
 //
 //   ?mem=MiB                           kernel memory (default: auto, from the SDK's autoMemoryMiB():
 //                                      512 on phones, 2048 otherwise, less on low-memory devices)
@@ -33,9 +33,16 @@
 //                                      kernel bundle's section unkernel.datadisk. One tab at a
 //                                      time: another tab gets an unsaved in-memory copy.
 //                                      KW.exportData(), KW.importData(file), KW.resetData() (also
-//                                      buttons in the panel). Hiding or leaving the page and
+//                                      buttons in Settings). Hiding or leaving the page and
 //                                      Reboot ask the guest to sync first (KW.sync(), the SDK's
 //                                      sync()).
+//   ?datasize=<GiB>                    the data disk's size, 4 (the default, the template's) to
+//                                      1024: a new disk is made this large, a saved one grows to
+//                                      it at the next boot without a suspended session to resume
+//                                      (it never shrinks), and the guest's /init grows /data to
+//                                      fill it. Space in IndexedDB is used only as /data fills;
+//                                      the size is clamped to the browser's quota for the page
+//                                      (Settings, Storage: Disk size; DATA_SIZES, dataSizeCap()).
 //   ?display=0                         no display. By default the guest gets /dev/fb0 (kwfb,
 //                                      640x480), and a canvas over the terminal shows it while a
 //                                      program has it open (try `glimmer`). Nothing is
@@ -72,7 +79,7 @@
 //                                      before the device, for comparison). Also none with
 //                                      ?display=0.
 //   ?shm=0                             this load only: no kwshm device, so no Wayland desktop
-//                                      (wayland.ts; the launcher's Wayland demos are disabled).
+//                                      (wayland.ts; the launcher's Wayland apps are disabled).
 //                                      A resumed session keeps the device it was saved with.
 //   ?wlgpu=0                           this load only: the Wayland desktop takes no GPU buffers
 //                                      (no gpu source for wland: GL apps render in software,
@@ -88,7 +95,7 @@
 //                                      safe (.agents/gl.md, Busy waits).
 //   ?root=initramfs                   safe mode for this boot (kw.root=initramfs): the plain
 //                                      image root instead of the overlay root; /data stays
-//                                      mounted (the panel's Safe mode button; .agents/data-disk.md)
+//                                      mounted (Settings' Safe mode button; .agents/data-disk.md)
 //   ?worker=1                          run the kernel in a Web Worker (the SDK's
 //                                      createKernel({ worker: true })), so it never blocks the
 //                                      page. The data disk and the Wisp network are built in the
@@ -129,9 +136,13 @@
 //                                      discarded at any time), off elsewhere.
 //   ?askleave=0                        no question when the page is closed or left while such a
 //                                      machine runs (beforeunload; staying suspends)
-//   ?showcase[=warm,<step>,...]        URL only: a fast scripted tour of the demos with captions;
+//   ?showcase[=warm,<step>,...]        URL only: a fast scripted tour of the apps with captions;
 //                                      warm pre-installs them, step ids pick a subset
 //                                      (showcase.ts); read in launcher.ts
+//   ?autohide=0|1                      URL only: 0: the console never minimizes itself after
+//                                      boot; 1: it does even where Settings > Desktop turned it
+//                                      off or automation drives the browser (navigator.webdriver,
+//                                      off by default there); read in autohide.ts
 //   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, glUrl, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
@@ -164,13 +175,33 @@ export const DEFAULT_ROUTES: Readonly<Record<string, string>> = Object.freeze({
 /** The project's source, linked from About and the boot notes. */
 export const REPO = "https://github.com/pithings/unkernel";
 
+/** The data disk sizes Settings offers, in GiB; the first is the default (the template's size). */
+export const DATA_SIZES: readonly number[] = [4, 8, 16, 32, 64];
+export const DATA_SIZE_DEFAULT = DATA_SIZES[0]!;
+
+/**
+ * The largest data disk size in GiB for a storage quota in bytes
+ * (navigator.storage.estimate(); undefined: none known): the quota rounded
+ * down, but at least the default and the saved disk's size (`have`, GiB),
+ * since a disk never shrinks.
+ */
+export function dataSizeCap(quota: number | undefined, have = 0): number {
+	return quota === undefined ? Infinity : Math.max(DATA_SIZE_DEFAULT, have, Math.floor(quota / 1073741824));
+}
+
+/** ?datasize=: whole GiB from 4 to 1024, else the default. */
+function dataSizeParam(v: string | null): number {
+	const n = v !== null && /^\d+$/.test(v) ? Number(v) : NaN;
+	return n >= DATA_SIZE_DEFAULT && n <= 1024 ? n : DATA_SIZE_DEFAULT;
+}
+
 /** The command line without ?append=. */
 export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 
 /** localStorage: the saved settings (the header above), a JSON object of strings. */
 export const SETTINGS_KEY = "kw.settings";
 /** The settings' names. ?net=0 is read as ?wisp=0 and never saved. */
-export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave", "gl"];
+export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "datasize", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave", "gl"];
 
 /** The saved settings ({} where there are none or localStorage refuses). */
 export function loadSettings(): Record<string, string> {
@@ -234,6 +265,8 @@ export interface Config {
 	sound: boolean;
 	/** Attach the data disk (?data=0 turns it off). */
 	data: boolean;
+	/** The data disk's size in GiB (?datasize=; DATA_SIZE_DEFAULT): openDataDisk()'s `size`. */
+	dataSizeGiB: number;
 	/** ?root=initramfs: safe mode (kw.root=initramfs) for this boot, else null. */
 	root: "initramfs" | null;
 	/** The kernel runs in a Web Worker (with the data disk, network, display, input and sound): ?worker=1, or more than one CPU. */
@@ -298,6 +331,7 @@ export interface Config {
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
 	mobile: boolean;
+	/** A coarse primary pointer (touch): the page focuses nothing by itself (a terminal, a field), which would raise the on-screen keyboard. */
 	coarse: boolean;
 	mobileUA: boolean;
 	fontSize: number;
@@ -455,6 +489,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		display: params.get("display") !== "0",
 		sound: params.get("sound") !== "0",
 		data: params.get("data") !== "0",
+		dataSizeGiB: dataSizeParam(params.get("datasize")),
 		root,
 		worker: workerParam || cpus > 1,
 		workerParam,

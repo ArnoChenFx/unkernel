@@ -4,12 +4,12 @@ Remove items when they are done.
 
 ## Not in the image
 
-The FreeDOS launcher demo (`web/src/demos/dos.ts`, hidden) boots the FreeDOS
+The FreeDOS launcher app (`web/src/apps/media/dos.ts`, hidden) boots the FreeDOS
 1.2 boot floppy in Alpine's qemu-system-i386 with the curses display. On
 the riscv64 guest it was too slow for the launcher (about 70 s from qemu's
 start to the prompt, 2026-11-15), also with a stripped FDCONFIG.SYS and
 AUTOEXEC.BAT and resuming from a qemu state saved at the prompt (in the
-demo now): qemu's TCG keeps writing new code, which kwemu interprets or
+app now): qemu's TCG keeps writing new code, which kwemu interprets or
 recompiles. Not yet run on the aarch64 guest (Alpine has qemu-system-i386
 and qemu-ui-curses 11.0.3 for aarch64).
 
@@ -175,7 +175,7 @@ Open:
    Android, and JSPI inside one. A service worker is unsuitable, since
    browsers stop idle ones.
 6. **glibc distros and systemd**: Debian 13 is a distro image
-   (`--distro debian`, kernel/guest.md) with apt; the page's Ubuntu demo
+   (`--distro debian`, kernel/guest.md) with apt; the page's Ubuntu app
    runs Ubuntu Base in a chroot on Alpine. systemd (once installed from
    apt) booted Ubuntu Base 26.10 to multi-user.target on 2026-11-18; no
    image ships it. Next: systemd as a distro's init with the kw layer's
@@ -398,13 +398,13 @@ Open:
   engine has no SIMD (V8 on an x86-64 without SSE4.1) runs them as
   interpreter calls, 2-13x slower than the integer paths would be; such a
   host could boot with `kw.isa=-sha512` or set `OPENSSL_armcap=0`.
-- **aarch64 page: not yet opened in a browser.** The launcher demos (web.md,
+- **aarch64 page: not yet opened in a browser.** The launcher's apps (web.md,
   Launcher), the stand-ins (web.md, Stand-ins) and qemu-user are checked
   through the Node SDK only (2026-11-18): static busybox binaries of
   x86_64, riscv64, i386 and armv7 each installed their qemu and library
   root on first run in 8-9 s and then ran in 0.2-0.3 s. In a browser,
   writing claude's 357 MB and opencode's 248 MB to the IndexedDB data disk
-  has not been timed, and every demo's first run there waits on Wisp
+  has not been timed, and every app's first run there waits on Wisp
   instead of the host's network.
 - **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
   --seccomp FD` fails, and GTK programs that load images through glycin

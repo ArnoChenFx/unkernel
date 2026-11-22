@@ -119,11 +119,16 @@ overlayfs, behaves as it does on a server, because it runs the same code.
 
 ## 🌐 Try it in the browser
 
-Open **[unkernel.dev](https://unkernel.dev/)**. A shell appears
-after a download of about 10 MB. Your changes are saved in the browser, and
-the status icon opens options, diagnostics, and export or reset for your
-disk. Ctrl-A n (or ⌘A n on a Mac) or `+` on the status line opens another
-terminal window with its own shell, up to 9; Ctrl-A and a digit switches.
+Open **[unkernel.dev](https://unkernel.dev/)**. A desktop appears after a
+download of about 10 MB, with a shell in its Terminal window. Your changes
+are saved in the browser. The Dock opens the apps (so do ⌘K on a Mac and
+Ctrl-Shift-O elsewhere); Settings has the options and export or reset for
+your disk, System the diagnostics. Ctrl-A n (or ⌘A n on a Mac) or `+` on
+a Terminal window's tabs opens another terminal with its own shell, up to
+9; Ctrl-A and a digit switches, and Ctrl-A ? lists every shortcut. The
+wallpaper is a random photo from [Lorem Picsum](https://picsum.photos/)
+by default, so the page fetches one from picsum.photos on every load;
+the built-in wallpaper or a preset (Settings > Desktop) stops that.
 
 The page takes a few URL parameters:
 
@@ -139,10 +144,10 @@ The page takes a few URL parameters:
 | `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox, one on phones, in Safari and on iOS, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
 | `?gl=0` | No guest GL (on by default on Debian: the guest's Mesa renders through your browser's WebGL2, see below) |
 
-On Debian the guest gets a GPU (`/dev/dri`, Options, Guest GL): Mesa's
+On Debian the guest gets a GPU (`/dev/dri`, Settings, Guest GL): Mesa's
 virgl driver draws through your browser's WebGL2. The renderer behind it
-is downloaded only when a guest program first uses GL; the status panel's
-Guest GL row then names the GPU (a software renderer such as SwiftShader
+is downloaded only when a guest program first uses GL; the Guest GL row
+in System > Environment then names the GPU (a software renderer such as SwiftShader
 is flagged). Mesa is installed in the guest, not shipped:
 
 ```sh
@@ -156,9 +161,9 @@ xvfb-run -a -s "-screen 0 640x480x24" glmark2-es2   # frame rates
 Wayland apps show as windows on the page: `wland foot` (or the
 launcher's foot tile) starts wland's relay in the guest and runs the app
 against it; [wland](https://github.com/pithings/wland)'s compositor runs in
-the page and reads the app's pixels straight from guest memory. The status
-line's desktop icon (Ctrl-A w) switches between the windows and the
-terminal.
+the page and reads the app's pixels straight from guest memory. Each app
+window is a window of the page's desktop; Ctrl-A w switches between them
+and the other windows.
 
 ```sh
 sudo apt-get install -y foot fonts-dejavu-core

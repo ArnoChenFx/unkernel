@@ -1,4 +1,4 @@
-From 62e0cda889fe605fa303277df18f567f0e47c310 Mon Sep 17 00:00:00 2001
+From be3b08f85de838402914a835ebc6ff6cddb84f85 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Tue, 17 Nov 2026 14:38:17 +0000
 Subject: [PATCH] wasm: do not wait for a CPU that compiles or yields to its

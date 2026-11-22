@@ -136,6 +136,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -501,9 +502,17 @@ static int find_account(const char *spec, struct account *a)
  * In the child, before exec: give the terminal on fd 0 (if it is one) to
  * the account, as login(1) does (owner, group tty, 0620), then take the
  * account's groups and ids. 0, or -errno.
+ *
+ * The session may also raise its threads' priority as far as nice -20
+ * (RLIMIT_NICE 40, soft and hard), as pam_limits lets a desktop's audio
+ * users; these sessions do not go through PAM. SDL asks for nice -20 for
+ * its audio thread, which at nice 0 shares the emulated CPU with the
+ * program's other busy threads and misses its periods (ALSA underruns,
+ * gaps in the sound). Best effort: a failure leaves the inherited limit.
  */
 static int become(const struct account *a)
 {
+	static const struct rlimit renice = { 40, 40 };
 	struct group *tty;
 
 	if (isatty(0)) {
@@ -511,6 +520,7 @@ static int become(const struct account *a)
 		if (fchown(0, a->uid, tty ? tty->gr_gid : a->gid) || fchmod(0, 0620))
 			return -errno;
 	}
+	setrlimit(RLIMIT_NICE, &renice);
 	if (initgroups(a->name, a->gid) || setgid(a->gid) || setuid(a->uid))
 		return -errno;
 	return 0;

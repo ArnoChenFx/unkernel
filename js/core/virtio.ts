@@ -121,7 +121,7 @@ export class Virtqueue {
 	/** avail->idx (the driver's), read with acquire semantics on a shared memory. */
 	#availIdx(): number {
 		const a = this.avail + 2;
-		if (this.#shared()) return Atomics.load(new Uint16Array(this.#mem().buffer, a & ~1, 1), 0);
+		if (this.#shared()) return Atomics.load(new Uint16Array(this.#mem().buffer, a, 1), 0);
 		return this.#dv().getUint16(a, true);
 	}
 
@@ -206,7 +206,7 @@ export class Virtqueue {
 		dv.setUint32(e + 4, len, true);
 		const next = (idx + 1) & 0xffff;
 		// The element before the index: on a shared memory the store is a release.
-		if (this.#shared()) Atomics.store(new Uint16Array(this.#mem().buffer, (this.used + 2) & ~1, 1), 0, next);
+		if (this.#shared()) Atomics.store(new Uint16Array(this.#mem().buffer, this.used + 2, 1), 0, next);
 		else dv.setUint16(this.used + 2, next, true);
 		this.#onPush(this);
 	}

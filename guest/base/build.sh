@@ -31,7 +31,9 @@
 #                           bin/wland: Wayland apps in the page, through
 #                           the relay the Debian image carries),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh,kw-gl.sh,kw-wayland.sh},
-#                           etc/chromium.d/kw-wayland, the X.Org
+#                           etc/chromium.d/kw-wayland,
+#                           usr/local/bin/Xwayland (the distro's, with a
+#                           pointer on its root window), the X.Org
 #                           fbdev/evdev config, usr/share/licenses/unkernel,
 #                           usr/lib/kw-base (the base's id), and an empty
 #                           /data mount point. Its scripts run the base's

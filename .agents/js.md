@@ -114,7 +114,11 @@ parts that are easy to get wrong.
   CPU 0; with several CPUs the others run on until their threads end, but
   the exit has closed the console ring, so nothing they write comes out,
   and every device is CPU 0's. The copy of an SMP kernel's shared memory
-  is an ordinary ArrayBuffer (transferable in worker mode).
+  is an ordinary ArrayBuffer (transferable in worker mode), except that a
+  snapshot memory of 2 GiB or more (copied or decoded) is on a growable
+  SharedArrayBuffer where there is one (`newSnapshotMemory()`): Chrome
+  neither allocates nor posts a plain ArrayBuffer that large, and a shared
+  one crosses threads without a copy.
   `snapshot({ commit, commitTimeoutMs })` (`SnapshotOptions`) is the safe
   way to suspend: `wasm_snapshot_point` is a JSPI suspending import, and
   for a commit `Kernel.holdForCommit()` returns a promise, so the kernel
@@ -391,7 +395,7 @@ parts that are easy to get wrong.
   point cannot save, so it refuses while anything is mounted) and posts
   `snapshot`; the worker
   runs `KernelInstance.snapshot()` and answers `snapshot-result` with the
-  memory transferred (no second copy). Every `snapshot` is answered before
+  memory transferred (no second copy; shared from 2 GiB). Every `snapshot` is answered before
   `exit`: the exit waits for the snapshots in progress (at most 60 s of
   awake time, `awakeTimeout()`), answers any still open as failed, then
   waits for saves in flight (at most 10 s of awake time). With a wall-clock
@@ -417,7 +421,8 @@ parts that are easy to get wrong.
   Node 24; a structured clone took about 340 ms, 2026-11-15), or with
   `transferRestore: true` (WorkerOption) the caller's buffer is handed
   over and detached, for a snapshot read for one boot (the CLI's
-  `--restore`, the page). A snapshot from either mode resumes in either
+  `--restore`, the page); a shared memory (2 GiB or more) is posted as it
+  is. A snapshot from either mode resumes in either
   (`test/api.test.ts`: a worker's snapshot resumed inline and in a worker,
   one with a data disk resumed in a worker, saved again there and resumed
   inline).

@@ -2131,7 +2131,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await assert.rejects(boot(t, { kernel: module, vsock: false, restore: snap, disks: [disk()], log: () => {} }), /was written after the snapshot/);
 	});
 
-	test("worker mode: snapshot() in the worker, resumed inline and in a worker (transferRestore detaches the memory)", async (t) => {
+	test("worker mode: snapshot() in the worker, resumed inline and in a worker (a 2 GiB memory is shared, not detached)", async (t) => {
 		const vm = await boot(t, { worker: true, vsock: false, log: () => {} });
 		assert.ok(vm instanceof sdk.WorkerKernel);
 		const a = screen(vm);
@@ -2141,6 +2141,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const snap = await vm.snapshot({ stop: true });
 		assert.equal((await vm.exited).kind, "stopped");
 		assert.equal(snap.memory.byteLength, 2048 * 1048576, "the memory came across");
+		assert.ok(snap.memory.buffer instanceof SharedArrayBuffer, "a memory of 2 GiB is shared (Chrome posts no plain ArrayBuffer that large)");
 
 		const vm2 = await boot(t, { vsock: false, restore: snap, log: () => {} });
 		assert.ok(vm2 instanceof sdk.KernelInstance);
@@ -2150,12 +2151,26 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm2.stop({ reason: "test" });
 
 		const vm3 = await boot(t, { worker: true, vsock: false, restore: snap, transferRestore: true, log: () => {} });
-		assert.equal(snap.memory.byteLength, 0, "transferRestore handed the buffer over");
+		assert.equal(snap.memory.byteLength, 2048 * 1048576, "a shared memory is posted as it is");
 		const c = screen(vm3);
 		vm3.write("echo worker-$X\n");
 		await c.waitFor(/worker-w-kept/);
 		vm3.write("poweroff\n");
 		assert.equal((await vm3.exited).code, 0);
+	});
+
+	test("worker mode: transferRestore detaches a memory under 2 GiB", async (t) => {
+		const vm = await boot(t, { worker: true, vsock: false, memoryMiB: 512, log: () => {} });
+		await screen(vm).waitFor(PROMPT);
+		const snap = await vm.snapshot({ stop: true });
+		assert.ok(snap.memory.buffer instanceof ArrayBuffer && snap.memory.byteLength === 512 * 1048576, "a plain memory came across");
+		const vm2 = await boot(t, { worker: true, vsock: false, restore: snap, transferRestore: true, log: () => {} });
+		assert.equal(snap.memory.byteLength, 0, "transferRestore handed the buffer over");
+		const b = screen(vm2);
+		vm2.write("echo back-$((6*7))\n");
+		await b.waitFor(/back-42/);
+		vm2.write("poweroff\n");
+		assert.equal((await vm2.exited).code, 0);
 	});
 
 	test("worker mode: snapshot() with a data disk, resumed in a worker and saved again, then inline; refused once the disk changed", async (t) => {

@@ -321,7 +321,8 @@ export interface WorkerOption {
 	/**
 	 * Worker mode with `restore`: hand the snapshot's memory buffer to the
 	 * worker instead of copying it (about 150 ms per 512 MiB), for a
-	 * snapshot that is used once; its `memory` is detached then. Default false.
+	 * snapshot that is used once; its `memory` is detached then (one of
+	 * 2 GiB or more is shared with the worker instead). Default false.
 	 */
 	transferRestore?: boolean;
 }

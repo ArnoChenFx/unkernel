@@ -35,7 +35,7 @@ import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput, errorText } from "./output.ts";
-import { SnapshotCommitError, receivedSnapshot, restoreSnapshotMemory, sentSnapshot, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { SHARED_SNAPSHOT_BYTES, SnapshotCommitError, newSnapshotMemory, receivedSnapshot, restoreSnapshotMemory, sentSnapshot, snapshotTransfer, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
 /** How long stop() waits for the worker to confirm (it first lets saves in flight commit, up to 10 s) before it ends the worker anyway. */
@@ -84,16 +84,19 @@ function toWorkerDisks(specs: DiskSpec[], platform: Platform): [DiskSpec[], Arra
  * transfer. Copied (slice, then transferred: about 120-170 ms for 512 MiB,
  * where a structured clone took about 340 ms; Node 24, 2026-11-15), unless
  * `transfer`, which hands over the caller's buffer (it is detached then).
+ * A shared memory (newSnapshotMemory) is posted as it is, never copied or
+ * detached.
  */
 function toWorkerRestore(s: KernelSnapshot | undefined, transfer: boolean): [KernelSnapshot | undefined, ArrayBuffer[]] {
 	if (!s) return [undefined, []];
 	const m = s.memory;
-	const whole = m.buffer instanceof ArrayBuffer && m.byteOffset === 0 && m.byteLength === m.buffer.byteLength;
-	if (transfer && whole) return [sentSnapshot(s), [m.buffer as ArrayBuffer]];
-	// A sparse copy: the snapshot's zero pages stay untouched in it.
-	const memory = new Uint8Array(m.byteLength);
+	if (!(m.buffer instanceof ArrayBuffer)) return [sentSnapshot(s), []];
+	const whole = m.byteOffset === 0 && m.byteLength === m.buffer.byteLength;
+	if (transfer && whole && m.byteLength < SHARED_SNAPSHOT_BYTES) return [sentSnapshot(s), [m.buffer]];
+	// A sparse copy (shared from 2 GiB): the snapshot's zero pages stay untouched in it.
+	const memory = newSnapshotMemory(m.byteLength);
 	restoreSnapshotMemory(memory, m, 0);
-	return [sentSnapshot({ ...s, memory }), [memory.buffer as ArrayBuffer]];
+	return [sentSnapshot({ ...s, memory }), snapshotTransfer(memory)];
 }
 
 function hasScheme(s: string): boolean {

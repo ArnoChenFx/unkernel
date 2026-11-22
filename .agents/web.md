@@ -706,13 +706,13 @@ answered at the kernel's next yield.
   know (a read per span, no GL windows by resource, no bridge). The
   relay asset is `wlandr-link-linux-arm64.tar.gz` (the `--link`-only
   build, its entry `wlandr`). The relay at boot needs `--link-on-demand`
-  (and `--version`, `--no-fence-wait`): wland after v0.1.0-261122-f36330a,
-  which the pin still is, so a base built with the pin starts no relay at
-  boot and gives shells no session (plain apps fail as outside the page;
-  `wland CMD` works as before); the page side needs no change for it
-  (the link protocol is the same; checked against wland 1567138). On
-  wland's next release: `WLANDR_VERSION` and `WLANDR_SHA256` in pins.sh
-  and the npm version in `web/package.json`, then `kernel/build.sh base`
+  (and `--version`, `--no-fence-wait`), and Firefox's input the core that
+  sends seat events to every pointer and keyboard of a client: both in
+  wland 0.1.0-261122-632f589, the pin. With an older relay the boot
+  starts none and shells get no session (plain apps fail as outside the
+  page; `wland CMD` works as before). A new release: `WLANDR_VERSION` and
+  `WLANDR_SHA256` in pins.sh and the npm version in `web/package.json`
+  (and the lockfile), then `kernel/build.sh base`
   without `KW_WLANDR`. To try a local wland build:
   `KW_WLANDR=<wland>/zig-out/release/wlandr-link-linux-arm64 kernel/build.sh
   base` (guest/base/build.sh; refused with `KW_RELEASE=1`), and for the
@@ -857,19 +857,20 @@ answered at the kernel's next yield.
   MiB is too little: the guest thrashes (about 20 MiB left, half the CPU
   time in I/O wait) and the first page takes minutes; with 2 GiB (the
   page's default on desktops) its window maps in about 45 to 65 s (a new
-  profile; 24 s for the next start in the same boot). With the pinned
-  wland it takes no input, on the GPU path and in software alike: wland
-  0.1.0-261122 keeps one wl_pointer and one wl_keyboard per client (the
+  profile; 24 s for the next start in the same boot). Its input
+  needs wland 0.1.0-261122-632f589 (the pin); before it Firefox took none,
+  on the GPU path and in software alike: wland
+  0.1.0-261122-f36330a kept one wl_pointer and one wl_keyboard per client (the
   last made; `pointer_id`, `keyboard_id` in its compositor.zig), while
   Firefox binds wl_seat twice (GTK's at v5, then its own at v8 for serials
   and pointer constraints), so the events go to Firefox's own objects and
   GTK's get none (seen with WAYLAND_DEBUG: `wl_pointer#36.button`,
   `wl_keyboard#37.key`, nothing for GTK's `wl_pointer#8`,
-  `wl_keyboard#19`). wland's fix after that release sends each seat event
+  `wl_keyboard#19`). wland now sends each seat event
   to every pointer, keyboard, relative pointer and data and
   primary-selection device of a client (WAYLAND_DEBUG: `wl_pointer#8` and
   `#36` both get the motion, button and frame, one enter serial for
-  both), and with it (a local build, `KW_WLAND_PKG`) Firefox takes
+  both), and Firefox takes
   clicks, typing, Ctrl+L and a typed URL, its context menu (a click on an
   item, Escape), the wheel, a drag selection (the primary selection) and
   Ctrl+C and Ctrl+V with wl-copy and wl-paste, on the GPU path and with

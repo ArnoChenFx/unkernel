@@ -1,4 +1,4 @@
 packages:
   - web
 minimumReleaseAgeExclude:
-  - wland@0.1.0-261121-6b1a8a2 || 0.1.0-261122-f36330a
+  - wland

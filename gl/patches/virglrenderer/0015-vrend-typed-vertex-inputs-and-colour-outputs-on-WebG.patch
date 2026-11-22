@@ -1,0 +1,76 @@
+From 473d12ab0356b48871f2f480d5093ce9159a7fb3 Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 22 Nov 2026 08:55:26 +0000
+Subject: [PATCH] vrend: typed vertex inputs and colour outputs on WebGL
+
+WebGL refuses a draw (GL_INVALID_OPERATION, "Vertex shader input type
+does not match the type of the bound vertex attribute") whose vertex
+shader declares an input as a float vector while its attribute is set
+with glVertexAttribIPointer, and likewise a fragment shader output whose
+base type differs from its colour buffer's. vrend declares every vertex
+input and colour output as vec4 unless use_integer is set, which only
+an ARM (Mali) host gets by default, and on a host without
+vertex_attrib_binding (GLES 3.0, WebGL2) it never filled the vertex
+elements' integer masks the shader key takes them from, so even
+VIRGL_USE_INTEGER left the inputs untyped there. The pending error then
+fails the context's next error check: the context is in error and
+refuses every later command buffer and transfer. Firefox's WebRender
+draws with integer instance attributes (ivec4 aData) from its first
+frame, so its window stayed blank and every transfer of its context
+failed.
+
+Fill the masks when the vertex elements are created, for every host,
+and use integer types on an emscripten (WebGL) host.
+---
+ src/vrend/vrend_renderer.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index fec16df..1d9c680 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -3475,6 +3475,13 @@ int vrend_create_vertex_elements_state(struct vrend_context *ctx,
+ 
+       if (desc->nr_channels == 4 && desc->swizzle[0] == PIPE_SWIZZLE_Z)
+          v->zyxw_bitmask |= 1 << i;
++
++      /* The shader key's integer inputs, also on a host without
++       * vertex_attrib_binding, whose attributes are set up at draw time
++       * (glVertexAttribIPointer for these) */
++      UPDATE_INT_SIGN_MASK(elements[i].src_format, i,
++                           v->signed_int_bitmask,
++                           v->unsigned_int_bitmask);
+    }
+ 
+    ret_handle = vrend_renderer_object_insert(ctx, v, handle,
+@@ -3518,12 +3525,8 @@ void vrend_bind_vertex_elements_state(struct vrend_context *ctx,
+          struct vrend_vertex_element *ve = &v->elements[i];
+          GLint size = !vrend_state.use_gles && (v->zyxw_bitmask & (1 << i)) ? GL_BGRA : ve->nr_chan;
+ 
+-         if (util_format_is_pure_integer(ve->base.src_format)) {
+-            UPDATE_INT_SIGN_MASK(ve->base.src_format, i,
+-                                 v->signed_int_bitmask,
+-                                 v->unsigned_int_bitmask);
++         if (util_format_is_pure_integer(ve->base.src_format))
+             glVertexAttribIFormat(i, size, ve->type, ve->base.src_offset);
+-         }
+          else
+             glVertexAttribFormat(i, size, ve->type, ve->norm, ve->base.src_offset);
+          glVertexAttribBinding(i, ve->base.vertex_buffer_index);
+@@ -7633,6 +7636,13 @@ static bool use_integer(void) {
+    if (getenv("VIRGL_USE_INTEGER"))
+       return true;
+ 
++   /* WebGL refuses a draw whose vertex shader input or fragment shader
++    * output is not of its attribute's or colour buffer's base type (float,
++    * int, uint) */
++#ifdef __EMSCRIPTEN__
++   return true;
++#endif
++
+    const char * a = (const char *) glGetString(GL_VENDOR);
+    if (!a)
+        return false;
+-- 
+2.56.0
+

@@ -945,7 +945,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t kw_vgpu_fences_done(void)
 
 // What the host needs of a resource: OUT[0] the GL texture (0: none, e.g. a
 // buffer), [1] width, [2] height, [3] the virgl format, [4] 1 when row 0 is
-// the top (VIRGL_RESOURCE_Y_0_TOP). 0 or -ENOENT.
+// the top (VIRGL_RESOURCE_Y_0_TOP), [5] 1 when the format has alpha (not an
+// X format such as B8G8R8X8). 0 or -ENOENT.
 EMSCRIPTEN_KEEPALIVE int kw_vgpu_info(uint32_t res, uint32_t *out)
 {
 	struct virgl_renderer_resource_info info;
@@ -957,16 +958,39 @@ EMSCRIPTEN_KEEPALIVE int kw_vgpu_info(uint32_t res, uint32_t *out)
 	out[2] = info.height;
 	out[3] = info.virgl_format;
 	out[4] = info.flags & VIRGL_RESOURCE_Y_0_TOP ? 1 : 0;
+	out[5] = info.virgl_format < VIRGL_FORMAT_MAX_EXTENDED &&
+		 util_format_has_alpha((enum pipe_format)info.virgl_format) ? 1 : 0;
 	return 0;
 }
 
-// Present: copy the rectangle (x, y, w, h) of the resource's picture (row 0
-// at the top, as the guest sees it) to the WebGL context's drawing buffer,
-// which the caller has sized w x h. A blit, no readback. vrend's single GL
-// context mode gives the GL context up first (no context owns it until the
-// next command, which restores that context's state), as for its own
-// blitter. 0, or -ENOENT for a resource without a texture.
-EMSCRIPTEN_KEEPALIVE int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+// Blit: copy the rectangle (x, y, w, h) of the resource's picture (row 0 at
+// the top, as the guest lays it out) to the WebGL context's drawing buffer,
+// which the caller has sized w x h, with the picture's top row at the
+// buffer's top (what transferToImageBitmap() takes as row 0), or its
+// bottom with KW_VGPU_BLIT_FLIP_Y. The texels go as they are: colour and
+// alpha (a Wayland client's ARGB is premultiplied, as a premultipliedAlpha
+// drawing buffer wants); KW_VGPU_BLIT_OPAQUE then sets alpha to 1 (an X
+// format's fourth byte is undefined). A clear, a blit and a masked clear,
+// no readback. vrend's single GL context mode gives the GL context up first
+// (no context owns it until the next command, which restores that
+// context's state), as for its own blitter; glClearColor is set by every
+// vrend clear, and the colour mask is left at the default the blitter
+// found. 0, -ENOENT for a resource without a texture, -EINVAL for a
+// rectangle outside it.
+// Clear the GL errors pending after a call of the host's own (not a
+// guest's command buffer), logging them: else the decoder's next error check
+// (once per command buffer, patch 10) charges them to whichever context
+// submits next.
+static void host_gl_errors(const char *what, uint32_t a)
+{
+	GLenum e;
+	int n = 0;
+
+	while ((e = glGetError()) != GL_NO_ERROR && n++ < 8)
+		fprintf(stderr, "kw_virgl: %s %u: GL error 0x%x (cleared, not charged to a client)\n", what, a, e);
+}
+
+EMSCRIPTEN_KEEPALIVE int kw_vgpu_blit(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t flags)
 {
 	static GLuint fbo;
 	struct virgl_renderer_resource_info info;
@@ -983,6 +1007,14 @@ EMSCRIPTEN_KEEPALIVE int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, u
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, info.tex_id, 0);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	// A clear first. WebGL clears a drawing buffer without
+	// preserveDrawingBuffer lazily, before the first draw or clear after it
+	// was taken (transferToImageBitmap) or resized; a blit does not do it,
+	// and Chromium folds it into the next clear, so the masked clear below
+	// would wipe the blitted colour (an opaque black image). Clearing now
+	// takes that clear before the blit.
+	glClearColor(0.0f, 0.0f, 0.0f, flags & KW_VGPU_BLIT_OPAQUE ? 1.0f : 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
 	// The drawing buffer's top row is its last. The texture's row k is the
 	// picture's row k (counted from the top, as the guest lays it out), or
 	// with Y_0_TOP its row height - 1 - k (vrend inverts transfers of such
@@ -998,10 +1030,35 @@ EMSCRIPTEN_KEEPALIVE int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, u
 		dy0 = (GLint)h;
 		dy1 = 0;
 	}
+	if (flags & KW_VGPU_BLIT_FLIP_Y) {
+		GLint t = dy0;
+
+		dy0 = dy1;
+		dy1 = t;
+	}
 	glBlitFramebuffer((GLint)x, sy0, (GLint)(x + w), sy1, 0, dy0, (GLint)w, dy1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (flags & KW_VGPU_BLIT_OPAQUE) {
+		// A blit ignores the colour mask; a clear does not.
+		glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	}
+	// An error of this blit (or one a transfer left, which vrend does not
+	// check) would be charged to the next command buffer of whichever
+	// context comes next, which it puts in error: take it here and say so.
+	// One glGetError (a round trip in WebGL) per present or image.
+	host_gl_errors("blit of resource", res);
 	return 0;
+}
+
+// Present the scanout: a blit with alpha 1 (the scanout is opaque whatever
+// its format; the renderer's drawing buffer has alpha, for window images).
+EMSCRIPTEN_KEEPALIVE int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	return kw_vgpu_blit(res, x, y, w, h, KW_VGPU_BLIT_OPAQUE);
 }
 
 // Read the rectangle of a resource back as the guest would (a

@@ -11,7 +11,16 @@
 // (TRANSFER_TO_HOST) and waits, so that the host can look the resource's
 // texture up: unkernel-check.mjs --drm step e.
 //
-//   prime [DEVICE] [SECONDS]     prints "res N" and the steps; exit 0 when they agree
+// With IDLE_FILE it first leaves the importer as a Wayland relay is
+// between clients (unkernel-check.mjs --drm --snapshot, step s): a
+// resource made by another opener, imported, and closed on both sides, so
+// the importer's DRM file keeps its 3D context with no resource and no
+// command ever submitted. It prints "idle" and waits until IDLE_FILE
+// exists (the host snapshots and restores the machine meanwhile), then
+// goes on as above with a new exporter and the same importer, whose
+// context the restored host must make again on its first use.
+//
+//   prime [DEVICE] [SECONDS] [IDLE_FILE]     prints "res N" and the steps; exit 0 when they agree
 #define _GNU_SOURCE
 #include <drm/drm.h>
 #include <drm/virtgpu_drm.h>
@@ -63,6 +72,40 @@ int main(int argc, char **argv)
 	if (xioctl(a, DRM_IOCTL_VIRTGPU_GETPARAM, &gp, "GETPARAM 3D_FEATURES") || !v3d) {
 		fprintf(stderr, "prime: no 3D on %s\n", dev);
 		return 1;
+	}
+	if (argc > 3) {
+		struct drm_gem_close gc;
+
+		rc = (struct drm_virtgpu_resource_create){ .target = 2, .format = 2, .bind = 2 | 8,
+			.width = W, .height = H, .depth = 1, .array_size = 1, .size = W * H * 4, .stride = W * 4 };
+		if (xioctl(a, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &rc, "RESOURCE_CREATE (idle)"))
+			return 1;
+		ph = (struct drm_prime_handle){ .handle = rc.bo_handle, .flags = DRM_CLOEXEC | DRM_RDWR };
+		if (xioctl(a, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph, "PRIME_HANDLE_TO_FD (idle)"))
+			return 1;
+		close(a);
+		ph.handle = 0;
+		if (xioctl(b, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph, "PRIME_FD_TO_HANDLE (idle)"))
+			return 1;
+		close(ph.fd);
+		gc = (struct drm_gem_close){ .handle = ph.handle };
+		if (xioctl(b, DRM_IOCTL_GEM_CLOSE, &gc, "GEM_CLOSE (idle)"))
+			return 1;
+		printf("idle: resource %u imported and closed\n", rc.res_handle);
+		fflush(stdout);
+		for (int i = 0; access(argv[3], F_OK); i++) {
+			if (i > 6000) {
+				fprintf(stderr, "prime: no %s after 600 s\n", argv[3]);
+				return 1;
+			}
+			usleep(100000);
+		}
+		printf("going on\n");
+		a = open(dev, O_RDWR | O_CLOEXEC);
+		if (a < 0) {
+			perror(dev);
+			return 1;
+		}
 	}
 	// A 2D texture, B8G8R8X8, render target and sampler view (bind 2 | 8), 64x64.
 	rc = (struct drm_virtgpu_resource_create){ .target = 2, .format = 2, .bind = 2 | 8,

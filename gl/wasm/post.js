@@ -27,7 +27,7 @@
 // timerPolls).
 //
 // v.gpu is the virtio-gpu entry (kw_vgpu_*): command(), capset(), format(),
-// fence(), fencesDone(), info(), present(), read(); see below.
+// fence(), fencesDone(), info(), blit(), present(), read(); see below.
 
 Module['virgl'] = (() => {
   let scratch = 0, scratchSize = 0, initGL = null;
@@ -123,17 +123,23 @@ Module['virgl'] = (() => {
       fence: () => _kw_vgpu_fence() >>> 0,
       fencesDone: () => _kw_vgpu_fences_done() >>> 0,
       // A resource's GL texture (the WebGLTexture of the renderer's context,
-      // null for a buffer), size, virgl format and whether row 0 is the top;
-      // null for no such resource.
+      // null for a buffer), size, virgl format, whether row 0 is the top and
+      // whether the format has alpha; null for no such resource.
       info(res) {
-        const p = _malloc(20);
+        const p = _malloc(24);
         const r = _kw_vgpu_info(res, p);
-        const a = HEAPU32.slice(p >> 2, (p >> 2) + 5);
+        const a = HEAPU32.slice(p >> 2, (p >> 2) + 6);
         _free(p);
         if (r < 0) return null;
-        return { texture: a[0] ? GL.textures[a[0]] ?? null : null, width: a[1], height: a[2], format: a[3], yTop: a[4] === 1 };
+        return { texture: a[0] ? GL.textures[a[0]] ?? null : null, width: a[1], height: a[2], format: a[3], yTop: a[4] === 1, alpha: a[5] === 1 };
       },
-      // Blit (x, y, w, h) of a resource to the context's drawing buffer, which the caller sized w x h.
+      // Blit (x, y, w, h) of a resource to the context's drawing buffer, which the
+      // caller sized w x h, top row at the top; flags BLIT_OPAQUE (alpha 1),
+      // BLIT_FLIP_Y (top row at the bottom). 0 or a negative errno.
+      BLIT_OPAQUE: 1,
+      BLIT_FLIP_Y: 2,
+      blit: (res, x, y, w, h, flags = 0) => _kw_vgpu_blit(res, x, y, w, h, flags),
+      // blit() with BLIT_OPAQUE: the scanout.
       present: (res, x, y, w, h) => _kw_vgpu_present(res, x, y, w, h),
       // Read (x, y, w, h) back, rows from the top: a Uint8Array, or null.
       read(res, x, y, w, h, bpp = 4) {

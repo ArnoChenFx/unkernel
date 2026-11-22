@@ -55,13 +55,14 @@ The guest sees GL 2.1 compatibility (GLSL 1.20) and GLES 3.0 (GLSL ES
 | `test/gl/kwgl-state.c` | the stale-state check run by `vtest-check.sh state` (surfaceless EGL clients taking turns) |
 | `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
 | `js/core/gl-gpu.ts` | virtio-gpu 3D: `VirglGpuBackend` (device side), `GpuRenderer` (`vm.gl.gpu`); see The DRM path |
-| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
+| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c`, `test/gpu/window-image.c`, `test/gpu/int-attrib.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
+| `test/gl-gpu.test.ts` | `VirglGpuBackend` against a fake link: the snapshot blocker, contexts made again after a restore (`pnpm test:gl-gpu`) |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
 | `test/gl/page-check.mjs` | the page's GL option in headless Chromium (the dev server, the default URL); see The page |
 | `guest/base/rootfs/etc/profile.d/kw-gl.sh` | the guest's shells' `GALLIUM_DRIVER=virpipe LIBGL_ALWAYS_SOFTWARE=1` when the command line has `kw.gl=1` and there is no DRM render node |
 | `web/` (`config.ts`, `boot.ts` `showGl()`, `scripts/kernel.ts`, `vite.config.ts`) | the page's Guest GL option and how the page gets `virgl.*` (web.md, Guest GL) |
-| `test/gl/build-guest-state.sh` | `kwgl-state.c` for the Debian guest (aarch64 glibc, linked against stand-ins for libEGL and libGLESv2) |
+| `test/gl/build-guest-state.sh` | `kwgl-state.c` (or another GL test program, `window-image.c`) for the Debian guest (aarch64 glibc, linked against stand-ins for libEGL, libGLESv2 and libgbm) |
 | `vendor/src/virglrenderer-wasm` (gitignored) | the source of both builds: branch `kw-wasm` = 1.3.0 + the series |
 | `vendor/build/gl-wasm`, `vendor/build/gl-native` | `virgl.{mjs,wasm}`; `vtest/virgl_test_server` |
 | `vendor/build/gl/` | `debian-gl.img` (the prepared disk), `kwgl-state-aarch64`, `vtest-bridge` (`build-guest.sh`) |
@@ -110,7 +111,33 @@ In order, each with its reason in the commit message:
     it hands out start at 0x40000000 (a virtio-gpu guest numbers its own
     from 1, in its command streams), and `vtest_renderer_add_fence()` adds
     an implicit fence for another user, as vtest's write_fence callback
-    takes every context 0 fence for one of its own (The DRM path).
+    takes every context 0 fence for one of its own (The DRM path);
+14. `PIPE_TEX_WRAP_CLAMP_TO_BORDER` as `GL_CLAMP_TO_EDGE` on a GLES host
+    without border clamp (WebGL2 has none): the guest's Mesa offers
+    OES_texture_border_clamp whatever the host can do, GTK 4's GL renderer
+    samples with it from its first frame, and WebGL's INVALID_ENUM then put
+    the context in error, so a GTK 4 window stayed blank; only lookups
+    outside a texture differ (its edge texel instead of the border colour).
+15. typed vertex inputs and colour outputs on WebGL: vrend declared every
+    vertex input and fragment output as a float vector unless `use_integer`
+    (by default only an ARM host), and on a host without
+    vertex_attrib_binding never filled the vertex elements' integer masks;
+    WebGL refuses a draw whose input type differs from its attribute's
+    (`glVertexAttribIPointer`; "Vertex shader input type does not match the
+    type of the bound vertex attribute") or whose output type differs from
+    its colour buffer's. Now the masks are filled at creation and an
+    emscripten host uses integer types. Firefox's WebRender draws with
+    instanced `ivec4` attributes from its first frame: before, its context
+    went into error at that draw, every later submit and transfer of it
+    failed (the guest's kernel: `response 0x1200 (command 0x207)` and
+    `(command 0x205)`, flooding), and its window stayed fully transparent
+    (2026-11-22; `unkernel-check.mjs --drm` step h).
+16. integer colour buffers cleared with `glClearBuffer{u,i}v`: a clear of
+    every bound colour buffer was one `glClear`, which WebGL refuses for
+    an integer buffer ("No defined conversion between clear value and
+    attachment format": the context in error), and the per-buffer path
+    tested the format of a truth value (`surf && surf->format`), so it
+    never took them (step h's RGBA8UI clear).
 
 ## Single GL context
 
@@ -456,11 +483,14 @@ GPU). One run each, on the shared host:
    (relay or `--wasm`).
 5. **unkernel.** Done: unkernel, below. Check: `node test/gl/unkernel-check.mjs`.
    The page's option: done (The page). Check: `node test/gl/page-check.mjs`.
-   Next: frames to the page's display (X on kwfb, unverified; kwshm, or
-   wland). Busy waits: done (Busy waits).
+   Next: frames to the page's display under X on kwfb (unverified); Wayland
+   clients show on the page through wland (item 6). Busy waits: done (Busy
+   waits).
 6. **virtio-gpu 3D.** Done: The DRM path, in the page by default (The
-   page), the renderer loaded on first use. Check: `node
-   test/gl/unkernel-check.mjs --drm`. Next: wland on PRIME.
+   page), the renderer loaded on first use, window images (`image()`) for
+   wland's relay mode, which the page uses (web.md, Wayland desktop). Check:
+   `node test/gl/unkernel-check.mjs --drm`; the page's Wayland GL windows:
+   `node test/wland/page-check.mjs --built --gpu`.
 
 ## unkernel
 
@@ -574,7 +604,9 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   of it gives the display its mode with no pixels, RESOURCE_FLUSH blits its
   texture into the renderer's OffscreenCanvas (sized to the scanout;
   `kw_vgpu_present` gives vrend's single GL context up first, as its
-  blitter does, so the next command restores the client's state) and takes
+  blitter does, so the next command restores the client's state; it is
+  `kw_vgpu_blit` with alpha set to 1 after the blit, as the drawing buffer
+  has alpha for window images, below) and takes
   it with `transferToImageBitmap()`; `vm.gl.gpu.drawFrame(ctx)` draws that
   into the page's 2D canvas (Display.tsx does, per animation frame, in both
   modes; the renderer is on the page's thread either way). No `readPixels`
@@ -586,17 +618,66 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   Page flips are paced by virtio-gpu's emulated vblank (60 Hz).
 - **dmabuf**: PRIME export and import between openers of the device is the
   stock driver's self-import (no vmap); `DRM_IOCTL_VIRTGPU_RESOURCE_INFO`
-  gives the resource id, and `vm.gl.gpu.texture(id)` its `WebGLTexture` in
-  the renderer's context (js.md). For wland zero-copy what remains is the
-  wland side: a Wayland client's `zwp_linux_dmabuf` buffer in a guest
-  compositor (or a relay) mapped to its resource id, and the page's
-  compositor drawing that texture in the renderer's context (textures do
-  not cross WebGL contexts: a compositor on another context needs a copy,
-  e.g. an ImageBitmap as presentation makes).
+  gives the resource id, `vm.gl.gpu.texture(id)` its `WebGLTexture` in
+  the renderer's context, and `vm.gl.gpu.image(id, opts)` its picture as
+  an ImageBitmap for a compositor on the page (textures do not cross WebGL
+  contexts, images do; js.md). The page's Wayland desktop shows GL
+  clients that way: wland's relay (`--dmabuf virtgpu`) names each client
+  buffer by its resource, and the page's `gpu.resolve()` is `image()`
+  (web.md, Wayland desktop, which has what Mesa picks and the numbers).
+- **Window images** (`image()`): `kw_vgpu_blit` (inside the module, as
+  present: vrend's state handled the same way) copies the resource's
+  rectangle into the drawing buffer, sized to it, and
+  `transferToImageBitmap()` takes it: no readback. Row 0 is the picture's
+  top row as the guest lays it out (Y_0_TOP or not, as present), or its
+  last with `flipY` (wland's y_invert flag, which the resolver honours);
+  colour and alpha go as the client rendered them, so a Wayland client's
+  premultiplied ARGB stays premultiplied (what a premultipliedAlpha drawing
+  buffer and drawImage() of an ImageBitmap take), and `opaque` (by default
+  for a format without alpha; the resolver passes it for XR24 and XB24)
+  sets alpha to 1 after the blit (an X format's fourth byte is whatever
+  the texel holds: blitted raw it showed). For that the renderer's WebGL2
+  context has `alpha: true` (premultiplied, no preserveDrawingBuffer);
+  with `alpha: false` every image was opaque. Chosen over a second canvas
+  (a context has one) and readback (the point); the cost is a clear of the
+  alpha channel per presented frame. Every blit starts with a full clear:
+  WebGL clears a drawing buffer lazily before the first draw or clear
+  after it was taken or resized, a blit does not trigger that, and
+  Chromium folds it into the next clear, so the masked alpha clear wiped
+  the blitted colour (opaque black images, and black scanout frames right
+  after an image) until the blit came after a clear. The drawing buffer is
+  resized to each image and back by the next present; nothing is lost, as
+  each present blits the whole scanout and its frame is already an
+  ImageBitmap (about 1.4 ms per resize on SwiftShader, below). A module
+  without `blit` keeps `alpha: false`, and `image()` gives null. Each blit
+  ends by clearing pending GL errors (logged as `kw_virgl: blit of
+  resource N: GL error ...`): with errors checked once per command buffer
+  (patch 10) one left there, or by a transfer, which vrend does not check,
+  was charged to the next client's command buffer and put that context in
+  error.
+- **Snapshots**: refused while any 3D resource exists or a context has
+  submitted commands (its objects, shaders, states, sub contexts, live
+  only in the renderer), before the guest parks; the page says a program
+  is using the GPU. A context that never submitted, with no resource
+  attached (none exists), is let through: a Wayland relay that imported
+  clients' buffers and closed them keeps such a context for its DRM file.
+  The renderer loses only its id; the restored guest's kernel still has
+  it, and the device side makes it again (CTX_CREATE, no debug name) on
+  the first command that names a context it did not see made. Without
+  that, a transfer through the old context after the restore failed in
+  the renderer while the guest saw no error (`--snapshot`, checked both
+  ways, 2026-11-22).
+- WebGL warnings in the page's console when the renderer loads (any
+  client's first GL use; 2026-11-22, SwiftShader): about 50 `texImage2D:
+  invalid internalformat` / `invalid format` and one `texParameter:
+  invalid parameter name` are vrend's probes, not errors: its format table
+  (`vrend_formats.c`, a 32x32 `glTexImage2D` of each format; the ones
+  WebGL refuses are left out of the caps, so the guest is never offered
+  them; fewer on a GPU with more WebGL extensions) and the
+  `GL_TEXTURE_SWIZZLE_R` probe of patch 9.
 - Not done: blob resources and host-visible memory (no coherent buffer
   maps), Venus, dumb buffers used by 3D contexts, the cursor plane (taken
-  and ignored), snapshots while 3D resources or contexts exist (refused,
-  before the guest parks; the page says a program is using the GPU). On
+  and ignored). On
   SMP only a short check: `page-check.mjs --cpus 0` (the page's default, 4
   CPUs, worker mode; 2026-11-21) ran `eglinfo -B -p gbm` on virgl and
   kmscube at 55 to 57 fps; the 2D device: `test/gpu/check.mjs --cpus 2`.
@@ -646,6 +727,25 @@ SwiftShader (software: a floor); one run each on a shared host.
 - PRIME (`test/gpu/prime.c` as the default user): exporter and importer
   name the same resource; `vm.gl.gpu.texture()` finds its 64x64 texture
   with the importer's upload in it.
+- Window images (2026-11-22, step g, inline and worker mode):
+  `window-image.c`'s GBM window surfaces on Mesa's virgl are B8G8R8A8
+  (ARGB8888) and B8G8R8X8 (XRGB8888), neither Y_0_TOP; Debian's Mesa has
+  no EGL config for ABGR8888 or XBGR8888 on GBM. Every image (default,
+  `opaque` as the fourcc says, `flipY`, a cropped quadrant) composited over
+  black and white is exact: premultiplied translucency, X opaque, the top
+  row at the top. kmscube's frames, drawn plain and over white, equal the
+  scanout read back while images are taken between presents. Per image
+  (image(), drawImage() into a 2D canvas, close(); 100 in a row, the GPU
+  waited for at the end): 800x600 7.0 ms, 1920x1080 28.5 ms (without the
+  drawImage 6.9 and 26.4); alternating the two sizes (a resize each) 19.3
+  ms; with the scanout at 640x480 between them about 10 ms for a 64x48,
+  a 1920x1080 and a 64x48. Nearly all of it is `transferToImageBitmap()`
+  waiting for SwiftShader's blit: a plain WebGL2 OffscreenCanvas doing a
+  clear, a blit of a texture of that size and the transfer takes the
+  same (6.6, 26.3 ms), while its clear and transfer alone take 1.1 and
+  4.3 ms. readPixels of the same textures is 0.7 and 2.6 to 4.0 ms
+  here (SwiftShader's blit is slow, its readback a copy); on a GPU the
+  blit is the cheap side. Not measured on a GPU.
 
 ## Loading on first use
 
@@ -739,7 +839,8 @@ on the page's display (Display.tsx, `vm.gl.gpu.drawFrame()`). The Environment ta
 WebGL2 renderer (unmasked; a software one, SwiftShader, llvmpipe or WARP,
 is a warning and a toast) and how long the load took and `vm.gl.stats` with the per-readback
 breakdown of the renderer's counters (Stats) and the device's
-(`vm.gl.stats.gpu`: presents, parks, time parked, readbacks, errors); `?glwait=strict` answers busy
+(`vm.gl.stats.gpu`: presents, parks, time parked, readbacks, errors and
+the last one's text; a lost WebGL2 context fails the row); `?glwait=strict` answers busy
 waits as vtest does. The browser console has `[unkernel] guest GL: WebGL2
 renderer ...`.
 
@@ -799,6 +900,8 @@ node test/gl/unkernel-check.mjs --drm --eager --skip c   # the renderer loaded b
 node test/gl/unkernel-check.mjs --drm --fail --glfail module   # the renderer fails at first use: what Mesa does, a dumb-buffer KMS client
 node test/gl/unkernel-check.mjs --drm --fail --gl-flags "--disable-gpu --disable-software-rasterizer"   # no WebGL2 context: the 2D device
 node test/gl/unkernel-check.mjs --drm --skip b,c,d,e --gl-delay 8   # virgl.mjs served 8 s late: the first GET_CAPS waits
+node test/gl/unkernel-check.mjs --drm --snapshot --skip a,b,c,d,e,g   # step s: a snapshot with an idle 3D context, restored, the context used again
+pnpm test:gl-gpu                             # VirglGpuBackend's snapshot blocker and contexts made again, no browser
 node test/gl/page-check.mjs                  # the page's option (dev server, port 8091, the default URL), about 1 min; needs the internet
 node test/gl/page-check.mjs --suspend        # plus suspend and resume before GL use, the refusal while kmscube runs, a session saved without GL
 node test/gl/page-check.mjs --gpu0           # the same with ?gpu=0 (the vtest link alone)
@@ -859,6 +962,7 @@ Results (2026-11-21, the series of Patches):
 | `unkernel-check.mjs --drm` (inline; `--worker --skip c`) | all pass; The DRM path, Measured |
 | `unkernel-check.mjs --drm --skip c`, lazy and `--eager`; `--fail` both ways; `--gl-delay 8` | all pass (2026-11-21); Loading on first use |
 | `page-check.mjs`, `--suspend` | all pass; The page |
+| `unkernel-check.mjs --drm --skip c` (inline; `--worker --skip c,d`) with window images (g), `--snapshot` (s) both modes | all pass (2026-11-22); The DRM path |
 
 Workloads that need no window system of ours (so nothing waits on wland):
 

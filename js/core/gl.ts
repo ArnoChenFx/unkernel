@@ -298,8 +298,25 @@ function describe(c: GlCore): string {
 	return `virglrenderer (wasm) on ${c.gl.getParameter(c.gl.VERSION)}; ${webglName(c.gl)}`;
 }
 
-/** The WebGL2 context's attributes (the probe's and the renderer's). */
+/**
+ * The WebGL2 context's attributes (the probe's; the renderer's add alpha).
+ * vrend draws into its own framebuffers; the drawing buffer only takes
+ * blits to become ImageBitmaps (transferToImageBitmap, which takes the
+ * buffer whatever preserveDrawingBuffer says).
+ */
 const WEBGL_ATTRS: WebGLContextAttributes = { alpha: false, depth: false, stencil: false, antialias: false, powerPreference: "high-performance" };
+
+/**
+ * The renderer's: with alpha, premultiplied, where the module has
+ * kw_vgpu_blit (GpuRenderer.image(): a client's translucent ARGB buffer as
+ * a translucent ImageBitmap; without alpha in the drawing buffer every
+ * image would be opaque). The scanout stays opaque: kw_vgpu_present writes
+ * alpha 1 after its blit. A module without blit keeps alpha: false, as
+ * its present copies an X format's undefined fourth byte.
+ */
+function rendererAttrs(module: VirglModule): WebGLContextAttributes {
+	return module.virgl.gpu.blit ? { ...WEBGL_ATTRS, alpha: true, premultipliedAlpha: true, preserveDrawingBuffer: false } : WEBGL_ATTRS;
+}
 
 /**
  * Load the module and start its renderer on a WebGL2 context of an
@@ -311,7 +328,7 @@ async function loadGlCore(url: string, log: (msg: string) => void): Promise<GlCo
 	const mod = await import(/* @vite-ignore */ url) as { default: (o: object) => Promise<VirglModule> };
 	const say = (s: string) => log(`[gl] virgl: ${s}`);
 	const Module = await mod.default({ print: say, printErr: say });
-	const gl = new OffscreenCanvas(1, 1).getContext("webgl2", WEBGL_ATTRS);
+	const gl = new OffscreenCanvas(1, 1).getContext("webgl2", rendererAttrs(Module));
 	if (!gl) throw new Error("no WebGL2 context (OffscreenCanvas.getContext(\"webgl2\") gave none)");
 	gl.canvas.addEventListener("webglcontextlost", () => log("[host] gl: the WebGL2 context was lost; GL clients will fail"));
 	Module.virgl.init(gl);

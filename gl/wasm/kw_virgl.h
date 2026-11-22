@@ -115,10 +115,16 @@ uint32_t kw_vgpu_format(uint32_t format);
 // last one retired.
 uint32_t kw_vgpu_fence(void);
 uint32_t kw_vgpu_fences_done(void);
-// A resource's texture, width, height, virgl format and Y_0_TOP; 0 or -ENOENT.
+// A resource's texture, width, height, virgl format, Y_0_TOP and whether
+// the format has alpha (OUT has 6 words); 0 or -ENOENT.
 int kw_vgpu_info(uint32_t res, uint32_t *out);
 // Blit a rectangle of a resource (row 0 at the top) to the context's
-// drawing buffer, sized w x h by the caller.
+// drawing buffer, sized w x h by the caller, top row at the top; colour and
+// alpha as the texture has them, unless these flags say otherwise.
+#define KW_VGPU_BLIT_OPAQUE 1u // alpha 1 (an X format, the scanout)
+#define KW_VGPU_BLIT_FLIP_Y 2u // the picture's top row at the bottom
+int kw_vgpu_blit(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t flags);
+// kw_vgpu_blit() with KW_VGPU_BLIT_OPAQUE: the scanout.
 int kw_vgpu_present(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 // Read a rectangle back (rows from the top, w * bpp bytes each).
 int kw_vgpu_read(uint32_t res, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t bpp, uint8_t *out);

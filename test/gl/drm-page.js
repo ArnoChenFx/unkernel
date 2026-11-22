@@ -8,7 +8,7 @@
 // repainted per animation frame: GlHost.gpu.drawFrame() while a GL client
 // has the scanout, frame() otherwise), runs the steps in the guest with no
 // GL environment variables and posts what they printed; the harness judges.
-// Query: size=WxH (the display), scenes= (glmark2 -b list), skip=a,b,c,d,e,
+// Query: size=WxH (the display), scenes= (glmark2 -b list), skip=a,b,c,d,e,g,
 // cmd= (a command run first, as root; for debugging), eager (gl: { eager:
 // true }: the renderer loads before the boot; by default it loads on the
 // guest's first GL use), glmodule=URL (another virgl.mjs: the harness's
@@ -103,17 +103,19 @@ async function main() {
 		: q.get("glmodule") ? { module: new URL(q.get("glmodule"), location.href).href, ...(q.has("eager") ? { eager: true } : {}) }
 		: q.has("eager") ? { eager: true } : true;
 	result.glOption = glOpt;
-	const vm = await createKernel({
+	const vmOpts = {
 		kernel: "/img/unkernel.wasm",
 		distro: "/img/debian.erofs",
-		disks: [{ kind: "http", url: "/img/debian-gl.img" }],
+		// snap: the overlay in IndexedDB (this run's own browser profile), so the machine can be snapshotted
+		disks: [{ kind: "http", url: "/img/debian-gl.img", ...(q.has("snap") ? { persist: "kwtest-drm-snapshot" } : {}) }],
 		gl: glOpt,
 		gpu: true,
 		display: { width: W, height: H, dpi: 96 },
 		worker: q.has("worker"),
 		memoryMiB: 1024,
 		log,
-	});
+	};
+	const vm = await createKernel(vmOpts);
 	vm.onOutput((b) => (consoleBuf += new TextDecoder().decode(b)));
 	const shown = display(vm);
 	log(`booted (transport ${vm.transport})`);
@@ -148,7 +150,7 @@ async function main() {
 	};
 
 	// the test programs, in /tmp
-	for (const name of ["kwgl-state", "prime", "kms-dumb"]) {
+	for (const name of ["kwgl-state", "prime", "kms-dumb", "window-image", "int-attrib"]) {
 		const r = await fetch(`/files/${name}`);
 		if (!r.ok) continue;
 		const bin = new Uint8Array(await r.arrayBuffer());
@@ -263,6 +265,38 @@ async function main() {
 		log(`prime: ${JSON.stringify(r)}, ${JSON.stringify(result.prime)}`);
 	}
 
+	// (g) window images: GL-rendered GBM window buffers of each format as
+	// ImageBitmaps (GlHost.gpu.image()), their pixels, the cost per image,
+	// and the scanout's presentation while images are taken in between
+	if (!skip.has("g")) await windowImages(vm, shown, result, run);
+
+	// (h) integer vertex attributes and colour buffers (Firefox's WebRender):
+	// right pixels, and no virtio-gpu command failed in the guest's kernel
+	if (!skip.has("h"))
+		await run("int-attrib", "dmesg -C; /tmp/int-attrib /dev/dri/renderD128; e=$?; echo \"kernel errors $(dmesg | grep -c 'response 0x')\"; exit $e");
+
+	// (l) lose=1: glmark2-es2-drm twice (the second run gets the first's
+	// context id again), then a third run during which the renderer's WebGL2
+	// context is lost (WEBGL_lose_context, as iOS drops contexts), then a
+	// fourth: the renderer must say so (stats.contextLost, lastError) and
+	// answer at once, so that the runs end instead of hanging
+	if (q.has("lose")) {
+		const gm = (name) => run(name, `${HOLD} timeout 300 glmark2-es2-drm ${DRM_GLMARK} -b build:duration=2 2>&1 <&3 | tail -3; echo "kernel errors $(dmesg | grep -c 'response 0x')"`);
+		await run("lose-clear", "dmesg -C");
+		await gm("lose-run1");
+		await gm("lose-run2");
+		result.lose = { before: { ...vm.gl.gpu.stats } };
+		const third = gm("lose-run3");
+		for (let i = 0; i < 600 && !(vm.gl.gpu.scanout?.seq > 10); i++) await sleep(100);
+		const sc = vm.gl.gpu.scanout, t = sc && vm.gl.gpu.texture(sc.resource);
+		const ext = t?.gl.getExtension("WEBGL_lose_context");
+		ext?.loseContext();
+		result.lose.lost = !!ext;
+		await third;
+		await gm("lose-run4");
+		result.lose.after = { ...vm.gl.gpu.stats };
+	}
+
 	// (f) without a renderer (glfail=module, or no WebGL2): what Mesa does, and the 2D KMS path
 	if (q.has("fail")) {
 		await run("fail-eglinfo-gbm", "eglinfo -B -p gbm 2>&1 | head -40");
@@ -276,10 +310,269 @@ async function main() {
 	result.fetches = virglFetches();
 	result.gl = vm.gl?.stats;
 	result.display = { painted: shown.st.painted, glPainted: shown.st.glPainted };
+
+	// (s) snap: a snapshot while a DRM file holds a 3D context that never
+	// submitted and has no resources (prime.c's importer between clients,
+	// as a Wayland relay idles), its restore, and the importer's context
+	// used again there (the restored device makes it again)
+	let vm2 = null;
+	if (q.has("snap")) vm2 = await snapshotIdleContext(vm, vmOpts, result, run);
+
 	result.totalS = Number(secs());
 	await post("/result", JSON.stringify(result));
 	log("done");
-	await vm.stop();
+	await (vm2 ?? vm).stop().catch(() => {});
+}
+
+async function snapshotIdleContext(vm, vmOpts, result, run) {
+	const out = (result.snapshot = { attempts: [] });
+	await run("snap-prime", "rm -f /tmp/go /tmp/prime.log; setsid nohup /tmp/prime /dev/dri/renderD128 60 /tmp/go </dev/null >/tmp/prime.log 2>&1 & echo started", { user: "user" });
+	const logOf = async (v) => (await v.exec("cat", ["/tmp/prime.log"])).stdout;
+	for (let i = 0; i < 100 && !/^idle/m.test(out.before ?? ""); i++) {
+		await sleep(200);
+		out.before = await logOf(vm);
+	}
+	if (!/^idle/m.test(out.before)) return (out.error = `prime did not get idle: ${out.before}`), null;
+	let snap = null;
+	for (let i = 0; i < 20 && !snap; i++) {
+		try {
+			snap = await vm.snapshot({ stop: true });
+			out.attempts.push("taken");
+		} catch (e) {
+			out.attempts.push(String(e?.message || e));
+			await sleep(250);
+		}
+	}
+	if (!snap) return (out.error = "no snapshot"), null;
+	const t = performance.now();
+	const vm2 = await createKernel({ ...vmOpts, restore: snap, log: (m) => {
+		if (/from before a restore/.test(m)) out.adopted = m;
+		log(m);
+	} });
+	out.restoreMs = Math.round(performance.now() - t);
+	await vm2.exec("touch", ["/tmp/go"]);
+	for (let i = 0; i < 150 && !/^res \d+$/m.test(out.after ?? ""); i++) {
+		await sleep(200);
+		out.after = await logOf(vm2);
+	}
+	const res = Number(/^res (\d+)$/m.exec(out.after ?? "")?.[1] ?? 0);
+	if (!res) return (out.error = `prime did not go on after the restore: ${out.after}`), vm2;
+	const img = await vm2.gl.gpu.image(res);
+	if (img) {
+		const c = new OffscreenCanvas(img.width, img.height).getContext("2d", { willReadFrequently: true });
+		c.drawImage(img, 0, 0);
+		out.pixel = Array.from(c.getImageData(40, 8, 1, 1).data);
+		out.size = `${img.width}x${img.height}`;
+		img.close();
+	}
+	out.gpu = vm2.gl.gpu.stats;
+	return vm2;
+}
+
+// test/gpu/window-image.c's picture, 64x48, by quadrant (TL, TR, BL, BR) as
+// premultiplied RGBA
+const WIN = { w: 64, h: 48, quads: [[255, 0, 0, 255], [0, 128, 0, 128], [0, 0, 0, 0], [0, 0, 64, 64]] };
+const XFORMATS = new Set([0x34325258, 0x34324258]); // XR24, XB24
+
+/** Pixels of `data` (w x h RGBA) more than 2 off what the picture composited over `bg` gives, per quadrant. */
+function judgePicture(data, w, h, { bg, opaque, flipY, crop }) {
+	const bad = [0, 0, 0, 0], got = [null, null, null, null];
+	for (let y = 0; y < h; y++)
+		for (let x = 0; x < w; x++) {
+			// where this pixel is in the picture
+			let px = x + (crop?.x ?? 0), py = y + (crop?.y ?? 0);
+			if (flipY) py = (crop?.height ?? WIN.h) - 1 - y + (crop?.y ?? 0);
+			const q = (py >= WIN.h / 2 ? 2 : 0) + (px >= WIN.w / 2 ? 1 : 0);
+			const [r, g, b, a] = WIN.quads[q];
+			const k = opaque ? 0 : 255 - a;
+			const want = [r + (bg * k) / 255, g + (bg * k) / 255, b + (bg * k) / 255];
+			const o = (y * w + x) * 4;
+			if (!got[q] && x % (WIN.w / 2) === 8 && y % (WIN.h / 2) === 8) got[q] = Array.from(data.slice(o, o + 3));
+			if (want.some((v, i) => Math.abs(data[o + i] - v) > 2) || data[o + 3] !== 255) bad[q]++;
+		}
+	return { bad: bad.reduce((a, b) => a + b, 0), perQuadrant: bad, samples: got };
+}
+
+/** Draw an image over a background of grey `bg` and read it back. */
+function composite(img, bg) {
+	const c = new OffscreenCanvas(img.width, img.height);
+	const ctx = c.getContext("2d", { willReadFrequently: true });
+	ctx.fillStyle = `rgb(${bg},${bg},${bg})`;
+	ctx.fillRect(0, 0, c.width, c.height);
+	ctx.drawImage(img, 0, 0);
+	return ctx.getImageData(0, 0, c.width, c.height).data;
+}
+
+async function windowImages(vm, shown, result, run) {
+	const gpu = vm.gl.gpu;
+	const out = (result.windowImages = { bufs: {}, checks: [], timing: {}, scanout: [] });
+	const p = await vm.spawn("/tmp/window-image", ["/dev/dri/renderD128", "600"], { user: "user", pty: false });
+	const errText = new Response(p.stderr).text();
+	const reader = p.stdout.getReader();
+	const dec = new TextDecoder();
+	let text = "";
+	for (;;) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		text += dec.decode(value);
+		if (/^ready$/m.test(text)) break;
+	}
+	out.stdout = text;
+	for (const m of text.matchAll(/^buf (\S+) res (\d+) fourcc 0x([0-9a-f]+) (\d+)x(\d+)$/gm))
+		out.bufs[m[1]] = { res: Number(m[2]), fourcc: parseInt(m[3], 16), width: Number(m[4]), height: Number(m[5]) };
+	if (!/^ready$/m.test(text)) {
+		out.error = `window-image did not get ready: ${text} ${await errText}`;
+		return;
+	}
+	const check = async (name, buf, opts, how) => {
+		const img = await gpu.image(buf.res, opts);
+		const c = { name, opts, size: img ? `${img.width}x${img.height}` : null };
+		if (img) {
+			const w = img.width, h = img.height;
+			const black = judgePicture(composite(img, 0), w, h, { ...how, bg: 0 });
+			const white = judgePicture(composite(img, 255), w, h, { ...how, bg: 255 });
+			c.bad = black.bad + white.bad;
+			c.overBlack = black.samples;
+			c.overWhite = white.samples;
+			c.perQuadrant = [black.perQuadrant, white.perQuadrant];
+			img.close();
+		}
+		out.checks.push(c);
+		return c;
+	};
+	for (const name of ["argb", "xrgb", "abgr", "xbgr"]) {
+		const b = out.bufs[name];
+		if (!b) continue;
+		const t = gpu.texture(b.res);
+		b.texture = t && { format: t.format, yTop: t.yTop, alpha: t.alpha, width: t.width, height: t.height };
+		const opaque = XFORMATS.has(b.fourcc);
+		b.want = opaque ? "opaque" : "alpha";
+		// as the page's resolver would pass it, and with the defaults (the resource's format decides)
+		await check(name, b, { opaque }, { opaque });
+		await check(`${name} default`, b, {}, { opaque });
+		await check(`${name} flipY`, b, { opaque, flipY: true }, { opaque, flipY: true });
+		// the top right quadrant alone
+		const crop = { x: 32, y: 0, width: 32, height: 24 };
+		await check(`${name} crop`, b, { opaque, ...crop }, { opaque, crop });
+	}
+	// null for an id the guest has not made, and for an empty rectangle
+	out.nulls = { unknown: gpu.image(0x3fffffff) === null, empty: gpu.image(out.bufs.argb.res, { width: 0 }) === null };
+
+	// The cost of an image: image() + drawImage() into a 2D canvas + close(),
+	// N times; then a 1x1 getImageData waits for the GPU (so "total" counts
+	// the GPU's work too)
+	const sink = new OffscreenCanvas(1920, 1080).getContext("2d", { willReadFrequently: true });
+	// (`draw` false: image() + close() alone, the last image drawn to wait)
+	const timeIt = (resList, n, draw = true) => {
+		for (let i = 0; i < 3; i++) for (const r of resList) gpu.image(r).close();
+		sink.getImageData(0, 0, 1, 1);
+		const t0 = performance.now();
+		let issue = 0;
+		for (let i = 0; i < n; i++) {
+			const r = resList[i % resList.length];
+			const t = performance.now();
+			const img = gpu.image(r);
+			if (draw || i === n - 1) sink.drawImage(img, 0, 0);
+			img.close();
+			issue += performance.now() - t;
+		}
+		sink.getImageData(0, 0, 1, 1);
+		const total = performance.now() - t0;
+		return { n, issueMs: +(issue / n).toFixed(3), totalMs: +(total / n).toFixed(3) };
+	};
+	const r800 = out.bufs["argb-800x600"].res, r1080 = out.bufs["argb-1920x1080"].res;
+	out.timing["800x600"] = timeIt([r800], 100);
+	out.timing["1920x1080"] = timeIt([r1080], 100);
+	out.timing["800x600, no drawImage"] = timeIt([r800], 100, false);
+	out.timing["1920x1080, no drawImage"] = timeIt([r1080], 100, false);
+	out.timing["alternating 800x600 / 1920x1080 (canvas resized each time)"] = timeIt([r800, r1080], 100);
+	// what a readback would cost instead: readPixels of the texture
+	const readback = (res, n) => {
+		const t = gpu.texture(res), gl = t.gl, fb = gl.createFramebuffer(), buf = new Uint8Array(t.width * t.height * 4);
+		gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+		gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.texture, 0);
+		gl.readPixels(0, 0, t.width, t.height, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+		const t0 = performance.now();
+		for (let i = 0; i < n; i++) gl.readPixels(0, 0, t.width, t.height, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+		const ms = (performance.now() - t0) / n;
+		gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+		gl.deleteFramebuffer(fb);
+		return +ms.toFixed(3);
+	};
+	out.timing.readPixels = { "800x600": readback(r800, 20), "1920x1080": readback(r1080, 20) };
+	// the same on a plain WebGL2 OffscreenCanvas (no virgl): a clear and a
+	// blit of a texture of that size into the drawing buffer, then
+	// transferToImageBitmap(), which waits for them
+	for (const [w, h] of [[800, 600], [1920, 1080]]) {
+		const c = new OffscreenCanvas(w, h), g2 = c.getContext("webgl2", { alpha: true, depth: false, antialias: false });
+		const tex = g2.createTexture(), fb = g2.createFramebuffer();
+		g2.bindTexture(g2.TEXTURE_2D, tex);
+		g2.texStorage2D(g2.TEXTURE_2D, 1, g2.RGBA8, w, h);
+		g2.bindFramebuffer(g2.READ_FRAMEBUFFER, fb);
+		g2.framebufferTexture2D(g2.READ_FRAMEBUFFER, g2.COLOR_ATTACHMENT0, g2.TEXTURE_2D, tex, 0);
+		let ms = 0;
+		for (let i = 0; i < 53; i++) {
+			const t = performance.now();
+			g2.clear(g2.COLOR_BUFFER_BIT);
+			g2.blitFramebuffer(0, 0, w, h, 0, h, w, 0, g2.COLOR_BUFFER_BIT, g2.NEAREST);
+			c.transferToImageBitmap().close();
+			if (i >= 3) ms += performance.now() - t;
+		}
+		out.timing[`plain WebGL2 ${w}x${h}: clear, blit, transferToImageBitmap`] = +(ms / 50).toFixed(3);
+		g2.getExtension("WEBGL_lose_context")?.loseContext();
+	}
+
+	// The scanout while images are taken: kmscube's frames on the page's
+	// canvas against the scanout read back, drawn over white too (opaque),
+	// with images of the window buffers taken between presents
+	if (!skip.has("b2")) {
+		const kms = run("window-image-kmscube", `${HOLD} timeout 300 kmscube -D /dev/dri/card0 -c 400 2>&1 <&3`);
+		const white = new OffscreenCanvas(1, 1).getContext("2d", { willReadFrequently: true });
+		let images = 0, imageMs = 0, imagesBad = 0;
+		for (let i = 0; i < 600 && out.scanout.length < 4; i++) {
+			await sleep(50);
+			const s = gpu.scanout;
+			if (!s || s.seq < 20) continue;
+			// images between presents (the drawing buffer resized to them and back)
+			for (const r of [out.bufs.argb.res, r1080, out.bufs.xrgb.res]) {
+				const t = performance.now();
+				const img = gpu.image(r, { opaque: r === out.bufs.xrgb.res });
+				imageMs += performance.now() - t;
+				images++;
+				if (r !== r1080 && judgePicture(composite(img, 255), img.width, img.height, { bg: 255, opaque: r === out.bufs.xrgb.res }).bad) imagesBad++;
+				img.close();
+			}
+			const seq = s.seq;
+			for (let k = 0; k < 40 && gpu.scanout?.seq === seq; k++) await sleep(10);
+			const s2 = gpu.scanout;
+			if (!s2 || s2.seq === seq) continue;
+			gpu.drawFrame(shown.ctx, true);
+			const img = shown.ctx.getImageData(0, 0, s2.width, s2.height);
+			white.canvas.width = s2.width;
+			white.canvas.height = s2.height;
+			white.fillStyle = "#fff";
+			white.fillRect(0, 0, s2.width, s2.height);
+			gpu.drawFrame(white, true);
+			const onWhite = white.getImageData(0, 0, s2.width, s2.height);
+			const back = vm.frame();
+			let diff = 0, diffWhite = 0, translucent = 0;
+			for (let q = 0; back && q < img.data.length; q += 4) {
+				if (img.data[q] !== back.data[q] || img.data[q + 1] !== back.data[q + 1] || img.data[q + 2] !== back.data[q + 2]) diff++;
+				if (onWhite.data[q] !== back.data[q] || onWhite.data[q + 1] !== back.data[q + 1] || onWhite.data[q + 2] !== back.data[q + 2]) diffWhite++;
+				if (img.data[q + 3] !== 255) translucent++;
+			}
+			out.scanout.push({ seq: s2.seq, size: `${s2.width}x${s2.height}`, ...summary(img.data), differFromReadback: back ? diff : -1,
+				overWhiteDifferFromReadback: back ? diffWhite : -1, translucent });
+		}
+		await kms;
+		out.scanoutImages = { images, bad: imagesBad, msPerImage: images ? +(imageMs / images).toFixed(3) : null };
+	}
+	p.kill("SIGTERM");
+	const end = await p.ended;
+	out.ended = end;
+	out.stderr = await errText;
+	result.steps["window-image"] = { exitCode: 0, stdout: text, stderr: out.stderr, ms: 0 };
+	log(`window images: ${JSON.stringify(out)}`);
 }
 
 main().catch(async (e) => {

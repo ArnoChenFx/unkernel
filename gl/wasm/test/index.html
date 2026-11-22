@@ -375,7 +375,8 @@ async function main() {
   code ||= g.command(vcmd(0x204, 1, [77, 2, 2, 2 | 8, 4, 4, 1, 1, 0, 0, 0]));
   code ||= g.command(vcmd(0x202, 1, [77])); // CTX_ATTACH_RESOURCE
   const px = new Uint8Array(64);
-  for (let i = 0; i < 16; i++) px.set([i * 16, 255 - i * 16, (i & 3) * 80, 255], i * 4); // B, G, R, X; row 0 first
+  // B, G, R, X; row 0 first; X is not 255, which present() must not show
+  for (let i = 0; i < 16; i++) px.set([i * 16, 255 - i * 16, (i & 3) * 80, 0x40], i * 4);
   // TRANSFER_TO_HOST_3D: box 0,0,0 4x4x1, offset 0 (u64), res 77, level 0, stride 16, layer_stride 64
   code ||= g.command(vcmd(0x205, 1, [0, 0, 0, 4, 4, 1, 0, 0, 77, 0, 16, 64]), px);
   const back3 = new Uint8Array(64);
@@ -396,11 +397,47 @@ async function main() {
   let bad = 0;
   for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
     const s = ((3 - y) * 4 + x) * 4, p = (y * 4 + x) * 4;
-    if (shown[s] !== px[p + 2] || shown[s + 1] !== px[p + 1] || shown[s + 2] !== px[p]) bad++;
+    if (shown[s] !== px[p + 2] || shown[s + 1] !== px[p + 1] || shown[s + 2] !== px[p] || shown[s + 3] !== 255) bad++;
   }
-  out.gpu.presented = bad ? `${bad} of 16 pixels differ` : 'top row at the top, colours right';
+  out.gpu.presented = bad ? `${bad} of 16 pixels differ` : 'top row at the top, colours right, opaque';
   if (bad) throw new Error(`gpu: presented picture: ${out.gpu.presented}; got ${Array.from(shown.slice(0, 8))}`);
   if (!out.gpu.read) throw new Error('gpu: read() differs');
+  // blit(): a B8G8R8A8 texture (78) with premultiplied translucent texels
+  // keeps its alpha, flipped with BLIT_FLIP_Y; the X texture (77) with
+  // BLIT_OPAQUE is opaque, without it its fourth byte shows
+  code = g.command(vcmd(0x204, 1, [78, 2, 1, 2 | 8, 4, 4, 1, 1, 0, 0, 0]));
+  code ||= g.command(vcmd(0x202, 1, [78]));
+  const pa = new Uint8Array(64);
+  for (let i = 0; i < 16; i++) {
+    const a = i * 17; // 0 .. 255
+    pa.set([(i & 1) * a, ((i >> 1) & 1) * a, a >> 1, a], i * 4); // B, G, R, A: premultiplied
+  }
+  code ||= g.command(vcmd(0x205, 1, [0, 0, 0, 4, 4, 1, 0, 0, 78, 0, 16, 64]), pa);
+  if (code) throw new Error(`gpu: command answered 0x${code.toString(16)}`);
+  const i77 = g.info(77), i78 = g.info(78);
+  out.gpu.alpha = { x: i77.alpha, a: i78.alpha };
+  if (i77.alpha || !i78.alpha) throw new Error(`gpu: info().alpha: B8G8R8X8 ${i77.alpha}, B8G8R8A8 ${i78.alpha}`);
+  const blitted = (res, flags, src, alpha) => {
+    if (g.blit(res, 0, 0, 4, 4, flags) !== 0) throw new Error(`gpu: blit ${res} failed`);
+    const got = new Uint8Array(64);
+    gl.readPixels(0, 0, 4, 4, gl.RGBA, gl.UNSIGNED_BYTE, got);
+    let n = 0;
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
+      // readPixels' row 0 is the bottom: unflipped, the picture's last row
+      const s = ((flags & g.BLIT_FLIP_Y ? y : 3 - y) * 4 + x) * 4, p = (y * 4 + x) * 4;
+      if (got[s] !== src[p + 2] || got[s + 1] !== src[p + 1] || got[s + 2] !== src[p] || got[s + 3] !== alpha(src[p + 3])) n++;
+    }
+    return n;
+  };
+  const blits = {
+    alpha: blitted(78, 0, pa, (a) => a),
+    flipped: blitted(78, g.BLIT_FLIP_Y, pa, (a) => a),
+    opaque: blitted(77, g.BLIT_OPAQUE, px, () => 255),
+    raw: blitted(77, 0, px, (a) => a),
+  };
+  out.gpu.blits = blits;
+  if (blits.alpha || blits.flipped || blits.opaque) throw new Error(`gpu: blit: pixels that differ ${JSON.stringify(blits)}`);
+  g.command(vcmd(0x102, 0, [78]));
   const seq = g.fence();
   let polls = 0;
   while (((g.fencesDone() - seq) | 0) < 0 && polls < 500) {

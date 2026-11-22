@@ -175,6 +175,8 @@ export class VirglGpuBackend implements GpuBackend {
 	#tail: Promise<unknown> | null = null;
 	#resources = new Map<number, Resource3d>();
 	#contexts = new Set<number>();
+	/** Contexts that submitted commands: they hold objects in the renderer (blocker()). */
+	#submitted = new Set<number>();
 
 	constructor(link: GpuLink, log: (msg: string) => void = () => {}) {
 		this.#link = link;
@@ -193,14 +195,42 @@ export class VirglGpuBackend implements GpuBackend {
 	reset(): void {
 		this.#resources.clear();
 		this.#contexts.clear();
+		this.#submitted.clear();
 		this.#tail = null;
 		this.#link.reset();
 	}
 
+	/**
+	 * What a snapshot would lose: any 3D resource, or a context that
+	 * submitted commands (its objects: shaders, states, sub contexts). A
+	 * context that never submitted and, as no resource exists, has none
+	 * attached (a compositor or relay that opened the render node and
+	 * imported buffers that are gone) is only its id in the renderer; the
+	 * guest's kernel keeps it across a restore, and the first command that
+	 * names it there makes it again (#adopt), as it was.
+	 */
 	blocker(): string {
 		if (this.#resources.size) return "virtio-gpu resources";
-		if (this.#contexts.size) return "virtio-gpu contexts";
+		if (this.#submitted.size) return "virtio-gpu contexts";
 		return "";
+	}
+
+	/**
+	 * A command names a context this side did not see made: one from
+	 * before a restore (blocker() let only empty ones through). Make it in
+	 * the renderer first, as the guest made it then (without
+	 * CONTEXT_INIT: no flags; the debug name is lost).
+	 */
+	#adopt(ctx: number): void {
+		if (!ctx || this.#contexts.has(ctx)) return;
+		this.#contexts.add(ctx);
+		this.#log(`[virtio-gpu] context ${ctx} is from before a restore: made again in the renderer`);
+		const b = new Uint8Array(HDR + 72);
+		const dv = new DataView(b.buffer);
+		dv.setUint32(0, GPU_CMD.CTX_CREATE, true);
+		dv.setUint32(16, ctx, true);
+		this.#start();
+		void this.#send({ cmd: b }, false);
 	}
 
 	/** The guest uses 3D: load the renderer (once). */
@@ -292,6 +322,7 @@ export class VirglGpuBackend implements GpuBackend {
 				need(48);
 				const res = this.#resources.get(dv.getUint32(HDR + 32, true));
 				if (!res) return resp(GPU_RESP.ERR_INVALID_RESOURCE_ID);
+				this.#adopt(dv.getUint32(16, true));
 				const toHost = type === GPU_CMD.TRANSFER_TO_HOST_3D;
 				// The packing needs the renderer's format table: wait for it, and keep later sends behind.
 				const run = () => this.#transferNow(cmd, dv, res, ctx, toHost, fenced);
@@ -304,10 +335,14 @@ export class VirglGpuBackend implements GpuBackend {
 				return this.#send({ cmd }, fenced);
 			case GPU_CMD.CTX_DESTROY:
 				this.#contexts.delete(dv.getUint32(16, true));
+				this.#submitted.delete(dv.getUint32(16, true));
 				return this.#send({ cmd }, fenced);
+			case GPU_CMD.SUBMIT_3D:
+				this.#submitted.add(dv.getUint32(16, true));
+			// fallthrough
 			case GPU_CMD.CTX_ATTACH_RESOURCE:
 			case GPU_CMD.CTX_DETACH_RESOURCE:
-			case GPU_CMD.SUBMIT_3D:
+				this.#adopt(dv.getUint32(16, true));
 				this.#start();
 				return this.#send({ cmd }, fenced);
 			case GPU_CMD.SET_SCANOUT:
@@ -476,7 +511,9 @@ export interface VirglGpuApi {
 	format(f: number): number;
 	fence(): number;
 	fencesDone(): number;
-	info(res: number): { texture: WebGLTexture | null; width: number; height: number; format: number; yTop: boolean } | null;
+	info(res: number): { texture: WebGLTexture | null; width: number; height: number; format: number; yTop: boolean; alpha?: boolean } | null;
+	/** Absent in a module from before window images (GpuRenderer.image() then gives null). */
+	blit?(res: number, x: number, y: number, w: number, h: number, flags?: number): number;
 	present(res: number, x: number, y: number, w: number, h: number): number;
 	read(res: number, x: number, y: number, w: number, h: number, bpp?: number): Uint8Array | null;
 }
@@ -504,6 +541,36 @@ export interface GpuTexture {
 	 * counts rows (from the bottom) it is upside down.
 	 */
 	yTop: boolean;
+	/** The format has alpha (B8G8R8A8, R8G8B8A8 ...; not B8G8R8X8, R8G8B8X8). */
+	alpha: boolean;
+}
+
+/** Command names for messages (GpuRendererStats.lastError). */
+const CMD_NAMES = new Map<number, string>(Object.entries(GPU_CMD).map(([k, v]) => [v, k]));
+
+/** kw_vgpu_blit()'s flags (gl/wasm/kw_virgl.h). */
+const BLIT_OPAQUE = 1, BLIT_FLIP_Y = 2;
+
+/** What GpuRenderer.image() takes of a resource, and how. */
+export interface GpuImageOptions {
+	/** The rectangle of the picture (rows from the top): default all of it; clamped to the resource. */
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+	/**
+	 * Alpha 1 everywhere. Default: when the resource's format has none
+	 * (GpuTexture.alpha). Pass what the client declared: true for an X
+	 * fourcc (XR24, XB24: the fourth byte is undefined), false for an A one
+	 * (AR24, AB24: premultiplied alpha, kept).
+	 */
+	opaque?: boolean;
+	/**
+	 * Upside down: the image's row 0 is the picture's last row. For a
+	 * buffer whose client set y_invert (zwp_linux_buffer_params_v1 flag 1:
+	 * its row 0 is the bottom), so that the image's row 0 is the top.
+	 */
+	flipY?: boolean;
 }
 
 export interface GpuRendererStats {
@@ -516,8 +583,18 @@ export interface GpuRendererStats {
 	/** Frames presented (RESOURCE_FLUSH of the scanout), and readbacks (TRANSFER_FROM_HOST_3D). */
 	presents: number;
 	reads: number;
-	/** Commands the renderer refused (logged). */
+	/** Window images made (image()). */
+	images: number;
+	/** Commands the renderer refused or could not run (logged, at most one line a second). */
 	errors: number;
+	/**
+	 * The latest of those, for a device without DevTools: the command, its
+	 * context and resource, the answer and why ("" while none failed), e.g.
+	 * "SUBMIT_3D ctx 1: 0x1200, the renderer refused it (...)".
+	 */
+	lastError: string;
+	/** The WebGL2 context was lost: every 3D command fails from then on. */
+	contextLost: boolean;
 }
 
 export interface GpuRendererOptions {
@@ -552,16 +629,23 @@ export interface GpuScanout {
  * it into the context's drawing buffer (sized to the scanout) and takes it
  * as an ImageBitmap (transferToImageBitmap: no readback), which
  * drawFrame() draws into the page's canvas. frame() reads the scanout back
- * on demand (screenshots).
+ * on demand (screenshots). image() takes any resource's picture the same
+ * way, for a compositor on the page (window images).
  */
 export class GpuRenderer {
 	/** The capsets and the format table once the renderer is up (after start()); rejects if it cannot be. */
 	readonly init: Promise<GpuInit>;
-	stats: GpuRendererStats = { commands: 0, fenced: 0, parks: 0, parkedMs: 0, presents: 0, reads: 0, errors: 0 };
+	stats: GpuRendererStats = { commands: 0, fenced: 0, parks: 0, parkedMs: 0, presents: 0, reads: 0, images: 0, errors: 0, lastError: "", contextLost: false };
 	/** A new frame was presented, or the scanout changed. */
 	onFrame: (() => void) | undefined;
 	#load: () => Promise<GpuRendererCore>;
 	#started = false;
+	#failed = false;
+	/** The WebGL2 context was lost (webglcontextlost, or isContextLost()). */
+	#lost = false;
+	/** Error lines: when the last was logged, and how many were left out since. */
+	#errorLogAt = -Infinity;
+	#errorsUnlogged = 0;
 	#settle!: { resolve: (c: GpuRendererCore) => void; reject: (e: unknown) => void };
 	#core: GpuRendererCore | null = null;
 	#queue: Array<{ req: GpuRequest; done?: (r: GpuReply | Promise<GpuReply>) => void }> | null = [];
@@ -605,6 +689,9 @@ export class GpuRenderer {
 			const formats = new Uint32Array(512);
 			for (let f = 0; f < formats.length; f++) formats[f] = c.gpu.format(f);
 			this.#core = c;
+			// The browser may drop the context (memory pressure, a page in the background on
+			// iOS, a GPU reset): fail every 3D command cleanly from then on (#loseContext).
+			(c.gl.canvas as OffscreenCanvas).addEventListener?.("webglcontextlost", () => this.#loseContext());
 			const q = this.#queue ?? [];
 			this.#queue = null;
 			for (const { req, done } of q) {
@@ -614,9 +701,11 @@ export class GpuRenderer {
 			return { capsets, formats };
 		});
 		this.init.catch((e: unknown) => {
+			this.#failed = true;
 			const q = this.#queue ?? [];
 			this.#queue = null;
 			for (const { done } of q) done?.({ code: GPU_RESP.ERR_UNSPEC });
+			this.stats.lastError = `no renderer, every 3D command fails: ${(e as Error)?.message ?? e}`;
 			this.#log(`[gl] virtio-gpu: no renderer: ${(e as Error)?.message ?? e}`);
 		});
 	}
@@ -735,7 +824,57 @@ export class GpuRenderer {
 	texture(resource: number): GpuTexture | null {
 		const c = this.#core;
 		const i = c?.gpu.info(resource);
-		return c && i ? { gl: c.gl, ...i } : null;
+		return c && i ? { gl: c.gl, ...i, alpha: i.alpha ?? false } : null;
+	}
+
+	/**
+	 * A resource's picture as an ImageBitmap, for a compositor on the page
+	 * (a guest client's dmabuf: DRM_IOCTL_VIRTGPU_RESOURCE_INFO gives the
+	 * resource id; textures do not cross WebGL contexts, images do). Row 0
+	 * is the picture's top row as the guest lays it out (VIRGL_RESOURCE_Y_0_TOP
+	 * resources included), unless `flipY`; colour and alpha as the client
+	 * rendered them, premultiplied (Wayland's ARGB, and what a 2D canvas's
+	 * drawImage() takes from an ImageBitmap), or opaque (`opaque`, by default
+	 * for a format without alpha). No readback: the module blits the texture
+	 * into the renderer's drawing buffer (vrend's state handled as for the
+	 * scanout) and takes it with transferToImageBitmap(), so the image holds
+	 * what the guest's commands before this call drew, now; later rendering
+	 * does not change it. The image is the caller's: close() it when drawn.
+	 *
+	 * Null for an unknown id, a resource without a texture (a buffer), an
+	 * empty rectangle, or no renderer; a promise while the renderer is
+	 * still loading (it waits for it; the guest made no 3D resource before
+	 * the renderer could run its commands, so nothing waits otherwise). It
+	 * never loads the renderer: before the guest's first 3D use there is no
+	 * resource. The drawing buffer is resized to the image (the scanout's
+	 * next present resizes it back; its frame is already an ImageBitmap).
+	 */
+	image(resource: number, opts: GpuImageOptions = {}): ImageBitmap | null | Promise<ImageBitmap | null> {
+		if (this.#core) return this.#image(this.#core, resource, opts);
+		if (!this.#started || this.#failed) return null;
+		return this.init.then(() => this.#image(this.#core!, resource, opts), () => null);
+	}
+
+	#image(c: GpuRendererCore, resource: number, opts: GpuImageOptions): ImageBitmap | null {
+		if (this.#lost) return null;
+		const i = c.gpu.info(resource);
+		const canvas = c.gl.canvas as OffscreenCanvas;
+		if (!i?.texture || !c.gpu.blit || typeof canvas.transferToImageBitmap !== "function") return null;
+		const x = Math.max(0, Math.floor(opts.x ?? 0)), y = Math.max(0, Math.floor(opts.y ?? 0));
+		const w = Math.min(Math.floor(opts.width ?? i.width), i.width - x), h = Math.min(Math.floor(opts.height ?? i.height), i.height - y);
+		if (!(w > 0 && h > 0)) return null;
+		if (canvas.width !== w || canvas.height !== h) {
+			canvas.width = w;
+			canvas.height = h;
+		}
+		if (c.gl.drawingBufferWidth !== w || c.gl.drawingBufferHeight !== h) {
+			this.#log(`[gl] virtio-gpu: no ${w}x${h} drawing buffer for resource ${resource} (got ${c.gl.drawingBufferWidth}x${c.gl.drawingBufferHeight})`);
+			return null;
+		}
+		const flags = ((opts.opaque ?? !i.alpha) ? BLIT_OPAQUE : 0) | (opts.flipY ? BLIT_FLIP_Y : 0);
+		if (c.gpu.blit(resource, x, y, w, h, flags) < 0) return null;
+		this.stats.images++;
+		return canvas.transferToImageBitmap();
 	}
 
 	#run(req: GpuRequest): GpuReply | Promise<GpuReply> {
@@ -744,6 +883,12 @@ export class GpuRenderer {
 		const type = dv.getUint32(0, true);
 		const fenced = (dv.getUint32(4, true) & FLAG_FENCE) !== 0;
 		this.stats.commands++;
+		if (this.#lost || c.gl.isContextLost()) {
+			// Counted; lastError keeps saying the context was lost (#loseContext).
+			this.#loseContext();
+			this.stats.errors++;
+			return { code: GPU_RESP.ERR_UNSPEC };
+		}
 		let code = 0, data: Uint8Array | undefined;
 		switch (type) {
 			case GPU_CMD.SET_SCANOUT: {
@@ -774,10 +919,7 @@ export class GpuRenderer {
 					else if (type === GPU_CMD.CTX_DESTROY) this.#contexts.delete(dv.getUint32(16, true));
 				}
 		}
-		if (code) {
-			this.stats.errors++;
-			return { code };
-		}
+		if (code) return this.#refused(dv, code, "the renderer refused it (the [gl] virgl: lines before this one have its reason)", true);
 		if (!fenced) return { code, data };
 		return this.#fence(type, { code, data });
 	}
@@ -814,7 +956,53 @@ export class GpuRenderer {
 		});
 	}
 
+	/**
+	 * A command that failed: counted, kept as stats.lastError, and logged at
+	 * most once a second (a client whose context is in error fails every
+	 * command; the guest's kernel logs each, rate-limited, as "response
+	 * 0x1200 (command 0x207)").
+	 */
+	#refused(dv: DataView, code: number, why: string, log: boolean): GpuReply {
+		const type = dv.getUint32(0, true), ctx = dv.getUint32(16, true);
+		const res = type === GPU_CMD.TRANSFER_TO_HOST_3D || type === GPU_CMD.TRANSFER_FROM_HOST_3D ? dv.getUint32(HDR + 32, true)
+			: type !== GPU_CMD.SUBMIT_3D && type !== GPU_CMD.CTX_CREATE && type !== GPU_CMD.CTX_DESTROY && dv.byteLength >= HDR + 4 ? dv.getUint32(HDR, true) : 0;
+		const name = CMD_NAMES.get(type) ?? `command 0x${type.toString(16)}`;
+		this.stats.errors++;
+		this.stats.lastError = `${name}${ctx ? ` ctx ${ctx}` : ""}${res ? ` resource ${res}` : ""}: 0x${code.toString(16)}, ${why}`;
+		if (log) {
+			const now = performance.now();
+			if (now - this.#errorLogAt >= 1000) {
+				this.#log(`[gl] virtio-gpu: ${this.stats.lastError}${this.#errorsUnlogged ? ` (${this.#errorsUnlogged} more failed since the last line)` : ""}`);
+				this.#errorLogAt = now;
+				this.#errorsUnlogged = 0;
+			} else this.#errorsUnlogged++;
+		}
+		return { code };
+	}
+
+	/**
+	 * The WebGL2 context is gone, and with it every object of the renderer:
+	 * the guest's contexts and resources cannot be had back (a restored
+	 * context is a new, empty one, and virtio-gpu has no way to tell the
+	 * guest its GPU objects are gone). Say so once, answer every later 3D
+	 * command with ERR_UNSPEC at once (no GL call on a lost context), and
+	 * let waits for GPU work end now, so no guest program hangs on a fence.
+	 */
+	#loseContext(): void {
+		if (this.#lost) return;
+		this.#lost = true;
+		this.stats.contextLost = true;
+		this.#log("[gl] virtio-gpu: the WebGL2 context was lost (the browser dropped it: memory pressure, the page in the background, a GPU reset); " +
+			"every 3D command fails from now on (the guest's kernel logs \"response 0x1200\"), so GL programs in the guest fail; reload the page for a new renderer");
+		this.stats.lastError = "the WebGL2 context was lost";
+		this.#hold = 0;
+		for (const w of this.#waits) w.resolve();
+		this.#waits = [];
+		this.#setScanout(null);
+	}
+
 	#done(seq: number): boolean {
+		if (this.#lost) return true;
 		return ((this.#core!.gpu.fencesDone() - seq) | 0) >= 0 || ((this.#floor - seq) | 0) >= 0;
 	}
 
@@ -856,9 +1044,13 @@ export class GpuRenderer {
 		try { this.onFrame?.(); } catch {}
 	}
 
-	/** Blit the scanout into the drawing buffer and take it as an ImageBitmap. */
+	/**
+	 * Blit the scanout into the drawing buffer, opaque (kw_vgpu_present: the
+	 * drawing buffer has alpha for image()), and take it as an ImageBitmap.
+	 */
 	#present(): void {
 		const s = this.#scanout!, c = this.#core!;
+		if (this.#lost) return;
 		const canvas = c.gl.canvas as OffscreenCanvas;
 		if (canvas.width !== s.width || canvas.height !== s.height) {
 			canvas.width = s.width;

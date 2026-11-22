@@ -47,6 +47,37 @@
 //      and imported by a second opener names the same host resource
 //      (DRM_IOCTL_VIRTGPU_RESOURCE_INFO), and the host finds its texture
 //      (GlHost.gpu.texture()) with the pattern the importer uploaded
+//   g  window images: test/gpu/window-image.c (built for the guest as
+//      kwgl-state is) draws a picture with translucent quadrants into GBM
+//      window surfaces (EGL, Mesa's virgl) of ARGB8888, XRGB8888 and, where
+//      Mesa has the configs, ABGR8888 and XBGR8888; the page takes each
+//      front buffer's resource as an ImageBitmap (GlHost.gpu.image()) and
+//      composites it over black and over white: alpha premultiplied, the
+//      top row at the top (flipY: at the bottom), X formats opaque, a
+//      cropped rectangle; null for unknown ids; the cost per image at
+//      800x600 and 1920x1080 (and against readPixels, reported); then
+//      kmscube's frames on the page's canvas, drawn plain and over white,
+//      must equal the scanout read back while images are taken between
+//      its presents (skip=b2 leaves that part out)
+//   h  test/gpu/int-attrib.c (built as kwgl-state is): a GLES 3 draw with
+//      integer vertex attributes (instanced, as Firefox's WebRender draws)
+//      into an RGBA8 and an RGBA8UI colour buffer, read back: the pixels
+//      must be right and the guest's kernel must log no failed virtio-gpu
+//      command (WebGL refuses a draw whose shader input types differ from
+//      the attributes', which put the renderer's context in error)
+//
+// --lose adds step l: glmark2-es2-drm twice, then a run during which the
+// renderer's WebGL2 context is lost (WEBGL_lose_context) and one after:
+// both earlier runs without a failed virtio-gpu command, and after the
+// loss the renderer says so (stats.contextLost) and the runs end.
+//
+// --snapshot adds step s (the Debian disk's overlay then lives in the
+// page's IndexedDB, so that the machine can be snapshotted): prime.c leaves
+// its importer's DRM file with a 3D context that has no resource and never
+// submitted (a Wayland relay between clients); the snapshot must be taken
+// (with stop) and restored in the same page, where the importer imports
+// and uploads a new buffer through that context: its picture must reach
+// GlHost.gpu.image() with no renderer error
 //
 // and reports the renderer's status (vm.gl.status) and when the page
 // fetched virgl.mjs and virgl.wasm: by default the renderer loads on the
@@ -96,7 +127,9 @@ const disk = join(build, "gl/debian-gl.img");
 const distro = join(build, "distro/debian.erofs");
 const stateBin = join(build, "gl/kwgl-state-aarch64");
 const primeBin = join(out, "prime");
+const windowBin = join(out, "window-image");
 const kmsDumbBin = join(out, "kms-dumb");
+const intAttribBin = join(out, "int-attrib");
 
 const step = (what, cmd, cmdArgs) => {
 	console.log(`== ${what}`);
@@ -122,6 +155,8 @@ if (drm && !existsSync(kernelFile)) {
 	process.exit(2);
 }
 if (drm) step("test/gpu/prime.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", primeBin, join(root, "test/gpu/prime.c")]);
+if (drm) step("test/gpu/window-image.c for the guest", join(here, "build-guest-state.sh"), [windowBin, join(root, "test/gpu/window-image.c")]);
+if (drm) step("test/gpu/int-attrib.c for the guest", join(here, "build-guest-state.sh"), [intAttribBin, join(root, "test/gpu/int-attrib.c")]);
 if (drm && has("--fail")) step("test/gpu/kms-dumb.c for the guest", process.env.ZIG ?? "zig", ["cc", "-target", "aarch64-linux-musl", "-mcpu=generic", "-static", "-O2", "-s", "-o", kmsDumbBin, join(root, "test/gpu/kms-dumb.c")]);
 
 const types = { ".html": "text/html", ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm" };
@@ -178,6 +213,8 @@ const server = createServer(async (req, res) => {
 	if (p === "/img/unkernel.wasm" && drm) return sendFile(req, res, kernelFile, "application/wasm");
 	if (p === "/files/kwgl-state") return sendFile(req, res, stateBin, "application/octet-stream");
 	if (p === "/files/prime" && drm) return sendFile(req, res, primeBin, "application/octet-stream");
+	if (p === "/files/window-image" && drm) return sendFile(req, res, windowBin, "application/octet-stream");
+	if (p === "/files/int-attrib" && drm) return sendFile(req, res, intAttribBin, "application/octet-stream");
 	if (p === "/files/kms-dumb" && drm && existsSync(kmsDumbBin)) return sendFile(req, res, kmsDumbBin, "application/octet-stream");
 	// --gl-delay: the renderer's module, late (/slow/virgl.mjs; virgl.wasm next to it on time)
 	if (p === "/slow/virgl.mjs" || p === "/slow/virgl.wasm") {
@@ -198,10 +235,12 @@ const query = new URLSearchParams();
 if (has("--worker")) query.set("worker", "1");
 for (const k of ["size", "scenes", "skip", "cmd", "glfail"]) if (opt(`--${k}`)) query.set(k, opt(`--${k}`));
 if (has("--eager")) query.set("eager", "1");
+if (has("--snapshot")) query.set("snap", "1");
+if (has("--lose")) query.set("lose", "1");
 if (opt("--gl-delay")) query.set("glmodule", "/slow/virgl.mjs");
 if (has("--fail")) {
 	query.set("fail", "1");
-	if (!opt("--skip")) query.set("skip", "a,b,c,d,e");
+	if (!opt("--skip")) query.set("skip", "a,b,c,d,e,g,h");
 }
 const url = `http://127.0.0.1:${server.address().port}/test/${drm ? "drm" : "unkernel"}.html?${query}`;
 console.log(`== ${url}\n   output in ${out}`);
@@ -351,6 +390,42 @@ function judgeDrm(res) {
 		const ok = pr.exitCode === 0 && p?.texture && p.width === 64 && p.height === 64 && p.pixel?.join() === "160,32,192";
 		report("prime", ok, `${pr.stdout.trim().split("\n").join("; ")}; host: ${JSON.stringify(p)}`);
 	}
+	const sn = res.snapshot;
+	if (sn) {
+		// prime.c's pattern at (40, 8): 160 red, 32 green, 0xc0 blue, opaque
+		const ok = !sn.error && sn.attempts.at(-1) === "taken" && sn.pixel?.join() === "160,32,192,255" && sn.gpu?.errors === 0 && !!sn.adopted;
+		report("snapshot with an idle 3D context", ok, `${sn.error ?? ""} attempts ${JSON.stringify(sn.attempts)}; restored in ${sn.restoreMs} ms; ` +
+			`${JSON.stringify(sn.adopted)}; image ${sn.size} pixel (40, 8) ${JSON.stringify(sn.pixel)}; renderer after the restore ${JSON.stringify(sn.gpu)}; ` +
+			`prime: ${(sn.before ?? "").trim().split("\n").join(" | ")} || ${(sn.after ?? "").trim().split("\n").join(" | ")}`);
+	}
+	if (res.lose) {
+		const runs = [1, 2, 3, 4].map((i) => res.steps[`lose-run${i}`]);
+		for (const [i, r] of runs.entries()) console.log(`--- lose-run${i + 1} (exit ${r?.exitCode}, ${((r?.ms ?? 0) / 1000).toFixed(1)} s):\n${r?.stdout.trim()}`);
+		const errs = (r) => Number(/kernel errors (\d+)/.exec(r?.stdout ?? "")?.[1] ?? -1);
+		const a = res.lose.after ?? {};
+		report("second run", errs(runs[0]) === 0 && errs(runs[1]) === 0 && /Score/.test(runs[1]?.stdout ?? ""), `kernel errors after run 1: ${errs(runs[0])}, after run 2: ${errs(runs[1])}`);
+		report("context lost", res.lose.lost && a.contextLost === true && runs[2] && runs[3] && (runs[3].ms ?? 1e9) < 120_000,
+			`lost ${res.lose.lost}; stats after ${JSON.stringify({ errors: a.errors, lastError: a.lastError, contextLost: a.contextLost })}; runs 3 and 4 ended after ${((runs[2]?.ms ?? 0) / 1000).toFixed(1)} and ${((runs[3]?.ms ?? 0) / 1000).toFixed(1)} s`);
+	}
+	const ia = res.steps["int-attrib"];
+	if (ia) report("integer attributes", ia.exitCode === 0 && /^ok int$/m.test(ia.stdout) && /^ok uint$/m.test(ia.stdout) && /^kernel errors 0$/m.test(ia.stdout),
+		ia.stdout.trim().split("\n").join("; ") + (ia.stderr.trim() ? ` (stderr: ${ia.stderr.trim()})` : ""));
+	const wi = res.windowImages;
+	if (wi) {
+		const named = Object.entries(wi.bufs).map(([n, b]) => `${n} res ${b.res}${b.texture ? ` (virgl format ${b.texture.format}, yTop ${b.texture.yTop}, alpha ${b.texture.alpha})` : ""}`);
+		const checks = wi.checks ?? [];
+		const bad = checks.filter((c) => c.bad !== 0);
+		const sc = wi.scanout ?? [];
+		const scBad = sc.filter((f) => f.differFromReadback !== 0 || f.overWhiteDifferFromReadback !== 0 || f.translucent !== 0 || f.colours <= 16);
+		const ok = !wi.error && wi.bufs.argb && wi.bufs.xrgb && checks.length >= 8 && !bad.length && wi.nulls?.unknown && wi.nulls?.empty &&
+			(skipped("b2") || (sc.length >= 2 && !scBad.length && !wi.scanoutImages?.bad));
+		report("window images", ok, `${wi.error ?? ""}${named.join(", ")}; ${checks.length} images, ${bad.length} wrong` +
+			`${bad.length ? ` (${bad.map((c) => `${c.name}: ${c.size}, ${c.bad} pixels off, over black ${JSON.stringify(c.overBlack)}, over white ${JSON.stringify(c.overWhite)}`).join("; ")})` : ""}; ` +
+			`nulls ${JSON.stringify(wi.nulls)}; scanout frames while taking images: ${sc.map((f) => `seq ${f.seq} ${f.size} ${f.colours} colours, ${f.differFromReadback} / ${f.overWhiteDifferFromReadback} pixels differ from the readback (plain / over white), ${f.translucent} translucent`).join("; ") || "none"}; ` +
+			`images then ${JSON.stringify(wi.scanoutImages)}`);
+		for (const c of checks) console.log(`   ${c.name}: ${c.size}, ${c.bad} off; over black ${JSON.stringify(c.overBlack)}, over white ${JSON.stringify(c.overWhite)}`);
+		console.log(`   per image (image() + drawImage() + close(); total waits for the GPU): ${JSON.stringify(wi.timing)}`);
+	}
 	if (res.steps.state) {
 		const alone = lines(res.steps["state-alone"]), mixed = lines(res.steps.state), vt = lines(res.steps["state-vtest"]);
 		const sums = alone.filter((l) => / [0-9a-f]{16}$/.test(l));
@@ -361,6 +436,10 @@ function judgeDrm(res) {
 			`${bad} of ${sums.length} frames differ from the clients alone; ${vbad} differ from the same clients on the vtest path; ` +
 			`${(res.steps.state.ms / 1000).toFixed(1)} s DRM, ${(res.steps["state-vtest"].ms / 1000).toFixed(1)} s vtest`);
 	}
+}
+
+function skipped(step) {
+	return (opt("--skip") ?? "").split(",").includes(step);
 }
 
 function fps(s) {

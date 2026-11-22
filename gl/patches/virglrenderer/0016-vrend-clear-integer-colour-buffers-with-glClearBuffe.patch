@@ -1,0 +1,58 @@
+From 20b20033cb3016726b969236eb3c81f9cd39e93e Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 22 Nov 2026 09:01:18 +0000
+Subject: [PATCH] vrend: clear integer colour buffers with glClearBuffer
+
+A clear of every bound colour buffer was one glClear, whatever their
+formats: its float clear colour is undefined for an integer colour buffer
+in GL, and WebGL refuses it (GL_INVALID_OPERATION, "No defined conversion
+between clear value and attachment format"), which puts the context in
+error. The per-buffer path meant for integer buffers never took them
+either: it tested util_format_is_pure_uint() of `surf && surf->format`,
+a truth value, so every buffer got glClearBufferfv.
+
+Clear each buffer with glClearBuffer{u,i,f}v by its own format when any
+bound colour buffer is an integer one.
+---
+ src/vrend/vrend_renderer.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 1d9c680..f8a0bcd 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -4903,21 +4903,25 @@ void vrend_clear(struct vrend_context *ctx, unsigned buffers,
+ 
+    if (buffers & PIPE_CLEAR_COLOR) {
+       uint32_t mask = 0;
++      bool integer = false;
+       for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+-         if (sub_ctx->surf[i])
++         if (sub_ctx->surf[i]) {
+             mask |= (1 << i);
++            if (util_format_is_pure_integer(sub_ctx->surf[i]->format))
++               integer = true;
++         }
+       }
+-      if (mask != (buffers >> 2)) {
++      /* glClear of an integer colour buffer is undefined in GL and an
++       * error in WebGL: those take glClearBuffer{u,i}v */
++      if (mask != (buffers >> 2) || integer) {
+          mask = buffers >> 2;
+          while (mask) {
+             int i = u_bit_scan(&mask);
+             if (i < PIPE_MAX_COLOR_BUFS && sub_ctx->surf[i] &&
+-                util_format_is_pure_uint(sub_ctx->surf[i] &&
+-                                         sub_ctx->surf[i]->format))
++                util_format_is_pure_uint(sub_ctx->surf[i]->format))
+                 glClearBufferuiv(GL_COLOR, i, (GLuint *)colorf);
+             else if (i < PIPE_MAX_COLOR_BUFS && sub_ctx->surf[i] &&
+-                     util_format_is_pure_sint(sub_ctx->surf[i] &&
+-                                              sub_ctx->surf[i]->format))
++                     util_format_is_pure_sint(sub_ctx->surf[i]->format))
+                 glClearBufferiv(GL_COLOR, i, (GLint *)colorf);
+             else
+                 glClearBufferfv(GL_COLOR, i, (GLfloat *)colorf);
+-- 
+2.56.0
+

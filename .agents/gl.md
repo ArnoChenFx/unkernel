@@ -162,6 +162,16 @@ In order, each with its reason in the commit message:
     and the unit stays empty; nor transferred (Mesa resolves first).
     Step m (`test/gpu/msaa.c`, 2026-11-22). The GL blitter's resolve
     path is not reached by any test.
+18. a deleted-key marker that no id can equal in `util_hash_table`: its
+    keys are ids cast to pointers (object handles, resource and context
+    ids), and Mesa's hash table marks a deleted slot with a static
+    variable's address, which on wasm32 is a small number (62592 in one
+    build), so the object with that handle was never found. Mesa's virgl
+    numbers objects from one counter, about one a frame for a KMS client,
+    so glmark2-es2-drm's whole run failed in its 31st scene (`Illegal
+    surface 62592`, then every draw of the context; 2026-11-22, the full
+    run by `unkernel-check.mjs --drm --cmd`, 0 errors since). The marker
+    is UINTPTR_MAX, refused as a key.
 
 ## Single GL context
 

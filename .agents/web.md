@@ -190,7 +190,7 @@ deploying the page needs no kernel toolchain.
     `cache: "no-cache"` (the one request that revalidates), then reads the
     prefetch the image's distro header names (Alpine: the whole image, one
     plain GET; Debian: one streamed Range request of its first 4 MiB), the
-    background tier it names once the boot is quiet (Debian: the warm set,
+    background tier it names once the guest has read the image and the boot is quiet (Debian: the warm set,
     apt's files, from 4 to 27 MiB, in 4 MiB Range requests one at a time),
     and lazy and read-ahead ranges (256 KiB-aligned; read-ahead up to 4 MiB),
     all `cache: "force-cache"`, comparing each response's
@@ -1394,13 +1394,35 @@ has no Options control.
   guest page's cross-origin subresources load only if they send CORP or
   CORS. A redirect to `/x` or to `http://localhost:<port>/x` is rewritten
   under the prefix.
-- Root-relative URLs: the worker answers only `/vm/<id>/<port>[/…]`.
-  Nothing outside it is relayed, so a preview document's `/style.css`
-  reaches the unkernel server, not the guest: guest pages must use
-  relative URLs. Navigations outside `/vm/` (a link to `/about`) reach the
-  server, which sends the page, and `main.tsx` sends them back under the
+- Root-relative URLs: a preview document's own requests outside `/vm/`
+  (`/style.css`, Vite's `/@vite/client`) reach the worker too, since it
+  controls that document. It relays them to the document's port
+  (`clients.get(clientId)` names it), except `/vm-ws.js`. Navigations
+  outside `/vm/` (a link to `/about`) are outside the scope: they reach
+  the server, which sends the page, and `main.tsx` sends them back under the
   prefix (`previewEscape()`: the iframe's `data-kw-preview`, or in a tab the
   referrer) instead of booting a second kernel.
+- WebSockets never reach a service worker. The worker puts
+  `<script src="/vm-ws.js" data-kw-vm data-kw-port>` into each relayed
+  navigation answered with HTML (2xx, not 206, no `content-encoding`), right
+  after the doctype (else at the start, after a BOM), drops its
+  `content-length`, and copies a `'nonce-…'` from the guest's CSP header
+  onto the tag. That shim (`public/vm-ws.js`, plain script, `no-cache`)
+  replaces `window.WebSocket`. URLs reaching the guest are
+  `ws://localhost:<port>` (or 127.0.0.1), this origin's
+  `/vm/<vmId>/<port>/…`, and other same-origin paths, which go to the
+  document's port. Other URLs get the browser's own WebSocket (`instanceof`
+  holds for both). The shim talks to the page over the BroadcastChannel
+  `kw-vm-<vmId>` (message format at the top of `vm-ws.js`); the page side
+  is `preview-ws.ts`. Each socket is `websocketOver()` (`js/core/ws.ts`,
+  RFC 6455 over `vm.connect()`, no extensions) with `origin` set to
+  `http://localhost:<port>`. At most 32 sockets are open at once, apart
+  from the 8 relayed requests. The guest's messages go out 16 ahead of the
+  document's acks, so a slow document holds the guest back. Web Locks
+  tell each side when the other is gone: the document holds `kw-ws-<id>`
+  while a socket lives, the page holds `kw-vm-<vmId>`. A page that does not
+  take a socket within 5 s (none runs that kernel, or an older build) fails
+  it: `error`, then `close` 1006. `attachPreview(null)` ends every socket.
 - Server: `/vm/**` reaching the server (a shift-reload bypasses the worker,
   or the worker is not installed) gets a 503 page from `server/vm.ts` that
   says the preview needs the page open, not the app. Its link to `/` is
@@ -1411,14 +1433,16 @@ has no Options control.
 - Limits: same-origin and trusted content only, since the guest's pages can
   script the unkernel page (`parent.KW`). A sandbox without
   `allow-same-origin` would take the iframe out of the worker's control. A client-side
-  router sees the `/vm/<id>/<port>` prefix in `location`. WebSockets and
-  Vite-style HMR bypass service workers, so they do not reach the guest.
-  Cookies are not set. A tab on the URL works only while the page that
+  router sees the `/vm/<id>/<port>` prefix in `location`. WebSockets opened
+  in workers, `about:blank` or `srcdoc` frames, or pages whose CSP (a
+  `<meta>` one, or a header without a nonce or `'self'`) blocks the shim
+  do not reach the guest. Cookies are not set. A tab on the URL works only while the page that
   owns the vmId stays open, and a reload gives a new vmId. There is no
   back-pressure beyond the 4 chunks ahead plus one per pull. A long
   stream may be cut when the browser stops a worker whose event runs for
   minutes. Checked by hand only, plus a Node harness of the
-  relay against a fake `vm.fetch`. No browser test.
+  relay against a fake `vm.fetch`, and `pnpm test:ws` for the WebSocket
+  client. No browser test.
 - Trying it by hand: the image's busybox has no httpd. In a terminal
   window, run `sudo apk add busybox-extras`, then `mkdir -p /tmp/www && echo hi >
   /tmp/www/index.html && httpd -f -p 8000 -h /tmp/www`. Or run `sudo apk add

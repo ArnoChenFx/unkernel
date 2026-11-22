@@ -6,16 +6,17 @@
 // relays those requests here; this page answers the ones for its vmId (a
 // random id per booted kernel) with vm.fetch() on the guest's
 // 127.0.0.1:<port>, and streams the body back in chunks. The message format
-// is at the top of vm-sw.js. Secure contexts only (service workers), and
-// same-origin: the guest's pages can reach this page, so trusted content
+// is at the top of vm-sw.js. WebSockets take another way (preview-ws.ts).
+// Secure contexts only (service workers), and same-origin: the guest's pages can reach this page, so trusted content
 // only. .agents/web.md (Guest preview) lists the limits.
 import { useSyncExternalStore } from "react";
+import { closeWebSockets, serveWebSockets, type GuestConnector } from "./preview-ws.ts";
 import { ui$ } from "./store.ts";
 import { serviceWorker, swSupported } from "./sw.ts";
 import { store } from "./ui.ts";
 
-/** What the relay needs of the kernel handle: the SDK's vm.fetch(). */
-export interface GuestFetcher {
+/** What the relay needs of the kernel handle: the SDK's vm.fetch(), and vm.connect() for WebSockets. */
+export interface GuestFetcher extends GuestConnector {
 	fetch(input: string, init?: RequestInit): Promise<Response>;
 }
 
@@ -58,8 +59,10 @@ export const previewUrl = (port: number, path = "/"): string => `/vm/${vmId}/${p
  */
 export function attachPreview(handle: GuestFetcher | null): void {
 	vm = handle;
+	if (!handle) closeWebSockets();
 	if (!handle || vmId) return;
 	vmId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
+	serveWebSockets(vmId, () => vm);
 	if (previewSupported()) {
 		navigator.serviceWorker.addEventListener("message", onRelay);
 		navigator.serviceWorker.startMessages(); // this page is not controlled (the scope is /vm/)

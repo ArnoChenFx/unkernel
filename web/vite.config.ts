@@ -275,6 +275,8 @@ export default defineConfig({
 				},
 				// Checked for updates on every load (src/sw.ts); not cached by the CDN.
 				"/vm-sw.js": { headers: { "cache-control": "no-cache" } },
+				// The preview's WebSocket shim, which vm-sw.js puts into guest pages: in step with the worker.
+				"/vm-ws.js": { headers: { "cache-control": "no-cache" } },
 				// The images, loadable by the cross-origin-isolated page. Their
 				// Cache-Control comes from server/range.ts on Node, and on Vercel from
 				// the hit-phase route unkernel:distro-images adds (a found file only,

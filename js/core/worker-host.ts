@@ -609,22 +609,30 @@ export class WorkerKernel implements KernelHandle {
 		// Shared: with the console input, so that what is typed after a resize sees it.
 		if (this.#shared) this.#shared.resize(cols, rows);
 		else this.#endpoint.post({ t: "resize", cols, rows });
-		this.updateDisplaySize();
+		if (typeof this.#displayOpt === "function") this.#sendDisplaySize(false);
 	}
 
 	/**
-	 * Ask a `display` function for the size again and send it to the worker
-	 * if it changed, so that the next program to open /dev/fb0 gets it
-	 * (inline, the kernel calls the function itself at that moment; the
-	 * worker cannot). resize() does this too. A no-op for other options.
+	 * See KernelHandle.updateDisplaySize(): a `display` function is asked
+	 * here (inline the kernel calls it itself when it needs a size; the
+	 * worker cannot), and the size goes to the worker, which answers kwfb's
+	 * next first open with it and lets virtio-gpu offer it. resize() sends a
+	 * function's new size too, for kwfb only.
 	 */
-	updateDisplaySize(): void {
-		if (this.#result || typeof this.#displayOpt !== "function") return;
+	updateDisplaySize(size?: DisplaySize): void {
+		if (this.#result || !this.#displayOpt) return;
+		if (size) this.#displayOpt = { width: size.width, height: size.height, dpi: size.dpi };
+		this.#sendDisplaySize(true);
+	}
+
+	/** Send the size wanted now when it changed, or with `hotplug` always (the device compares it with what its driver read). */
+	#sendDisplaySize(hotplug: boolean): void {
 		const size = displayNow(this.#displayOpt, this.#log);
+		if (typeof size !== "object") return;
 		const key = JSON.stringify(size);
-		if (key === this.#displaySize || typeof size !== "object") return;
+		if (key === this.#displaySize && !hotplug) return;
 		this.#displaySize = key;
-		this.#endpoint.post({ t: "display-size", size });
+		this.#endpoint.post({ t: "display-size", size, hotplug });
 	}
 
 	/** @internal The display option as it goes in the boot message. */

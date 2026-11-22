@@ -8,7 +8,7 @@
 
 import type { BlockDevice, BlockStats } from "./block.ts";
 import type { CpuEndpoint, CpuInit } from "./cpu.ts";
-import type { DisplayFrame, DisplayHost, DisplayMode, DisplayOption, DisplayStats } from "./display.ts";
+import type { DisplayFrame, DisplayHost, DisplayMode, DisplayOption, DisplaySize, DisplayStats } from "./display.ts";
 import type { Evdev, InputHost, InputState, InputStats } from "./input.ts";
 import type { JitStats, KwemuStats } from "./jit.ts";
 import type { ProfileOptions, ProfileReport, SamplerHandle, SamplerInit } from "./profile.ts";
@@ -412,6 +412,22 @@ export interface KernelHandle {
 	readonly memory64: boolean;
 	/** With the display option: the mode while a program has /dev/fb0 open, else null. */
 	readonly display: { readonly mode: DisplayMode | null } | undefined;
+	/**
+	 * With the display option: the display size changed. `size` replaces
+	 * the option from now on; without one a `display` function is asked
+	 * again (in a worker on this thread; other options: no change). kwfb
+	 * takes it at the next first open of /dev/fb0. The virtio-gpu device
+	 * (gpu option) offers it at once when it differs from the size the
+	 * guest's driver last read (fitted: 64 to 4095 a side, at most about
+	 * 3840x2400; virtio-gpu.ts fitGpuSize()): a display event, after which
+	 * the driver reads the display info and the EDID again and sends a
+	 * hotplug uevent. The guest decides whether to switch: a KMS client
+	 * that probes the connector finds the new preferred mode (X: `xrandr
+	 * --auto`; kmscube on its next start), and `display`, frames and
+	 * onDisplay follow the mode it sets, not this size. Cheap when nothing
+	 * changed; debounce calls during a drag yourself.
+	 */
+	updateDisplaySize(size?: DisplaySize): void;
 	/** With the display option: the keyboard, mouse and tablet (InputHost's methods). */
 	readonly evdev: Evdev | undefined;
 	/** The current frame as RGBA (in a worker: the latest one it sent), or null. */
@@ -844,6 +860,14 @@ export class KernelInstance implements KernelHandle {
 		return this.kernel.display.enabled ? this.kernel.display : undefined;
 	}
 
+	/** See KernelHandle.updateDisplaySize(). */
+	updateDisplaySize(size?: DisplaySize): void {
+		const k = this.kernel;
+		if (k.result || !k.display.enabled) return;
+		if (size) k.display.setSize({ width: size.width, height: size.height, dpi: size.dpi });
+		k.gpu?.displayChanged();
+	}
+
 	/**
 	 * The current frame as RGBA (canvas ImageData layout), or null when there
 	 * is no display or no program has it open. The guest is suspended
@@ -1030,6 +1054,8 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		throw new BootError(err.name === "MemoryAllocationError" ? "memory" : "boot", err.message, { cause: e });
 	}
 	booting.catch(() => {});
+	// A restored guest's virtio-gpu driver read a display size this host does not know: offer the current one.
+	if (opts.restore) kernel.gpu?.displayChanged(true);
 	instance.startMounts(rest);
 	instance.startCommands(commands);
 	instance.attachGl(startGl(glPrep, vsock, log));

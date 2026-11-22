@@ -6,7 +6,8 @@
 // display (display.ts) instead of kwfb's pixels while it is set.
 //
 // 2D only: GET_DISPLAY_INFO, GET_EDID (VIRTIO_GPU_F_EDID: the size and the
-// physical size of the display option), RESOURCE_CREATE_2D, RESOURCE_UNREF,
+// physical size of the display option, fitted by fitGpuSize(); a change on
+// a running machine is a display event, displayChanged()), RESOURCE_CREATE_2D, RESOURCE_UNREF,
 // RESOURCE_ATTACH_BACKING and DETACH_BACKING, SET_SCANOUT,
 // TRANSFER_TO_HOST_2D, RESOURCE_FLUSH, and the cursor queue (taken and
 // ignored). No capsets (no VIRTIO_GPU_F_VIRGL), so Mesa in the guest uses
@@ -217,6 +218,8 @@ export class VirtioGpu implements VirtioDeviceModel {
 	/** Scanout 0 showing a backend's resource instead (its id and the rectangle), or null. */
 	#scanout3d: { id: number; rect: Rect } | null = null;
 	#eventsRead = 0;
+	/** The size last answered to GET_DISPLAY_INFO, or null before the first (displayChanged()). */
+	#told: DisplaySize | null = null;
 	/** An unfenced backend command is pending: later ones wait. */
 	#stalled = false;
 	/** The last fenced answer still to go back (later fenced answers go after it). */
@@ -258,10 +261,29 @@ export class VirtioGpu implements VirtioDeviceModel {
 		this.#notifyFn = fn;
 	}
 
-	/** The host's display size changed: the driver asks for the display info again (a hotplug event). */
-	displayChanged(): void {
+	/**
+	 * The host's display size may have changed (DisplayHost.wantedSize()):
+	 * when it differs from the size the driver last read, set
+	 * VIRTIO_GPU_EVENT_DISPLAY in events_read and raise a config interrupt.
+	 * The driver then asks for the EDID and the display info again and sends
+	 * a hotplug uevent; a KMS client that probes the connector finds the new
+	 * preferred mode and sets it if it wants (the display follows the mode
+	 * set, not this size). Before the driver has read a size nothing is
+	 * raised (it reads one when it probes); `force` raises it anyway (after
+	 * a restore, where the size the snapshot's driver read is not known).
+	 * True when raised.
+	 */
+	displayChanged(force = false): boolean {
+		const s = this.#size(), t = this.#told;
+		if (!force && (!t || (t.width === s.width && t.height === s.height && t.dpi === s.dpi))) return false;
 		this.#eventsRead |= EVENT_DISPLAY;
 		this.#notifyFn?.();
+		return true;
+	}
+
+	/** The display size the driver last read (GET_DISPLAY_INFO), or null before it has. */
+	get displaySize(): DisplaySize | null {
+		return this.#told && { ...this.#told };
 	}
 
 	reset(): void {
@@ -531,16 +553,14 @@ export class VirtioGpu implements VirtioDeviceModel {
 	}
 
 	#size(): DisplaySize {
-		const s = this.#display.wantedSize();
-		const w = Math.min(16384, Math.max(64, Math.round(s.width) || 640));
-		const h = Math.min(16384, Math.max(64, Math.round(s.height) || 480));
-		return { width: w, height: h, dpi: s.dpi };
+		return fitGpuSize(this.#display.wantedSize());
 	}
 
 	#displayInfo(): Uint8Array {
 		const out = resp(GPU_RESP.OK_DISPLAY_INFO, HDR + MAX_SCANOUTS * 24);
 		const dv = new DataView(out.buffer);
 		const s = this.#size();
+		this.#told = s;
 		dv.setUint32(HDR + 8, s.width, true);
 		dv.setUint32(HDR + 12, s.height, true);
 		dv.setUint32(HDR + 16, 1, true); // enabled
@@ -638,10 +658,40 @@ function resp(type: number, size = HDR): Uint8Array {
 	return b;
 }
 
+/** CVT-RB vertical blanking lines of a mode `h` lines high at 60 Hz (makeEdid()). */
+const cvtVblank = (h: number) => Math.max(15, Math.ceil((460e-6 * 60 * (h + 3)) / (1 - 460e-6 * 60)));
+/** makeEdid()'s pixel clock in 10 kHz units: (w + 160) x (h + vblank) at 60 Hz. */
+const edidClock = (w: number, h: number) => Math.round(((w + 160) * (h + cvtVblank(h)) * 60) / 10000);
+
+/**
+ * The size the device offers for a wanted one (GET_DISPLAY_INFO and
+ * GET_EDID agree): whole pixels, 64 to 4095 a side (an EDID detailed timing
+ * has 12 bits per side and Linux ignores one under 64), and shrunk with
+ * its aspect kept until its 60 Hz pixel clock fits the EDID's 16 bits
+ * (655.35 MHz: about 3840x2400). Odd sizes stay as they are: the mode
+ * comes from the EDID, not from drm_cvt_mode(), which would round the
+ * width down to a multiple of 8.
+ */
+export function fitGpuSize(s: DisplaySize): DisplaySize {
+	let w = Math.round(s.width) || 640, h = Math.round(s.height) || 480;
+	if (w > 4095 || h > 4095) {
+		const k = Math.min(4095 / w, 4095 / h);
+		w = Math.min(4095, Math.round(w * k));
+		h = Math.min(4095, Math.round(h * k));
+	}
+	w = Math.max(64, w);
+	h = Math.max(64, h);
+	while (edidClock(w, h) > 0xffff) {
+		w = Math.max(64, Math.floor(w * 0.99));
+		h = Math.max(64, Math.floor(h * 0.99));
+	}
+	return { width: w, height: h, dpi: s.dpi };
+}
+
 /**
  * An EDID 1.4 base block for one mode at 60 Hz (CVT reduced blanking
  * timings), with the physical size from `dpi` when known, named
- * "unkernel".
+ * "unkernel". The size must fit (fitGpuSize()).
  */
 export function makeEdid(s: DisplaySize): Uint8Array {
 	const e = new Uint8Array(128);
@@ -667,8 +717,8 @@ export function makeEdid(s: DisplaySize): Uint8Array {
 	for (let i = 38; i < 54; i++) e[i] = 1; // no standard timings
 	// Detailed timing: CVT-RB blanking.
 	const hb = 160, hfp = 48, hs = 32, vfp = 3, vs = 6;
-	const vb = Math.max(vfp + vs + 6, Math.ceil((460e-6 * 60 * (h + vfp)) / (1 - 460e-6 * 60)));
-	const clock = Math.min(0xffff, Math.round(((w + hb) * (h + vb) * 60) / 10000));
+	const vb = cvtVblank(h);
+	const clock = Math.min(0xffff, edidClock(w, h));
 	const d = 54;
 	e[d] = clock & 0xff;
 	e[d + 1] = clock >> 8;

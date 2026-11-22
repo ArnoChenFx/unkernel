@@ -8,7 +8,14 @@
 // - the mode: when a program first opens /dev/fb0 the kernel asks for a
 //   size, and gets the stage's (the area above the status line) in CSS
 //   pixels (size()); it may pick less (at most 1M pixels: divided by an
-//   integer), and a program may set its own;
+//   integer), and a program may set its own. The virtio-gpu device (guest
+//   GL) offers the same size as its connector's preferred mode, and when
+//   the stage settles at another size (window resize, full screen, the
+//   phone turned, the rotate option, the preview docked: a ResizeObserver,
+//   300 ms after the last change) offerSize() tells the running guest
+//   (updateDisplaySize(): a hotplug); a KMS client then picks the new mode
+//   itself or not (X: a plain xrandr, then xrandr --output NAME --auto),
+//   and the canvas follows the mode the guest sets;
 // - rotation: on touch devices, while the page is portrait and the rotate
 //   option is on (off by default; kept in localStorage), the display is drawn
 //   a quarter turn clockwise over the whole page, status line included, so
@@ -32,9 +39,9 @@
 //   evdev (its open state follows onInput; calls are forwarded in order).
 //   The kernel cannot ask this thread for the size when a program opens
 //   /dev/fb0, so the SDK asks size() ahead of time: at boot and on every
-//   terminal resize; offerSize() covers the window resizing and the rotate
+//   terminal resize; offerSize() covers the stage resizing and the rotate
 //   option.
-import { WorkerKernel, domCodeToLinux, type DisplayMode, type InputState, type KernelInstance } from "./sdk.ts";
+import { KernelInstance, domCodeToLinux, type WorkerKernel, type DisplayMode, type InputState } from "./sdk.ts";
 import { useSyncExternalStore } from "react";
 import { ui$, type PadLayout, type TouchMode } from "./store.ts";
 import { store } from "./ui.ts";
@@ -61,11 +68,20 @@ export interface DisplayUi {
 
 let current: DisplayUiOptions | null = null;
 let stageEl: HTMLElement | null = null;
+let stageRo: ResizeObserver | null = null;
 
 /** What Display.tsx needs from boot.ts (null until the boot module runs). */
 export const displayOpts = (): DisplayUiOptions | null => current;
-/** The stage (components/App.tsx): the area the display fills. */
-export const setStage = (el: HTMLElement | null): void => { stageEl = el; };
+/** The stage (components/App.tsx): the area the display fills; its size is offered to the guest as it changes. */
+export const setStage = (el: HTMLElement | null): void => {
+	stageEl = el;
+	stageRo?.disconnect();
+	stageRo = null;
+	if (el && typeof ResizeObserver === "function") {
+		stageRo = new ResizeObserver(() => offerSize());
+		stageRo.observe(el);
+	}
+};
 export const evdev = () => current?.vm()?.evdev;
 /** The canvas holds pointer lock (components/Display.tsx). */
 export const pointerLocked = (): boolean => (document.pointerLockElement as HTMLElement | null)?.id === "fb";
@@ -76,10 +92,22 @@ const appEl = (): HTMLElement | null => stageEl?.closest<HTMLElement>("#app") ??
 /** The display is drawn a quarter turn round: a touch device, the rotate option on, and a portrait page (w x h). */
 export const isRotated = (w: number, h: number): boolean => !!current?.touch && ui$().get().display.rotate && h > w;
 
-/** Worker mode: send the size to offer to the worker again (inline the kernel asks size() itself). */
+/** Wait this long after the last size change before telling the guest: one hotplug per drag, not one per frame. */
+const OFFER_MS = 300;
+let offerTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * The size to offer changed (or may have): tell the running guest once it
+ * has settled. updateDisplaySize() asks size() again (worker mode: here,
+ * for the worker; inline the kernel asks it when it needs it) and lets
+ * virtio-gpu offer it when it differs from what the guest's driver has.
+ */
 function offerSize(): void {
-	const vm = current?.vm();
-	if (vm instanceof WorkerKernel) vm.updateDisplaySize();
+	clearTimeout(offerTimer);
+	offerTimer = setTimeout(() => {
+		const vm = current?.vm();
+		if (vm && !(vm instanceof KernelInstance && vm.kernel.result)) vm.updateDisplaySize();
+	}, OFFER_MS);
 }
 
 /** The rotate option (the touch controls' button). */

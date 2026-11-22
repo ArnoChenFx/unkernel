@@ -518,6 +518,11 @@ export function serveKernel(port: WorkerPort, options: ServeKernelOptions = {}):
 			break;
 		case "display-size":
 			displaySize = msg.size;
+			// The kernel's display may have booted with `true`: from now on it asks for this size.
+			if (instance && !instance.kernel.result) {
+				instance.kernel.display.setSize(() => displaySize as DisplaySize);
+				if (msg.hotplug) instance.kernel.gpu?.displayChanged();
+			}
 			break;
 		case "frame-want":
 			if (!instance || instance.kernel.result) post({ t: "frame", id: msg.id, mode: null, data: null });

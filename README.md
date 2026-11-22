@@ -549,6 +549,8 @@ it with no variables set, and a KMS client's frames (kmscube,
 const vm = await createKernel({ distro, gl: true, gpu: true, display: { width: 1280, height: 720 } });
 // per animation frame: the scanout's latest frame, no readback (null: no GL client on it)
 if (vm.gl.gpu.drawFrame(ctx) === null) { /* show vm.frame() as above */ }
+// the window resized: a hotplug with a new preferred mode, which KMS clients may take
+vm.updateDisplaySize({ width: 1600, height: 900 });
 ```
 
 ### Run it in a worker

@@ -256,6 +256,20 @@ context; gl.md, The DRM path). Without it Mesa falls back to software.
 There is no udev: the kw layer's rc gives `card*` to video (0660) and
 `renderD*` to everyone (0666), as udev's rules do (guest.md).
 
+- Display size: the connector's one mode is the host's EDID mode (the
+  host's display size, preferred). A size change on the host is the
+  config space's VIRTIO_GPU_EVENT_DISPLAY with a config interrupt
+  (kwvirtio's KWVIRTIO_INT_CONFIG, `virtio_config_changed()`); the stock
+  driver's work item asks for the EDID and display info again and calls
+  `drm_kms_helper_hotplug_event()`: a `change` uevent of `card0` with
+  HOTPLUG=1 on the kernel's netlink group, and nothing else (no fbdev
+  client). The modes are refreshed when a DRM master probes the connector
+  (GETCONNECTOR with no modes; `/sys/class/drm/card0-Virtual-1/status`
+  "detect"). With no udev a program hears of it only from netlink itself
+  (`test/gpu/kms-hotplug.c`); libudev monitors (X's modesetting driver)
+  listen to udevd's group and hear nothing. Nothing in the kernel was
+  needed (js.md, virtio-gpu).
+
 - What the kernel side does not use: `vmap()` (VMALLOC_FLAT cannot map
   scattered pages). The 2D paths pass backing as page lists and never
   vmap; only `drm_gem_shmem_vmap()` callers would (fbdev emulation, the
@@ -294,7 +308,8 @@ There is no udev: the kw layer's rc gives `card*` to video (0660) and
   DRM_FBDEV_EMULATION, DRM_PANIC, DRM_DDC, DRM_HDMI_INFOFRAMES,
   DRM_PANEL_BRIDGE, NET_DEVMEM.
 - Check: `node test/gpu/check.mjs` (a dumb-buffer client,
-  `test/gpu/kms-dumb.c`, against the host's frame; testing.md).
+  `test/gpu/kms-dumb.c`, against the host's frame, and display size
+  changes heard by `test/gpu/kms-hotplug.c`; testing.md).
 
 ## 9p (host file systems)
 

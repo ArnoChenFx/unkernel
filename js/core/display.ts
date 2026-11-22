@@ -23,7 +23,9 @@
 // scanout (virtio-gpu.ts), while a KMS client has a framebuffer on it. The
 // display then shows that picture (mode, pixels(), readRGBA()), and kwfb's
 // again when the scanout goes; both devices stay registered. The size
-// wanted (wantedSize()) is the same for both.
+// wanted (wantedSize()) is the same for both. virtio-gpu tells a running
+// guest when it changes (KernelInstance.updateDisplaySize(): a hotplug);
+// kwfb takes it at the next first open.
 
 /** DRM fourcc of XRGB8888 ("XR24"): 32-bit pixels, little endian B, G, R, X. */
 export const FOURCC_XRGB8888 = 0x34325258;
@@ -156,6 +158,11 @@ export class DisplayHost {
 			this.#log(`[display] size callback failed: ${e}`);
 		}
 		return s;
+	}
+
+	/** Replace the size wanted (the option's size or function) from now on; ignored without a display. */
+	setSize(size: DisplaySize | (() => DisplaySize)): void {
+		if (this.enabled) this.#size = size;
 	}
 
 	/**

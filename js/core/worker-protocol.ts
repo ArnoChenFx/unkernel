@@ -126,8 +126,8 @@ export type ToWorker =
 	| { t: "disk"; id: number; index: number; op: "detach" | "export" }
 	/** Evdev calls, in order (EVDEV_OP triples). */
 	| { t: "evdev"; ops: number[] }
-	/** The display size the owner's `display` function returns now (asked at the next first open). */
-	| { t: "display-size"; size: DisplaySize }
+	/** The display size wanted now (kwfb asks at the next first open); `hotplug`: virtio-gpu offers it (updateDisplaySize()). */
+	| { t: "display-size"; size: DisplaySize; hotplug?: boolean }
 	/**
 	 * A frame credit: send one "frame" (id = this id) once the picture may
 	 * have changed (at once with `now`, even if unchanged). `buf` is a

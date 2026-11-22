@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+
+Explanation: unkernel: PID 1 is /usr/local/sbin/kw-init, which runs services
+Explanation: through sysv-rc. systemd-sysv would replace /sbin/init and remove
+Explanation: sysv-rc (systemd does not boot here), and desktop packages reach
+Explanation: it through dbus-user-session and libpam-systemd; without it apt
+Explanation: takes their other alternatives (dbus-x11). systemd itself, not as
+Explanation: init, installs fine.
+Package: systemd-sysv
+Pin: release *
+Pin-Priority: -1

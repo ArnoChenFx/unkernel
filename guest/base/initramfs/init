@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 # /init of the base initramfs (guest/base/build.sh): find the distro image,
-# make the root an overlay of it, and exec its /sbin/init.
+# make the root an overlay of it, and exec its init: /usr/local/sbin/kw-init
+# where the image has one (an init of ours, where no package puts files:
+# on Debian a package that pulls in systemd-sysv replaces /sbin/init, and
+# the next boot would be systemd's, which does not come up here), else
+# /sbin/init.
 #
 #   1. devtmpfs, proc, sysfs and a tmpfs on /run;
 #   2. /data: the data disk (ext4 labelled kwdata), if the host attached one;
@@ -14,7 +18,7 @@
 #      else (no data disk, safe mode, kw.root=initramfs) a tmpfs at /kw/tmp;
 #   5. the root: overlay of /kw/layer (the kw tools and runtime, on top) and
 #      /kw/distro under that upper layer, checked (the merged /bin/sh runs,
-#      /sbin/init is executable), then pivot_root with this root at
+#      its init is executable), then pivot_root with this root at
 #      /run/kw-lower, /dev /proc /sys /run /data moved along and a tmpfs on
 #      /tmp.
 #
@@ -156,10 +160,11 @@ root() {
 	mount -t overlay overlay -o "lowerdir=/kw/layer:/kw/distro,upperdir=$1,workdir=$2,redirect_dir=off,index=off,xino=off,metacopy=off" /mnt
 }
 # Whether the merged root can boot: its /bin/sh runs (a broken shell or C
-# library shows up here) and /sbin/init is executable. Sets $bad.
+# library shows up here) and its init (kw-init, else /sbin/init) is
+# executable. Sets $bad.
 check() {
 	bad=
-	chroot /mnt /bin/sh -c '[ -x /sbin/init ]' 2>/dev/null && return 0
+	chroot /mnt /bin/sh -c '[ -x /usr/local/sbin/kw-init ] || [ -x /sbin/init ]' 2>/dev/null && return 0
 	if chroot /mnt /bin/sh -c : 2>/dev/null; then
 		bad="/sbin/init is missing or not executable"
 	elif [ -e /mnt/bin/sh ] || [ -L /mnt/bin/sh ]; then
@@ -214,4 +219,5 @@ if ! cd /mnt || ! pivot_root . run/kw-lower; then
 	base_shell "pivot_root into the overlay failed"
 fi
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ ! -x /usr/local/sbin/kw-init ] || exec /usr/local/sbin/kw-init
 exec /sbin/init

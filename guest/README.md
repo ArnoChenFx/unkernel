@@ -125,7 +125,8 @@ UNKERNEL_TEST_KERNEL=/tmp/b/unkernel.wasm UNKERNEL_TEST_DISTRO_DIR=/tmp/d pnpm t
    `/usr/lib/kw-image` and prints the image id last. It gets `KW_DISTRO`
    and `KW_DISTRO_DIR` from the driver.
 3. `distro/NAME/rootfs/`: at least an executable `/sbin/init` (or what it
-   links to). The base has mounted `/dev`, `/proc`, `/sys`, `/run`, `/tmp`
+   links to), or `/usr/local/sbin/kw-init`, which the base execs first
+   (where a package manager may replace `/sbin/init`: Debian). The base has mounted `/dev`, `/proc`, `/sys`, `/run`, `/tmp`
    and `/data`; init runs `/usr/lib/kw/rc`, `/usr/lib/kw/welcome` and
    `/usr/lib/kw/net`, keeps `/usr/bin/kwtty login` on hvc0 (the console's
    shell, as the image's user) and `/usr/bin/kwtty serve` running, and at

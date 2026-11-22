@@ -34,6 +34,9 @@ rc() {
 	local links="/etc/rc$2.d/[SK][0-9][0-9]*"
 	[ "$1" != N ] || links="/etc/rc$2.d/S[0-9][0-9]*"
 	compgen -G "$links" >/dev/null || return 0
+	# No sysv-rc (a disk from before /etc/apt/preferences.d/kw-init, where a
+	# package had apt replace it with systemd): no services, the boot goes on.
+	[ -x /etc/init.d/rc ] || return 0
 	RUNLEVEL=$2 PREVLEVEL=$1 /etc/init.d/rc "$2"
 }
 rc N 2

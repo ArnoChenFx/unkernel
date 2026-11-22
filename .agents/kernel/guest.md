@@ -147,7 +147,9 @@ base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features.
   wrapper clears `CHROMIUM_FLAGS` and sources that directory:
   `--ozone-platform=wayland` in a Wayland session, and a `chromium` with
   no display at all, such as one not started from a shell, gets wland's
-  session first, where `/dev/kwshm` is). Programs the host starts without
+  session first, where `/dev/kwshm` is; with a render node but no
+  `libEGL.so.1` it says to install `libegl1 libegl-mesa0`, without which
+  Chromium renders in software; web.md, Wayland desktop). Programs the host starts without
   a shell (`vm.exec()`, `vm.spawn()`) get no session: `/etc/environment`
   is static and kwtty sets none, `/etc/profile.d/kw-term.sh
   (busybox init's console is vt102, without colours: TERM becomes

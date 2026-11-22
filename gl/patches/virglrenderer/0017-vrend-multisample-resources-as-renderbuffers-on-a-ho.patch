@@ -1,0 +1,392 @@
+From 68dc9cdaa03365521f5f40a51f08975bb4600f1a Mon Sep 17 00:00:00 2001
+From: Pooya Parsa <pooya@pi0.io>
+Date: Sun, 22 Nov 2026 11:40:09 +0000
+Subject: [PATCH] vrend: multisample resources as renderbuffers on a host
+ without multisample textures
+
+WebGL 2 (and GLES 3.0) has multisample renderbuffers but no multisample
+textures (GL_TEXTURE_2D_MULTISAMPLE is GLES 3.1), so vrend left every format
+without VIRGL_TEXTURE_CAN_MULTISAMPLE and the texture_multisample cap off,
+and Mesa's virgl driver, which offers multisampling only with that cap,
+offered none: GL_MAX_SAMPLES 1 and one sample for every format. ANGLE's GL
+backend then caps the OpenGL ES version it offers at 2.0 (ES 3.0 needs 4
+samples for each required renderable format), and Chromium, which asks for
+ES 3.0 and no less, cannot make a context ("eglCreateContext: Requested
+version is not supported"): its GPU process exits and it renders in
+software.
+
+On a GLES host without multisample textures, back multisample resources
+with multisample renderbuffers: formats that take GL_MAX_SAMPLES samples as
+a renderbuffer can be multisampled, the cap is set, framebuffer attachments
+of such a resource are renderbuffer attachments, and a blit that the GL
+blitter must do (it samples its source) first resolves the renderbuffer
+into a single-sample texture of its format. They can be rendered to,
+cleared and resolved, which is what GLES 3.0 and multisampled window
+surfaces use; they cannot be sampled (sampler2DMS, which only a desktop
+GL context with ARB_texture_multisample could ask for, does not build on
+such a host either), nor transferred (the guest resolves first). The
+guest gets the standard sample positions, which the host cannot tell.
+---
+ src/vrend/vrend_formats.c  |  49 ++++++++++++
+ src/vrend/vrend_renderer.c | 150 ++++++++++++++++++++++++++++++++++---
+ src/vrend/vrend_renderer.h |   7 ++
+ 3 files changed, 197 insertions(+), 9 deletions(-)
+
+diff --git a/src/vrend/vrend_formats.c b/src/vrend/vrend_formats.c
+index e920197..f31304c 100644
+--- a/src/vrend/vrend_formats.c
++++ b/src/vrend/vrend_formats.c
+@@ -673,6 +673,32 @@ void vrend_check_texture_multisample(struct vrend_format_table *table,
+    }
+ }
+ 
++/* On a host without multisample textures (GLES 3.0, WebGL 2) multisample
++ * resources are multisample renderbuffers: a format can be multisampled if a
++ * renderbuffer of it takes SAMPLES (the host's GL_MAX_SAMPLES) samples.
++ * Integer formats cannot (GLES 3.0), nor formats that are not renderable. */
++void vrend_check_renderbuffer_multisample(struct vrend_format_table *table,
++                                          int samples)
++{
++   GLuint rb;
++
++   if (samples < 2)
++      return;
++   glGenRenderbuffers(1, &rb);
++   glBindRenderbuffer(GL_RENDERBUFFER, rb);
++   for (int i = 0; i < VIRGL_FORMAT_MAX_EXTENDED; i++) {
++      if (table[i].internalformat == 0 ||
++          !(table[i].bindings & (VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_DEPTH_STENCIL)))
++         continue;
++      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples,
++                                       table[i].internalformat, 32, 32);
++      if (glGetError() == GL_NO_ERROR)
++         table[i].flags |= VIRGL_TEXTURE_CAN_MULTISAMPLE;
++   }
++   glBindRenderbuffer(GL_RENDERBUFFER, 0);
++   glDeleteRenderbuffers(1, &rb);
++}
++
+ bool vrend_check_framebuffer_mixed_color_attachements(void)
+ {
+    GLuint tex_id[2];
+@@ -761,6 +787,29 @@ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples, struct virg
+    return max_samples_confirmed;
+ }
+ 
++/* The standard sample positions (Direct3D's and Vulkan's, which GPUs and
++ * WebGL implementations use) for 2, 4, 8 and 16 samples, packed as
++ * vrend_renderer_query_multisample_caps packs measured ones: for a host that
++ * cannot tell them (multisample renderbuffers only). In 1/16 pixel. */
++void vrend_renderer_standard_sample_locations(struct virgl_caps_v2 *caps)
++{
++   static const uint8_t pos2[] = { 12,12, 4,4 };
++   static const uint8_t pos4[] = { 6,2, 14,6, 2,10, 10,14 };
++   static const uint8_t pos8[] = { 9,5, 7,11, 13,9, 5,3, 3,13, 1,7, 11,15, 15,1 };
++   static const uint8_t pos16[] = { 9,9, 7,5, 5,10, 12,7, 3,6, 10,13, 13,11, 11,3,
++                                    6,14, 8,1, 4,2, 2,12, 0,8, 15,4, 14,15, 1,0 };
++   static const uint8_t *const pos[4] = { pos2, pos4, pos8, pos16 };
++   static const int offsets[4] = { 0, 1, 2, 4 };
++
++   memset(caps->sample_locations, 0, 8 * sizeof(uint32_t));
++   for (int i = 0; i < 4; i++) {
++      for (int k = 0; k < (2 << i); k++) {
++         uint32_t c = (uint32_t)(pos[i][2 * k] & 0xf) << 4 | (pos[i][2 * k + 1] & 0xf);
++         caps->sample_locations[offsets[i] + (k >> 2)] |= c << (8 * (k & 3));
++      }
++   }
++}
++
+ /* returns: 1 = compatible, -1 = not compatible, 0 = undecided */
+ static int format_uncompressed_compressed_copy_compatible(enum virgl_formats src,
+                                                           enum virgl_formats dst)
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index f8a0bcd..ad5abd2 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -420,6 +420,10 @@ struct global_renderer_state {
+     * swizzles */
+    bool lower_tex_swizzle : 1;
+    bool coarse_gl_errors : 1;
++   /* no multisample textures (GLES 3.0, WebGL 2): multisample resources
++    * are multisample renderbuffers, which can be rendered to, cleared and
++    * blitted (resolved) from, but not sampled */
++   bool ms_renderbuffers : 1;
+ };
+ 
+ struct sysval_uniform_block {
+@@ -3034,6 +3038,13 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
+          attachment = GL_DEPTH_ATTACHMENT;
+    }
+ 
++   if (has_bit(res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
++      glFramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, id);
++      if (attachment == GL_DEPTH_ATTACHMENT)
++         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
++      return;
++   }
++
+    switch (res->target) {
+    case GL_TEXTURE_1D_ARRAY:
+    case GL_TEXTURE_2D_ARRAY:
+@@ -3753,7 +3764,8 @@ void vrend_set_single_sampler_view(struct vrend_context *ctx,
+       if (vrend_state.lower_tex_swizzle)
+          ctx->sub->shader_dirty = true;
+ 
+-      if (!has_bit(view->texture->storage_bits, VREND_STORAGE_GL_BUFFER)) {
++      if (!has_bit(view->texture->storage_bits, VREND_STORAGE_GL_BUFFER) &&
++          !has_bit(view->texture->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
+          if (view->texture->gl_id == view->gl_id) {
+             glBindTexture(view->target, view->gl_id);
+ 
+@@ -5362,7 +5374,12 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+                         tview->gl_swizzle[3] == GL_ONE ? 1.0 : 0.0);
+          }
+ 
+-         if (tview->texture) {
++         if (tview->texture &&
++             has_bit(tview->texture->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
++            /* a multisample renderbuffer cannot be sampled: the unit stays
++             * empty (such a shader, sampler2DMS, does not build on the hosts
++             * that have them) */
++         } else if (tview->texture) {
+             GLuint id = tview->gl_id;
+             GLenum target = tview->target;
+ 
+@@ -7845,6 +7862,16 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
+                                       has_feature(feat_storage_multisample));
+    }
+ 
++   vrend_state.ms_renderbuffers = vrend_state.use_gles &&
++      has_feature(feat_multisample) && !has_feature(feat_texture_multisample);
++   if (vrend_state.ms_renderbuffers) {
++      GLint max_samples = 0;
++      glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
++      vrend_check_renderbuffer_multisample(tex_conv_table, max_samples);
++      virgl_info("host has no multisample textures: multisample resources are renderbuffers (%d samples at most)\n",
++                 max_samples);
++   }
++
+    /* disable for format testing */
+    if (has_feature(feat_debug_cb)) {
+       glEnable(GL_DEBUG_OUTPUT);
+@@ -8253,6 +8280,10 @@ static int check_resource_valid(const struct vrend_renderer_resource_create_args
+          snprintf(errmsg, 256, "Multisample textures not 2D (target:%d)", args->target);
+          return -1;
+       }
++      if (vrend_state.ms_renderbuffers && args->target != PIPE_TEXTURE_2D) {
++         snprintf(errmsg, 256, "Multisample array textures need multisample textures");
++         return -1;
++      }
+       /* multisample can't have miplevels */
+       if (args->last_level > 0) {
+          snprintf(errmsg, 256, "Multisample textures don't support mipmaps");
+@@ -8848,6 +8879,25 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+       image_oes = gr->egl_image;
+    }
+ 
++   if (pr->nr_samples > 1 && vrend_state.ms_renderbuffers && !image_oes) {
++      internalformat = tex_conv_table[format].internalformat;
++      if (internalformat == 0 || pr->target != PIPE_TEXTURE_2D)
++         return EINVAL;
++      gr->target = GL_RENDERBUFFER;
++      gr->storage_bits &= ~VREND_STORAGE_GL_IMMUTABLE;
++      gr->storage_bits |= VREND_STORAGE_GL_RENDERBUFFER;
++      glGenRenderbuffers(1, &gr->gl_id);
++      glBindRenderbuffer(GL_RENDERBUFFER, gr->gl_id);
++      glRenderbufferStorageMultisample(GL_RENDERBUFFER, pr->nr_samples,
++                                       internalformat, pr->width0, pr->height0);
++      glBindRenderbuffer(GL_RENDERBUFFER, 0);
++      gt->state.max_lod = -1;
++      gt->cur_swizzle[0] = gt->cur_swizzle[1] = gt->cur_swizzle[2] = gt->cur_swizzle[3] = -1;
++      gt->cur_base = -1;
++      gt->cur_max = 10000;
++      return 0;
++   }
++
+    gr->target = tgsitargettogltarget(pr->target, pr->nr_samples);
+    gr->storage_bits |= VREND_STORAGE_GL_TEXTURE;
+ 
+@@ -9074,6 +9124,8 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+ {
+    if (has_bit(res->storage_bits, VREND_STORAGE_GL_TEXTURE)) {
+       glDeleteTextures(1, &res->gl_id);
++   } else if (has_bit(res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
++      glDeleteRenderbuffers(1, &res->gl_id);
+    } else if (has_bit(res->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+       glDeleteBuffers(1, &res->gl_id);
+       if (res->tbo_tex_id)
+@@ -10157,6 +10209,9 @@ static int vrend_renderer_transfer_internal(struct vrend_context *ctx,
+    if (!info->box)
+       return EINVAL;
+ 
++   if (has_bit(res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER))
++      return EINVAL;
++
+    if (!vrend_hw_switch_context(ctx, true))
+       return EINVAL;
+ 
+@@ -11321,6 +11376,60 @@ static void vrend_renderer_blit_fbo(struct vrend_context *ctx,
+ 
+ }
+ 
++/* A single-sample texture with a multisample renderbuffer's picture
++ * (glBlitFramebuffer resolves it), for the GL blitter, which samples its
++ * source; the caller destroys it. */
++static struct vrend_resource *vrend_resolve_renderbuffer(struct vrend_context *ctx,
++                                                         struct vrend_resource *src_res)
++{
++   struct vrend_renderer_resource_create_args args;
++   struct vrend_resource *copy;
++   GLbitfield mask = 0;
++   const struct util_format_description *desc = util_format_description(src_res->base.format);
++
++   memset(&args, 0, sizeof(args));
++   args.width = src_res->base.width0;
++   args.height = src_res->base.height0;
++   args.depth = 1;
++   args.array_size = 1;
++   args.format = src_res->base.format;
++   args.target = PIPE_TEXTURE_2D;
++   copy = (struct vrend_resource *)CALLOC_STRUCT(vrend_texture);
++   if (!copy)
++      return NULL;
++   vrend_renderer_resource_copy_args(&args, copy);
++   copy->y_0_top = src_res->y_0_top;
++   if (vrend_resource_alloc_texture(copy, args.format, NULL)) {
++      FREE(copy);
++      return NULL;
++   }
++
++   if (util_format_has_depth(desc))
++      mask |= GL_DEPTH_BUFFER_BIT;
++   if (util_format_has_stencil(desc))
++      mask |= GL_STENCIL_BUFFER_BIT;
++   if (!mask)
++      mask = GL_COLOR_BUFFER_BIT;
++
++   glDisable(GL_SCISSOR_TEST);
++   glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[0]);
++   vrend_fb_bind_texture_id(src_res, src_res->gl_id, 0, 0, 0, 0);
++   glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[1]);
++   vrend_fb_bind_texture_id(copy, copy->gl_id, 0, 0, 0, 0);
++   glBindFramebuffer(GL_READ_FRAMEBUFFER, ctx->sub->blit_fb_ids[0]);
++   glBlitFramebuffer(0, 0, args.width, args.height, 0, 0, args.width, args.height,
++                     mask, GL_NEAREST);
++   for (int i = 0; i < 2; i++) {
++      glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->blit_fb_ids[i]);
++      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
++   }
++   glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->fb_id);
++   if (ctx->sub->rs_state.scissor)
++      glEnable(GL_SCISSOR_TEST);
++   return copy;
++}
++
+ static void vrend_renderer_blit_int(struct vrend_context *ctx,
+                                     struct vrend_resource *src_res,
+                                     struct vrend_resource *dst_res,
+@@ -11349,15 +11458,33 @@ static void vrend_renderer_blit_int(struct vrend_context *ctx,
+       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use FBO blit\n");
+       vrend_renderer_blit_fbo(ctx, src_res, dst_res, &blit_info);
+    } else {
++      struct vrend_resource *resolved = NULL;
++
+       blit_info.has_srgb_write_control = has_feature(feat_texture_srgb_decode);
+       blit_info.has_texture_srgb_decode = has_feature(feat_srgb_write_control);
+ 
++      /* the GL blitter samples its source: a multisample renderbuffer is
++       * resolved into a single-sample texture of its format first */
++      if (has_bit(src_res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
++         resolved = vrend_resolve_renderbuffer(ctx, src_res);
++         if (resolved)
++            blit_info.src_view = resolved->gl_id;
++         else
++            virgl_error("blit: could not resolve a multisample renderbuffer\n");
++      }
++
+       VREND_DEBUG(dbg_blit, ctx, "BLIT_INT: use GL fallback\n");
+-      vrend_renderer_blit_gl(ctx, src_res, dst_res, &blit_info);
+-      if (vrend_state.single_gl_context)
+-         vrend_single_acquire(ctx->sub);
+-      else
+-         vrend_sync_make_current(ctx->sub->gl_context);
++      if (resolved || !has_bit(src_res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER)) {
++         vrend_renderer_blit_gl(ctx, resolved ? resolved : src_res, dst_res, &blit_info);
++         if (vrend_state.single_gl_context)
++            vrend_single_acquire(ctx->sub);
++         else
++            vrend_sync_make_current(ctx->sub->gl_context);
++      }
++      if (resolved) {
++         vrend_renderer_resource_destroy(resolved);
++         blit_info.src_view = src_res->gl_id;
++      }
+    }
+ 
+    if (blit_info.src_view != src_res->gl_id)
+@@ -12736,7 +12863,10 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
+    if (has_feature(feat_seamless_cubemap_per_texture))
+       caps->v1.bset.seamless_cube_map_per_texture = 1;
+ 
+-   if (has_feature(feat_texture_multisample))
++   /* virgl's guest driver offers multisampling only with this bit; with
++    * renderbuffers the resources can be rendered to and resolved, not
++    * sampled */
++   if (has_feature(feat_texture_multisample) || vrend_state.ms_renderbuffers)
+       caps->v1.bset.texture_multisample = 1;
+ 
+    if (has_feature(feat_tessellation))
+@@ -13014,6 +13144,8 @@ static void vrend_renderer_fill_caps_v2(int gl_ver, int gles_ver,  union virgl_c
+ 
+    if (has_feature(feat_storage_multisample))
+       caps->v1.max_samples = vrend_renderer_query_multisample_caps(caps->v1.max_samples, &caps->v2);
++   else if (vrend_state.ms_renderbuffers)
++      vrend_renderer_standard_sample_locations(&caps->v2);
+ 
+    caps->v2.capability_bits |= VIRGL_CAP_TGSI_INVARIANT | VIRGL_CAP_SET_MIN_SAMPLES |
+                                VIRGL_CAP_TGSI_PRECISE | VIRGL_CAP_APP_TWEAK_SUPPORT;
+@@ -13616,7 +13748,7 @@ void vrend_renderer_resource_get_info(struct pipe_resource *pres,
+ 
+    elsize = util_format_get_blocksize(res->base.format);
+ 
+-   info->tex_id = res->gl_id;
++   info->tex_id = has_bit(res->storage_bits, VREND_STORAGE_GL_RENDERBUFFER) ? 0 : res->gl_id;
+    info->width = res->base.width0;
+    info->height = res->base.height0;
+    info->depth = res->base.depth0;
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index 49e99c0..7e48382 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -78,6 +78,10 @@ struct vrend_context;
+ #define VREND_STORAGE_GL_IMMUTABLE       BIT(6)
+ #define VREND_STORAGE_GL_MEMOBJ          BIT(7)
+ #define VREND_STORAGE_D3D_TEXTURE        BIT(8)
++/* a multisample resource as a multisample renderbuffer, on a host
++ * without multisample textures (vrend_state.ms_renderbuffers): gl_id is
++ * the renderbuffer, target GL_RENDERBUFFER */
++#define VREND_STORAGE_GL_RENDERBUFFER    BIT(9)
+ 
+ struct vrend_resource {
+    struct pipe_resource base;
+@@ -505,6 +509,8 @@ void vrend_build_emulated_format_list_gles(void);
+ void vrend_check_texture_storage(struct vrend_format_table *table);
+ void vrend_check_texture_multisample(struct vrend_format_table *table,
+                                      bool enable_storage);
++void vrend_check_renderbuffer_multisample(struct vrend_format_table *table,
++                                          int samples);
+ 
+ struct vrend_resource *vrend_renderer_ctx_res_lookup(struct vrend_context *ctx,
+                                                      int res_handle);
+@@ -605,6 +611,7 @@ unsigned vrend_context_has_debug_flag(const struct vrend_context *ctx,
+ 
+ unsigned vrend_renderer_query_multisample_caps(unsigned max_samples,
+                                                struct virgl_caps_v2 *caps);
++void vrend_renderer_standard_sample_locations(struct virgl_caps_v2 *caps);
+ 
+ struct gl_version {
+    uint32_t major;
+-- 
+2.56.0
+

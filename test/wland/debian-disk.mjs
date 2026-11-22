@@ -20,7 +20,8 @@
 // $KW_BUILD/wland/debian-wland-firefox.img, and FILE.kwsparse.gz. --gl adds
 // the GL clients of page-check.mjs --gpu (WLAND_GL_PACKAGES, below);
 // --chromium installs chromium instead, as a user does (apt-get install
-// chromium: with its recommends) for page-check.mjs --chromium; --firefox
+// chromium: with its recommends), and Mesa's EGL (CHROMIUM_GL_PACKAGES) for
+// page-check.mjs --chromium; --firefox
 // adds firefox-esr (no recommends) to the GL disk's packages for
 // page-check.mjs --firefox.
 import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, readFileSync, writeFileSync } from "node:fs";
@@ -42,6 +43,11 @@ export const WLAND_PACKAGES = ["foot", "fonts-dejavu-core", "fontconfig", "wayla
 // its GL renderer); weston-simple-egl comes from weston's .deb as the shm
 // clients do.
 export const WLAND_GL_PACKAGES = ["libegl-mesa0", "libgles2", "libgl1-mesa-dri", "libgbm1", "libwayland-egl1", "mesa-utils", "glmark2-es2-wayland", "gtk-4-examples"];
+// --chromium: next to chromium (with its recommends, which bring Mesa's DRI
+// drivers, GBM and GLX but not EGL), Mesa's EGL, which Chromium's ANGLE loads
+// as libEGL.so.1 for the GPU path (without it Chromium renders in software),
+// and mesa-utils (eglinfo).
+export const CHROMIUM_GL_PACKAGES = ["libegl1", "libegl-mesa0", "libgles2", "libgbm1", "mesa-utils"];
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
@@ -114,9 +120,9 @@ vm.onOutput((b) => process.stderr.write(b));
 const script = chromium ? `set -e
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /tmp/debs/partial
-inst() { apt-get install -y -q -o Dir::Cache::Archives=/tmp/debs chromium </dev/null; }
+inst() { apt-get install -y -q -o Dir::Cache::Archives=/tmp/debs chromium </dev/null && apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives=/tmp/debs ${CHROMIUM_GL_PACKAGES.join(" ")} </dev/null; }
 inst || { apt-get update -q && inst; }
-command -v chromium
+command -v chromium eglinfo
 dpkg -l | awk '/^ii/ { print $2 }' | grep -E '^(dbus|systemd|libpam-systemd|libgl1-mesa-dri|libegl-mesa0)' || true
 sync` : `set -e
 export DEBIAN_FRONTEND=noninteractive

@@ -15,3 +15,8 @@ if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ -c /dev/kwshm ] &
 	unset _kw_env
 fi
 [ -z "${WAYLAND_DISPLAY:-}" ] || CHROMIUM_FLAGS="$CHROMIUM_FLAGS --ozone-platform=wayland"
+# Guest GL's render node is there but not Mesa's EGL, which Debian's chromium
+# does not pull in: its GPU process cannot start and it renders in software.
+if [ -c /dev/dri/renderD128 ] && ! ls /usr/lib/*-linux-gnu/libEGL.so.1 >/dev/null 2>&1; then
+	echo "chromium: no Mesa EGL, so no GPU rendering; for it: sudo apt-get install libegl1 libegl-mesa0" >&2
+fi

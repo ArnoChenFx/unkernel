@@ -215,15 +215,15 @@ export class WorkerKernel implements KernelHandle {
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
 	#nextShm = 1;
-	/** profile() calls waiting for "profile-result", by id; the last report, from "exit". */
-	#profiles = new Map<number, (r: ProfileReport | undefined) => void>();
-	#nextProfile = 1;
 	/** shm writes on their way: reads go as messages meanwhile, behind them. */
 	#shmWrites = 0;
 	/** The kernel's memory, when the worker shared it ("shm-share"): reads in place. */
 	#shmInPlace: ShmInPlace | undefined;
 	/** It as the ShmClient's local backend. */
 	#shmLocal: ShmLocal | undefined;
+	/** profile() calls waiting for "profile-result", by id; the last report, from "exit". */
+	#profiles = new Map<number, (r: ProfileReport | undefined) => void>();
+	#nextProfile = 1;
 	#profile: ProfileReport | undefined;
 	/**
 	 * Snapshots asked of the worker, by id. With a commit: the snapshot the
@@ -440,14 +440,11 @@ export class WorkerKernel implements KernelHandle {
 			const c = this.#shmCalls.get(m.rid);
 			if (!c) break;
 			this.#shmCalls.delete(m.rid);
+			if (m.ok && m.place) this.#shmInPlace?.set((m.value as { id: number }).id, m.place);
 			if (m.ok) c.resolve(m.value);
 			else c.reject(new ShmError(m.code, m.message));
 			break;
-			if (m.ok && m.place) this.#shmInPlace?.set((m.value as { id: number }).id, m.place);
 		}
-		case "shm-attach":
-			this.#shm?.update(m.info);
-			break;
 		case "shm-read":
 			this.#shared?.shmAnswer(m.seq, m.ok ? m.data : null, m.ok ? null : new ShmError(m.code, m.message));
 			break;
@@ -463,11 +460,14 @@ export class WorkerKernel implements KernelHandle {
 				};
 			}
 			break;
+		case "shm-attach":
+			this.#shm?.update(m.info);
+			break;
 		case "shm-detach":
+			this.#shmInPlace?.drop(m.id);
 			this.#shm?.detached(m.id);
 			break;
 		case "snapshot-held":
-			this.#shmInPlace?.drop(m.id);
 			this.#commitHeld(m.id, this.#withTtys(m.snapshot));
 			break;
 		case "snapshot-result": {

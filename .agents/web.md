@@ -292,10 +292,10 @@ deploying the page needs no kernel toolchain.
   the boot chunk only after `checkSupport()` passed. A missing feature, a
   module that fails to load, a 404, a failed allocation, a panic or a trap
   all end there.
-- Memory: the default is the SDK's `autoMemoryMiB()` (512 MiB on desktops,
-  256 on phones, less with a low `navigator.deviceMemory`); if the browser
+- Memory: the default is the SDK's `autoMemoryMiB()` (2 GiB on desktops,
+  512 MiB on phones, less with a low `navigator.deviceMemory`); if the browser
   refuses the allocation the runtime retries with
-  `DEFAULT_MEMORY_FALLBACK_MIB` (384 down to 64, `js/web/memory.ts`).
+  `DEFAULT_MEMORY_FALLBACK_MIB` (1024 down to 64, `js/web/memory.ts`).
   Alpine boots in 48 MiB.
 - Keyboard shortcuts (`shortcuts.ts`): Ctrl-A is a prefix as in GNU
   screen, and ⌘A too on Apple devices (it takes nothing from the guest). Digits

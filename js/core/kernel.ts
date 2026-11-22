@@ -131,7 +131,7 @@ export interface KernelConfig {
 	module: WebAssembly.Module;
 	/** Memory type to import; default: moduleIsMemory64(module). */
 	memory64?: boolean;
-	/** Default 512. */
+	/** Default 2048. */
 	memoryMiB?: number;
 	/** Default: the module's bundled one (bundledBoot), else "". */
 	cmdline?: string;
@@ -1174,7 +1174,7 @@ export class Kernel {
 				?? snapshotDeviceMismatch(restore.devices ?? {}, this.devicesPresent(), this.opts.net?.mac);
 			if (why) throw new Error(`snapshot: ${why}`);
 		}
-		const memoryMiB = restore ? restore.memory.byteLength / 1048576 : this.opts.memoryMiB ?? 512;
+		const memoryMiB = restore ? restore.memory.byteLength / 1048576 : this.opts.memoryMiB ?? 2048;
 		const bundled = bundledBoot(module);
 		const initrd = restore ? null : this.opts.initrd === undefined ? bundled.initrd : this.opts.initrd;
 		const cmdline = this.opts.cmdline ?? bundled.cmdline ?? "";

@@ -269,7 +269,7 @@ const diskBoot = diskSpecs.length > 0 && !distroOpt;
 const initrdOpt = initrdArg ?? (diskBoot ? "none" : "bundled");
 const kernelOpt = positional ?? opt("kernel");
 const kernelPath = kernelOpt ?? fileURLToPath(bundledKernelUrl);
-const memoryMiB = Number(opt("mem", "512"));
+const memoryMiB = Number(opt("mem", "2048"));
 const timeout = Number(opt("timeout", "0"));
 const scripted = opt("input");
 const rel = (p: string) => path.relative(process.cwd(), p) || p;

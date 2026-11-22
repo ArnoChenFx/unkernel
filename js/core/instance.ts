@@ -90,7 +90,7 @@ export interface CreateKernelOptions {
 	 * no initramfs; else "console=hvc0 rdinit=/init".
 	 */
 	cmdline?: string;
-	/** Kernel memory (fixed for the run). Default 512 on Node; on the web, autoMemoryMiB(). */
+	/** Kernel memory (fixed for the run). Default 2048 on Node; on the web, autoMemoryMiB(). */
 	memoryMiB?: number;
 	/** Smaller sizes to try in order if memoryMiB cannot be allocated. Default none on Node; DEFAULT_MEMORY_FALLBACK_MIB on the web. */
 	memoryFallbackMiB?: number[];
@@ -968,7 +968,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	const startedP = new Promise<void>((r) => (started = r));
 	const kernel = new Kernel({
 		module, initrd, cmdline, disks, net,
-		memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 512,
+		memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 2048,
 		memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,
 		memory64: opts.memory64,
 		jit: opts.jit,

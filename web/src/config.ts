@@ -13,7 +13,7 @@
 // and ?routes are read from the URL only.
 //
 //   ?mem=MiB                           kernel memory (default: auto, from the SDK's autoMemoryMiB():
-//                                      256 on phones, 512 otherwise, less on low-memory devices)
+//                                      512 on phones, 2048 otherwise, less on low-memory devices)
 //   ?append=<cmdline>                  kernel command line
 //   ?net=0                             no network device (else: the Wisp server(s), default:
 //                                      the project's)

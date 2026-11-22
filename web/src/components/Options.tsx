@@ -125,7 +125,7 @@ function Slider({ id, name, label, value, stops, disabled, note, noteId, warnNot
 	);
 }
 
-const SIZES = [64, 128, 256, 512, 1024];
+const SIZES = [64, 128, 256, 512, 1024, 2048, 4096];
 const CPU_COUNTS = [1, 2, 4, 8, 16];
 const FONTS = [11, 12, 13, 14, 15, 16, 18];
 

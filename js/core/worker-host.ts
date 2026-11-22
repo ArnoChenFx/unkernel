@@ -35,7 +35,7 @@ import { moduleIsMemory64 } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BootFailStage, type KernelSource } from "./load.ts";
 import { ConsoleRing, ConsoleRingReader, newConsoleRing } from "./console-ring.ts";
 import { ConsoleOutput } from "./output.ts";
-import { SnapshotCommitError, receivedSnapshot, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
+import { SnapshotCommitError, receivedSnapshot, restoreSnapshotMemory, type KernelSnapshot, type SnapshotOptions } from "./snapshot.ts";
 import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint, WorkerExit, WorkerSource } from "./worker-protocol.ts";
 
 /** How long stop() waits for the worker to confirm (it first lets saves in flight commit, up to 10 s) before it ends the worker anyway. */
@@ -89,7 +89,10 @@ function toWorkerRestore(s: KernelSnapshot | undefined, transfer: boolean): [Ker
 	if (!s) return [undefined, []];
 	const m = s.memory;
 	const whole = m.buffer instanceof ArrayBuffer && m.byteOffset === 0 && m.byteLength === m.buffer.byteLength;
-	const memory = transfer && whole ? m : m.slice();
+	if (transfer && whole) return [{ ...s, memory: m }, [m.buffer as ArrayBuffer]];
+	// A sparse copy: the snapshot's zero pages stay untouched in it.
+	const memory = new Uint8Array(m.byteLength);
+	restoreSnapshotMemory(memory, m);
 	return [{ ...s, memory }, [memory.buffer as ArrayBuffer]];
 }
 
@@ -976,7 +979,7 @@ export async function createKernelInWorker(platform: Platform, opts: CreateKerne
 		spec = {
 			kernel, initrd, disks, distro, net: opts.net as NetSpec | undefined,
 			cmdline: opts.cmdline,
-			memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 512,
+			memoryMiB: opts.memoryMiB ?? platform.defaultMemoryMiB?.() ?? 2048,
 			memoryFallbackMiB: opts.memoryFallbackMiB ?? platform.defaultMemoryFallbackMiB,
 			memory64: opts.memory64,
 			jit: opts.jit,

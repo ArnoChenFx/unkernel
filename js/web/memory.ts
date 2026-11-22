@@ -4,9 +4,9 @@
 
 /**
  * Sizes createKernel() tries, in order, when the requested memory cannot be
- * allocated (phones often lack the address space for 512 MiB).
+ * allocated (phones often lack the address space for the larger ones).
  */
-export const DEFAULT_MEMORY_FALLBACK_MIB: readonly number[] = Object.freeze([384, 256, 192, 128, 96, 64]);
+export const DEFAULT_MEMORY_FALLBACK_MIB: readonly number[] = Object.freeze([1024, 512, 384, 256, 192, 128, 96, 64]);
 
 /** A phone or tablet: a coarse pointer (touch) or a mobile user agent (the old page's rule). */
 export function isMobile(): boolean {
@@ -18,11 +18,14 @@ export function isMobile(): boolean {
 
 /**
  * A memory size for this device: from navigator.deviceMemory (secure
- * contexts only) when known, else 256 MiB on phones and 512 MiB otherwise.
+ * contexts only) when known, else 512 MiB on phones and 2 GiB otherwise
+ * (at most 512 MiB on a phone whatever it reports). Memory the guest never
+ * touches costs the host nothing.
  */
 export function autoMemoryMiB(opts: { mobile?: boolean } = {}): { mib: number; why: string } {
 	const devMem = (globalThis.navigator as (Navigator & { deviceMemory?: number }) | undefined)?.deviceMemory;
-	if (devMem) return { mib: devMem <= 1 ? 96 : devMem <= 2 ? 128 : devMem <= 4 ? 256 : 512, why: `auto: device reports ${devMem} GB` };
-	if (opts.mobile ?? isMobile()) return { mib: 256, why: "auto: mobile device" };
-	return { mib: 512, why: "auto" };
+	const mobile = opts.mobile ?? isMobile();
+	if (devMem) return { mib: devMem <= 1 ? 96 : devMem <= 2 ? 256 : devMem <= 4 || mobile ? 512 : 2048, why: `auto: device reports ${devMem} GB` };
+	if (mobile) return { mib: 512, why: "auto: mobile device" };
+	return { mib: 2048, why: "auto" };
 }

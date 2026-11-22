@@ -134,7 +134,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			assert.equal(vm.transport, transport);
 			assert.equal("kernel" in vm, !worker, "the low-level kernel only inline");
 			assert.equal(vm instanceof sdk.WorkerKernel, worker);
-			assert.equal(vm.memoryMiB, 512);
+			assert.equal(vm.memoryMiB, 2048);
 			assert.equal(vm.memory64, false);
 			assert.ok(stages.includes("compiled") && stages.includes("memory") && stages.at(-1) === "start", stages.join(","));
 			assert.match(vm.cmdline, /rdinit=/);
@@ -1774,7 +1774,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		vm.write("X=kept; echo $((6*7)) > /tmp/f; (while :; do usleep 50000; done) & echo saved-$X\n");
 		await a.waitFor(/saved-kept/);
 		const snap = sdk.decodeSnapshot(sdk.encodeSnapshot(await vm.snapshot()));
-		assert.equal(snap.memory.byteLength, 512 * 1048576);
+		assert.equal(snap.memory.byteLength, 2048 * 1048576);
 		assert.match(snap.fingerprint, /^Linux version /);
 		vm.write("echo still-$X\n");
 		await a.waitFor(/still-kept/);
@@ -2140,7 +2140,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await a.waitFor(/saved-w-kept/);
 		const snap = await vm.snapshot({ stop: true });
 		assert.equal((await vm.exited).kind, "stopped");
-		assert.equal(snap.memory.byteLength, 512 * 1048576, "the memory came across");
+		assert.equal(snap.memory.byteLength, 2048 * 1048576, "the memory came across");
 
 		const vm2 = await boot(t, { vsock: false, restore: snap, log: () => {} });
 		assert.ok(vm2 instanceof sdk.KernelInstance);
@@ -2176,7 +2176,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		assert.equal(snapA.disks[0]?.name, file);
 
 		const vm2 = await boot(t, { worker: true, kernel: module, vsock: false, disks: [spec], restore: snapA, log: () => {} });
-		assert.equal(snapA.memory.byteLength, 512 * 1048576, "copied, not transferred, by default");
+		assert.equal(snapA.memory.byteLength, 2048 * 1048576, "copied, not transferred, by default");
 		const b = screen(vm2);
 		vm2.write("echo two > /data/two; echo got-$(cat /data/one)\n");
 		await b.waitFor(/got-one/);
@@ -2241,7 +2241,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			return new Promise((_, reject) => setTimeout(() => reject(new Error("no room")), 200));
 		} }).catch((e: unknown) => e);
 		assert.ok(e1 instanceof sdk.SnapshotCommitError && /no room/.test(e1.message) && /runs on/.test(e1.message) && !e1.timedOut, String(e1));
-		assert.equal(held?.memory.byteLength, 512 * 1048576, "the commit got the snapshot");
+		assert.equal(held?.memory.byteLength, 2048 * 1048576, "the commit got the snapshot");
 		assert.match(String(await second), /one is in progress/);
 		await runsOn("a rejected commit");
 
@@ -2267,7 +2267,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		let bytes: Uint8Array | undefined;
 		const snap = await vm.snapshot({ commit: (s) => { bytes = sdk.encodeSnapshot(s); } });
 		assert.equal((await vm.exited).kind, "stopped", "stopped once committed");
-		assert.equal(snap.memory.byteLength, 512 * 1048576);
+		assert.equal(snap.memory.byteLength, 2048 * 1048576);
 
 		const vm2 = await boot(t, { worker, kernel: module, vsock: false, disks: [disk()], restore: sdk.decodeSnapshot(bytes!), log: () => {} } as BootOptions);
 		const b = screen(vm2), sh2 = shell(vm2, b);
@@ -2358,7 +2358,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 			},
 		});
 		const heldS = (performance.now() - h1) / 1000;
-		assert.equal(snap.memory.byteLength, 512 * 1048576, "resolved with the snapshot");
+		assert.equal(snap.memory.byteLength, 2048 * 1048576, "resolved with the snapshot");
 		// True, and not through the kernel (held, it would not flush: false after sync()'s 3 s).
 		assert.ok(during.sync === true && during.syncMs! < 2500, `sync() during the hold: ${during.sync} after ${during.syncMs?.toFixed(0)} ms`);
 		assert.match(String(during.second), /one is in progress/);
@@ -2405,7 +2405,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		const m = await heldMachine(t, worker);
 		let bytes: Uint8Array | undefined;
 		const snap = await m.quietly({ commit: (s) => { bytes = sdk.encodeSnapshot(s); }, hold: () => new Promise((r) => setTimeout(() => r("stop"), 500)) });
-		assert.equal(snap.memory.byteLength, 512 * 1048576);
+		assert.equal(snap.memory.byteLength, 2048 * 1048576);
 		assert.equal((await m.vm.exited).reason, "stopped after a snapshot");
 		const vm2 = await boot(t, { worker, kernel: m.module, disks: [m.disk()], restore: sdk.decodeSnapshot(bytes!), log: () => {} } as BootOptions);
 		const re = await vm2.attach(m.d.sessionId!);
@@ -2490,7 +2490,7 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 
 		const t0 = performance.now();
 		const snap = await vm.snapshot({ stop: true });
-		assert.ok(performance.now() - t0 >= 11000 && snap.memory.byteLength === 512 * 1048576, "resolved once the disk was durable");
+		assert.ok(performance.now() - t0 >= 11000 && snap.memory.byteLength === 2048 * 1048576, "resolved once the disk was durable");
 		assert.equal((await vm.exited).reason, "stopped after a snapshot");
 
 		await sh2("echo before > /data/f; sync");

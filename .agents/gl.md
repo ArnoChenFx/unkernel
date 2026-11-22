@@ -241,6 +241,15 @@ is made up at three levels, the shim first:
     `getBufferSubData` unless all of it is invalidated), written back by
     `bufferSubData` at unmap or flush: buffer upload and readback,
     stride-0 vertex attributes.
+  - **Uniform buffer sizes.** WebGL refuses a draw whose uniform buffer
+    range is smaller than its block (`UNIFORM_BLOCK_DATA_SIZE`), which
+    desktop drivers allow and vrend passes on as the guest bound it.
+    `kw_glBindBufferRange` rounds a uniform range up to 16 bytes (an std140
+    block's size is a multiple of 16) and `kw_glBufferData` rounds every
+    buffer vrend allocates the same way, so a range short of only its
+    trailing padding draws: SuperTuxKart 1.4 (Matrices, 592 bytes in a
+    584-byte buffer), whose context otherwise went into error at its first
+    3D draw.
   - **Indexed blend and colour mask** on `OES_draw_buffers_indexed`, whose
     GLES name vrend's feature check finds in emscripten's extension list.
   - **Base vertex and base instance draws**:

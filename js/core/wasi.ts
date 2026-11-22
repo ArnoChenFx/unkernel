@@ -65,6 +65,29 @@ export function never(): Promise<never> {
 	return new Promise(() => {});
 }
 
+/** What a dropped stack's suspended import throws (dropStack, stackDropped). */
+export const STACK_DROPPED: unique symbol = Symbol("unkernel stack dropped");
+
+/**
+ * A rejected promise for a JSPI-suspended kernel stack that never runs
+ * again (its task exited, or started on a fresh stack): the import throws
+ * STACK_DROPPED there, which unwinds the stack without running kernel code
+ * and frees it at once. Parked for good (never()) it is freed only by a
+ * garbage collection, and Firefox allows a thread about 2000 stacks (2 GiB
+ * at 1 MiB each): "too many continuation stacks".
+ */
+export function stackDropped(): Promise<never> {
+	return Promise.reject(STACK_DROPPED);
+}
+
+/** Unwind the parked stack of `task`, if `resumers` has one (stackDropped). */
+export function dropStack(resumers: Map<bigint, (task: bigint) => void>, task: bigint): void {
+	const resume = resumers.get(task);
+	if (!resume) return;
+	resumers.delete(task);
+	(resume as (v: unknown) => void)(stackDropped());
+}
+
 export function nowNs(): bigint {
 	return BigInt(Math.round(performance.now() * 1e6));
 }

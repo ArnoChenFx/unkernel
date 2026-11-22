@@ -87,11 +87,14 @@ this one) at two kinds of point:
 The CPU that holds a moved task's old stack learns it from a per-CPU list
 (`kw_stack_drop()`, 32 entries) and, at its next switch or idle, before it
 could switch to that task (or a new task at the same address) again, calls
-`wasm_stack_drop(task)`; its host forgets the stack. A full list only leaks
-that stack until the task next starts fresh on that CPU. A task picked
-again on its own CPU resumes its stack rather than starting fresh:
-preemptions are frequent and moves rare, and a fresh start costs a new JSPI
-stack while the old one waits for garbage collection.
+`wasm_stack_drop(task)`; its host unwinds the stack (its suspended import
+throws `STACK_DROPPED`, js/core/wasi.ts, as for an exited task's), which
+frees it at once: left parked it would wait for a garbage collection, and
+Firefox allows a thread about 2000 stacks ("too many continuation stacks").
+A full list only leaks that stack until the task next starts fresh on that
+CPU. A task picked again on its own CPU resumes its stack rather than
+starting fresh: preemptions are frequent and moves rare, and a fresh start
+costs a new JSPI stack.
 
 Held tasks never call `migrate_enable()` before they exit, so
 `rq->nr_pinned` (used only by CPU hot-unplug, which this arch lacks) only

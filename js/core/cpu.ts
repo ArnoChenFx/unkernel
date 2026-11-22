@@ -20,7 +20,7 @@
 
 import { ConsoleRing, type ConsoleBatch, type ConsoleFull } from "./console-ring.ts";
 import { JitHost } from "./jit.ts";
-import { ERRNO, never, yieldToEventLoop } from "./wasi.ts";
+import { ERRNO, STACK_DROPPED, dropStack, never, stackDropped, yieldToEventLoop } from "./wasi.ts";
 import { errorText } from "./output.ts";
 
 /** What CPU 0's host sends to start a CPU (structured-cloneable). */
@@ -199,7 +199,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 	let exited = false;
 	let retFromFork!: (prev: bigint, next: bigint) => Promise<unknown>;
 	const trap = (e: unknown) => {
-		if (exited) return;
+		if (exited || e === STACK_DROPPED) return;
 		exited = true;
 		port.post({ t: "trap", error: `CPU ${cpu}: ${errorText(e)}` });
 		stopCpu0();
@@ -277,7 +277,7 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		...jit.imports(),
 		// A task started on a fresh stack on another CPU: its old one here never runs again.
 		wasm_stack_drop(task: bigint): void {
-			resumers.delete(task);
+			dropStack(resumers, task);
 		},
 		wasm_dump_stacktrace(buf: bigint, max: bigint): void {
 			const s = new TextEncoder().encode(new Error().stack ?? "");
@@ -288,9 +288,9 @@ export async function runCpu(init: CpuInit, port: CpuPort): Promise<void> {
 		// (JSPI) Park prev, run next, as on CPU 0 (kernel.ts), with this thread's stacks.
 		wasm_switch_to: new WebAssembly.Suspending((prev: bigint, next: bigint, isNew: unknown, prevDead: unknown) => {
 			if (exited) return never();
-			const parked = prevDead ? never() : new Promise<bigint>((r) => resumers.set(prev, r));
+			const parked = prevDead ? stackDropped() : new Promise<bigint>((r) => resumers.set(prev, r));
 			if (isNew) {
-				resumers.delete(next);
+				dropStack(resumers, next);
 				queueMicrotask(() => {
 					retFromFork(prev, next).then(() => trap(new Error("task returned from ret_from_fork")), trap);
 				});

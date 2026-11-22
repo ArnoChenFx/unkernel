@@ -45,7 +45,7 @@ import { HOLD_CLOCK_LAG_MS, SNAPSHOT_COMMIT_TIMEOUT_MS, SnapshotCommitError, awa
 import { VirtioHost } from "./virtio.ts";
 import { VirtioGpu, type GpuBackend } from "./virtio-gpu.ts";
 import { VsockDevice } from "./vsock.ts";
-import { WasiHost, never } from "./wasi.ts";
+import { STACK_DROPPED, WasiHost, dropStack, never, stackDropped } from "./wasi.ts";
 import { errorText } from "./output.ts";
 
 const IRQ_CONSOLE = 1;
@@ -1062,7 +1062,7 @@ export class Kernel {
 			// The task started on a fresh stack on another CPU: its old one
 			// here never runs again (kernel process.c, kw_stack_drain()).
 			wasm_stack_drop(task: bigint): void {
-				k.resumers.delete(task);
+				dropStack(k.resumers, task);
 			},
 			// (JSPI) Suspends only for snapshot({ commit }), which holds the kernel at its consistent point.
 			wasm_snapshot_point: new WebAssembly.Suspending((result: number, blocker: bigint, freeMap: bigint, freeBits: bigint) => k.snapshotPoint(result, blocker, freeMap, freeBits)),
@@ -1073,12 +1073,12 @@ export class Kernel {
 				if (k.result) return never(); // exited or stopped: park for good
 				k.stats.switches++;
 				const parked = prevDead
-					? never()
+					? stackDropped()
 					: new Promise<bigint>((r) => k.resumers.set(prev, r));
 				if (isNew) {
 					// A parked task resumes on a fresh stack too (park.c): drop
 					// its old one, which never runs again.
-					k.resumers.delete(next);
+					dropStack(k.resumers, next);
 					queueMicrotask(() => {
 						k.retFromFork(prev, next).then(
 							() => k.fatal("task returned from ret_from_fork"),
@@ -1129,6 +1129,7 @@ export class Kernel {
 	}
 
 	onTrap(e: unknown): void {
+		if (e === STACK_DROPPED) return; // a dropped stack unwound (wasi.ts, stackDropped)
 		this.log(`[host] wasm trap: ${errorText(e)}`);
 		this.exit({ code: 254, reason: String(e), kind: "trap", error: e });
 	}

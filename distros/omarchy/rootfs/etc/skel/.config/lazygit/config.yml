@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # ~/.config/lazygit/config.yml of the Omarchy image: lazygit in Tokyo Night,
-# without icons (no Nerd Font).
+# without icons (no Nerd Font), and without its first-run popups.
+
+disableStartupPopups: true
 
 gui:
   nerdFontsVersion: ""

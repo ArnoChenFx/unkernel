@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+# ~/.config/lazygit/config.yml of the Omarchy image: lazygit in Tokyo Night,
+# without icons (no Nerd Font).
+
+gui:
+  nerdFontsVersion: ""
+  showIcons: false
+  showRandomTip: false
+  border: rounded
+  theme:
+    activeBorderColor:
+      - "#7aa2f7"
+      - bold
+    inactiveBorderColor:
+      - "#565f89"
+    optionsTextColor:
+      - "#7aa2f7"
+    selectedLineBgColor:
+      - "#283457"
+    cherryPickedCommitBgColor:
+      - "#3b4261"
+    cherryPickedCommitFgColor:
+      - "#bb9af7"
+    unstagedChangesColor:
+      - "#f7768e"

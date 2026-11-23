@@ -1,0 +1,31 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+# /etc/init.d/omarchy: the desktop's runtime. udev gives libinput the input
+# devices' properties; the user's runtime directory /run/user/UID is where sway
+# and its clients keep their sockets. /run is empty at each boot, so the service
+# makes both at runlevel 2.
+
+### BEGIN INIT INFO
+# Provides:          omarchy
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     2
+# Default-Stop:
+# Short-Description: The desktop's runtime: udev and the user's runtime directory
+### END INIT INFO
+
+case $1 in
+start)
+	uid=$(id -u user) || exit 0
+	install -d -m 700 -o user -g user "/run/user/$uid"
+	/usr/lib/systemd/systemd-udevd --daemon
+	udevadm trigger --action=add
+	udevadm settle --timeout=10
+	;;
+stop | restart | force-reload | status) ;;
+*)
+	echo "Usage: $0 start" >&2
+	exit 3
+	;;
+esac

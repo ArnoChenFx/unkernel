@@ -1,0 +1,151 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+# omarchy: the desktop's commands of the Omarchy image (distros/omarchy).
+# The desktop is sway on the display's DRM device (the page's GPU option, or
+# the CLI's --gpu). Run `omarchy` for the list.
+
+set -u
+
+die() { echo "omarchy: $*" >&2; exit 1; }
+
+usage() {
+	cat <<'EOT'
+usage: omarchy COMMAND [ARGS]
+  desktop              start sway on the display (also: start)
+  menu                 the menu of the desktop (Super+Alt+Space)
+  keys                 the keybindings
+  install PKG...       install packages (apt, with sudo)
+  update               update the system (apt, with sudo)
+  lock                 lock the screen (needs a password: sudo passwd user)
+  screenshot [region|output]   a screenshot to the clipboard and ~/Pictures
+  version              the image and the desktop's versions
+  bar                  the status line of the bar (sway runs it)
+EOT
+}
+
+# Runs a program in a terminal window of the desktop; without a desktop, here.
+in_term() {
+	if [ -n "${SWAYSOCK-}" ]; then
+		swaymsg "exec foot -- $*" >/dev/null
+	else
+		"$@"
+	fi
+}
+
+desktop() {
+	local run=/run/user/$(id -u)
+	if [ ! -e /dev/dri/card0 ]; then
+		die "no /dev/dri/card0: sway draws on the display's DRM device (the page's GPU option, or the CLI's --gpu)"
+	fi
+	if [ ! -d "$run" ] || [ ! -O "$run" ]; then
+		die "$run is missing (the omarchy service makes it at boot: sudo /etc/init.d/omarchy start)"
+	fi
+	# A console shell of the page has the wland relay's display (kw-wayland.sh):
+	# sway must not nest in it.
+	unset DISPLAY WAYLAND_DISPLAY
+	export XDG_RUNTIME_DIR="$run" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=sway XDG_SESSION_DESKTOP=sway
+	export LIBSEAT_BACKEND=seatd XCURSOR_THEME=DMZ-White XCURSOR_SIZE=24
+	# pixman draws in software on the display's dumb buffers, which the CLI's --gpu
+	# and the page's GPU both give; WLR_RENDERER=gles2 asks for the GPU's GL instead.
+	export WLR_RENDERER=${WLR_RENDERER:-pixman}
+	dbus-run-session -- sway "$@"
+}
+
+menu() {
+	local choice
+	choice=$(printf '%s\n' \
+		'Terminal' 'Launcher' 'Editor' 'Git (lazygit)' 'System monitor (btop)' \
+		'Install a package' 'Update the system' 'Keybindings' 'Screenshot' \
+		'Lock the screen' 'Restart' 'Shut down' 'Exit the desktop' |
+		fzf --prompt='omarchy > ' --no-multi --height=100% --border=none --info=hidden) || return 0
+	case $choice in
+	Terminal) in_term bash ;;
+	Launcher) [ -z "${SWAYSOCK-}" ] || swaymsg exec fuzzel >/dev/null ;;
+	Editor) in_term nvim ;;
+	'Git (lazygit)') in_term lazygit ;;
+	'System monitor (btop)') in_term btop ;;
+	'Install a package')
+		read -r -a pkgs -p 'package(s): ' && install "${pkgs[@]}"
+		read -r -n1 -s -p 'press a key '
+		;;
+	'Update the system')
+		sudo apt-get update && sudo apt-get upgrade -y
+		read -r -n1 -s -p 'press a key '
+		;;
+	Keybindings) keys | "${PAGER:-less}" ;;
+	Screenshot) screenshot region ;;
+	'Lock the screen') lock ;;
+	Restart) sudo reboot ;;
+	'Shut down') sudo poweroff ;;
+	'Exit the desktop') [ -z "${SWAYSOCK-}" ] || swaymsg exit >/dev/null ;;
+	esac
+}
+
+keys() { cat /usr/share/omarchy/keys; }
+
+install() {
+	[ $# -gt 0 ] || die "install PKG..."
+	sudo apt-get install -y "$@"
+}
+
+update() {
+	sudo apt-get update && sudo apt-get upgrade -y
+}
+
+lock() {
+	local pw msg="no password is set, so the lock could not be opened: set one with sudo passwd $(id -un)"
+	pw=$(sudo -n getent shadow "$(id -un)" 2>/dev/null | cut -d: -f2)
+	case $pw in
+	'' | '*' | '!'*)
+		[ -z "${SWAYSOCK-}" ] || notify-send -u critical 'omarchy lock' "$msg" 2>/dev/null
+		die "$msg"
+		;;
+	esac
+	exec swaylock -f -c 1a1b26
+}
+
+screenshot() {
+	local f
+	mkdir -p "$HOME/Pictures"
+	f="$HOME/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"
+	case ${1:-region} in
+	region) grim -g "$(slurp)" "$f" || return 1 ;;
+	output | full) grim "$f" || return 1 ;;
+	*) die "screenshot [region|output]" ;;
+	esac
+	wl-copy --type image/png < "$f"
+	notify-send -t 3000 'Screenshot' "$f" 2>/dev/null || true
+	echo "$f"
+}
+
+bar() {
+	local load mem
+	while :; do
+		read -r load _ < /proc/loadavg
+		mem=$(awk '/^MemTotal:/ { t = $2 } /^MemAvailable:/ { a = $2 } END { printf "%d", (t - a) * 100 / t }' /proc/meminfo)
+		printf 'load %s   mem %s%%   %s\n' "$load" "$mem" "$(date '+%a %d %b  %H:%M')"
+		sleep 1
+	done
+}
+
+version() {
+	echo "omarchy image: $(cat /usr/lib/kw-image 2>/dev/null || echo unknown)"
+	echo "debian: $(. /etc/os-release && echo "$PRETTY_NAME")"
+	if command -v sway >/dev/null; then sway --version; fi
+	if command -v foot >/dev/null; then foot --version | head -1; fi
+}
+
+case ${1:-} in
+desktop | start) shift; desktop "$@" ;;
+menu) menu ;;
+keys) keys ;;
+install) shift; install "$@" ;;
+update) update ;;
+lock) lock ;;
+screenshot) shift; screenshot "$@" ;;
+version) version ;;
+bar) bar ;;
+'' | -h | --help | help) usage ;;
+*) usage >&2; exit 2 ;;
+esac

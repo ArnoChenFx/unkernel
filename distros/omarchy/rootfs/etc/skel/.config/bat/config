@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+# ~/.config/bat/config of the Omarchy image: bat paints with the terminal's own
+# palette (foot's Tokyo Night), so the colours match the rest of the desktop.
+
+--theme="ansi"
+--style="numbers,changes"

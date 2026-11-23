@@ -1,0 +1,54 @@
+Keybindings of the Omarchy desktop (sway). Super is the Windows or Command key.
+The configuration is ~/.config/sway/config; Super+Shift+C reloads it.
+
+Windows and workspaces
+  Super+Return            terminal (foot)
+  Super+Space             launcher (fuzzel): type the name of an app
+  Super+Alt+Space         the menu: install, update, lock, restart, shut down
+  Super+W                 close the window (also Super+Shift+Q)
+  Super+H J K L           focus left, down, up, right (or the arrow keys)
+  Super+Shift+H J K L     move the window (or the arrow keys)
+  Super+1 .. 0            workspace 1 .. 10
+  Super+Shift+1 .. 0      move the window to workspace 1 .. 10
+  Super+Tab               the last workspace
+  Super+F                 fullscreen
+  Super+T                 floating or tiled
+  Super+E                 split direction (toggle)
+  Super+S                 stacked layout
+  Super+A                 the parent container
+  Super+Shift+Minus       move the window to the scratchpad (hidden)
+  Super+Minus             show the scratchpad, or hide it again
+  Super+R                 resize mode: H J K L or the arrows; Escape or Return ends it
+
+Screen and notifications
+  Print                   screenshot of the whole screen to ~/Pictures and the clipboard
+  Super+Shift+S           screenshot of a region (drag with the mouse)
+  Super+N                 dismiss the notification
+  Super+Escape            lock the screen (Super+Ctrl+L too); needs a password: sudo passwd user
+
+Desktop
+  Super+Shift+E           exit the desktop
+
+Terminal (foot)
+  Ctrl+Shift+C / V        copy and paste
+  Ctrl+Shift+R            search the scrollback
+  Shift+Page Up / Down    scroll by page (the mouse wheel works too)
+
+Shell (bash)
+  Ctrl+R                  search the history (fzf)
+  Ctrl+T                  insert a file name (fzf)
+  Alt+C                   change to a directory (fzf)
+  z NAME                  jump to a directory you have used (zoxide)
+  v, lg, top              neovim, lazygit, btop
+
+tmux (ctrl-a is the prefix)
+  prefix |  /  prefix -   split the window to the right or below
+  prefix c                new window
+  prefix d                detach
+
+Neovim (Space is the leader)
+  Space w, Space q        save, quit
+  Space f f               find a file below the directory (:find)
+  Space f b               list the buffers
+  Space e                 the file browser (netrw)
+  Ctrl+h J K L            move between windows

@@ -48,7 +48,7 @@ $UserAgent = 'unkernel-remote-update'
 $userHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 $unkernelHome = Join-Path $userHome '.unkernel'
 if (-not $Dir) { $Dir = if ($env:UNKERNEL_APP) { $env:UNKERNEL_APP } else { Join-Path $unkernelHome 'app' } }
-$app = [IO.Path]::GetFullPath($Dir)
+$app = if ([IO.Path]::IsPathRooted($Dir)) { [IO.Path]::GetFullPath($Dir) } else { [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Dir)) }
 $dataDir = [IO.Path]::GetFullPath((Join-Path $unkernelHome 'remote'))
 if ($app -eq $dataDir -or $app.StartsWith($dataDir + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
 	throw "-Dir ($app) must not be the data directory ($dataDir)"

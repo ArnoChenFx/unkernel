@@ -42,6 +42,7 @@ function Stop-Start([string]$message) {
 
 function Resolve-Path-Arg([string]$path) {
 	if ([string]::IsNullOrEmpty($path)) { return $path }
+	if ([IO.Path]::IsPathRooted($path)) { return [IO.Path]::GetFullPath($path) }
 	return [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $path))
 }
 

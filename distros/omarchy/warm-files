@@ -155,7 +155,6 @@ usr/lib/aarch64-linux-gnu/libgit2.so.1.9.0
 usr/lib/aarch64-linux-gnu/libglib-2.0.so.0.8400.4
 usr/lib/aarch64-linux-gnu/libharfbuzz.so.0.61020.0
 usr/lib/aarch64-linux-gnu/libstdc++.so.6.0.33
-usr/lib/aarch64-linux-gnu/libsystemd.so.0.40.0
 usr/lib/aarch64-linux-gnu/libwlroots-0.18.so
 usr/lib/cargo/bin/fd
 var/cache/apt/srcpkgcache.bin

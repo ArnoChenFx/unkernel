@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The remote kernel backend's server (Bun), on 127.0.0.1 only: the page's
-// files from the web build (its index.html says ?remote=1 is the default),
-// /remote/info, and /remote/ws, the page's connection to the kernel
-// (js/node/remote.ts). Every request must carry this backend's own Host and,
-// when it has one, its own Origin and a same-origin Sec-Fetch-Site, so a page
+// files from the web build (its HTML says the page runs its kernel here, see
+// http.ts), /remote/info, and /remote/ws, the page's connection to the kernel
+// (js/node/remote.ts). Every request passes http.ts's sameSiteGuard, so a page
 // on another site cannot reach the kernel. The kernel's files are looked up
 // only under the web build, the distro images are copied to the cache, and
 // the data disk is created from the kernel's template when missing.

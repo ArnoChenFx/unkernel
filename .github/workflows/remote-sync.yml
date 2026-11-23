@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+#
+# Remote sync: merges pithings/unkernel's main into this fork's main every day
+# (and on demand), then releases the merge through remote-release.yml. The
+# merge is made by remote/scripts/sync-upstream.sh, a merge commit only: nothing
+# is force-pushed and no history is rewritten.
+#   - No upstream commit that main lacks: nothing happens. force_release
+#     releases main's head anyway.
+#   - New upstream commits, merged cleanly: main is pushed (a fast-forward) and
+#     released as remote-v<YYMMDD>-<sha7> of the merge commit.
+#   - A conflict: main is not touched. The conflicted merge is pushed to
+#     upstream-sync/<sha7>, and one draft pull request for that branch is
+#     opened (it is never merged automatically).
+#
+# GITHUB_TOKEN is the only credential, and no repository secret is used. The
+# release is a reusable workflow (workflow_call): a push made with GITHUB_TOKEN
+# starts no workflow run, so the merge cannot start a release by pushing a tag.
+# The repository must let GitHub Actions create pull requests (Settings >
+# Actions > General > "Allow GitHub Actions to create and approve pull
+# requests"), or the conflict's pull request is not opened.
+
+name: Remote sync
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: Release main's head even when upstream has no new commits
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: remote-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream main into main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # push main, or the conflict's branch
+      pull-requests: write # the draft pull request of a conflict
+    outputs:
+      released: ${{ steps.sync.outputs.released }}
+      tag: ${{ steps.sync.outputs.tag }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      # Full history for the merge. The token stays in the clone: the script pushes main with it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main into main, or report the conflict
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
+          UPSTREAM_URL: https://github.com/pithings/unkernel.git
+        run: bash remote/scripts/sync-upstream.sh
+
+  release:
+    name: Release the merge
+    needs: sync
+    if: needs.sync.outputs.released == 'true'
+    permissions:
+      contents: write # the tag and the release, in remote-release.yml
+    uses: ./.github/workflows/remote-release.yml
+    with:
+      tag: ${{ needs.sync.outputs.tag }}
+      sha: ${{ needs.sync.outputs.sha }}

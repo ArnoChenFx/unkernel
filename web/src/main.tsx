@@ -12,6 +12,7 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { App } from "./components/App.tsx";
 import { readConfig } from "./config.ts";
+import { remoteConfig } from "../../remote/web/page.ts";
 import { KW } from "./kw.ts";
 import { previewEscape } from "./preview.ts";
 import { checkSupport } from "./sdk.ts";
@@ -37,7 +38,7 @@ if (/Macintosh/.test(navigator.userAgent) && !navigator.maxTouchPoints) {
 	document.addEventListener("fullscreenchange", fit);
 }
 
-const cfg = (KW.config = readConfig());
+const cfg = (KW.config = remoteConfig(readConfig()));
 const ui = createUi(cfg);
 KW.ui = ui;
 // Rendered at once (it replaces index.html's static desktop, which it draws

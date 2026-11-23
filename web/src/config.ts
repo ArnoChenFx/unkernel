@@ -227,6 +227,8 @@ export function saveSettings(s: Record<string, string>): boolean {
 export interface Config {
 	/** The settings this load read: the saved ones with the URL's on top (?net=0 as wisp=0). */
 	settings: Record<string, string>;
+	/** The kernel runs in the remote backend (remote/web/page.ts remoteConfig()): one CPU, a Web Worker's messages on a socket. */
+	remote: boolean;
 	/** The kernel this page boots on one CPU: the base bundle unkernel.wasm (its UP kernel). */
 	kernelUrl: string;
 	/** The image this load boots, or null (?distro=none). */
@@ -474,6 +476,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const glWhy = !glParam ? null : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
 	return {
 		settings: Object.fromEntries(params),
+		remote: false,
 		kernelUrl: kernelUrl.pathname,
 		distro,
 		distroParam,

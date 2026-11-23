@@ -51,6 +51,7 @@ import {
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot, type SnapshotHoldDecision,
 	type GlStats, type VirglTotals,
 } from "./sdk.ts";
+import { connectRemote, createRemoteKernel, remoteDataError, type RemoteLink } from "../../remote/web/page.ts";
 
 /** The virtio-gpu device's 3D counters (vm.gl.stats.gpu). */
 type GpuRendererStats = NonNullable<GlStats["gpu"]>;
@@ -126,6 +127,8 @@ export function start(): void {
 	let vm: KernelHandle | null = null;
 	const local = (): KernelInstance | null => (vm instanceof KernelInstance ? vm : null);
 	let vmExited = false;
+	/** Remote mode (cfg.remote): the connection to the backend that runs the kernel, made at boot. */
+	let remoteLink: RemoteLink | null = null;
 	/** createKernel() is running (in worker mode the worker may be opening the data disk). */
 	let kernelStarting = false;
 	/** The kernel has exited (inline: the moment it does; a worker: once its exit message arrived). */
@@ -186,7 +189,7 @@ export function start(): void {
 			st.persisted ? "not evicted under storage pressure" : st.persisted === false ? "the browser may evict the saved disks under storage pressure (it did not grant navigator.storage.persist())" : "");
 	}
 	/** Worker mode: the worker's latest snapshot of the data disk (spec 0), if it was built. */
-	const workerData = (): DiskState | undefined => (vm instanceof WorkerKernel ? vm.disks.find((d) => d.index === 0 && d.kind === "data") : undefined);
+	const workerData = (): DiskState | undefined => (vm instanceof WorkerKernel ? vm.disks.find((d) => d.index === 0 && (d.kind === "data" || cfg.remote)) : undefined);
 	function dataStatus() {
 		const d = data?.disk;
 		const w = d ? undefined : workerData();
@@ -194,7 +197,7 @@ export function start(): void {
 			const blocks = w.overlayBlocks ?? 0;
 			ui.diskUsage(blocks * 4096, w.size, w.persistent);
 			ui.dataStatus(w.persistent
-				? `Saved in this browser (IndexedDB ${w.store}, written by the kernel worker): ${fmtSize(w.size)} disk, ${blocks} blocks (${fmtSize(blocks * 4096)}) stored.`
+				? `${cfg.remote ? `Kept by the backend in ${remoteLink?.hello.data ?? "its data disk"}` : `Saved in this browser (IndexedDB ${w.store}, written by the kernel worker)`}: ${fmtSize(w.size)} disk, ${blocks} blocks (${fmtSize(blocks * 4096)}) stored.`
 				: `In memory only: ${data?.notice ?? w.notice ?? "not saved"}.`);
 			return;
 		}
@@ -238,11 +241,11 @@ export function start(): void {
 			ui.hostLog(`[host] data disk: ${data.notice}`);
 		} else {
 			const stored = d.storedBlocks ?? 0;
-			ui.check("data", "Data disk", "pass", `${dev} (${fmtSize(d.size)}), saved in this browser`,
+			ui.check("data", "Data disk", "pass", `${dev} (${fmtSize(d.size)}), ${cfg.remote ? "a file on the backend's computer" : "saved in this browser"}`,
 				`${d.seeded ? `created from the template (${data.from})` : `${stored} blocks stored`}; lock: ${data.lock?.how}; opened in ${fmtS(ms)}` +
 				(cfg.worker ? "; the kernel worker writes it" : ""));
 			ok(`Attached the data disk ${dev} (${d.seeded ? "new" : `${fmtSize(stored * 4096)} stored`})`, ms);
-			void showStorage({ ask: true });
+			if (!cfg.remote) void showStorage({ ask: true });
 		}
 		dataStatus();
 		setInterval(dataStatus, 5000); // the stored block count grows as the guest writes
@@ -253,6 +256,10 @@ export function start(): void {
 	 * the lock gets a snapshot); the worker opens IndexedDB and builds it.
 	 */
 	async function dataSpec(size: number | undefined): Promise<DiskSpec[]> {
+		if (cfg.remote && cfg.data) {
+			data = { disk: null, lock: { held: true, how: "the backend's file" }, from: "the backend's data disk" };
+			return [{ kind: "data", template: "bundled", optional: true }];
+		}
 		if (!cfg.data) data = { disk: null, lock: null, reason: "off (?data=0)" };
 		else if (typeof indexedDB === "undefined") data = { disk: null, lock: null, reason: "no IndexedDB in this browser" };
 		else {
@@ -301,6 +308,7 @@ export function start(): void {
 	addEventListener("pagehide", () => { void KW.sync!(); });
 	/** Download the data disk as a .kwsparse.gz file (synced first). */
 	KW.exportData = async () => {
+		if (cfg.remote) throw remoteDataError();
 		const d = data?.disk;
 		const w = d ? undefined : workerData();
 		if (w && vm instanceof WorkerKernel) {
@@ -336,6 +344,7 @@ export function start(): void {
 	}
 	/** Replace the saved data disk with a .kwsparse[.gz] file (File, Blob or bytes), then reload. */
 	KW.importData = async (file) => {
+		if (cfg.remote) throw remoteDataError();
 		const bytes = file instanceof Uint8Array ? file : new Uint8Array(await file.arrayBuffer());
 		await takeOverData();
 		const r = await importDataDisk(bytes, { log: dataLog }); // any size: the next boot grows it to ?datasize=, if larger
@@ -345,6 +354,7 @@ export function start(): void {
 	};
 	/** Forget the saved data disk (the next boot starts from the template), then reload. */
 	KW.resetData = async () => {
+		if (cfg.remote) throw remoteDataError();
 		await takeOverData();
 		await resetDataDisk();
 		ui.hostLog("[host] data disk: reset; reloading");
@@ -424,7 +434,7 @@ export function start(): void {
 	// ?showcase: the scripted tour of the demos (launcher.ts).
 	void guestReady.then(showcaseFromUrl, () => {});
 	// Fresh apk indexes, fetched by the page over Wisp and pushed in once user space runs (apk.ts).
-	if (cfg.net && alpine) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
+	if (cfg.net && alpine && !cfg.remote) void guestReady.then((vm) => prefetchApkIndexes(vm, { servers: cfg.wisp, log: (m) => ui.log(m, "h") }), () => {});
 	// What the base booted (/run/kw-base: the image id, the upper layer), for the
 	// Environment rows, About and diagnostics.
 	void guestReady.then(showBase, () => {});
@@ -838,6 +848,7 @@ export function start(): void {
 	 * held, Suspend turns the hold into the stop.
 	 */
 	KW.suspend = async ({ hold = false } = {}) => {
+		if (cfg.remote) throw new Error("remote mode: the kernel runs in the backend, which keeps no suspended machine (Reboot starts it again; the data disk stays)");
 		if (holdState) {
 			const h = holdState;
 			await stopHeld();
@@ -1123,6 +1134,7 @@ export function start(): void {
 	 * make the reload try the same again: then the caller reports the failure.
 	 */
 	function bootUpOnce(reason: string, resume = false, inline = false): boolean {
+		if (cfg.remote) return false;
 		try {
 			sessionStorage.setItem(inline ? INLINE_ONCE_KEY : UP_ONCE_KEY, reason);
 		} catch {
@@ -1405,6 +1417,7 @@ export function start(): void {
 		ui.setState("loading", "Downloading");
 		setLive(" .... ", "Downloading");
 		const t0 = performance.now();
+		if (cfg.remote) remoteLink = await connectRemote(ui).catch((e: unknown) => { throw tag(e, "remote", "kernel"); });
 		// The kernel downloads and compiles on this thread in both modes (the engine compiles
 		// off-thread while it streams), so it overlaps the terminal's start and, in worker
 		// mode, the data disk lock; the worker then gets the compiled Module.
@@ -1431,7 +1444,7 @@ export function start(): void {
 			? openDistroDisk(distro.url, { log: (m) => { console.log(m); ui.hostLog(m); } }).then((d) => ({ d, ms: performance.now() - tDistro }))
 			: null;
 		distroOpening?.catch(() => {}); // awaited below
-		const session = sessionInfo();
+		const session = cfg.remote ? Promise.resolve(null) : sessionInfo();
 		session.catch(() => {});
 		if (resumeRequest === null && quietResume) {
 			// A plain load: quiet only if there is a session it can resume as it is (offerResume() decides for good,
@@ -1587,6 +1600,15 @@ export function start(): void {
 		kernelStarting = true;
 		try {
 			const create = (restore?: KernelSnapshot) => {
+				if (remoteLink) {
+					const mounts = remoteLink.fs();
+					return createRemoteKernel(remoteLink, {
+						...common, ...glDevices(), worker: true, kernel: new URL(kernelUrl, location.href).href, compileInWorker: true,
+						disks: dataDisks as DiskSpec[], onDiskError: (_i, e) => saveError(e), distro: distro?.url,
+						net: browserNetSpec({ enabled: cfg.net, servers: cfg.wisp, routes: cfg.routes }),
+						mounts: mounts ? { "/work": mounts } : undefined,
+					});
+				}
 				// Worker mode: the SDK posts the Module compiled above to the worker. An engine
 				// that cannot post one (not seen so far; Safari is untested) gets the kernel's
 				// URL instead, absolute because the worker has no base of its own, and the
@@ -1811,7 +1833,7 @@ export function start(): void {
 		failed(e.kind === "distro" ? `Open the ${cfg.guest} image` : STEP[e.stageId ?? ""] ?? "Boot");
 		if (e.stageId) ui.stage(e.stageId, "fail", e.message);
 		const titles: Record<string, string> = { fetch: "Download failed", compile: "Kernel failed to compile", memory: "Not enough memory", boot: "Boot failed", terminal: "The terminal failed to start",
-			worker: "Worker mode cannot run in this browser", distro: "The distro image could not be opened" };
+			worker: "Worker mode cannot run in this browser", distro: "The distro image could not be opened", remote: "The remote kernel is not running" };
 		const hint = e.kind === "distro" ? `The page reads ${cfg.distro?.url ?? "the image"} from its own server with Range requests (web/scripts/kernel.ts picks the images; kernel/build.sh distro builds them). ` +
 			"Pick another distro under Options and Reboot, or boot with ?distro=none for the base shell." : undefined;
 		ui.fail(e.kind ?? "boot", e.message, (e.cause as Error | undefined)?.stack ?? e.stack, { title: titles[e.kind ?? ""] ?? "Boot failed", ...(hint ? { hint } : {}) });

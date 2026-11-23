@@ -136,12 +136,12 @@ The screenshots come from the page with virgl at 1280x800. The check boots the i
 | ![Unlocked](screenshots/11-unlocked.png) | |
 | Unlocked again | |
 
-The CLI (no virgl) runs the same desktop on the software rasterizer; the console shows `[drm] features: -virgl`, so niri took `kms_swrast`. In that run the bar came up, a terminal and the omarchy menu opened, a notification showed, the screen locked and unlocked with the password, and niri quit before the guest powered off with `halt (code 0)`. The frames lag the keys because the emulated CPU is saturated, so some show an intermediate state:
+The CLI (no virgl) runs the same desktop on the software rasterizer; the console shows `[drm] features: -virgl`, so niri took `kms_swrast`. In that run the bar came up, a terminal and the omarchy menu opened, and notifications showed. The first `omarchy lock`, before a password was set, was refused with a notification, as intended. After a password was set, the lock held and the password unlocked the desktop. niri then quit, and the guest powered off with `halt (code 0)`. The frames lag the keys because the emulated CPU is saturated, so some show an intermediate state:
 
 | | |
 | --- | --- |
-| ![CLI desktop with a terminal and a notification](screenshots/cli-06-desktop.png) | ![CLI menu](screenshots/cli-09-menu.png) |
-| The CLI desktop (kms_swrast) | The CLI omarchy menu |
+| ![A terminal on kms_swrast, with the refused lock's notification](screenshots/cli-06-desktop.png) | ![The CLI omarchy menu, after the unlock](screenshots/cli-09-menu.png) |
+| A terminal on kms_swrast, with the notification from the refused lock | The omarchy menu, after the unlock |
 
 ## Limits
 

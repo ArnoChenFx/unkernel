@@ -38,4 +38,37 @@ declare namespace Bun {
 
 	function serve<T>(options: ServeOptions<T>): Server<T>;
 	function file(path: string): BunFile;
+
+	interface PluginBuilder {
+		onLoad(
+			options: { filter: RegExp; namespace?: string },
+			callback: (args: { path: string }) => { contents: string; loader?: string } | undefined | Promise<{ contents: string; loader?: string } | undefined>,
+		): void;
+	}
+
+	interface BunPlugin {
+		name: string;
+		setup(build: PluginBuilder): void | Promise<void>;
+	}
+
+	interface BuildConfig {
+		entrypoints: string[];
+		target?: "bun" | "browser" | "node";
+		format?: "esm" | "cjs" | "iife";
+		minify?: boolean;
+		plugins?: BunPlugin[];
+	}
+
+	interface BuildOutput {
+		readonly path: string;
+		text(): Promise<string>;
+	}
+
+	interface BuildResult {
+		readonly success: boolean;
+		readonly logs: unknown[];
+		readonly outputs: BuildOutput[];
+	}
+
+	function build(config: BuildConfig): Promise<BuildResult>;
 }

@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+#
+# Remote release: the prebuilt Windows package of remote/ from this fork, built
+# from the web page of the newest upstream release (pithings/unkernel). The
+# release carries an app archive (the backend, the page, the updater and the
+# docs), a kernel archive (the page's kernel and GL renderer, named by their
+# content), manifest.json (every install file with its sha256, size and asset,
+# and the upstream distro images with their URLs) and the updater on its own
+# (update.ps1, update.cmd). The distro images are not copied into the release.
+# remote/README.md says how Windows uses it.
+#
+# Runs:
+#   - on a pushed tag remote-v<...> on a commit of main;
+#   - by hand (Actions > Remote release > Run workflow) with such a tag, on the
+#     newest commit of main;
+#   - by remote-sync.yml, through workflow_call, with the tag and the commit it
+#     has just merged into main. A push made with GITHUB_TOKEN starts no
+#     workflow run, so the sync cannot push a tag that starts this one.
+# The tag is created at that commit when it does not exist. A release of the tag
+# that is not a draft is left as it is.
+#
+# Only the release job can write (contents: write, to create the tag and the
+# release). The build reads the repository and the upstream release with
+# GITHUB_TOKEN; no repository secret is used.
+
+name: Remote release
+
+on:
+  push:
+    tags: ["remote-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: remote-v<...>; created at the commit when it does not exist, which must be on main
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      sha:
+        description: The commit to release, on main
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Check the tag and the commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check the tag, its commit (on main) and whether it is released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^remote-v[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::$TAG is not a remote-v<...> tag"
+            exit 1
+          fi
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$SHA" --jq .status)"
+          case "$status" in
+          identical | behind) ;;
+          *)
+            echo "::error::$SHA is not on main (compare: $status)"
+            exit 1
+            ;;
+          esac
+          if at="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null)" && [ "$at" != "$SHA" ]; then
+            echo "::error::$TAG is at ${at:0:7}, not ${SHA:0:7}"
+            exit 1
+          fi
+          skip=false
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ "$draft" = false ]; then
+            echo "::notice::$TAG is released already: nothing to do"
+            skip=true
+          fi
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and smoke-test the release
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          cache: true
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and run the remote tests
+        run: |
+          pnpm typecheck
+          pnpm typecheck:web
+          pnpm exec tsc -p remote
+          node --test remote/test/*.test.ts
+
+      - name: Install Bun 1.4.5, checked by its sha256
+        env:
+          BUN_VERSION: "1.4.5"
+          BUN_SHA256: 94559b3b528995a49452f9f2404cec74f2efd7d06e0a000a8cd214b02c3666eb
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/bun"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/bun.zip" \
+            "https://github.com/oven-sh/bun/releases/download/bun-v$BUN_VERSION/bun-linux-x64.zip"
+          echo "$BUN_SHA256  $dir/bun.zip" | sha256sum -c -
+          unzip -q "$dir/bun.zip" -d "$dir"
+          test "$("$dir/bun-linux-x64/bun" --version)" = "$BUN_VERSION"
+          echo "BUN=$dir/bun-linux-x64/bun" >> "$GITHUB_ENV"
+
+      # The upstream release: the page takes its kernel and distro images from
+      # the newest release of pithings/unkernel (KW_LOCAL=0: never a local build).
+      - name: Build the web page
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KW_LOCAL: "0"
+        run: pnpm build:web
+
+      - name: Pack the release (app and kernel archives, manifest.json, the updater)
+        run: node remote/scripts/release.ts --tag "$TAG" --repo "$GITHUB_REPOSITORY" --commit "$SHA" --out remote/dist
+
+      - name: Smoke-test the install (Bun runs the bundle, the kernel boots)
+        run: node remote/scripts/smoke.ts remote/dist/install
+
+      - name: Stage the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p remote/dist/publish
+          cp remote/dist/assets.txt remote/dist/release-notes.md remote/dist/publish/
+          while read -r name; do
+            cp "remote/dist/$name" remote/dist/publish/
+          done < remote/dist/assets.txt
+          ls -l remote/dist/publish
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: remote-release
+          path: remote/dist/publish/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish the GitHub release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # the tag (when it does not exist) and the release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: remote-release
+          path: publish
+
+      # The assets go up to a draft, which is published last: a run cut off in
+      # between leaves a draft, and the next run replaces it.
+      - name: Create the release as a draft, upload its assets, publish it
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          files=()
+          while read -r name; do
+            files+=("publish/$name")
+          done < publish/assets.txt
+          gh release create "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+            --draft --target "$SHA" --title "$TAG" --notes-file publish/release-notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "::notice title=Released::$TAG at ${SHA:0:7}: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

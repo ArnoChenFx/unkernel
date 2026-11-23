@@ -92,7 +92,8 @@ block is shaped is the ISA's (a64/tier.md).
   compare-and-swaps against: ABA goes unnoticed, as in QEMU), everything
   is seq_cst, and a barrier is a seq_cst RMW of `Hart.fence_word` (a
   locked instruction on x86-64 V8, about 4.3 ns, against 8.9 ns for
-  `atomic.fence`; an atomic load costs nothing extra; 2026-11-16). Without
+  `atomic.fence`; an atomic load costs nothing extra in V8, and is a
+  read-modify-write in JavaScriptCore; 2026-11-16). Without
   the option everything assumes one CPU.
 - **Precise state.** Ops update `kw_regs` directly. On a fault mid-block,
   pc is recomputed from the ops (`pcAt`) and the budget refunded. `icount`
@@ -279,7 +280,8 @@ its own thread, on one shared memory. The JIT is per CPU:
 - **Interrupts.** Compiled code polls the `irqp` it is called with (taken
   from the CPU's own `irq_pending` at every call; nothing is baked into a
   module). With a shared memory (caps bit 3) the load is
-  `i32.atomic.load`: a plain load in a loop that stores nothing may be
+  `i32.atomic.load` (a read-modify-write in JavaScriptCore, so the kernel
+  gives each CPU's word 128 bytes to itself): a plain load in a loop that stores nothing may be
   hoisted, and another CPU's IPI (a TLB shootdown waits for the answer)
   would never be seen. Nothing in compiled code waits for another CPU.
 - **Compile window: compiles do not hold up TLB flushes.** A compile

@@ -1071,8 +1071,9 @@ pub fn Jit(comptime I: type) type {
             }
             /// Push *irqp (the CPU's word of pending interrupts). With a shared
             /// memory another CPU sets it (an IPI: a TLB shootdown waits for the
-            /// answer), so the load is atomic (i32.atomic.load, a plain load on
-            /// x86-64 and arm64): an engine may hoist a plain load out of a loop
+            /// answer), so the load is atomic (i32.atomic.load: a plain load in V8,
+            /// a read-modify-write in JavaScriptCore, so each CPU's word needs a
+            /// cache line of its own): an engine may hoist a plain load out of a loop
             /// that stores nothing, which would leave a compiled self-loop deaf.
             pub fn irqWord(e: *Emit) void {
                 e.get(l_irq);

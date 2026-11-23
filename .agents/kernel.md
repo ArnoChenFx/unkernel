@@ -390,8 +390,14 @@ MTE, PAC, BTI, GCS or POE.
 - The exclusive monitor belongs to the CPU, not the task, and every entry
   to user mode clears it (The kwemu contract), as ERET does on arm64 and
   qemu-user does.
-- ptrace has no regsets (`PTRACE_GETREGSET` fails), so strace and gdb do
-  not work. No core dumps, modules, swap or kallsyms (config.md).
+- ptrace (ptrace.c): arm64's regsets NT_PRSTATUS (pstate is NZCV and
+  EL0t), NT_PRFPREG, NT_ARM_TLS and NT_ARM_SYSTEM_CALL (the syscall
+  number apart from x8, as arm64's `syscallno`), which also make the core
+  dump notes; single-step in software (traps.c: `kw_run()` with a budget
+  of 1, a stepped SVC reported at its exit); no hardware breakpoints or
+  watchpoints. The kernel's writes into user code (POKETEXT,
+  `/proc/PID/mem`) flush the page (`flush_icache_user_page`, tlb.c). No
+  modules, swap or kallsyms (config.md).
   A wasm trap in the kernel ends the session.
 
 ## Two builds: wasm64 and lowered

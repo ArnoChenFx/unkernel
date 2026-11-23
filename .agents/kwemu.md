@@ -387,8 +387,8 @@ block interpreted that long instead of the ~0.25 ms compiling takes.
 
 ## Measuring
 
-The guest has no perf events, and strace and gdb hang in it (no
-regsets); host-side `perf` works (a64/performance.md, Measuring).
+The guest has no perf events; host-side `perf` works (a64/performance.md,
+Measuring).
 `kernel/build.sh stats` builds a `-Dkwemu-stats` bundle of the UP kernel
 only, so counters come from one CPU and time samples (which need two or
 more) from the regular bundle; the CLI's `--stats` prints its counters

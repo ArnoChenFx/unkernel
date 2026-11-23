@@ -288,7 +288,8 @@ well behind native.
 - No IPv6, no UDP beyond DHCP and DNS, no inbound network connections
   ([`vm.connect()`, `vm.fetch()`](#talk-over-vsock) and `--forward` reach
   guest servers over vsock instead).
-- No ptrace register sets, so `strace` and `gdb` don't work.
+- No hardware breakpoints or watchpoints: `gdb`'s watchpoints are
+  software ones, which single-step the program.
 - Code that runs only a few times (a large program's startup, such as
   `npm`'s) stays on the interpreter, and FP and AdvSIMD floating point
   run through it even inside compiled code. Without wasm SIMD in the host

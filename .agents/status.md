@@ -243,8 +243,11 @@ Open:
      (Chrome, 14-thread Mac), so 8 CPUs give little over 4 (testing.md,
      Profiling CPUs and worker mode, 2026-11-19). Not yet traced (a
      `kernel/build.sh stats` kernel's per-CPU counters would say where the
-     CPUs wait). In Safari 27.2 parallel work got slower with every CPU
-     (0.4x on 4); the page boots one CPU there (`webkitEngine()`).
+     CPUs wait). On other workloads (/smp-probe.html, 2026-11-23, the
+     same Mac) 8 CPUs ran 5.4-6.9x in Chrome and 5.2-5.8x in Safari.
+     Guest LDAR and LDXR are still wasm atomic loads, which JavaScriptCore
+     runs as read-modify-writes: threads that load one shared word in a
+     loop may contend there (not measured).
    - Under host load (kernel/smp.md, Waiting for another CPU): a
      synchronous TLB shootdown to a
      CPU running user code still waits until that CPU's host thread runs
@@ -272,7 +275,8 @@ Open:
      one CPU. Run in headless Chromium (2 and 4 CPUs: boot, a terminal
      window, glimmer, the JIT on every CPU, parallel loops scaling) and
      by hand on a deployed build in desktop Chrome, Firefox and on iOS.
-     Desktop Safari 27.2 runs it, slower with each CPU (above). Not
+     Desktop Safari 27.2 runs it and scales as Chrome does (testing.md,
+     Profiling CPUs and worker mode). Not
      tried: Android, a hidden tab (worker throttling), long sessions. The page offers it when its release
      bundle carries the SMP patch, as releases do since 2026-11-17
      (testing.md, Release workflow, lists the SMP checks the workflow

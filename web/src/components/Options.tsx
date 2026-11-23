@@ -27,7 +27,7 @@
 // values nextSettings() reads.
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type ReactNode } from "react";
 import { AUTO_SUSPEND_CHOICES, autoSuspendLabel } from "../autosuspend.ts";
-import { DATA_SIZES, DEFAULT_CMDLINE, dataSizeCap, DEFAULT_DISTRO, DISTROS_OFFERED, GL_DISTROS, webkitEngine } from "../config.ts";
+import { DATA_SIZES, DEFAULT_CMDLINE, dataSizeCap, DEFAULT_DISTRO, DISTROS_OFFERED, GL_DISTROS } from "../config.ts";
 import { capitalize, fmtSize } from "../format.ts";
 import { KW } from "../kw.ts";
 import { useStore, type Options as Opts } from "../store.ts";
@@ -200,9 +200,7 @@ export function MachineOptions() {
 			const sug = n === cfg.cpuSuggested && n > 1;
 			return { value: String(n), tick: String(n), label: `${n} CPU${n > 1 ? "s" : ""}${sug ? " (suggested)" : ""}`, note: sug ? "suggested" : undefined, warn: n > cpuOk };
 		});
-	const cpuWarn = webkitEngine()
-		? "To try: in Safari and on iOS, several CPUs ran slower than one (/profile.html)."
-		: `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 9 MiB of guest memory, and as much in a suspended session.`;
+	const cpuWarn = `To try: more than ${cpuOk} CPU${cpuOk > 1 ? "s" : ""} leaves this device's threads busy (a busy host stalls the guest) and gains little; boot is slower and each CPU takes 9 MiB of guest memory, and as much in a suspended session.`;
 	// More than one CPU runs each in a Web Worker (config.ts: worker), so Worker thread is ticked and locked.
 	const smp = o.cpus !== "1" && !cfg.smpBlocked;
 	const cpuNote = cfg.smpBlocked ? `One CPU on this page: ${cfg.smpBlocked}.`

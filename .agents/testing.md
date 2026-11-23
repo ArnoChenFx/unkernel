@@ -123,8 +123,26 @@ CPU in a worker; 2026-11-19):
 | Safari 27.2, same Mac (reports 8) | same speed, smoother | 0.4-0.6x | 0.15-0.4x | | +7% | 0.23 / 0.63 s |
 | Node 24, Linux, i7-10700K, 16 threads | same speed; event loop lag 4 ms vs 23 ms | 2.9-3.3x | 2.9-3.8x | 16: 2.9-4.0x | +4% | 0.39 / 1.08 s |
 
-Parallel work tops out near 4x however many CPUs (status.md, SMP), and
-Safari gets slower with each CPU, which Host threads is there to explain.
+Parallel work tops out near 4x however many CPUs on these workloads
+(status.md, SMP). Safari's row predates the fix for its loss: kwemu polled
+the code epoch, one word, with an atomic load at every block end, and
+JavaScriptCore runs a wasm atomic load as a read-modify-write, so the CPUs
+took the cache line from each other (a64/tier.md, Coherence).
+
+`/smp-probe.html` (web/src/smp-probe.ts; the dev server or a build) is the
+page that found it: engine probes without a kernel (workers and nested
+workers, timed waits and wake latency, wasm loads, stores and atomics on
+one shared memory, compiles, GC) and the kernel on 1 to 8 CPUs with as
+many copies of a compute, a syscall and a fork+exec loop, with the JIT off
+and with the `kw_spin_*` parameters changed; Copy text / Copy JSON, and
+URL options (`?auto=`, `?configs=`, `?probes=`, `?scale=`). With the fix
+(2026-11-23, JIT; speedup against one CPU):
+
+| Host | 2 CPUs | 4 CPUs | 8 CPUs | 4 CPUs, JIT off |
+| --- | --- | --- | --- | --- |
+| Safari 27.2, macOS, 14 threads (reports 8) | 1.6-1.9x | 3.3-3.5x | 5.2-5.8x | 3.2-3.7x |
+| Chrome 157, same Mac | 1.6-1.9x | 3.4-3.6x | 5.4-6.9x | 3.3-3.7x |
+| Safari 27.2, iPhone 15 Pro (2 fast cores, reports 4) | 1.3-1.6x | 1.8-2.0x | | 2.1-2.4x |
 
 ## Release workflow (CI)
 

@@ -1289,10 +1289,9 @@ other options.
 - Choices: 1, 2, 4, 8 and 16 up to `navigator.hardwareConcurrency`, and
   that count itself (the kernel's limit is 16, `NR_CPUS`), plus the suggested count,
   hardwareConcurrency / 2 up to `SUGGESTED_CPUS` (4 on desktops, 2 in
-  Firefox, none on phones until measured; config.ts, with the
+  Firefox and on phones; config.ts, with the
   /profile.html numbers behind it), marked
-  "(suggested)" (none below 4 threads, and none in WebKit: Safari 27.2 ran
-  parallel work slower on every added CPU, 2026-11-19; `webkitEngine()`).
+  "(suggested)" (none below 4 threads; desktop Safari as Chrome: testing.md, Profiling CPUs and worker mode).
   A count past the suggestion (past one where there is none) is there to
   try: selected, the slider, its value and its note turn red (`Stop.warn`).
   Half the host's threads stay free for the page, the browser and other

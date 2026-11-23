@@ -124,8 +124,8 @@
 //                                      another count offers to reload on N: CPUS_ONCE_KEY).
 //                                      Default in worker mode: the suggested count (half the
 //                                      threads, at most SUGGESTED_CPUS: 4 on desktops, 2 in
-//                                      Firefox; one on phones, on fewer than 4 threads and in
-//                                      WebKit, where several CPUs ran slower), else one.
+//                                      Firefox and on phones; one on fewer than 4 threads),
+//                                      else one.
 //                                      ?cpus=1: one CPU, the UP kernel.
 //   ?autosuspend=now|<s>|0             save the machine and pause it by itself once the tab has been
 //                                      hidden that long (now: at once; seconds; 0: never); it goes
@@ -381,12 +381,13 @@ export function smpBlocker(): string | null {
  * Chrome): 4 CPUs ran 4-wide work 2.5x and 8-wide 3.5x as fast as one; 8
  * CPUs only gained on 8-wide work (4-5x), 14 no more, for 3-7% on
  * single-threaded work, 40 ms more boot per CPU past 4 and 9 MiB each.
- * Firefox and phones are not measured yet: two and one. WebKit
- * (webkitEngine()) suggests none: in desktop Safari 27.2 (same machine,
- * 2026-11-19) parallel work got slower with every CPU added (8 CPUs: 0.25-0.4x
- * of one), so it boots one by default.
+ * Firefox is not measured yet: two. Desktop Safari 27.2 (same machine,
+ * 2026-11-23, /smp-probe.html): 3.3-3.5x on 4 CPUs and 5.2-5.8x on 8,
+ * against Chrome's 3.4-3.6x and 5.4-6.9x. Phones: two (an iPhone 15 Pro,
+ * two fast cores, 4 threads reported: 1.3-1.6x on 2 CPUs, 1.8-2.0x on 4,
+ * which would leave the browser no thread of its own).
  */
-export const SUGGESTED_CPUS = { desktop: 4, firefox: 2, mobile: 1 };
+export const SUGGESTED_CPUS = { desktop: 4, firefox: 2, mobile: 2 };
 
 /** JavaScriptCore: Safari, and every browser on iOS (CriOS and FxiOS are WebKit too, without "Chrome/"). */
 export function webkitEngine(ua = navigator.userAgent): boolean {
@@ -441,7 +442,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const cpuMax = Math.max(1, Math.min(MAX_CPUS, hc));
 	const cap = mobile ? SUGGESTED_CPUS.mobile : /Firefox\//.test(navigator.userAgent) ? SUGGESTED_CPUS.firefox : SUGGESTED_CPUS.desktop;
 	const half = Math.min(cap, Math.floor(hc / 2));
-	const cpuSuggested = half >= 2 && !webkitEngine() ? Math.min(half, cpuMax) : 0;
+	const cpuSuggested = half >= 2 ? Math.min(half, cpuMax) : 0;
 	const smpBlocked = smpBlocker();
 	const cpuDefault = !smpBlocked && workerParam && cpuSuggested ? cpuSuggested : 1;
 	const smpParam = params.has("cpus") ? Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1)) : cpuDefault;

@@ -141,7 +141,7 @@ The page takes a few URL parameters:
 | `?jit=0` | Interpreter only |
 | `?data=0` | No persistent disk, a fresh system every time |
 | `?worker=0` | Run the kernel on the page's thread (default: in a Web Worker where the page is cross-origin isolated) |
-| `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox, one on phones, in Safari and on iOS, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
+| `?cpus=2` | Boot on that many CPUs, each in a Web Worker (default: half the device's threads, up to 4 on desktops and 2 in Firefox and on phones, where the page has the SMP kernel and is cross-origin isolated; `?cpus=1`: one CPU) |
 | `?gl=0` | No guest GL (on by default on Debian: the guest's Mesa renders through your browser's WebGL2, see below) |
 
 On Debian the guest gets a GPU (`/dev/dri`, Settings, Guest GL): Mesa's

@@ -660,8 +660,24 @@ Thanks to:
   patches and the Kbuild toolchain wrapper.
 - [iSH](https://github.com/ish-app/ish) and [v86](https://github.com/copy/v86),
   for showing how to build a fast user-mode emulator and a wasm JIT.
-- [Alpine Linux](https://alpinelinux.org/), [wterm](https://wterm.dev/) and
-  [Binaryen](https://github.com/WebAssembly/binaryen).
+- [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer) and
+  [Mesa](https://mesa3d.org/), for guest GL: Mesa's virgl driver in the
+  guest, and virglrenderer compiled to wasm with
+  [Emscripten](https://emscripten.org/), rendering on WebGL2 in the page.
+- [Alpine Linux](https://alpinelinux.org/) and
+  [Debian](https://www.debian.org/), the distributions it boots, packed with
+  [erofs-utils](https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git),
+  [LZ4](https://github.com/lz4/lz4) and [Zstandard](https://github.com/facebook/zstd).
+- [wland](https://github.com/pithings/wland), the Wayland compositor that
+  brings the guest's windows to the page, and [wterm](https://wterm.dev/),
+  the page's terminals.
+- [Zig](https://ziglang.org/), [LLVM](https://llvm.org/) and
+  [Binaryen](https://github.com/WebAssembly/binaryen), which build it;
+  [React](https://react.dev/), [Tailwind CSS](https://tailwindcss.com/),
+  [Vite](https://vite.dev/), [Nitro](https://nitro.build/) and the
+  [Geist](https://vercel.com/font) fonts, which make the page.
+- [Wisp](https://github.com/MercuryWorkshop/wisp-protocol), the protocol
+  behind the guest's network in the browser.
 
 ## 📄 License
 
@@ -675,7 +691,11 @@ otherwise. The JavaScript SDK and page (`js/`, `web/`, SDK tests) are MIT
 
 The npm package ships a Linux kernel (GPL-2.0) with a small base system
 (Alpine's static busybox, GPL-2.0, and unkernel's own tools), so it is `MIT
-AND GPL-2.0-only`. The distro images it downloads hold the distributions'
+AND GPL-2.0-only`. It also ships the guest GL renderer (`virgl.wasm`:
+virglrenderer and Emscripten's runtime, MIT, with unkernel's glue,
+GPL-2.0-or-later). [THIRD-PARTY.md](THIRD-PARTY.md), in the package and on
+the page at `/licenses.md`, lists what is not unkernel's, with the notices
+its licenses ask for. The distro images it downloads hold the distributions'
 packages, which keep their own licenses. The
 kernel's source is Linux 7.3.4 plus
 [kernel/patches/linux](kernel/patches/linux) (`arch/wasm` is based on

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// About: credits and the build (vite.config.ts's __KW_BUILD__: the base
+// About: credits, the licenses (/licenses.md, vite.config.ts
+// unkernel:licenses) and the build (vite.config.ts's __KW_BUILD__: the base
 // bundle's Linux release and where it came from; the distro image, the
 // store's distro). AboutInfo is Settings' About section (Settings.tsx), which
 // the top bar's mark menu (TopBar.tsx) and the prefix, a (keys.ts),
@@ -46,9 +47,15 @@ export function AboutInfo() {
 				<Row k="distro">{distro ? <>{distro.image || distro.name}<span className="text-faint">, {distro.url}</span></> : "none (base shell)"}</Row>
 				<Row k="commit">{commit ? <A href={`${REPO}/commit/${B.commit}`}>{commit}</A> : "dev"}{B.date && <span className="text-faint">, {day(B.date)}</span>}</Row>
 			</dl>
+			<p className="mt-4 text-[12px] text-muted">
+				Built on <A href="https://kernel.org/">Linux</A>, <A href="https://github.com/joelseverin/linux-wasm">linux-wasm</A>,{" "}
+				<A href="https://gitlab.freedesktop.org/virgl/virglrenderer">virglrenderer</A>, <A href="https://mesa3d.org/">Mesa</A>,{" "}
+				<A href="https://emscripten.org/">Emscripten</A>, <A href="https://github.com/pithings/wland">wland</A>,{" "}
+				<A href="https://wterm.dev/">wterm</A>, <A href="https://alpinelinux.org/">Alpine</A> and <A href="https://www.debian.org/">Debian</A>.
+			</p>
 			<p className="mt-5 border-t border-line pt-3 text-[12px] text-muted">
 				Made with <span className="text-fg" aria-label="love">♥</span> by <A href="https://x.com/_pi0_">Pooya Parsa</A> (<A href="https://github.com/pi0">pi0</A>){" "}
-				<span className="text-faint">· <A href={`${REPO}#-credits`}>full credits</A></span><br />
+				<span className="text-faint">· <A href={`${REPO}#-credits`}>full credits</A> · <A href="/licenses.md">licenses</A></span><br />
 				sponsored by <A href="https://vercel.com/open-source-program"><span className="inline-flex items-center gap-1"><Triangle size={10} />Vercel</span></A>
 			</p>
 		</div>

@@ -37,10 +37,15 @@
 // running dev server are left alone. Build only: a dev server still takes
 // wland from node_modules.
 //
+// /licenses.md: the repository's THIRD-PARTY.md, then each package the
+// page's bundle carries with its license text (unkernel:licenses). The dev
+// server answers it with THIRD-PARTY.md alone.
+//
 // Runtime settings (environment variables of the built Node server):
 //   PORT, HOST (NITRO_PORT, NITRO_HOST)  where it listens (default: port 3000, all interfaces)
 import { execFileSync } from "node:child_process";
-import { createReadStream, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { copyFile, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
@@ -50,6 +55,8 @@ import { defineConfig, type Plugin } from "vite";
 import { nitro } from "nitro/vite";
 import { GL_FILES, baseSplit, pageSource, rescanImages, servedName, splitBase, type PageImage } from "./scripts/kernel.ts";
 import { IMMUTABLE, distroReply } from "./server/range.ts";
+
+const require = createRequire(import.meta.url);
 
 const git = (...args: string[]) => {
 	try { return execFileSync("git", args, { cwd: import.meta.dirname, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
@@ -70,6 +77,42 @@ async function buildInfo(dev: boolean) {
 		commit: commit || process.env.VERCEL_GIT_COMMIT_SHA || "",
 		date,
 	};
+}
+
+/** Where Vite lists the client's bundled packages (build.license), replaced by licenses.md. */
+const BUNDLED_LICENSES = ".vite/license.json";
+
+/** A package in Vite's build.license list. */
+type BundledPackage = { name: string; version: string; identifier?: string; text?: string };
+
+/**
+ * Packages the page carries that Vite's list misses: it follows the JS
+ * module graph, and src/style.css's @import of the fonts is not in it.
+ */
+const CSS_PACKAGES = ["@fontsource-variable/geist", "@fontsource-variable/geist-mono"];
+
+/**
+ * /licenses.md: THIRD-PARTY.md (its relative links made links into the
+ * repository), then `bundled` and CSS_PACKAGES, each with its license text.
+ */
+function licenses(bundled: BundledPackage[]): string {
+	const repo = "https://github.com/pithings/unkernel/blob/main/"; // src/config.ts REPO
+	const notice = readFileSync(path.join(import.meta.dirname, "../THIRD-PARTY.md"), "utf8")
+		.replace(/^<!--.*-->\n/gm, "")
+		.replace(/\]\((?![a-z]+:)([^)]+)\)/g, (_, p: string) => `](${repo}${p})`);
+	if (!bundled.length) return notice; // the dev server
+	const all = new Map(bundled.map((p) => [p.name, p]));
+	for (const name of CSS_PACKAGES) {
+		if (all.has(name)) continue;
+		const dir = path.dirname(require.resolve(`${name}/package.json`));
+		const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as { version: string; license?: string };
+		const file = ["LICENSE", "LICENSE.md", "OFL.txt"].map((f) => path.join(dir, f)).find((f) => existsSync(f));
+		if (!file) throw new Error(`[licenses] ${name} has no license file`);
+		all.set(name, { name, version: pkg.version, identifier: pkg.license, text: readFileSync(file, "utf8").trim() });
+	}
+	const packages = [...all.values()].sort((a, b) => a.name.localeCompare(b.name)).map((p) =>
+		`### ${p.name} ${p.version}${p.identifier ? ` (${p.identifier})` : ""}\n\n${p.text ? `\`\`\`\n${p.text.replaceAll("```", "'''")}\n\`\`\`` : "No license text in the package."}\n`);
+	return `${notice}\n## The page's packages\n\n${packages.join("\n")}`;
 }
 
 /** The build output's directories and preset (Nitro's), known once Nitro has compiled. */
@@ -130,7 +173,12 @@ export default defineConfig({
 	// builds the client environment from index.html alone (its renderer
 	// template), so they are a second client environment, which it builds
 	// into the same public directory.
-	environments: { pages: { consumer: "client", build: { rollupOptions: { input: { profile: path.join(import.meta.dirname, "profile.html"), "smp-probe": path.join(import.meta.dirname, "smp-probe.html") } } } } },
+	// The page's bundled packages, as JSON for unkernel:licenses (client only:
+	// the pages' bundles are a part of it).
+	environments: {
+		client: { build: { license: { fileName: BUNDLED_LICENSES } } },
+		pages: { consumer: "client", build: { rollupOptions: { input: { profile: path.join(import.meta.dirname, "profile.html"), "smp-probe": path.join(import.meta.dirname, "smp-probe.html") } } } },
+	},
 	// The SDK's worker mode (?worker=1): js/web/worker.ts starts a module worker.
 	worker: { format: "es" },
 	plugins: [
@@ -245,6 +293,29 @@ export default defineConfig({
 							res.end(html);
 						}, next);
 				});
+			},
+		},
+		{
+			// /licenses.md (licenses() below): the dev server's, and a build's
+			// in place of Vite's JSON list of the client's bundled packages.
+			name: "unkernel:licenses",
+			configureServer(server) {
+				server.middlewares.use((req, res, next) => {
+					if ((req.url ?? "").split("?")[0] !== "/licenses.md") return next();
+					res.setHeader("content-type", "text/markdown; charset=utf-8");
+					res.setHeader("cache-control", "no-cache");
+					res.end(licenses([]));
+				});
+			},
+			generateBundle: {
+				order: "post", // after vite:license
+				handler(_, bundle) {
+					if (this.environment.name !== "client") return;
+					const list = bundle[BUNDLED_LICENSES];
+					if (list?.type !== "asset") throw new Error(`[licenses] Vite gave no ${BUNDLED_LICENSES}`);
+					delete bundle[BUNDLED_LICENSES];
+					this.emitFile({ type: "asset", fileName: "licenses.md", source: licenses(JSON.parse(String(list.source)) as BundledPackage[]) });
+				},
 			},
 		},
 		...(wlandPkg ? [wlandPkgPlugin(wlandPkg)] : []),

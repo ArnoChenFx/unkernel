@@ -41,7 +41,8 @@
   "files": [
     "dist",
     "LICENSE",
-    "LICENSE-MIT"
+    "LICENSE-MIT",
+    "THIRD-PARTY.md"
   ],
   "engines": {
     "node": ">=24"

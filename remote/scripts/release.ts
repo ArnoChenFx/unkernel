@@ -6,7 +6,7 @@
 //   unkernel-remote-app-<hash>.zip     the backend, the page, the updater and the docs
 //   unkernel-remote-kernel-<hash>.zip  the page's kernel and GL renderer
 //   manifest.json                      every install file, its asset and URL; the assets
-//   update.ps1, update.cmd             the updater on its own (the first download)
+//   update.ps1, update.cmd, update.sh, start.sh  the updater on its own (the first download)
 //   release-notes.md, assets.txt       for the GitHub release (remote-release.yml)
 // The distro images are not archived: the manifest refers to their upstream
 // release, and the updater downloads them from there. install/ is the same
@@ -31,9 +31,9 @@ const KERNEL_FILE = /^web\/\.output\/public\/assets\/unkernel(?:-smp)?-[A-Za-z0-
 const GL_FILE = /^web\/\.output\/public\/assets\/virgl-[0-9a-f]+\//;
 const DISTRO_FILE = /^web\/\.output\/public\/distros\//;
 const ROOT_FILES = ["LICENSE", "LICENSE-MIT"];
-const REMOTE_FILES = ["start-windows.ps1", "start-windows.cmd", "unkernel-remote.example.json", "README.md", "update.ps1", "update.cmd"];
+const REMOTE_FILES = ["start-windows.ps1", "start-windows.cmd", "unkernel-remote.example.json", "README.md", "update.ps1", "update.cmd", "update.sh", "start.sh"];
 const BUNDLE_FILES = ["unkernel-remote.js", "worker-entry.js"];
-const UPDATER_FILES = ["update.ps1", "update.cmd"];
+const UPDATER_FILES = ["update.ps1", "update.cmd", "update.sh", "start.sh"];
 
 interface UpstreamRelease {
 	tag: string;
@@ -222,6 +222,8 @@ function releaseNotes(m: Manifest, repo: string, commit: string): string {
 		`Built from [\`${commit.slice(0, 7)}\`](https://github.com/${repo}/commit/${commit}) with the kernel of upstream release [${m.upstream.tag}](https://github.com/${m.upstream.repo}/releases/tag/${m.upstream.tag}).`,
 		"",
 		"Windows: run `update.ps1` (or `update.cmd`) with Bun installed. It installs this release under `%USERPROFILE%\\.unkernel\\app` and starts the backend; later runs update only the files that changed. See `remote/README.md`.",
+		"",
+		`Linux and macOS (Bun 1.4.5 or newer): \`curl -fsSL https://github.com/${repo}/releases/latest/download/update.sh | sh\` installs this release under \`~/.unkernel/app\` and starts the backend; run \`~/.unkernel/app/update.sh\` again to update, or \`~/.unkernel/app/start.sh\` to start without updating.`,
 		"",
 		"| Asset | Kind | Bytes | sha256 |",
 		"| --- | --- | ---: | --- |",

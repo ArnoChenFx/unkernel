@@ -10,6 +10,42 @@ The backend is Bun code (`remote/cli.ts`, `remote/server.ts`, `remote/backend.ts
 Bun is its only requirement at run time: a release carries the backend bundled
 into one file, the page, and the kernel.
 
+## Linux and macOS, from a release
+
+Needs [Bun](https://bun.sh) 1.4.5 or newer (`curl -fsSL https://bun.sh/install | bash`,
+then `bun upgrade`), `curl` or `wget`, `sha256sum` or `shasum`, and `unzip`
+(or `bsdtar`, or `python3`).
+
+```sh
+curl -fsSL https://github.com/ArnoChenFx/unkernel/releases/latest/download/update.sh | sh
+# or download update.sh from a remote-v* release, then:
+sh update.sh
+```
+
+The first run installs the newest release under `~/.unkernel/app`, starts the
+backend and opens the page. Later runs of `~/.unkernel/app/update.sh` download
+only the files that changed and start the new version;
+`~/.unkernel/app/start.sh` starts the installed version without updating.
+Ctrl+C stops the backend after it saves the guest's disk (the scripts `exec`
+Bun, so the signal reaches it directly). Same layout, checks and atomic switch as
+the Windows updater, with `current.txt` for the running version and
+`update.lock` against concurrent runs; the data directory (`~/.unkernel/remote`)
+is never touched.
+
+| `update.sh` option | Meaning |
+| --- | --- |
+| `--check` | Report whether an update is available; change nothing. |
+| `--no-update` | Start the installed version without contacting GitHub. |
+| `--no-start` | Install or update, then do not start the backend. |
+| `--tag remote-v...` | Install that release instead of the newest. |
+| `--force` | Reinstall the release even when it is installed. |
+| `--repo owner/name` | The fork whose releases are used. |
+| `-d DIR`, `--dir DIR` | The install directory (default `~/.unkernel/app`, or `UNKERNEL_APP`); absolute or relative. |
+| `--data`, `--work`, `--cache`, `--port`, `--config`, `--no-net`, `--no-open` | Passed to the backend through `start.sh` (see Settings). |
+
+With the one-liner, pass options after `sh -s --`, for example
+`curl -fsSL .../update.sh | sh -s -- --no-open --port 8790`.
+
 ## Windows, from a release
 
 1. Install Bun: `powershell -c "irm bun.sh/install.ps1 | iex"`.
@@ -66,6 +102,7 @@ Running `update.ps1` needs PowerShell 5.1 (built into Windows) or PowerShell 7.
                            manifest.json, the release's manifest
   current.txt              the tag that runs
   update.ps1, update.cmd   the launchers; update.ps1 hands over to versions\<current>\remote\update.ps1
+                           (Linux and macOS: update.sh, start.sh under ~/.unkernel/app, the same way)
   unkernel-remote.json     the settings file for installs (optional, kept across updates)
   downloads\, partial-*    transient, while an update runs
 %USERPROFILE%\.unkernel\remote\   the data disk, /work and the distro cache: updates never touch them
@@ -139,7 +176,7 @@ all uploaded:
   GL renderer;
 - `manifest.json`: every install file with its size, sha256 and asset, and the
   upstream distro images with their URLs and sha256;
-- `update.ps1` and `update.cmd`, for the first download.
+- `update.ps1`, `update.cmd`, `update.sh` and `start.sh`, for the first download.
 
 An archive's `<hash>` is the hash of the files it holds, so an archive changes
 its name only when one of its files changes.

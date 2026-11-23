@@ -246,6 +246,12 @@ grep -qx 'DAEMON_ARGS="-g video"' "$stage/etc/default/seatd" ||
 	{ echo "omarchy: /etc/default/seatd is not the seatd package's (upstream changed it?)" >&2; exit 1; }
 echo 'export SEATD_VTBOUND=0' >> "$stage/etc/default/seatd"
 
+# Two files the packages write at install time differ from one build to the next,
+# and the image does without them: dbus's machine id (random; the omarchy service
+# makes one at each boot) and fontconfig's caches (fontconfig makes them on first
+# use, in the user's cache directory).
+rm -f "$stage/var/lib/dbus/machine-id" "$stage"/var/cache/fontconfig/*
+
 # --- services and policy --------------------------------------------------------
 # The image's policy-rc.d (docker's: exit 101) stays for the install above; with it
 # gone, an apt-get install starts its service as on a Debian system.

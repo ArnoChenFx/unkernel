@@ -3,8 +3,9 @@
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # /etc/init.d/omarchy: the desktop's runtime. udev gives libinput the input
 # devices' properties; the user's runtime directory /run/user/UID is where sway
-# and its clients keep their sockets. /run is empty at each boot, so the service
-# makes both at runlevel 2.
+# and its clients keep their sockets; dbus's machine id is made here, since the
+# image has none (each boot makes its own). /run is empty at each boot, so the
+# service makes all of these at runlevel 2.
 
 ### BEGIN INIT INFO
 # Provides:          omarchy
@@ -17,6 +18,7 @@
 
 case $1 in
 start)
+	dbus-uuidgen --ensure
 	uid=$(id -u user) || exit 0
 	install -d -m 700 -o user -g user "/run/user/$uid"
 	/usr/lib/systemd/systemd-udevd --daemon

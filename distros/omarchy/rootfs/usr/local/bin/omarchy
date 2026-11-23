@@ -34,7 +34,8 @@ in_term() {
 }
 
 desktop() {
-	local run=/run/user/$(id -u)
+	local run
+	run=/run/user/$(id -u)
 	if [ ! -e /dev/dri/card0 ]; then
 		die "no /dev/dri/card0: sway draws on the display's DRM device (the page's GPU option, or the CLI's --gpu)"
 	fi
@@ -94,11 +95,13 @@ update() {
 }
 
 lock() {
-	local pw msg="no password is set, so the lock could not be opened: set one with sudo passwd $(id -un)"
-	pw=$(sudo -n getent shadow "$(id -un)" 2>/dev/null | cut -d: -f2)
+	local pw me msg
+	me=$(id -un)
+	msg="no password is set, so the lock could not be opened: set one with sudo passwd $me"
+	pw=$(sudo -n getent shadow "$me" 2>/dev/null | cut -d: -f2)
 	case $pw in
 	'' | '*' | '!'*)
-		[ -z "${SWAYSOCK-}" ] || notify-send -u critical 'omarchy lock' "$msg" 2>/dev/null
+		[ -z "${SWAYSOCK-}" ] || notify-send -u critical 'omarchy lock' "no password set: sudo passwd $me" 2>/dev/null
 		die "$msg"
 		;;
 	esac

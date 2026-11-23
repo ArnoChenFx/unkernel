@@ -10,9 +10,11 @@
 import { createKernelOn, type CreateKernelOptions, type KernelHandle, type KernelInstance, type WorkerOption } from "../../js/core/instance.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
 import { webPlatform } from "../../js/web/platform.ts";
+import type { RemoteLink } from "../../js/web/remote.ts";
 import { glUrl, kernelSmpUrl, kernelUrl } from "virtual:unkernel-kernel";
 
 export * from "../../js/core/index.ts";
+export { RemoteLink } from "../../js/web/remote.ts";
 export { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB } from "../../js/web/memory.ts";
 export { DATA_DISK_NAME, importDataDisk, openDataDisk, openDistroDisk, resetDataDisk } from "../../js/web/disk.ts";
 export { webCpuBlocker } from "../../js/web/cpu.ts";
@@ -48,4 +50,15 @@ export function createKernel(opts?: CreateKernelOptions & { worker?: false }): P
 export function createKernel(opts?: CreateKernelOptions & WorkerOption): Promise<KernelHandle>;
 export function createKernel(opts: CreateKernelOptions & WorkerOption = {}): Promise<KernelHandle> {
 	return createKernelOn(platform, opts);
+}
+
+/**
+ * createKernel({ worker: true }) with the kernel in the remote backend
+ * (remote.ts): the link's WebSocket is the kernel's worker endpoint. The
+ * backend's kernel shares no memory with the page, so input and frames are
+ * messages even where the page is cross-origin isolated.
+ */
+export function createRemoteKernel(link: RemoteLink, opts: CreateKernelOptions & WorkerOption & { worker: true }): Promise<WorkerKernel> {
+	const workerOpts: CreateKernelOptions & WorkerOption & { worker: true } = { ...opts, shared: false };
+	return createKernelOn({ ...platform, spawnWorker: () => link.endpoint() }, workerOpts);
 }

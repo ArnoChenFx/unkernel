@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # The Omarchy distro image: vendor/build/distro/omarchy.erofs (guest/lib/image.sh),
-# a Debian 13 arm64 root with a keyboard-driven desktop: sway, a tiling Wayland
-# compositor drawn on the display's DRM device, with foot, fuzzel, mako and
-# swaylock, and the terminal tools (bash with starship, fzf, zoxide, ripgrep, fd,
-# bat, eza, neovim, tmux, lazygit, btop, git), themed Tokyo Night throughout.
+# a Debian 13 arm64 root with a keyboard-driven desktop: niri, a scrolling Wayland
+# compositor drawn on the display's DRM device (niri-session: virgl when the
+# display has it, kms_swrast otherwise), with a top bar (waybar), the wallpaper
+# (swaybg), foot, fuzzel, mako and swaylock, and the terminal tools (bash with
+# starship, fzf, zoxide, ripgrep, fd, bat, eza, neovim, tmux, lazygit, btop, git),
+# themed Tokyo Night throughout. README.md describes the desktop and its keys.
 #
 # The root is the Debian image's (guest/distro/debian/pins.sh: the trixie-slim
 # arm64 root, the package lists of its snapshot date, the wland relay), with the
@@ -24,9 +26,8 @@
 #   KW_WLANDR=FILE                    a local wlandr for development (refused with KW_RELEASE=1)
 #   KW_RELEASE=1                      a release build: the pinned wland relay only
 #   KW_OMARCHY_APT_CACHE=0            no apt cache in the image (no boot at build time)
-#   KW_OMARCHY_NAME=NAME              the image's name (a variant: distros/omarchy-niri)
-#   KW_OMARCHY_PACKAGES="PKG..."      more packages, and KW_OMARCHY_ROOTFS=DIR more files
-#                                     (a rootfs/ tree, installed over this distro's)
+#   KW_NIRI_BIN=FILE                  niri built elsewhere (default vendor/build/niri-arm64/niri,
+#                                     which build-niri.sh builds when it is missing)
 #
 # distros.json next to the image: guest/build.sh index (with KW_DISTRO_OUT set to
 # this directory). The release workflow (.github/workflows/omarchy-image.yml) runs
@@ -42,9 +43,12 @@ export KW_DISTRO_FORMATS="${KW_DISTRO_FORMATS:-erofs}"
 . "$here/pins.sh"                  # DEBIAN_*, WLANDR_*, OMARCHY_PACKAGES
 umask 022
 export KW_DISTRO_DIR="$here"
-name=${KW_OMARCHY_NAME:-omarchy}
-pkgs="${OMARCHY_PACKAGES[*]}${KW_OMARCHY_PACKAGES:+ $KW_OMARCHY_PACKAGES}"
+name=omarchy
+pkgs="${OMARCHY_PACKAGES[*]}"
 debian="$guest/distro/debian"
+niri="${KW_NIRI_BIN:-$root/vendor/build/niri-arm64/niri}"
+[ -n "${KW_NIRI_BIN:-}" ] || [ -x "$niri" ] || "$here/build-niri.sh"
+[ -x "$niri" ] || { echo "omarchy: no niri at $niri (build-niri.sh builds it)" >&2; exit 1; }
 
 distro_unpack "$name" DEBIAN   # $stage, $DEBIAN_TARBALL
 
@@ -143,7 +147,11 @@ printf '127.0.0.1\tlocalhost\n127.0.1.1\tunkernel\n::1\tlocalhost ip6-localhost 
 # distro's own, which replace any of them.
 install_tree "$debian/rootfs" "$stage"
 install_tree "$here/rootfs" "$stage"
-[ -z "${KW_OMARCHY_ROOTFS:-}" ] || install_tree "$KW_OMARCHY_ROOTFS" "$stage"
+# niri (build-niri.sh) and the wallpaper (wallpaper.py draws it, so the repository
+# carries no image).
+install -D -m 755 "$niri" "$stage/usr/bin/niri"
+install -d -m 755 "$stage/usr/share/backgrounds/omarchy"
+python3 -I "$here/wallpaper.py" "$stage/usr/share/backgrounds/omarchy/tokyo-night.png"
 chmod 440 "$stage/etc/sudoers.d/kw-user"
 install_common "$stage"
 
@@ -273,7 +281,7 @@ grep -q '^input:' "$stage/etc/group" || {
 printf '\n%s\n%s\n' '# unkernel: the kw profile files in interactive shells that are not login shells too' \
 	'[ -r /usr/lib/kw/shrc ] && . /usr/lib/kw/shrc' >> "$stage/etc/bash.bashrc"
 if [ -x "$stage/usr/bin/sudo" ]; then
-	install_user "$stage" /bin/bash sudo audio video input users
+	install_user "$stage" /bin/bash sudo audio video render input users
 fi
 
 # The command map without the commands the image has (/usr/local: the kw-init's
@@ -286,7 +294,7 @@ mv "$stage/usr/lib/kw-commands.new" "$stage/usr/lib/kw-commands"
 # The warm set (guest/lib/image.sh): what the first commands read, fetched after
 # the boot. The desktop's programs and the terminal tools, the offline apt reads
 # and dpkg's unpackers (the Debian image's list, plus this distro's commands).
-KW_WARM_SCRIPT='apt-cache show bash >/dev/null; apt-cache policy >/dev/null; apt-get -s install git >/dev/null; dpkg -l >/dev/null; sway --version >/dev/null; foot --version >/dev/null; fuzzel --version >/dev/null; swaylock --version >/dev/null; nvim --version >/dev/null; starship --version >/dev/null; zoxide --version >/dev/null; fzf --version >/dev/null; rg --version >/dev/null; fdfind --version >/dev/null; batcat --version >/dev/null; eza --version >/dev/null; btop --version >/dev/null; lazygit --version >/dev/null; git --version >/dev/null; tmux -V >/dev/null; jq --version >/dev/null; omarchy version >/dev/null'
+KW_WARM_SCRIPT='apt-cache show bash >/dev/null; apt-cache policy >/dev/null; apt-get -s install git >/dev/null; dpkg -l >/dev/null; niri --version >/dev/null; waybar --version >/dev/null; foot --version >/dev/null; fuzzel --version >/dev/null; swaylock --version >/dev/null; nvim --version >/dev/null; starship --version >/dev/null; zoxide --version >/dev/null; fzf --version >/dev/null; rg --version >/dev/null; fdfind --version >/dev/null; batcat --version >/dev/null; eza --version >/dev/null; btop --version >/dev/null; lazygit --version >/dev/null; git --version >/dev/null; tmux -V >/dev/null; jq --version >/dev/null; omarchy version >/dev/null'
 KW_WARM_EXCLUDE='var/lib/apt/lists/*'
 KW_WARM_FILES='usr/lib/apt/methods/http usr/bin/dpkg-deb usr/bin/dpkg-split'
 export KW_WARM_SCRIPT KW_WARM_EXCLUDE KW_WARM_FILES
@@ -306,13 +314,15 @@ fi
 # is missing or cannot start.
 node "$guest/tools/vm-run.ts" "$kernel" "$distro_out/$name.erofs" --timeout 300 \
 	'set -e
-	for c in sway swaymsg foot fuzzel swaylock grim slurp wl-copy wl-paste wlr-randr mako makoctl notify-send lazygit nvim starship zoxide fzf rg fdfind batcat eza btop tmux git jq udevadm omarchy dbus-run-session; do
+	for c in niri niri-session waybar swaybg foot fuzzel swaylock grim slurp wl-copy wl-paste wlr-randr mako makoctl notify-send lazygit nvim starship zoxide fzf rg fdfind batcat eza btop tmux git jq udevadm omarchy dbus-run-session; do
 		command -v "$c" >/dev/null || { echo "omarchy: missing $c" >&2; exit 1; }
 	done
 	[ -x /usr/sbin/seatd ] || { echo "omarchy: missing seatd" >&2; exit 1; }
 	[ -x /usr/lib/systemd/systemd-udevd ] || { echo "omarchy: missing systemd-udevd" >&2; exit 1; }
 	grep -qx "export SEATD_VTBOUND=0" /etc/default/seatd || { echo "omarchy: /etc/default/seatd does not unbind the seat" >&2; exit 1; }
-	sway --version; foot --version; fuzzel --version; swaylock --version; lazygit --version; nvim --version | head -1
+	[ -r /usr/share/backgrounds/omarchy/tokyo-night.png ] || { echo "omarchy: no wallpaper" >&2; exit 1; }
+	niri validate -c /etc/skel/.config/niri/config.kdl || { echo "omarchy: the niri config does not validate" >&2; exit 1; }
+	niri --version; waybar --version; foot --version; fuzzel --version; swaylock --version; lazygit --version; nvim --version | head -1
 	starship --version; btop --version; tmux -V; omarchy version' ||
 	{ echo "omarchy: the smoke test in $name.erofs failed" >&2; exit 1; }
 echo "omarchy: $name.erofs passed the smoke test" >&2

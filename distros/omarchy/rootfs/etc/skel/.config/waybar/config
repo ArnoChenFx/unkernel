@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+// ~/.config/waybar/config of the Omarchy image: the top bar, started by niri
+// (spawn-at-startup). The workspaces and the focused window come from niri's IPC;
+// the colours are in style.css.
+
+{
+    "layer": "top",
+    "position": "top",
+    "height": 30,
+    "spacing": 8,
+    "modules-left": ["niri/workspaces", "niri/window"],
+    "modules-center": ["clock"],
+    "modules-right": ["cpu", "memory"],
+    "niri/workspaces": {
+        "format": "{index}"
+    },
+    "niri/window": {
+        "format": "{title}",
+        "max-length": 90,
+        "separate-outputs": true
+    },
+    "clock": {
+        "format": "{:%a %d %b  %H:%M}",
+        "tooltip": false
+    },
+    "cpu": {
+        "format": "cpu {usage}%",
+        "interval": 2,
+        "tooltip": false
+    },
+    "memory": {
+        "format": "mem {percentage}%",
+        "interval": 2,
+        "tooltip": false
+    }
+}

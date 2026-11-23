@@ -282,6 +282,27 @@ jobs:
           ls -l vendor/build/bundle/unkernel.wasm vendor/build/initramfs/base.cpio
           sha256sum vendor/build/bundle/unkernel.wasm
 
+      # niri (distros/omarchy/build-niri.sh): cross-compiled for arm64 on this
+      # runner, its binary cached by the pins it is built from (the niri commit is
+      # in build-niri.sh, the libraries' lists in guest/distro/debian/pins.sh).
+      - name: Restore niri
+        id: niri
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/niri-arm64/niri
+          key: niri-${{ runner.os }}-${{ hashFiles('distros/omarchy/build-niri.sh', 'distros/omarchy/resolve-debs.py', 'guest/distro/debian/pins.sh') }}
+      - name: Build niri
+        if: steps.niri.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libclang-22-dev
+          distros/omarchy/build-niri.sh
+      - name: Save niri
+        if: steps.niri.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/niri-arm64/niri
+          key: ${{ steps.niri.outputs.cache-primary-key }}
+
       # The image itself (distros/omarchy/build.sh), in its own output directory,
       # then its distros.json: guest/build.sh index, which reads the base bundle's
       # abi and base id from the same bundle the image boots on.

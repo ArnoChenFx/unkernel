@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
-# niri for the omarchy-niri image: NIRI_TAG, cross-compiled for aarch64 on this
-# host as vendor/build/niri-arm64/niri (stripped). The libraries it links are the
+# niri for the omarchy image (build.sh): NIRI_TAG, cross-compiled for aarch64 on
+# this host as vendor/build/niri-arm64/niri (stripped). The libraries it links are the
 # trixie arm64 -dev packages of the pinned package lists (guest/distro/debian/
 # pins.sh, checked by SHA-256 from snapshot.debian.org), extracted into
 # vendor/build/niri-sysroot; glibc is the host's cross toolchain's (libc6-arm64-cross),

@@ -1,14 +1,18 @@
 Omarchy: a keyboard-driven desktop and terminal on Debian 13 (arm64),
-running on unkernel. The packages are Debian's own.
+running on unkernel. The packages are Debian's own, except niri, the
+compositor, which is its release built for this image.
 
 Desktop
 
-    omarchy desktop         start sway on the display (the page's GPU option,
+    omarchy desktop         start niri on the display (the page's GPU option,
                             or the CLI's --gpu). Super+Shift+E leaves it.
     Super+Alt+Space         the menu: install, update, lock, power.
     Super+Space             the launcher (fuzzel).
     Super+Return            a terminal (foot).
     omarchy keys            every keybinding.
+
+    The top bar (waybar) shows the workspaces, the focused window, the clock,
+    and the CPU and memory use. The wallpaper is Tokyo Night.
 
 Terminal
 
@@ -37,10 +41,12 @@ Lock screen
 
 Configuration
 
-    ~/.config: sway, foot, fuzzel, mako, starship.toml, nvim, btop, tmux,
-    lazygit, bat. Everything is in Tokyo Night.
+    ~/.config: niri, waybar, foot, fuzzel, mako, starship.toml, nvim, btop,
+    tmux, lazygit, bat. Everything is in Tokyo Night.
 
 Limits
 
-    No sound, no Nerd Font, no network tools beyond curl and git. The
-    desktop is for one user, on the display the page or the CLI draws.
+    No sound, no Nerd Font, no network tools beyond curl and git. No X11
+    programs (there is no Xwayland). niri has no scratchpad and no split
+    direction: the keys for them are gone. The desktop is for one user, on
+    the display the page or the CLI draws.

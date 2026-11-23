@@ -1,5 +1,5 @@
-Keybindings of the Omarchy desktop (sway). Super is the Windows or Command key.
-The configuration is ~/.config/sway/config; Super+Shift+C reloads it.
+Keybindings of the Omarchy desktop (niri). Super is the Windows or Command key.
+The configuration is ~/.config/niri/config.kdl; niri reloads it when it changes.
 
 Windows and workspaces
   Super+Return            terminal (foot)
@@ -7,18 +7,16 @@ Windows and workspaces
   Super+Alt+Space         the menu: install, update, lock, restart, shut down
   Super+W                 close the window (also Super+Shift+Q)
   Super+H J K L           focus left, down, up, right (or the arrow keys)
-  Super+Shift+H J K L     move the window (or the arrow keys)
+  Super+Shift+H J K L     move the column or the window (or the arrow keys)
+  Super+Ctrl+Left Right   the column's width, narrower or wider
+  Super+Ctrl+Up Down      the window's height, shorter or taller
+  Super+R                 the column's width: the next preset (a third, half, two thirds)
   Super+1 .. 0            workspace 1 .. 10
   Super+Shift+1 .. 0      move the window to workspace 1 .. 10
-  Super+Tab               the last workspace
+  Super+Tab               the previous workspace
   Super+F                 fullscreen
   Super+T                 floating or tiled
-  Super+E                 split direction (toggle)
-  Super+S                 stacked layout
-  Super+A                 the parent container
-  Super+Shift+Minus       move the window to the scratchpad (hidden)
-  Super+Minus             show the scratchpad, or hide it again
-  Super+R                 resize mode: H J K L or the arrows; Escape or Return ends it
+  Super+S                 the column's windows in tabs (again: back to a column)
 
 Screen and notifications
   Print                   screenshot of the whole screen to ~/Pictures and the clipboard
@@ -27,7 +25,8 @@ Screen and notifications
   Super+Escape            lock the screen (Super+Ctrl+L too); needs a password: sudo passwd user
 
 Desktop
-  Super+Shift+E           exit the desktop
+  Super+Shift+/           the keys of niri itself (the hotkey overlay)
+  Super+Shift+E           exit the desktop (niri asks first)
 
 Terminal (foot)
   Ctrl+Shift+C / V        copy and paste

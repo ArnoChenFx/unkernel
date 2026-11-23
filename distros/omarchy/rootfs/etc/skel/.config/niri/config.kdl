@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+// ~/.config/niri/config.kdl of the Omarchy image: niri 26.04 in Tokyo Night. The
+// keys are listed by `omarchy keys`; niri reloads this file when it changes.
+
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+        repeat-delay 350
+        repeat-rate 35
+    }
+}
+
+cursor {
+    xcursor-theme "DMZ-White"
+    xcursor-size 24
+}
+
+layout {
+    gaps 8
+    center-focused-column "never"
+    default-column-width { proportion 0.5; }
+    preset-column-widths {
+        proportion 0.33333
+        proportion 0.5
+        proportion 0.66667
+    }
+
+    focus-ring {
+        width 2
+        active-color "#7aa2f7"
+        inactive-color "#292e42"
+        urgent-color "#f7768e"
+    }
+
+    border {
+        off
+    }
+
+    background-color "#1a1b26"
+}
+
+prefer-no-csd
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+window-rule {
+    geometry-corner-radius 10
+    clip-to-geometry true
+}
+
+window-rule {
+    match app-id="^omarchy-menu$"
+    open-floating true
+}
+
+spawn-at-startup "waybar"
+spawn-at-startup "mako"
+spawn-at-startup "swaybg" "--image" "/usr/share/backgrounds/omarchy/tokyo-night.png" "--mode" "fill"
+
+binds {
+    Mod+Return { spawn "foot"; }
+    Mod+Space { spawn "fuzzel"; }
+    Mod+Alt+Space { spawn "foot" "--app-id=omarchy-menu" "omarchy" "menu"; }
+    Mod+W { close-window; }
+    Mod+Shift+Q { close-window; }
+    Mod+Escape { spawn "omarchy" "lock"; }
+    Mod+Ctrl+L { spawn "omarchy" "lock"; }
+    Mod+Shift+E { quit; }
+    Mod+Shift+Slash { show-hotkey-overlay; }
+
+    Mod+H { focus-column-left; }
+    Mod+J { focus-window-down; }
+    Mod+K { focus-window-up; }
+    Mod+L { focus-column-right; }
+    Mod+Left { focus-column-left; }
+    Mod+Down { focus-window-down; }
+    Mod+Up { focus-window-up; }
+    Mod+Right { focus-column-right; }
+
+    Mod+Shift+H { move-column-left; }
+    Mod+Shift+J { move-window-down; }
+    Mod+Shift+K { move-window-up; }
+    Mod+Shift+L { move-column-right; }
+    Mod+Shift+Left { move-column-left; }
+    Mod+Shift+Down { move-window-down; }
+    Mod+Shift+Up { move-window-up; }
+    Mod+Shift+Right { move-column-right; }
+
+    Mod+Ctrl+Left { set-column-width "-10%"; }
+    Mod+Ctrl+Right { set-column-width "+10%"; }
+    Mod+Ctrl+Up { set-window-height "-10%"; }
+    Mod+Ctrl+Down { set-window-height "+10%"; }
+    Mod+R { switch-preset-column-width; }
+
+    Mod+1 { focus-workspace 1; }
+    Mod+2 { focus-workspace 2; }
+    Mod+3 { focus-workspace 3; }
+    Mod+4 { focus-workspace 4; }
+    Mod+5 { focus-workspace 5; }
+    Mod+6 { focus-workspace 6; }
+    Mod+7 { focus-workspace 7; }
+    Mod+8 { focus-workspace 8; }
+    Mod+9 { focus-workspace 9; }
+    Mod+0 { focus-workspace 10; }
+    Mod+Shift+1 { move-window-to-workspace 1; }
+    Mod+Shift+2 { move-window-to-workspace 2; }
+    Mod+Shift+3 { move-window-to-workspace 3; }
+    Mod+Shift+4 { move-window-to-workspace 4; }
+    Mod+Shift+5 { move-window-to-workspace 5; }
+    Mod+Shift+6 { move-window-to-workspace 6; }
+    Mod+Shift+7 { move-window-to-workspace 7; }
+    Mod+Shift+8 { move-window-to-workspace 8; }
+    Mod+Shift+9 { move-window-to-workspace 9; }
+    Mod+Shift+0 { move-window-to-workspace 10; }
+    Mod+Tab { focus-workspace-previous; }
+
+    Mod+F { fullscreen-window; }
+    Mod+T { toggle-window-floating; }
+    Mod+S { toggle-column-tabbed-display; }
+
+    Print { spawn "omarchy" "screenshot" "output"; }
+    Mod+Shift+S { spawn "omarchy" "screenshot" "region"; }
+    Mod+N { spawn "makoctl" "dismiss"; }
+}

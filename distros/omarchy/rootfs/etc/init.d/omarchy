@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # /etc/init.d/omarchy: the desktop's runtime. udev gives libinput the input
-# devices' properties; the user's runtime directory /run/user/UID is where sway
+# devices' properties; the user's runtime directory /run/user/UID is where niri
 # and its clients keep their sockets; dbus's machine id is made here, since the
 # image has none (each boot makes its own). /run is empty at each boot, so the
 # service makes all of these at runlevel 2.

@@ -1,0 +1,7 @@
+{
+  "data": "E:/tmp/unkernel-data/img/vm1.img",
+  "work": "E:/tmp/unkernel-data/work",
+  "cache": "E:/tmp/unkernel-cache",
+  "port": 8787,
+  "net": true
+}

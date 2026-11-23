@@ -24,6 +24,9 @@
 #   KW_WLANDR=FILE                    a local wlandr for development (refused with KW_RELEASE=1)
 #   KW_RELEASE=1                      a release build: the pinned wland relay only
 #   KW_OMARCHY_APT_CACHE=0            no apt cache in the image (no boot at build time)
+#   KW_OMARCHY_NAME=NAME              the image's name (a variant: distros/omarchy-niri)
+#   KW_OMARCHY_PACKAGES="PKG..."      more packages, and KW_OMARCHY_ROOTFS=DIR more files
+#                                     (a rootfs/ tree, installed over this distro's)
 #
 # distros.json next to the image: guest/build.sh index (with KW_DISTRO_OUT set to
 # this directory). The release workflow (.github/workflows/omarchy-image.yml) runs
@@ -39,8 +42,8 @@ export KW_DISTRO_FORMATS="${KW_DISTRO_FORMATS:-erofs}"
 . "$here/pins.sh"                  # DEBIAN_*, WLANDR_*, OMARCHY_PACKAGES
 umask 022
 export KW_DISTRO_DIR="$here"
-name=omarchy
-pkgs="${OMARCHY_PACKAGES[*]}"
+name=${KW_OMARCHY_NAME:-omarchy}
+pkgs="${OMARCHY_PACKAGES[*]}${KW_OMARCHY_PACKAGES:+ $KW_OMARCHY_PACKAGES}"
 debian="$guest/distro/debian"
 
 distro_unpack "$name" DEBIAN   # $stage, $DEBIAN_TARBALL
@@ -140,6 +143,7 @@ printf '127.0.0.1\tlocalhost\n127.0.1.1\tunkernel\n::1\tlocalhost ip6-localhost 
 # distro's own, which replace any of them.
 install_tree "$debian/rootfs" "$stage"
 install_tree "$here/rootfs" "$stage"
+[ -z "${KW_OMARCHY_ROOTFS:-}" ] || install_tree "$KW_OMARCHY_ROOTFS" "$stage"
 chmod 440 "$stage/etc/sudoers.d/kw-user"
 install_common "$stage"
 
@@ -169,7 +173,7 @@ chmod 755 "$stage/usr/lib/kw/wlandr"
 mktree_opts=(--keep-mtime var/lib/apt/lists)
 kernel="$base_bundle"
 gen=omarchy-aptgen
-genimage() { (KW_DISTRO_FORMATS=erofs KW_EROFS_COMPRESS=none KW_DISTRO_HINT=0 distro_images "$gen" "$stage" "$DEBIAN_TARBALL" "omarchy-$DEBIAN_VERSION" "${mktree_opts[@]}") >/dev/null; }
+genimage() { (KW_DISTRO_FORMATS=erofs KW_EROFS_COMPRESS=none KW_DISTRO_HINT=0 distro_images "$gen" "$stage" "$DEBIAN_TARBALL" "$name-$DEBIAN_VERSION" "${mktree_opts[@]}") >/dev/null; }
 if [ ! -f "$kernel" ] || ! command -v node >/dev/null; then
 	echo "omarchy: no $kernel (kernel/build.sh base) or no node: the image has no apt cache and not $pkgs" >&2
 	exit 1
@@ -286,7 +290,7 @@ KW_WARM_SCRIPT='apt-cache show bash >/dev/null; apt-cache policy >/dev/null; apt
 KW_WARM_EXCLUDE='var/lib/apt/lists/*'
 KW_WARM_FILES='usr/lib/apt/methods/http usr/bin/dpkg-deb usr/bin/dpkg-split'
 export KW_WARM_SCRIPT KW_WARM_EXCLUDE KW_WARM_FILES
-distro_images "$name" "$stage" "$DEBIAN_TARBALL" "omarchy-$DEBIAN_VERSION" "${mktree_opts[@]}" "${user_owner[@]}"
+distro_images "$name" "$stage" "$DEBIAN_TARBALL" "$name-$DEBIAN_VERSION" "${mktree_opts[@]}" "${user_owner[@]}"
 
 # apt in the image takes its source cache as it is: a new one would have been
 # written to the upper layer, with a new mtime.

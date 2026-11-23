@@ -3,7 +3,7 @@
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # niri on the display's DRM device, started by `omarchy desktop`: the user's
 # runtime directory, the seat through seatd, dbus for niri's clients.
-# niri renders with GLES on the render node. With virgl (the CLI's --gl) the
+# niri renders with GLES on the render node. With virgl (the page's GL option) the
 # virtio_gpu driver renders on the host's GL; without it the device has no 3D
 # context and niri gets llvmpipe through kms_swrast on the dumb buffers that
 # --gpu gives. MESA_LOADER_DRIVER_OVERRIDE, when set, is used as it is.

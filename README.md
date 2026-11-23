@@ -215,6 +215,57 @@ kernel panic, 254 wasm trap, 255 fatal error. The CLI is built on the
 mounts](#mount-host-files) and `--forward` its
 [`vm.connect()`](#talk-over-vsock).
 
+## Remote mode: the kernel on your computer
+
+The page can run its kernel in a small backend on your own computer instead
+of in the browser. The guest then keeps its data disk as a file there, sees a
+host folder at `/work`, and uses your computer's network. The desktop still
+opens in the browser, at `http://127.0.0.1:8787/?remote=1`. The backend runs on
+[Bun](https://bun.sh), listens on 127.0.0.1 only, and refuses any request whose
+Host, Origin or Sec-Fetch-Site is not its own (HTTP and the WebSocket alike).
+
+On Windows, `remote\start-windows.cmd` starts it, builds the web app when the
+build is missing, and opens the page. It needs Bun, Node.js 24 and pnpm:
+
+```bat
+remote\start-windows.cmd -Data E:\tmp\unkernel-data\img\vm1.img -Work E:\tmp\unkernel-data\work -Cache E:\tmp\unkernel-cache
+```
+
+Double-clicking `start-windows.cmd` uses the settings below. `-Rebuild` builds
+the web app again, `-NoOpen` leaves the browser closed. Elsewhere, after
+`pnpm build:web`: `bun --bun remote/cli.ts --open`.
+
+Each setting comes from the first of these that is set: its flag, its
+environment variable, the JSON file (`--config`, or `remote/unkernel-remote.json`,
+which starts as a copy of `remote/unkernel-remote.example.json`), and the
+default under `~/.unkernel/remote` (`%USERPROFILE%\.unkernel\remote` on Windows).
+
+| Flag | Environment variable | Does |
+| --- | --- | --- |
+| `--data FILE` | `UNKERNEL_REMOTE_DATA` | the data disk image, created from the kernel's template when missing |
+| `--work DIR` | `UNKERNEL_REMOTE_WORK` | the host directory at `/work` (`none`: no `/work`) |
+| `--cache DIR` | `UNKERNEL_REMOTE_CACHE` | copies of the distro images the guest runs from |
+| `--port N` | `UNKERNEL_REMOTE_PORT` | the port on 127.0.0.1 (default 8787) |
+| `--no-net` | `UNKERNEL_REMOTE_NET=off` | the guest without a network |
+| `--web DIR` | `UNKERNEL_REMOTE_WEB` | the web build (default `web/.output/public`) |
+| `--config FILE` | `UNKERNEL_REMOTE_CONFIG` | a JSON file with these settings |
+| `--open` | | open the page once the backend listens |
+
+Stop the backend with Ctrl+C in its window: the guest's disk is saved before
+it exits, and the next start finds it. The data image is locked while the
+backend runs, so a second backend on the same file stops with an error that
+names the first one's process and its lock file.
+
+Limits in remote mode:
+
+- One kernel at a time: a page that connects takes it over from the old one.
+- One CPU (`?cpus` has no effect), and no suspend or session resume.
+- No guest GL and no Wayland windows. Sound plays in the page.
+- The disk is the file given by `--data`: the page cannot export, replace or reset it.
+- The network is your computer's, through direct sockets. The page's Wisp proxy (`?wisp=`) does not apply.
+- Windows gives a closed console window only a few seconds, so closing it may not save the disk; Ctrl+C does.
+- Tested on Linux (the backend, the page, `/work`, the display and sound). The Windows scripts and the Windows file modes are not tested on Windows yet.
+
 ## 🔍 How it works
 
 Most "Linux in the browser" projects take one of three approaches:

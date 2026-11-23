@@ -51,7 +51,7 @@ function Find-Tool([string]$name, [string[]]$fallbacks) {
 }
 
 $Data = Resolve-Path-Arg $Data
-$Work = Resolve-Path-Arg $Work
+if ($Work -ne "none") { $Work = Resolve-Path-Arg $Work }
 $Cache = Resolve-Path-Arg $Cache
 $Config = Resolve-Path-Arg $Config
 

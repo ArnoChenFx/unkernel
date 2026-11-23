@@ -7,7 +7,7 @@
 # docs), a kernel archive (the page's kernel and GL renderer, named by their
 # content), manifest.json (every install file with its sha256, size and asset,
 # and the upstream distro images with their URLs) and the updater on its own
-# (update.ps1, update.cmd). The distro images are not copied into the release.
+# (update.ps1, update.cmd, update.sh, start.sh). The distro images are not copied into the release.
 # remote/README.md says how Windows uses it.
 #
 # Runs:

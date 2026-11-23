@@ -61,7 +61,7 @@ export const agoSince = (t: number): string => {
 	return m < 1 ? "just now" : m < 120 ? `${m} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} days ago`;
 };
 
-// ---- shares and counts (the Overview, the top bar's Control Center) ---------------
+// ---- shares and counts (the Overview, the top bar's Resources) -------------------
 
 /** A share 0 to 1 as a percentage: <1%, 37%. */
 export const fmtPct = (f: number): string => (f > 0 && f < 0.005 ? "<1%" : `${Math.round(f * 100)}%`);

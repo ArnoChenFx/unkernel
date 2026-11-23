@@ -562,7 +562,7 @@ deploying the page needs no kernel toolchain.
   TerminalTabs.tsx), and a terminal is a tab of exactly one window. The
   console's window (`terminal-1`) is opened by Workspace.tsx when it
   loads, with `#term` in it, and never goes: its tab cannot be closed or
-  moved, and its close button closes its other tabs and minimizes it. Any
+  moved, and it has no close button or Close Window entry (only minimize). Any
   other window goes with its last tab. A new terminal (Ctrl-A n, the tab
   strip's +) goes into the Terminal window that last had the focus;
   Ctrl-A N, or a right click, Shift-click or long press on +, into a new
@@ -591,34 +591,38 @@ deploying the page needs no kernel toolchain.
   (`winmenu.tsx` `windowItems()`, the same items as the top bar's app
   menu). The tiles scroll sideways when they do not fit.
 - Top bar (`TopBar.tsx`, `#topbar`): no background over the wallpaper, a
-  blurred tint over a window. The mark's menu (`#tb-mark`: About,
-  Settings, System, the kernel log, the shortcuts, Suspend or Resume,
-  Reboot); the current app (the focused window's `meta` title, then its
-  own title in a quieter tone; "Desktop" with none), a menu of the
-  window's items (`#tb-app`), and in its place until user space prints the
+  blurred tint over a window. The current app, one control (its icon, as
+  on its Dock tile, the focused window's `meta` title, then its own title
+  in a quieter tone; unkernel's mark and "Desktop" with none), a menu of
+  the window's items (`#tb-app`), and in its place until user space prints the
   boot indicator (BootIndicator.tsx, `#tb-boot`: a ring with the boot's
   progress and the step, red with the failure's title, a press opens
   System); on the right Errors (`#tb-errors`) while there are any, the
   resource meters (`#tb-cpu`, `#tb-mem`, from sm up `#tb-disk`, `#tb-net`,
-  and `#tb-gpu` while guest GL's renderer is loaded) and the Control
-  Center's item (`#tb-status`, `#tb-status-label`). The bar always shows:
+  and `#tb-gpu` while guest GL's renderer is loaded), which open
+  Resources, and the Control Center's item (`#tb-status`,
+  `#tb-status-label`). The bar always shows:
   its auto-hide over a maximized window is off (`auto` in TopBar.tsx; the
   code for it stays).
-- Control Center (`ControlCenter.tsx`, `#tb-cc`), opened by `#tb-status`
-  or by hovering or clicking a meter (that resource's row marked): the
-  state and the uptime, quick buttons for what applies at once (full
-  screen, the next random wallpaper, the Display window), every
-  resource's sparkline and facts (`Glance.tsx`), System… (`#tb-cc-system`)
-  and Settings…, and the power items (`#tb-suspend` or `#tb-resume`,
-  `#tb-reboot`: "Reboot to apply" while Settings' options differ from this
-  boot's, and it asks first; Leave safe mode in safe mode). Boot options
-  stay in Settings.
-- Resources (`stats.ts`): one sampler for the meters, the Control Center
-  and System's Overview, never two reads at once: a `vm.exec()` of a POSIX
+- Control Center (`ControlCenter.tsx`, `#tb-cc`), opened by hovering or
+  clicking `#tb-status`:
+  the state and the uptime, quick buttons for what applies at once (full
+  screen, the next random wallpaper, the Display window), Settings…, System…
+  (`#tb-cc-system`), the kernel log, the shortcuts and About, and the
+  power items (`#tb-suspend` or
+  `#tb-resume`, `#tb-reboot`: "Reboot to apply" while Settings' options
+  differ from this boot's, and it asks first; Leave safe mode in safe
+  mode). Boot options stay in Settings.
+- Resources popover (`ControlCenter.tsx`, `#tb-res`), opened by hovering
+  or clicking a meter (that resource's row marked), under the last meter:
+  every resource's sparkline and facts (`Glance.tsx`), then System…
+  (`#tb-res-system`). One of the two popovers is open at a time.
+- Resources (`stats.ts`): one sampler for the meters, the Resources
+  popover and System's Overview, never two reads at once: a `vm.exec()` of a POSIX
   sh snippet of builtins only (no program started, nothing read from the
   image) that prints the guest's `/proc` (every few samples also `df`),
   with the SDK's host counters and guest GL's. A light sample every 5 s
-  for the meters, a full one every 2 s while the Control Center or the
+  for the meters, a full one every 2 s while the Resources popover or the
   Overview shows; only while the page is visible and the machine runs; the
   last 90 samples kept for the charts.
 - Shortcuts HUD (`KeysHud.tsx`): 180 ms after the prefix is armed, a

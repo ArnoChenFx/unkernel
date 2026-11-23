@@ -11,7 +11,7 @@
 // - Panels, in a grid by the section's own width (container queries: one
 //   column at phone width, two, then three), each a figure, a chart of the
 //   last three minutes or a meter, and a few short facts; each resource in
-//   its colour (Charts.tsx TONE, as in the top bar's Control Center):
+//   its colour (Charts.tsx TONE, as in the top bar's Resources):
 //   CPU (busy history, each CPU's bar, load, tasks, context switches);
 //   Memory (in use, cache and free as one bar, in-use history, swap);
 //   Disk (/data and the root's own changes as bars, host block I/O history

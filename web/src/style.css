@@ -293,12 +293,14 @@
 .wallpaper > .wp-dim { transition: background-color .2s; }
 @keyframes wp-in { from { opacity: 0; } }
 /* The photo's credit (Wallpaper.tsx WallpaperCredit, in #workspace under the
-   windows): plain small text, faint on a dark wallpaper, dark on a light one. */
+   windows): plain small text, faint on a dark wallpaper, dark on a light one.
+   Not selectable: a long press on the empty desktop would otherwise select
+   it, the only text there. */
 .wp-credit {
 	position: absolute; right: 10px; bottom: 6px; z-index: var(--z-credit); max-width: 40%;
 	overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 	font-size: 10.5px; line-height: 1.3; color: rgb(255 255 255 / 38%); text-decoration: none;
-	transition: color .15s; -webkit-touch-callout: none;
+	transition: color .15s; -webkit-touch-callout: none; user-select: none; -webkit-user-select: none;
 }
 .wp-credit:hover, .wp-credit:focus-visible { color: rgb(255 255 255 / 80%); }
 :root[data-wallpaper="light"] .wp-credit { color: rgb(0 0 0 / 42%); }
@@ -461,7 +463,6 @@
 		& > svg { flex: none; filter: drop-shadow(var(--tb-shadow)); }
 		@media (pointer: coarse) { min-width: 34px; height: calc(var(--tb-h) - 4px); }
 	}
-	.tb-mark { padding: 0 7px; }
 	.tb-app { flex: 0 1 auto; min-width: 0; justify-content: flex-start; gap: 7px; padding: 0 8px; }
 	.tb-detail { color: rgb(237 237 237 / 55%); }
 	.tb-off { color: var(--color-faint); }

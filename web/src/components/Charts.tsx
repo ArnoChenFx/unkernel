@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The small charts of System's Overview (components/Overview.tsx) and of the
-// top bar's Control Center (components/Glance.tsx), drawn as inline SVG and
+// top bar's Resources (components/Glance.tsx), drawn as inline SVG and
 // plain elements, no chart library:
 // - Spark: a time series (stats.ts's history) as a line with a faint flat
 //   area under it, one or two series, over a fixed window of time ending at

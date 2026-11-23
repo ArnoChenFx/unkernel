@@ -187,7 +187,7 @@ export interface Group extends GroupDef {
 	apps: App[];
 }
 
-/** A group (apps/<id>/index.ts) and its apps, in the order the launcher lists them. */
+/** A group (apps/<id>/index.ts) and its apps, in the order the launcher lists them. An app's getters stay getters (chromium.ts commands). */
 export function defineGroup(g: GroupDef, apps: AppDef[]): Group {
-	return { ...g, apps: apps.map((a) => ({ ...a, group: g.id })) };
+	return { ...g, apps: apps.map((a) => Object.defineProperties({ group: g.id }, Object.getOwnPropertyDescriptors(a)) as App) };
 }

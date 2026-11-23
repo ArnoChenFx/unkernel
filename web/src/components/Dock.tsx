@@ -8,7 +8,8 @@
 //   Ctrl-A o; dimmed while the system does not run: data-off, store.ts
 //   isRunning);
 // - the apps and launcher groups kept in the Dock (pins.ts; by default
-//   Terminal, Chromium, Thunar, Desktop, Games and Settings), in their order. A
+//   Terminal, Chromium, Thunar, Desktop, Games and Settings; on phones
+//   Terminal, glmark2, Galculator, Desktop and Settings), in their order. A
 //   group's tile (#dock-group-<id>, GroupFace: its icon in front of a small
 //   fan of cards) opens its apps in a popover above it (DockStack.tsx
 //   #dock-stack; a second click closes it), has a running dot while one of

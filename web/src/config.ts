@@ -410,14 +410,19 @@ function takeOnce(key: string): string | null {
 	}
 }
 
+const isCoarse = (): boolean => typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+const isMobileUA = (): boolean => typeof navigator !== "undefined" && /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
+/** A touch device or a mobile user agent (Config.mobile). */
+export const isMobile = (): boolean => isCoarse() || isMobileUA();
+
 export function readConfig(search: string = location.search, saved: Record<string, string> = loadSettings()): Config {
 	const url = new URLSearchParams(search);
 	const params = new URLSearchParams(saved);
 	for (const k of SETTING_NAMES) if (url.has(k)) params.set(k, url.get(k)!);
 	if (params.get("net") === "0") params.set("wisp", "0");
 	params.delete("net");
-	const coarse = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
-	const mobileUA = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
+	const coarse = isCoarse();
+	const mobileUA = isMobileUA();
 	const mobile = coarse || mobileUA;
 	const memParam = params.get("mem");
 	const auto = autoMemoryMiB({ mobile });

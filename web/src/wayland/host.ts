@@ -54,7 +54,10 @@
 //   any other window focused takes it away (input.blur), so keys typed in a
 //   terminal never reach an app and the reverse. A press in the focused
 //   Wayland window whose keyboard went (the page's focus taken outside the
-//   windows) gives it back before the press reaches the app.
+//   windows) gives it back before the press reaches the app. A press on
+//   a surface never moves the DOM focus (its mousedown is cancelled: iOS
+//   sends one even after wland cancelled the pointerdown), so the sink
+//   keeps it and the on-screen keyboard it raised stays up.
 // - What the chrome shows of it (describe(): wm.ts meta and title), by its
 //   app id (xdg_toplevel.set_app_id: ViewWindow.appId): a launcher app's
 //   (appwindows.ts waylandApp(): foot, thunar, chromium, the games), whose
@@ -550,6 +553,18 @@ export function createHost(popupRole: number): Host {
 		if (wl && h?.open && wm.focused() === h.id && !wl.input.focused(h.conn, h.surface)) focused(h);
 	};
 	addEventListener("pointerdown", onDown, true);
+	/**
+	 * A press on an app's surface never moves the DOM focus: the keyboard sink keeps it. wland cancels
+	 * the pointerdown, which keeps Chrome and Firefox from sending the mousedown, but iOS WebKit sends
+	 * its tap's mousedown anyway, after the touchend. On an input region (a div that cannot take the
+	 * focus) that mousedown cleared the focus: the sink lost it right after the tap's pointerup had
+	 * raised the on-screen keyboard for the app's text field, so the app lost its keyboard and the
+	 * on-screen keyboard closed again.
+	 */
+	const onMouseDown = (ev: MouseEvent) => {
+		if (wl?.view.surfaceOf(ev.target as Element | null)) ev.preventDefault();
+	};
+	addEventListener("mousedown", onMouseDown, true);
 
 	return {
 		byId,
@@ -592,6 +607,7 @@ export function createHost(popupRole: number): Host {
 			unsubscribe();
 			unIcon();
 			removeEventListener("pointerdown", onDown, true);
+			removeEventListener("mousedown", onMouseDown, true);
 			cancelAnimationFrame(posRaf);
 			grabbing?.end();
 			for (const h of hosts.values()) {

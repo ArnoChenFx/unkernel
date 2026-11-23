@@ -12,9 +12,9 @@
 //   tabs, one per terminal, and one active tab. A terminal is a tab of
 //   exactly one window. The console's window is CONSOLE_WIN, opened by
 //   components/Workspace.tsx when it loads, and it never goes: the console
-//   tab cannot be closed or moved, and closing that window closes its other
-//   tabs and minimizes it (the close action, terminals.ts
-//   closeTerminalWindow). Any other window goes once its last tab does.
+//   tab cannot be closed or moved, and the window has no close button (it
+//   minimizes). Closing any other window closes its tabs (the close action,
+//   terminals.ts closeTerminalWindow); it goes once its last tab does.
 // - The window's content is a box (.term-stack) holding the terminal elements
 //   of its tabs (#term, .term-pty) stacked in it (style.css), so they all
 //   share its size and refit together; only the active one is visible, the
@@ -125,7 +125,7 @@ export const terminalHasFocus = (): boolean => isTerminalEl(document.activeEleme
 interface Config {
 	/** The tab strip for a window's title bar. */
 	strip?: (id: string) => ReactNode;
-	/** A window's close button (WM onClose): close its tabs (asking first), minimize the console's. */
+	/** A window's close button (WM onClose; the console's has none): close its tabs, asking first. */
 	close?: (id: string) => void;
 	/** The descriptor of the terminal app a terminal is named after (appwindows.ts terminalAppMeta), if any. */
 	appMeta?: (name: string) => AppMeta | undefined;
@@ -186,11 +186,11 @@ function openWindow(id: string, first: number, el: HTMLElement, geom: { w?: numb
 	const spec = {
 		id, appId: TERMINAL.id, meta: windowMeta(tw), title: windowTitle(tw), dockId: `dock-${id}`, content: box, ...geom,
 		titleContent: cfg.strip?.(id), status: windowStatus(tw),
+		closable: id !== CONSOLE_WIN, // the console's: minimize only
 		onFocus: () => focused(id),
 		onClose: () => {
-			if (cfg.close) cfg.close(id);
-			else if (termWindow(id)?.tabs.includes(0)) wm.minimize(id);
-			return false; // the close action removes it (its tabs gone) or minimizes it
+			cfg.close?.(id);
+			return false; // the close action removes it, its tabs gone
 		},
 	};
 	// Mounted at once (flushSync), so the terminal measures its box in place; where React cannot render now, it mounts on the next render.

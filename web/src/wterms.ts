@@ -19,7 +19,8 @@
 //   KW.term and the prefix's x act on it.
 // - A tab's × asks as the prefix's x does (terminals.ts closeTerminal) and
 //   closes its session; the console's tab has none. A Terminal window's
-//   close button closes all its tabs (terminals.ts closeTerminalWindow).
+//   close button closes all its tabs (terminals.ts closeTerminalWindow);
+//   the console's window has none.
 //
 // - Opening waits until user space runs (the first console output), then
 //   spawn() retries for up to 30 s while kwtty is not listening.

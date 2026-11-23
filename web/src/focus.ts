@@ -12,7 +12,7 @@
 //   system apps' windows (Settings, System), the modal dialogs (confirm,
 //   paste), the launcher;
 // - inBars(): the Dock, the top bar, their menus, the Dock's group stack and
-//   the top bar's Control Center;
+//   the top bar's popovers (the Control Center, Resources);
 // - ownsKeys(): keys typed here are the page's, not the guest's: any of the
 //   above but a terminal, or a notification's button (the toast, the Resume
 //   card). boot.ts (a key that ends a pause) and display.ts (evdev routing)
@@ -26,8 +26,8 @@ const TERMINALS = '#term, .term-pty, .wterm, [data-app="terminal"]';
 const FIELDS = "input, select, textarea, [contenteditable]";
 /** The system apps (sysapps.ts .kw-app), every modal <dialog> (#confirm, #paste: Dialog.tsx), the launcher. */
 const SURFACES = ".kw-app, dialog, #launcher";
-/** The Dock (#dock), the top bar, an open menu (Menu.tsx), the Dock's group stack (DockStack.tsx) or the Control Center (ControlCenter.tsx), all three in portals on <body>. */
-const BARS = "#dock, #topbar, [role=menu], #dock-stack, #tb-cc";
+/** The Dock (#dock), the top bar, an open menu (Menu.tsx), the Dock's group stack (DockStack.tsx) or the top bar's popovers (ControlCenter.tsx), all in portals on <body>. */
+const BARS = "#dock, #topbar, [role=menu], #dock-stack, #tb-cc, #tb-res";
 /** The toast's button, the Resume card's. */
 const CARDS = "#toast, #resume-card";
 /**
@@ -46,7 +46,7 @@ export const inTerminal = (t: Target): boolean => !!el(t)?.closest(TERMINALS);
 export const isField = (t: Target): boolean => !!el(t)?.closest(FIELDS) && !inTerminal(t);
 /** In the system apps, a modal dialog or the launcher. */
 export const inSurface = (t: Target): boolean => !!el(t)?.closest(SURFACES);
-/** In the Dock, the top bar, a menu, the group stack or the Control Center. */
+/** In the Dock, the top bar, a menu, the group stack or a top bar popover. */
 export const inBars = (t: Target): boolean => !!el(t)?.closest(BARS);
 /** Keys typed here are the page's: a field, a surface, the bars, a card's button; never a terminal. */
 export const ownsKeys = (t: Target): boolean => !inTerminal(t) && (!!el(t)?.closest(`${SURFACES}, ${BARS}, ${CARDS}`) || isField(t));

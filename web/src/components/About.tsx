@@ -4,7 +4,7 @@
 // unkernel:licenses) and the build (vite.config.ts's __KW_BUILD__: the base
 // bundle's Linux release and where it came from; the distro image, the
 // store's distro). AboutInfo is Settings' About section (Settings.tsx), which
-// the top bar's mark menu (TopBar.tsx) and the prefix, a (keys.ts),
+// the top bar's Control Center (ControlCenter.tsx) and the prefix, a (keys.ts),
 // open (openAbout()).
 import type { ReactNode } from "react";
 import { openSection } from "../sysapps.ts";
@@ -29,7 +29,7 @@ function Row({ k, children }: { k: string; children: ReactNode }) {
 	);
 }
 
-/** Open Settings on About (the top bar's mark menu, and the prefix, a). */
+/** Open Settings on About (the top bar's Control Center, and the prefix, a). */
 export function openAbout(): void {
 	openSection("about");
 }

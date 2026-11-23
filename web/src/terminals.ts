@@ -6,13 +6,12 @@
 // terminal (its tab, and its window focused, raised and restored), open one
 // (a tab of a given Terminal window, of a new one, or of the one that last
 // had the focus), close one (asking first while its shell runs), and a
-// Terminal window's close button (all its tabs; the console's window only
-// minimizes). Each says why in a toast when it cannot.
+// Terminal window's close button (all its tabs; the console's window has
+// none). Each says why in a toast when it cannot.
 import { keyFor, PREFIX } from "./keys.ts";
 import { KW } from "./kw.ts";
 import { isRunning, ui$ } from "./store.ts";
 import { currentTerminal, selectTab, termWindow } from "./termtabs.ts";
-import { wm } from "./wm.ts";
 import type { OpenError } from "./wterms.ts";
 
 /** Show terminal n (0: the console): its tab, and its Terminal window focused, raised and restored. */
@@ -52,8 +51,7 @@ export async function closeTerminal(n = currentTerminal()): Promise<void> {
 
 /**
  * A Terminal window's close button: close its terminals, asking once while
- * any of their shells runs; the console's window keeps the console tab and
- * is minimized instead.
+ * any of their shells runs. The console's window has no close button.
  */
 export async function closeTerminalWindow(id: string): Promise<void> {
 	const tw = termWindow(id);
@@ -63,9 +61,8 @@ export async function closeTerminalWindow(id: string): Promise<void> {
 	const running = list.filter((x) => ttys.includes(x.n) && x.state === "open");
 	if (running.length && !await KW.ui!.ask({
 		title: running.length > 1 ? `close ${running.length} terminals` : `close terminal ${running[0]!.n}`,
-		msg: `${running.length > 1 ? "Their shells" : "Its shell"} and the programs started from ${running.length > 1 ? "them" : "it"} are hung up (SIGHUP).${tw.tabs.includes(0) ? " The console stays: its window is minimized." : ""}`,
+		msg: `${running.length > 1 ? "Their shells" : "Its shell"} and the programs started from ${running.length > 1 ? "them" : "it"} are hung up (SIGHUP).`,
 		ok: "Close", danger: true,
 	})) return;
 	await Promise.all(ttys.map((n) => KW.windows?.close(n)));
-	if (termWindow(id)?.tabs.includes(0)) wm.minimize(id);
 }

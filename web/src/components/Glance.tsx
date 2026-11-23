@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The resource glance: the Control Center's Resources section
-// (ControlCenter.tsx, opened from the top bar's #tb-status, or by hovering or
-// clicking a resource meter: TopBar.tsx #tb-cpu, #tb-mem, #tb-disk, #tb-net,
-// #tb-gpu, whose row is then marked and scrolled into view). One row per
+// The resource glance: the top bar's Resources popover (ControlCenter.tsx
+// #tb-res, opened by hovering or clicking a resource meter: TopBar.tsx
+// #tb-cpu, #tb-mem, #tb-disk, #tb-net, #tb-gpu, whose row is then marked
+// and scrolled into view). One row per
 // resource: its icon in its colour (Charts.tsx TONE, as in the Overview),
 // its name, a sparkline of the history (stats.ts, the last three minutes)
 // and its current value on one line, then a line of secondary facts:

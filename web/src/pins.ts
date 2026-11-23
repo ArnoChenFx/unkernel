@@ -24,13 +24,18 @@ import { APPS, GROUPS } from "./apps/index.ts";
 import type { App, Group } from "./apps/types.ts";
 import { createStore } from "./store.ts";
 import { store } from "./prefs.ts";
+import { isMobile } from "./config.ts";
 
 /** The key under prefs.ts store()'s `kw.` prefix. */
 const KEY = "pins";
 /** A stored group entry's prefix. */
 const GROUP = "group:";
-/** A fresh profile's pins: the console's Terminal, Chromium, Thunar, the Desktop and Games folders and Settings. */
-export const DEFAULT_PINS: readonly string[] = ["terminal", "chromium", "thunar", `${GROUP}desktop`, `${GROUP}games`, "settings"];
+/** A fresh profile's pins on a desktop: the console's Terminal, Chromium, Thunar, the Desktop and Games folders and Settings. */
+const DESKTOP_PINS: readonly string[] = ["terminal", "chromium", "thunar", `${GROUP}desktop`, `${GROUP}games`, "settings"];
+/** A fresh profile's pins on a phone (config.ts isMobile()): the console's Terminal, glmark2, Galculator, the Desktop folder and Settings. */
+const MOBILE_PINS: readonly string[] = ["terminal", "glmark2", "galculator", `${GROUP}desktop`, "settings"];
+/** A fresh profile's pins: MOBILE_PINS on a phone, else DESKTOP_PINS. */
+export const DEFAULT_PINS: readonly string[] = isMobile() ? MOBILE_PINS : DESKTOP_PINS;
 
 const BY_ID = new Map(APPS.map((a) => [a.id, a]));
 const GROUP_BY_ID = new Map(GROUPS.map((g) => [g.id, g]));

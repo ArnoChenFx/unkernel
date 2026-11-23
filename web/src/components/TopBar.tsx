@@ -4,15 +4,14 @@
 // the page (style.css: --tb-h, over the top safe area), with no background
 // over the wallpaper. The workspace (#workspace, Workspace.tsx) starts below
 // it (--tb-space). Left to right:
-// - the mark (#tb-mark), a menu (#tb-menu): About, Settings, System, the
-//   kernel log, the keyboard shortcuts, Suspend or Resume, Reboot (as in
-//   macOS's Apple menu);
-// - the current app: the focused window's app, its descriptor's title (wm.ts
-//   meta: Terminal, or the terminal app a Terminal window or a Wayland
-//   window stands for; Browser, Display, Settings, System, another Wayland
-//   app's title) in semibold,
-//   then the window's title in a quieter tone when it says more
-//   (appwindows.ts windowDetail(); truncated), "Desktop" when no
+// - the current app, one control (what macOS's Apple menu has is in the
+//   Control Center): its icon (AppIcon: its Dock tile's icon, wm.ts meta,
+//   on its colours when it has them), then the focused window's app, its
+//   descriptor's title (wm.ts meta: Terminal, or the terminal app a
+//   Terminal window or a Wayland window stands for; Browser, Display,
+//   Settings, System, another Wayland app's title) in semibold, then the
+//   window's title in a quieter tone when it says more (appwindows.ts
+//   windowDetail(); truncated); unkernel's mark and "Desktop" when no
 //   window has the focus. It is a menu (#tb-app, #tb-app-menu): the
 //   window's own items, as in its Dock tile's menu (winmenu.tsx
 //   windowItems(): a Terminal window's New Tab, New Window and Close Tab,
@@ -33,15 +32,18 @@
 //   switches in the state's colour, red on an error, dim once halted, green
 //   while suspended, style.css; #tb-status-label is the state's name), which
 //   opens its popover (ControlCenter.tsx, #tb-cc: the state and uptime, quick
-//   settings, every resource's sparkline and facts, System… and Settings…,
-//   Suspend or Resume and Reboot). The meters open the same popover: under
-//   the mouse they show it with their row marked (it goes when the mouse
-//   leaves the meters, the item and the popover), a click keeps it (a second
-//   click closes it, a click on another meter marks that one); a click on
-//   the item opens it, or keeps one a hover opened, or closes it. The
+//   settings, Settings…, System…, the log, the shortcuts, About, Suspend or
+//   Resume and Reboot). Under the mouse it shows (it goes when the mouse
+//   leaves the item and the popover), a click keeps it, a second click
+//   closes it. The meters open their own popover, Resources
+//   (ControlCenter.tsx, #tb-res: every resource's sparkline and facts,
+//   System…), under the last meter: under the mouse they show it with their
+//   row marked (it goes when the mouse leaves the meters and the popover), a
+//   click keeps it (a second click closes it, a click on another meter marks
+//   that one). One of the two is open at a time. The
 //   figures are stats.ts's light samples (useStats("lite"): every
 //   LITE_INTERVAL ms while the machine runs and the page shows, faster while
-//   the Overview or the popover is open); before the first one, and while
+//   the Overview or Resources is open); before the first one, and while
 //   the guest cannot be read or the machine does not run, the bars are empty
 //   tracks. The tooltips have the exact figures and keys; while the prefix
 //   is armed each control shows its key (which-key style; looked up by
@@ -57,19 +59,16 @@ import { windowDetail } from "../appwindows.ts";
 import { fmtFps, fmtPct, fmtRateShort, fmtSizeShort } from "../format.ts";
 import { KW } from "../kw.ts";
 import { useStats } from "../stats.ts";
-import { openSection, openSettings, SETTINGS, SYSTEM, toggleSection, useFocusedSection } from "../sysapps.ts";
-import { keyFor, PREFIX_SHORT, type CommandId } from "../keys.ts";
-import { isRunning, useStore } from "../store.ts";
-import { openItem, windowItems } from "../winmenu.tsx";
+import { toggleSection, useFocusedSection } from "../sysapps.ts";
+import { keyFor, type CommandId } from "../keys.ts";
+import { useStore } from "../store.ts";
+import { windowItems } from "../winmenu.tsx";
 import { useWm, type WmWindow } from "../wm.ts";
-import { openAbout } from "./About.tsx";
 import { BootSlot } from "./BootIndicator.tsx";
-import { ControlCenter, type CcClose } from "./ControlCenter.tsx";
+import { ControlCenter, ResourcesPopover, type CcClose } from "./ControlCenter.tsx";
 import { GPU_STATE, type ResKey } from "./Glance.tsx";
-import {
-	ControlIcon, CpuIcon, DiskIcon, ErrIcon, GpuIcon, LogIcon, Mark, NetIcon, PauseIcon, PlayIcon, RamIcon, RebootIcon, Triangle,
-} from "./icons.tsx";
-import { KeyHint, menuKeys, withKey } from "./KeyHint.tsx";
+import { ControlIcon, CpuIcon, DiskIcon, ErrIcon, GpuIcon, Mark, MetaIcon, NetIcon, RamIcon } from "./icons.tsx";
+import { KeyHint, withKey } from "./KeyHint.tsx";
 import { Menu, type MenuClose, type MenuEntry } from "./Menu.tsx";
 
 /** A status icon: muted until hovered or pressed; a press keeps the focus where it is. `cmd`: its command (its key shows while the prefix is armed). */
@@ -86,15 +85,15 @@ function BarButton({ id, title, label, cmd, on, tone, onClick, className = "", c
 }
 
 /**
- * A resource's meter: under the mouse it shows the Control Center with its row marked, a click keeps it
+ * A resource's meter: under the mouse it shows Resources with its row marked, a click keeps it
  * (or closes a kept one); a press keeps the focus where it is.
  */
 function ResButton({ res, open, title, label, tone, onToggle, onHover, className = "", children }: {
 	res: ResKey; open: boolean; title: string; label: string; tone?: string; onToggle: (res: ResKey, kb: boolean) => void; onHover: (res: ResKey) => void; className?: string; children: ReactNode;
 }) {
 	return (
-		<button id={`tb-${res}`} type="button" title={open ? undefined : title} aria-label={label} aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? "tb-cc" : undefined}
-			data-cc={res} data-tone={tone} className={`tb-btn tb-meter ${className}`}
+		<button id={`tb-${res}`} type="button" title={open ? undefined : title} aria-label={label} aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? "tb-res" : undefined}
+			data-meter={res} data-pop="" data-tone={tone} className={`tb-btn tb-meter ${className}`}
 			onMouseDown={(e) => e.preventDefault()}
 			onPointerEnter={(e) => { if (e.pointerType === "mouse") onHover(res); }}
 			onKeyDown={(e) => { if (e.key === "ArrowDown" && !open) { e.preventDefault(); onToggle(res, true); } }}
@@ -192,12 +191,21 @@ function Bars({ values }: { values: (number | null)[] }) {
 	);
 }
 
+/** The current app's icon: a 16 px rounded square in the app's colours with its icon in white (as unkernel's mark), or the bare icon. */
+function AppIcon({ meta }: { meta: WmWindow["meta"] }) {
+	if (!meta.colors) return <MetaIcon meta={meta} size={15} />;
+	return (
+		<span aria-hidden="true" className="flex size-4 flex-none items-center justify-center rounded-[4px] text-white"
+			style={{ backgroundImage: `linear-gradient(135deg, ${meta.colors[0]}, ${meta.colors[1]})` }}>
+			<MetaIcon meta={meta} size={11} />
+		</span>
+	);
+}
+
 /** The focused window's app, and its title when that says more. */
 const appOf = (w: WmWindow): { name: string; detail: string } => ({ name: w.meta.title, detail: windowDetail(w) });
 
 export function TopBar() {
-	const ui = KW.ui!;
-	const running = useStore(isRunning);
 	const label = useStore((s) => s.label);
 	const suspended = useStore((s) => s.suspended);
 	const disk = useStore((s) => s.disk);
@@ -226,68 +234,62 @@ export function TopBar() {
 	const gpuText = gpu ? `GPU (guest GL): ${gpu.state === "ready" ? `${fps != null ? `${fmtFps(fps)} · ` : ""}renderer ${glBusy != null ? fmtPct(glBusy) : "–"} of the page's time` : GPU_STATE[gpu.state]}` : "";
 
 	const bar = useRef<HTMLElement>(null);
-	/** In the bar, or in a menu or the Control Center (Menu.tsx and ControlCenter.tsx render them in <body>). */
-	const inBar = (n: EventTarget | null): boolean => !!n && (!!bar.current?.contains(n as Node) || !!(n as Element).closest?.('[role="menu"], #tb-cc'));
+	/** In the bar, or in a menu or a popover (Menu.tsx and ControlCenter.tsx render them in <body>). */
+	const inBar = (n: EventTarget | null): boolean => !!n && (!!bar.current?.contains(n as Node) || !!(n as Element).closest?.('[role="menu"], #tb-cc, #tb-res'));
 
-	// ---- the Control Center (ControlCenter.tsx) ----
-	// res: the meter whose row is marked (null: opened from the item); from: the control it opened from (Esc after a
-	// keyboard open goes back to it); pinned: opened by a click or a key, so it stays until closed; a meter's hover
-	// opens it unpinned, and it goes when the mouse leaves the meters, the item and the popover.
-	const [cc, setCc] = useState<{ res: ResKey | null; from: string; kb: boolean; pinned: boolean } | null>(null);
-	const ccOpen = !!cc;
+	// ---- the popovers (ControlCenter.tsx): the Control Center (#tb-cc) and Resources (#tb-res) ----
+	// One at a time. view: which; res: the meter whose row is marked (Resources); from: the control it opened from
+	// (Esc after a keyboard open goes back to it); pinned: opened by a click or a key, so it stays until closed. A
+	// hover (the mouse) on a meter opens Resources, on the item the Control Center, unpinned: it goes when the mouse
+	// leaves those controls and the popover; a click then pins it. Under the mouse, the other kind of control over an
+	// open popover switches to its own, pinned or not as the one it replaces, as a menu bar does.
+	const [pop, setPop] = useState<{ view: "cc" | "res"; res: ResKey | null; from: string; kb: boolean; pinned: boolean } | null>(null);
+	const popOpen = !!pop;
 	/** Where the focus was when it opened (not in the bar), for Esc after the user tabbed into a mouse-opened one. */
-	const ccPrev = useRef<HTMLElement | null>(null);
+	const popPrev = useRef<HTMLElement | null>(null);
 	useEffect(() => {
-		if (!ccOpen) return;
+		if (!popOpen) return;
 		const f = document.activeElement as HTMLElement | null;
-		ccPrev.current = f && !inBar(f) ? f : null;
-	}, [ccOpen]);
-	const toggleCc = (kb: boolean) => setCc((c) => (c?.pinned ? null : { res: c?.res ?? null, from: "tb-status", kb, pinned: true }));
-	const toggleRes = (res: ResKey, kb: boolean) => setCc((c) => (c?.res === res && c.pinned ? null : { res, from: `tb-${res}`, kb, pinned: true }));
-	const hoverRes = useCallback((res: ResKey) => setCc((c) => (c?.pinned ? (c.res === res ? c : { ...c, res }) : c?.res === res ? c : { res, from: `tb-${res}`, kb: false, pinned: false })), []);
-	const hovering = !!cc && !cc.pinned;
+		popPrev.current = f && !inBar(f) ? f : null;
+	}, [popOpen]);
+	const toggleCc = (kb: boolean) => setPop((c) => (c?.view === "cc" && c.pinned ? null : { view: "cc", res: null, from: "tb-status", kb, pinned: true }));
+	const hoverCc = () => setPop((c) => (c?.view === "cc" ? c : { view: "cc", res: null, from: "tb-status", kb: false, pinned: !!c?.pinned }));
+	const toggleRes = (res: ResKey, kb: boolean) => setPop((c) => (c?.view === "res" && c.res === res && c.pinned ? null : { view: "res", res, from: `tb-${res}`, kb, pinned: true }));
+	const hoverRes = useCallback((res: ResKey) => setPop((c) =>
+		c?.view === "res" ? (c.res === res ? c : { ...c, res })
+			: { view: "res", res, from: `tb-${res}`, kb: false, pinned: !!c?.pinned }), []);
+	const hovering = !!pop && !pop.pinned;
 	useEffect(() => {
 		if (!hovering) return;
-		// Away from the meters, the item and the popover for a moment (the gap between them is crossed in less): it goes.
+		// Away from the bar's popover controls and the popover for a moment (the gap between them is crossed in less): it
+		// goes. Over another control, that one's hover has switched to its own popover.
 		let t: ReturnType<typeof setTimeout> | undefined;
 		const move = (e: PointerEvent) => {
-			const over = !!(e.target as Element | null)?.closest?.("[data-cc], #tb-cc");
+			const over = !!(e.target as Element | null)?.closest?.("[data-pop], #tb-cc, #tb-res");
 			if (over) { clearTimeout(t); t = undefined; }
-			else t ??= setTimeout(() => setCc((c) => (c && !c.pinned ? null : c)), 300);
+			else t ??= setTimeout(() => setPop((c) => (c && !c.pinned ? null : c)), 300);
 		};
 		document.addEventListener("pointermove", move, true);
 		return () => { clearTimeout(t); document.removeEventListener("pointermove", move, true); };
 	}, [hovering]);
-	const closeCc = (how: CcClose) => {
-		const from = cc;
-		setCc(null);
+	const closePop = (how: CcClose) => {
+		const from = pop;
+		setPop(null);
 		if (how !== "key" || !from) return;
 		// Esc: back to the control it opened from after a keyboard open, else (the user tabbed into it) to where the focus was.
-		const inCc = !!document.activeElement?.closest?.("#tb-cc");
-		const back = from.kb ? document.getElementById(from.from) : inCc ? ccPrev.current : null;
+		const inPop = !!document.activeElement?.closest?.("#tb-cc, #tb-res");
+		const back = from.kb ? document.getElementById(from.from) : inPop ? popPrev.current : null;
 		if (back?.isConnected && back !== document.body) back.focus({ preventScroll: true });
 	};
 	// The meter it marks went (the GPU's renderer was dropped): no row marked.
-	if (cc?.res === "gpu" && !gpu) setCc({ ...cc, res: null });
-	const onCcControl = (t: EventTarget | null) => !!(t as Element | null)?.closest?.("[data-cc]");
+	if (pop?.res === "gpu" && !gpu) setPop({ ...pop, res: null });
+	/** The bar's controls that open a popover: a press on one does not close the open one (its click toggles or switches). */
+	const onPopControl = (t: EventTarget | null) => !!(t as Element | null)?.closest?.("[data-pop]");
+	/** Resources opens under the last meter shown (from sm up; under sm it is a sheet). */
+	const resAnchor = gpu ? "tb-gpu" : "tb-net";
+	const ccOn = pop?.view === "cc";
 
 	// ---- menus ----
-	/** As in the Control Center, without its ids (ControlCenter.tsx has #tb-suspend, #tb-resume, #tb-reboot). */
-	const power = (): MenuEntry[] => [
-		...(suspended ? [{ label: "Resume", icon: <PlayIcon />, run: ui.resume }]
-			: running && KW.suspend ? [{ label: "Suspend", icon: <PauseIcon />, keys: menuKeys("suspend"), run: () => ui.suspend() }] : []),
-		{ label: "Reboot", icon: <RebootIcon />, keys: menuKeys("reboot"), run: () => void ui.confirmReboot() },
-	];
-	const markItems = (): MenuEntry[] => [
-		{ label: "About unkernel", icon: <Triangle />, keys: menuKeys("about"), run: openAbout },
-		null,
-		openItem(SETTINGS, openSettings),
-		openItem(SYSTEM, () => openSection("status")),
-		{ label: "Kernel log", icon: <LogIcon />, keys: menuKeys("log"), run: () => openSection("log") },
-		{ label: "Keyboard shortcuts", icon: <span className="font-mono text-[10px]">{PREFIX_SHORT}</span>, keys: menuKeys("keys"), run: () => openSection("keys") },
-		null,
-		...power(),
-	];
 	/** The focused window's menu: its own items (winmenu.tsx, as on its Dock tile). */
 	const appItems = (w: WmWindow) => (): MenuEntry[] => windowItems(w.id) ?? [];
 
@@ -298,17 +300,15 @@ export function TopBar() {
 	return (
 		<header id="topbar" ref={bar} aria-label="Menu bar">
 			<nav aria-label="Menus" className="tb-left">
-				<BarMenu id="tb-mark" menuId="tb-menu" title="unkernel" label="unkernel" items={markItems} className="tb-mark">
-					<Mark size={16} />
-				</BarMenu>
 				<BootSlot>
 					{win && app ? (
 						<BarMenu id="tb-app" menuId="tb-app-menu" title={app.detail ? `${app.name}: ${app.detail}` : app.name} label={app.name} header={app.name}
 							items={appItems(win)} className="tb-app">
+							<AppIcon meta={win.meta} />
 							<span className="truncate font-semibold">{app.name}</span>
 							{app.detail && <span className="tb-detail truncate">{app.detail}</span>}
 						</BarMenu>
-					) : <span className="tb-app tb-btn pointer-events-none font-semibold">Desktop</span>}
+					) : <span className="tb-app tb-btn pointer-events-none font-semibold"><Mark size={16} /><span className="truncate">Desktop</span></span>}
 				</BootSlot>
 			</nav>
 			<div role="group" aria-label="Status" className="tb-right">
@@ -317,36 +317,38 @@ export function TopBar() {
 						<ErrIcon size={14} />{errors > 0 && <span className="font-mono text-[12px]">{errors}</span>}
 					</BarButton>
 				)}
-				<ResButton res="cpu" open={cc?.res === "cpu"} title={cpuText} label={cpuText} tone={tone(cpu)} onToggle={toggleRes} onHover={hoverRes}>
+				<ResButton res="cpu" open={pop?.view === "res" && pop.res === "cpu"} title={cpuText} label={cpuText} tone={tone(cpu)} onToggle={toggleRes} onHover={hoverRes}>
 					<CpuIcon size={14} /><Bars values={[cpu]} />
 				</ResButton>
-				<ResButton res="mem" open={cc?.res === "mem"} title={memText} label={memText} tone={tone(memShare)} onToggle={toggleRes} onHover={hoverRes}>
+				<ResButton res="mem" open={pop?.view === "res" && pop.res === "mem"} title={memText} label={memText} tone={tone(memShare)} onToggle={toggleRes} onHover={hoverRes}>
 					<RamIcon size={14} /><Bars values={[memShare]} />
 				</ResButton>
 				{disk && (
-					<ResButton res="disk" open={cc?.res === "disk"} className="tb-wide" tone={tone(diskShare)} label={`Data disk: ${used} in use`} onToggle={toggleRes} onHover={hoverRes}
+					<ResButton res="disk" open={pop?.view === "res" && pop.res === "disk"} className="tb-wide" tone={tone(diskShare)} label={`Data disk: ${used} in use`} onToggle={toggleRes} onHover={hoverRes}
 						title={`Data disk (/data): ${used} in use, ${disk.saved ? "saved in this browser" : "in memory only"}; counts blocks ever written, df in the guest is exact`}>
 						<DiskIcon size={14} /><Bars values={[diskShare]} />
 					</ResButton>
 				)}
-				<ResButton res="net" open={cc?.res === "net"} className={`tb-wide ${net ? "" : "tb-off"}`} title={netText} label={netText} onToggle={toggleRes} onHover={hoverRes}>
+				<ResButton res="net" open={pop?.view === "res" && pop.res === "net"} className={`tb-wide ${net ? "" : "tb-off"}`} title={netText} label={netText} onToggle={toggleRes} onHover={hoverRes}>
 					<NetIcon off={!net} size={14} />{net && <Bars values={[netLevel(rx), netLevel(tx)]} />}
 				</ResButton>
 				{gpu && (
-					<ResButton res="gpu" open={cc?.res === "gpu"} className="tb-wide" title={gpuText} label={gpuText} onToggle={toggleRes} onHover={hoverRes}>
+					<ResButton res="gpu" open={pop?.view === "res" && pop.res === "gpu"} className="tb-wide" title={gpuText} label={gpuText} onToggle={toggleRes} onHover={hoverRes}>
 						<GpuIcon size={14} /><Bars values={[glBusy]} />
 					</ResButton>
 				)}
-				<button id="tb-status" type="button" title={cc ? undefined : `Control Center: ${label}`}
-					aria-label={`Control Center: ${label}`} aria-haspopup="dialog" aria-expanded={!!cc} aria-controls={cc ? "tb-cc" : undefined}
-					data-cc="" className={`tb-btn ${suspended ? "text-ok!" : ""}`}
+				<button id="tb-status" type="button" title={ccOn ? undefined : `Control Center: ${label}`}
+					aria-label={`Control Center: ${label}`} aria-haspopup="dialog" aria-expanded={ccOn} aria-controls={ccOn ? "tb-cc" : undefined}
+					data-pop="" className={`tb-btn ${suspended ? "text-ok!" : ""}`}
 					onMouseDown={(e) => e.preventDefault()}
-					onKeyDown={(e) => { if (e.key === "ArrowDown" && !cc?.pinned) { e.preventDefault(); toggleCc(true); } }}
+					onPointerEnter={(e) => { if (e.pointerType === "mouse") hoverCc(); }}
+					onKeyDown={(e) => { if (e.key === "ArrowDown" && !(ccOn && pop?.pinned)) { e.preventDefault(); toggleCc(true); } }}
 					onClick={(e) => toggleCc(e.detail === 0)}>
 					<ControlIcon size={15} /><span id="tb-status-label" className="sr-only">{label}</span>
 				</button>
 			</div>
-			{cc && <ControlCenter anchorId="tb-status" current={cc.res} kb={cc.kb} inside={onCcControl} onClose={closeCc} />}
+			{pop?.view === "cc" && <ControlCenter anchorId="tb-status" kb={pop.kb} inside={onPopControl} onClose={closePop} />}
+			{pop?.view === "res" && <ResourcesPopover anchorId={resAnchor} current={pop.res} kb={pop.kb} inside={onPopControl} onClose={closePop} />}
 		</header>
 	);
 }

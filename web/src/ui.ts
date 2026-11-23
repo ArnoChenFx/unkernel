@@ -342,14 +342,14 @@ export function createUi(cfg: Config) {
 		},
 
 		setPrefix(on: boolean) { if ($.get().prefix !== on) $.set({ prefix: on }); },
-		/** Reboot from a shortcut, the top bar's mark menu or its Control Center: one key away from a running session, so ask first. */
+		/** Reboot from a shortcut or the top bar's Control Center: one key away from a running session, so ask first. */
 		async confirmReboot() {
 			if (isUp($.get()) &&
 				!await ui.ask({ title: "reboot", msg: "The running system and its unsaved state are lost.", ok: "Reboot", danger: true })) return;
 			reboot();
 		},
 		/**
-		 * Suspend from a shortcut, the top bar (its mark menu, its Control Center) or Settings, at once (boot.ts
+		 * Suspend from a shortcut, the top bar's Control Center or Settings, at once (boot.ts
 		 * does it: KW.suspend). Nothing to confirm: the machine stops only once its
 		 * session is stored, and Resume (or the next load) brings it back.
 		 */

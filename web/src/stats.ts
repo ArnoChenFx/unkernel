@@ -24,7 +24,7 @@
 //   them, virtio-gpu's presents, fences and errors; the Wayland compositor's
 //   GPU commits, wayland/buffers.ts stats): a few property reads, no guest.
 // - Users: useStats() (full: the Overview while System's window shows it,
-//   the Control Center while it is open) samples every INTERVAL ms with the
+//   the top bar's Resources while it is open) samples every INTERVAL ms with the
 //   full snippet; useStats("lite") (the top bar, always mounted) samples
 //   every LITE_INTERVAL ms with the light one while no full user is
 //   mounted. Either way it is one sampler: never two reads at once, one
@@ -505,7 +505,7 @@ function onVisibility(): void {
 
 /**
  * The sampler's state; sampling runs while a component that calls this is
- * mounted: "full" (the default: the Overview, the Control Center) at
+ * mounted: "full" (the default: the Overview, the top bar's Resources) at
  * INTERVAL with the full snippet, "lite" (the top bar) at LITE_INTERVAL with
  * the light one while no full user is mounted.
  */

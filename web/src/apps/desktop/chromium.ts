@@ -13,7 +13,25 @@
 // which no machine here runs, still fails, a few lines); and without its
 // background requests to Google's services (updates, variations, Safe
 // Browsing lists), work an emulated CPU need not do.
+// Its window is no narrower than MIN_W (532 px at scale 1, maximized,
+// 2026-11-23): on a narrower workspace (a phone) it ignored the maximized
+// size and was cut off at the right, its menu button too. There it starts
+// with a smaller scale factor, the largest step of 0.05 at which it fits
+// (0.7 on a 390 px phone; not below 0.6: at 0.5 its window went away), as
+// the workspace is when it starts (a phone turned later keeps it).
+import { wm$ } from "../../wm.ts";
 import type { TerminalApp } from "../types.ts";
+
+/** Chromium's narrowest window at scale 1, px. */
+const MIN_W = 532;
+
+/** --force-device-scale-factor for the workspace's width, or "" (it fits as it is). */
+function scaleFlag(): string {
+	const w = wm$.get().area.w || innerWidth;
+	if (w >= MIN_W) return "";
+	const scale = Math.max(0.6, Math.floor((w / MIN_W) * 20) / 20);
+	return ` --force-device-scale-factor=${scale}`;
+}
 
 export default {
 	id: "chromium",
@@ -24,5 +42,8 @@ export default {
 	colors: ["#60a5fa", "#1e3a8a"],
 	needs: { net: true, wayland: true },
 	packages: { debian: ["chromium", "libegl1", "libegl-mesa0", "fonts-liberation", "dbus-daemon"] },
-	commands: ["dbus-run-session -- chromium --no-first-run --no-default-browser-check --disable-background-networking"],
+	// Read when it launches (run.sh): the scale for the workspace then.
+	get commands() {
+		return [`dbus-run-session -- chromium --no-first-run --no-default-browser-check --disable-background-networking${scaleFlag()}`];
+	},
 } satisfies TerminalApp;

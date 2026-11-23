@@ -231,13 +231,13 @@ build is missing, and opens the page. It needs Bun, Node.js 24 and pnpm:
 remote\start-windows.cmd -Data E:\tmp\unkernel-data\img\vm1.img -Work E:\tmp\unkernel-data\work -Cache E:\tmp\unkernel-cache
 ```
 
-Double-clicking `start-windows.cmd` uses the settings below. `-Rebuild` builds
-the web app again, `-NoOpen` leaves the browser closed. Elsewhere, after
-`pnpm build:web`: `bun --bun remote/cli.ts --open`.
+Double-clicking `start-windows.cmd` uses the JSON settings file, if you made one,
+or the defaults. `-Rebuild` builds the web app again, `-NoOpen` leaves the
+browser closed. Elsewhere, after `pnpm build:web`: `bun --bun remote/cli.ts --open`.
 
 Each setting comes from the first of these that is set: its flag, its
-environment variable, the JSON file (`--config`, or `remote/unkernel-remote.json`,
-which starts as a copy of `remote/unkernel-remote.example.json`), and the
+environment variable, the JSON file (`--config`, or `remote/unkernel-remote.json`:
+copy `remote/unkernel-remote.example.json` to that name and edit it), and the
 default under `~/.unkernel/remote` (`%USERPROFILE%\.unkernel\remote` on Windows).
 
 | Flag | Environment variable | Does |

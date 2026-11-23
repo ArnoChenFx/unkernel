@@ -22,7 +22,8 @@
  *
  * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
  * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
- * user virtual addresses below 2^38):
+ * user virtual addresses below 2^39, all three levels' index bits, with no
+ * sign-extended upper half):
  *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
  *   bits 10..53 PPN (physical address >> 12).
  * A valid PTE with R=W=X=0 points to the next level. Leaves are only
@@ -79,7 +80,7 @@
 extern "C" {
 #endif
 
-#define KW_ABI_VERSION 3
+#define KW_ABI_VERSION 4
 
 /*
  * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]

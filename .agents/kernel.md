@@ -100,7 +100,7 @@ git -C vendor/src/linux-wasm-kernel format-patch -N -o "$PWD/kernel/patches/linu
 warns if they differed, so a header change also needs a kernel commit and
 a patch re-export.
 
-- `KW_ABI_VERSION` is 3. `tlb.c` compares it with `kw_abi_version()` at
+- `KW_ABI_VERSION` is 4. `tlb.c` compares it with `kw_abi_version()` at
   boot and panics on a mismatch. Bump it in both copies on any change to
   the layout or the semantics; the header describes the current contract
   only. A new `KW_ISA_*` bit is an ABI change; implementing an extension
@@ -379,10 +379,11 @@ MTE, PAC, BTI, GCS or POE.
   so `-sha2` turns both off. A masked feature raises SIGILL like an
   unimplemented instruction. Every feature kwemu implements starts on.
 - Address space: user page tables keep the Sv39 format, and TASK_SIZE is
-  1 << 38 (256 GiB), half of arm64's 39-bit VA: mmap hints and MAP_FIXED at
-  or above 1 << 38 do not get there. kwemu has no top-byte-ignore, so
-  tagged pointers fault (SIGSEGV), and there is no tagged address ABI
-  (`PR_SET_TAGGED_ADDR_CTRL`).
+  1 << 39 (512 GiB), arm64's 39-bit VA: all three levels' index bits, with
+  no sign-extended upper half (kwemu faults any address at or above
+  1 << 39), so large reservations such as .NET's 256 GiB GC regions range
+  fit. kwemu has no top-byte-ignore, so tagged pointers fault (SIGSEGV),
+  and there is no tagged address ABI (`PR_SET_TAGGED_ADDR_CTRL`).
 - New code: user space makes it visible with DC CVAU and IC IVAU (CTR_EL0
   has IDC = DIC = 0); there is no cache-flush syscall. IC IVAU on one CPU
   is seen by every CPU (smp.md, MM).

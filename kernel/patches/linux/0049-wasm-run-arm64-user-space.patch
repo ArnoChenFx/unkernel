@@ -1,4 +1,4 @@
-From e8e38eef2d847aff9d621afc588755388b9741b6 Mon Sep 17 00:00:00 2001
+From 3b4ddc78b5f7a13545300e684a61f037c90d56a9 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -46,7 +46,9 @@ kw_flush_tlb_all(), kw_set_pgd()) make kwemu check decoded blocks again;
 instructions; IC IVAU on one CPU reaches the others through kwemu's own
 code epoch.
 
-The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
+The page tables keep the Sv39 format, and TASK_SIZE is 1 << 39, as on
+arm64 with 39-bit VAs: the whole range the three levels index, with no
+sign-extended upper half (kwemu faults addresses at or above it).
 ---
  arch/wasm/Kconfig                        |  15 +-
  arch/wasm/Makefile                       |   4 +-
@@ -54,8 +56,8 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/include/asm/elf.h              |  42 ++-
  arch/wasm/include/asm/futex.h            |   6 +-
  arch/wasm/include/asm/hwcap.h            |  15 +-
- arch/wasm/include/asm/kw_emu.h           | 252 +++++++------
- arch/wasm/include/asm/processor.h        |  11 +-
+ arch/wasm/include/asm/kw_emu.h           | 253 +++++++------
+ arch/wasm/include/asm/processor.h        |  13 +-
  arch/wasm/include/asm/ptrace.h           |  25 +-
  arch/wasm/include/asm/seccomp.h          |  17 +
  arch/wasm/include/asm/syscall.h          |  42 +--
@@ -91,7 +93,7 @@ The page tables keep the Sv39 format and TASK_SIZE stays 1 << 38.
  arch/wasm/mm/fault.c                     |   6 +-
  arch/wasm/mm/sigpage.c                   |   7 +-
  arch/wasm/mm/tlb.c                       |  11 -
- 43 files changed, 1615 insertions(+), 1061 deletions(-)
+ 43 files changed, 1617 insertions(+), 1062 deletions(-)
  create mode 100644 arch/wasm/include/asm/seccomp.h
  delete mode 100644 arch/wasm/include/uapi/asm/elf.h
  create mode 100644 arch/wasm/include/uapi/asm/fcntl.h
@@ -161,7 +163,7 @@ index 49049055794..8512b7e3cae 100644
  KCFLAGS += -nostdlib -fno-builtin
  KCFLAGS += -march=wasm64
 diff --git a/arch/wasm/configs/kw_defconfig b/arch/wasm/configs/kw_defconfig
-index 7c84764b4fe..cf980898e86 100644
+index eb90662a5f9..724d19cc3d0 100644
 --- a/arch/wasm/configs/kw_defconfig
 +++ b/arch/wasm/configs/kw_defconfig
 @@ -1,4 +1,4 @@
@@ -300,10 +302,10 @@ index e116408e5c1..4fc957f3bba 100644
  
  #endif /* _ASM_WASM_HWCAP_H */
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 3308c54e1fe..f717e59b25f 100644
+index 3308c54e1fe..658460a555c 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
-@@ -1,21 +1,28 @@
+@@ -1,21 +1,29 @@
  /* SPDX-License-Identifier: GPL-2.0-or-later */
  /*
   * Contract between the wasm Linux kernel (arch side) and the guest CPU
@@ -336,11 +338,12 @@ index 3308c54e1fe..f717e59b25f 100644
 - * entries per level, 8-byte little-endian PTEs):
 + * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
 + * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
-+ * user virtual addresses below 2^38):
++ * user virtual addresses below 2^39, all three levels' index bits, with no
++ * sign-extended upper half):
   *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
   *   bits 10..53 PPN (physical address >> 12).
   * A valid PTE with R=W=X=0 points to the next level. Leaves are only
-@@ -23,42 +30,41 @@
+@@ -23,42 +31,41 @@
   * The emulator never writes PTEs: an access with A=0, or a store with
   * D=0, raises KW_EV_FAULT so the kernel can set the bits.
   *
@@ -415,12 +418,12 @@ index 3308c54e1fe..f717e59b25f 100644
   */
  #ifndef KW_EMU_H
  #define KW_EMU_H
-@@ -73,23 +79,42 @@
+@@ -73,23 +80,42 @@
  extern "C" {
  #endif
  
 -#define KW_ABI_VERSION 8
-+#define KW_ABI_VERSION 3
++#define KW_ABI_VERSION 4
  
 +/*
 + * A64 register state of one task. Fixed layout (offsets in bytes): x[0..30]
@@ -467,7 +470,7 @@ index 3308c54e1fe..f717e59b25f 100644
  	KW_EV_INTERRUPT = 6,   /* *cpu->irq_pending became non-zero */
  };
  
-@@ -105,29 +130,29 @@ struct kw_event {
+@@ -105,29 +131,29 @@ struct kw_event {
  	uint64_t addr;    /* faulting guest virtual address (FAULT: any byte of
  			     the faulting page; MISALIGNED: the address;
  			     ILLEGAL/BREAKPOINT: the pc) */
@@ -506,7 +509,7 @@ index 3308c54e1fe..f717e59b25f 100644
  	uint32_t jit_busy;             /* written by kwemu only */
  	uint32_t flush_all;            /* set by other CPUs, cleared by kwemu */
  };
-@@ -138,112 +163,79 @@ void kw_cpu_init(struct kw_cpu *cpu);
+@@ -138,112 +164,79 @@ void kw_cpu_init(struct kw_cpu *cpu);
  /*
   * Run guest code from regs until an event. Returns enum kw_event_kind and
   * fills cpu->ev. Never blocks, never re-enters the kernel.
@@ -658,25 +661,28 @@ index 3308c54e1fe..f717e59b25f 100644
  
  #ifdef __cplusplus
 diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
-index 67d9ec0deed..cb9aea05732 100644
+index 67d9ec0deed..24d8affb806 100644
 --- a/arch/wasm/include/asm/processor.h
 +++ b/arch/wasm/include/asm/processor.h
-@@ -9,9 +9,12 @@
+@@ -9,11 +9,14 @@
  #define STACK_ALIGN 16
  
  /*
 - * User address space: Sv39 lower half, as on riscv64 (256 GiB). User and
 - * kernel addresses overlap numerically; they are different address spaces
 - * (user memory is only reachable through page-table walks).
-+ * User address space: the lower half of Sv39 (256 GiB, 38 bits), the
-+ * page-table format kwemu walks for every guest ISA (kw_emu.h). arm64 with
-+ * 39-bit VAs gives user space 512 GiB; here mmap hints and fixed mappings
-+ * at or above 1 << 38 fail or move down. User and kernel addresses overlap
++ * User address space: the whole 39 bits (512 GiB) that the three levels of
++ * the Sv39-format page tables kwemu walks index (kw_emu.h), as arm64 with
++ * 39-bit VAs gives user space. There is no sign-extended upper half: kernel
++ * memory is never mapped in these tables. User and kernel addresses overlap
 + * numerically; they are different address spaces (user memory is only
 + * reachable through page-table walks).
   */
- #define TASK_SIZE		(_AC(1, UL) << 38)
+-#define TASK_SIZE		(_AC(1, UL) << 38)
++#define TASK_SIZE		(_AC(1, UL) << 39)
  #define TASK_SIZE_MAX		TASK_SIZE
+ #define DEFAULT_MAP_WINDOW	TASK_SIZE
+ #define STACK_TOP		TASK_SIZE
 @@ -81,7 +84,7 @@ static inline unsigned long __get_wchan(struct task_struct *p)
  	((struct pt_regs *)(task_stack_page(task) + THREAD_SIZE) - 1)
  

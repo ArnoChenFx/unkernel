@@ -22,7 +22,7 @@ const std = @import("std");
 const core = @import("../cpu/core.zig");
 const c = @import("kw_h"); // include/kw_emu.h via translate-c
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const cpu_size: usize = 9 << 20;
 
 pub const Event = extern struct {
@@ -381,8 +381,7 @@ pub const Cpu = extern struct {
         for (x) |e| if (e.tag == vpn) return (vpn << page_shift) +% e.add;
         const r = self.priv.tlb_r[@intCast(vpn & (dtlb_n - 1))];
         if (r.tag == vpn) return (vpn << page_shift) +% r.add;
-        const top = va >> 38;
-        if (top != 0 and top != (1 << 26) - 1) return null;
+        if (va >> 39 != 0) return null;
         var table = self.pgd;
         var level: u6 = 2;
         while (true) : (level -= 1) {
@@ -439,9 +438,9 @@ pub const Cpu = extern struct {
             .write => count(self, "walks_w", 1),
             .exec => count(self, "walks_x", 1),
         }
-        // Sv39: bits 63..39 must equal bit 38.
-        const top = va >> 38;
-        if (top != 0 and top != (1 << 26) - 1) return self.fault(va, access);
+        // User addresses are the whole 39 bits the three levels index (as
+        // arm64's TTBR0 with 39-bit VAs): no sign-extended upper half.
+        if (va >> 39 != 0) return self.fault(va, access);
         var table = self.pgd;
         var level: u6 = 2;
         const pte: u64 = while (true) : (level -= 1) {

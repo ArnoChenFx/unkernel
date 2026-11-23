@@ -101,8 +101,8 @@ with one floor: an image from before kwbox does not boot on a base with it
 - `/usr/lib/kw/rc`: cgroup2, devpts, `/dev/shm`, `/run/lock`, the
   hostname (`/etc/hostname` unless empty or `localhost`, else
   `unkernel`), binfmt_misc and the WASI format (kwwasi), the console
-  user's devices as udev's rules give them (no udev: `/dev/fb*` and
-  `/dev/dri/card*` to video, `/dev/input/*` to input, `/dev/dsp*`,
+  user's devices as udev's rules give them (no udev: `/dev/fb*`,
+  `/dev/dri/card*` and `/dev/udmabuf` to video, `/dev/input/*` to input, `/dev/dsp*`,
   `/dev/snd/*` to audio, 0660, by group name; `/dev/fuse` and
   `/dev/dri/renderD*` 0666; the drivers make them at boot, none later),
   udev's links `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr`,

@@ -237,7 +237,7 @@ function remoteDefault(): boolean {
 export interface Config {
 	/** The settings this load read: the saved ones with the URL's on top (?net=0 as wisp=0). */
 	settings: Record<string, string>;
-	/** The kernel runs in the remote backend (?remote=1, or the backend's page; remote.ts): one CPU, a Web Worker's messages on a socket. */
+	/** The kernel runs in the remote backend (?remote=1, or the backend's page; js/web/remote.ts): one CPU, a Web Worker's messages on a socket. */
 	remote: boolean;
 	/** The kernel this page boots on one CPU: the base bundle unkernel.wasm (its UP kernel). */
 	kernelUrl: string;

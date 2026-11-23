@@ -54,7 +54,7 @@ export function createKernel(opts: CreateKernelOptions & WorkerOption = {}): Pro
 
 /**
  * createKernel({ worker: true }) with the kernel in the remote backend
- * (remote.ts): the link's WebSocket is the kernel's worker endpoint. The
+ * (js/web/remote.ts): the link's WebSocket is the kernel's worker endpoint. The
  * backend's kernel shares no memory with the page, so input and frames are
  * messages even where the page is cross-origin isolated.
  */

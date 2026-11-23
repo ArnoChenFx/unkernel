@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 ARNO <arnochen101@gmail.com>
 # ~/.config/starship.toml of the Omarchy image: the prompt in Tokyo Night. No
-# Nerd Font, so no symbols outside plain Unicode.
+# Nerd Font, so no symbols outside plain Unicode. The symbol is the kw distros'
+# ⇒: the image build's boots wait for a prompt that ends in ⇒, # or $ (vm-run.ts).
 
 add_newline = false
 format = """
@@ -27,5 +28,5 @@ format = "took [$duration]($style) "
 min_time = 2000
 
 [character]
-success_symbol = "[❯](bold #9ece6a)"
-error_symbol = "[❯](bold #f7768e)"
+success_symbol = "[⇒](bold #9ece6a)"
+error_symbol = "[⇒](bold #f7768e)"

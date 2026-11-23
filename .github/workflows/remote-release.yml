@@ -20,8 +20,12 @@
 # The tag is created at that commit when it does not exist. A release of the tag
 # that is not a draft is left as it is.
 #
-# Only the release job can write (contents: write, to create the tag and the
-# release). The build reads the repository and the upstream release with
+# The Omarchy image of the same commit is published by omarchy-image.yml, through
+# workflow_call, as its own release (omarchy-<YYMMDD>-<sha7>, never the latest).
+# It runs beside the package and does not gate it: the package carries no image.
+#
+# Only the release jobs can write (contents: write, to create the tags and the
+# releases). The build reads the repository and the upstream release with
 # GITHUB_TOKEN; no repository secret is used.
 
 name: Remote release
@@ -216,3 +220,14 @@ jobs:
             --draft --target "$SHA" --title "$TAG" --notes-file publish/release-notes.md
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           echo "::notice title=Released::$TAG at ${SHA:0:7}: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+  omarchy:
+    name: Publish the Omarchy image of the commit
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    permissions:
+      contents: write # the Omarchy release of the commit, in omarchy-image.yml
+    uses: ./.github/workflows/omarchy-image.yml
+    with:
+      release: true
+      sha: ${{ needs.prepare.outputs.sha }}

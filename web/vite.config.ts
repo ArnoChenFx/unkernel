@@ -124,8 +124,13 @@ export default defineConfig({
 		// there must not reload an open dev page, which would end its VM.
 		watch: { ignored: ["**/.output/**", "**/.vercel/**", "**/kernel/release/**", "**/kernel/page/**"] },
 	},
-	// profile.html: the defaults profiler (src/profile.ts), a page of its own.
-	build: { target: "esnext", rollupOptions: { input: { main: path.join(import.meta.dirname, "index.html"), profile: path.join(import.meta.dirname, "profile.html") } } },
+	build: { target: "esnext" },
+	// profile.html: the defaults profiler (src/profile.ts), and smp-probe.html:
+	// the SMP slowdown probe (src/smp-probe.ts), pages of their own. Nitro
+	// builds the client environment from index.html alone (its renderer
+	// template), so they are a second client environment, which it builds
+	// into the same public directory.
+	environments: { pages: { consumer: "client", build: { rollupOptions: { input: { profile: path.join(import.meta.dirname, "profile.html"), "smp-probe": path.join(import.meta.dirname, "smp-probe.html") } } } } },
 	// The SDK's worker mode (?worker=1): js/web/worker.ts starts a module worker.
 	worker: { format: "es" },
 	plugins: [
@@ -226,13 +231,15 @@ export default defineConfig({
 		},
 		{
 			// Nitro's dev renderer answers every page with index.html: profile.html
-			// here (a build emits it as a page of its own, build.rollupOptions above).
+			// and smp-probe.html here (a build emits them as pages of their own,
+			// build.rollupOptions above).
 			name: "unkernel:profile-page",
 			configureServer(server) {
 				server.middlewares.use((req, res, next) => {
-					if ((req.url ?? "").split("?")[0] !== "/profile.html") return next();
-					readFile(path.join(import.meta.dirname, "profile.html"), "utf8")
-						.then((html) => server.transformIndexHtml("/profile.html", html))
+					const url = (req.url ?? "").split("?")[0]!;
+					if (url !== "/profile.html" && url !== "/smp-probe.html") return next();
+					readFile(path.join(import.meta.dirname, url.slice(1)), "utf8")
+						.then((html) => server.transformIndexHtml(url, html))
 						.then((html) => {
 							res.setHeader("content-type", "text/html; charset=utf-8");
 							res.end(html);

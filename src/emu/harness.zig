@@ -48,7 +48,7 @@ extern fn kw_debug_run_ref(cpu: *kw.struct_kw_cpu, regs: *kw.struct_kw_regs) u32
 const kw_options = @import("kwemu_options");
 /// -Dkwemu-stats only: kwemu.Stats (11 counters, then executed ops per
 /// kind; more after them that the harness does not read).
-extern fn kw_debug_stats(cpu: *kw.struct_kw_cpu, out: *[11 + 192 + 2 + 192 + 40 + 64 + 3 * 512]u64) void;
+extern fn kw_debug_stats(cpu: *kw.struct_kw_cpu, out: *[11 + 192 + 2 + 192 + 40 + 64 + 3 * 256]u64) void;
 
 /// Most argv + envp strings `load` takes.
 pub const max_args = 1024;
@@ -418,7 +418,7 @@ pub const Machine = struct {
     /// -Dkwemu-stats: kwemu's counters and the 40 most executed op kinds
     /// (indexes of src/a64/ops.zig's H).
     fn printKwStats(m: *Machine) void {
-        var st: [11 + 192 + 2 + 192 + 40 + 64 + 3 * 512]u64 = undefined;
+        var st: [11 + 192 + 2 + 192 + 40 + 64 + 3 * 256]u64 = undefined;
         kw_debug_stats(m.cpu, &st);
         m.print("[kwemu-stats] lookups_slow={d} revalidated={d} decoded={d} resets={d} blocks={d} block_insns={d} single_steps={d} walks r/w/x={d}/{d}/{d} generic={d}\n", .{
             st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10],

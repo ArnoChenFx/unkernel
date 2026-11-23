@@ -124,7 +124,9 @@ What `emit` may do, with the core's `Emit` (jitcore.zig):
   continues at a member through `memberTail`), side exits
   `e.exit(target, jc.code_side + at.k)` + `e.brExit()` or, in a region
   (`e.rg`), `e.regionSide(rg, target, at.k, at.b)`; a self-loop's
-  terminator `e.backEdge(at.b)` (poll, budget, charge, loop).
+  terminator `e.backEdge(at.b)` (poll, budget, charge, loop; in a region,
+  where a self-loop is a guest, the same through `toMember` to the
+  member's own `loop`).
 - Locals: `l_t` (scratch within one op), its own family range, the slots
   through `cm`. More locals or a module-level helper function
   (`helperCount`, `emitHelpers`: none yet) go through the core.
@@ -400,7 +402,8 @@ exactly that meaning.
   and TBZ/TBNZ on edge values and every bit, each as side exit, self-loop
   terminator, terminator as a block's last instruction (`max_block`) and
   inside a region; every budget from 1 to 99 over a self-loop, a two-page
-  call loop and a BR loop; an interrupt during a compile stops loops at
+  call loop, a BR loop and a self-loop run as a region's guest (also with
+  every poll stopping on a changed code epoch); an interrupt during a compile stops loops at
   the exact count; a second `kw_cpu` storing SVC over a compiled loop and
   executing IC IVAU makes the loop leave at its next back edge or checked
   entry.

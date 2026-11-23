@@ -208,7 +208,7 @@ pub const JitStats = extern struct {
     gen_words: [3 * gen_words_n]u64 = @splat(0),
 };
 
-pub const gen_words_n = 512;
+pub const gen_words_n = 256;
 
 /// -Dkwemu-stats: count one execution of the `generic` op `raw` in
 /// JitStats.gen_words, or (`from_jit`) one call of it from compiled code.

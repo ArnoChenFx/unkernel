@@ -238,9 +238,13 @@ rm -rf "$archives"
 while read -r p; do rm -rf "${stage:?}/${p#./}"; done < "$distro_out/$gen.gone"
 tar -xpf "$distro_out/$gen.pkgs.tar" -C "$stage" --no-same-owner
 rm -f "$distro_out/$gen".{erofs,tar,id,uris,sums,pkgs.tar,gone}
-# The image's own files over the packages' again: the seatd package's
-# /etc/default/seatd came with the tar, and its seat is VT-bound.
-install_tree "$here/rootfs" "$stage"
+
+# seatd's seat is not bound to a VT: this console has none (hvc0). The package's
+# /etc/default/seatd is sourced by its init script, so the variable goes there;
+# the file is the package's own (no rootfs copy: dpkg would prompt over it).
+grep -qx 'DAEMON_ARGS="-g video"' "$stage/etc/default/seatd" ||
+	{ echo "omarchy: /etc/default/seatd is not the seatd package's (upstream changed it?)" >&2; exit 1; }
+echo 'export SEATD_VTBOUND=0' >> "$stage/etc/default/seatd"
 
 # --- services and policy --------------------------------------------------------
 # The image's policy-rc.d (docker's: exit 101) stays for the install above; with it

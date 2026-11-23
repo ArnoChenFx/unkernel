@@ -6,7 +6,8 @@
 # images move together; what is pinned here is the package set on top.
 # OMARCHY_PACKAGES is installed in the image's own apt with no recommends
 # (build.sh joins it with spaces); adding one is adding its name here.
-# Sizes: 268 packages, 563 MiB installed, 127 MiB of .deb files (2026-11-23).
+# Sizes (2026-11-23): 231 packages on the base's 78 (117.6 MiB of .deb files,
+# 522.1 MiB installed by them), omarchy.erofs 198.1 MiB.
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../guest/distro/debian/pins.sh"
 

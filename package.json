@@ -48,7 +48,7 @@
   },
   "scripts": {
     "build": "obuild",
-    "typecheck": "tsc -p .",
+    "typecheck": "tsc -p . && tsc -p remote",
     "test": "pnpm typecheck && pnpm test:block && pnpm test:net && pnpm test:tty && pnpm test:http && pnpm test:ws && pnpm test:9p && pnpm test:distro && pnpm test:gl-gpu",
     "test:block": "node --test test/block.test.ts",
     "test:net": "node --test test/net.test.ts",

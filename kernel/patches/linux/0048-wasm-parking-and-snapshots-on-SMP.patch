@@ -1,4 +1,4 @@
-From 5b923b121aece8d24af4599fe15883ee6c37bb5e Mon Sep 17 00:00:00 2001
+From 33d2c08dfeea6365dbd0c7294d6b508953d80da8 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Fri, 20 Nov 2026 08:27:30 +0000
 Subject: [PATCH] wasm: parking and snapshots on SMP

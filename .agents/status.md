@@ -410,12 +410,6 @@ Open:
   writing claude's 357 MB and opencode's 248 MB to the IndexedDB data disk
   has not been timed, and every app's first run there waits on Wisp
   instead of the host's network.
-- **No seccomp**: `arch/wasm` has no seccomp filter support, so `bwrap
-  --seccomp FD` fails, and GTK programs that load images through glycin
-  abort. Workaround in the image: `/usr/local/bin/bwrap`
-  (`guest/distro/alpine/rootfs/usr/local/bin/bwrap`) drops the seccomp arguments. The fix is
-  seccomp in the arch (a syscall entry hook and the `asm/syscall.h`
-  helpers); remove the shim then.
 - **kwfb: mmap racing a mode change.** An `mmap` of `/dev/fb0` racing a
   mode change from another thread of the same program can map the old
   buffer (found 2026-11-16, on UP too). Not fixed.

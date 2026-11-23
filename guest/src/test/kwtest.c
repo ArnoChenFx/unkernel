@@ -8,6 +8,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,6 +153,10 @@ static int failures;
 #include <linux/rtnetlink.h>
 #include <linux/fib_rules.h>
 #include <linux/veth.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
 
 /*
  * The arm64 features the kernel may report (arch/wasm/kernel/cpu.c): the
@@ -1846,6 +1851,108 @@ static void config_checks(void)
 	      file_has("/proc/misc", " tun"),
 	      "config: user ns %s, userfaultfd %s, pids cgroup, PSI, /proc/self/io, sysrq, loop-control, tun",
 	      WIFEXITED(status) && !WEXITSTATUS(status) ? "ok" : "BAD", uffd >= 0 ? "ok" : "BAD");
+}
+
+static volatile int sys_nr, sys_code, sys_errno;
+static volatile unsigned sys_arch;
+
+static void on_sigsys(int sig, siginfo_t *si, void *uc)
+{
+	sys_nr = si->si_syscall;
+	sys_arch = si->si_arch;
+	sys_code = si->si_code;
+	sys_errno = si->si_errno;
+}
+
+/*
+ * seccomp, each case in a child of its own: a filter (tsync) that checks the
+ * arch and returns ERRNO for getppid, ERRNO for close(4242) only (the first
+ * argument), TRAP for getpgid (SIGSYS with the syscall, the arch and the
+ * data) and ALLOW otherwise; KILL_PROCESS (SIGSYS); strict mode (write
+ * works, getpid is SIGKILL).
+ */
+static void seccomp_checks(void)
+{
+	struct sock_filter f[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpgid, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | 7),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_close, 0, 3),
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 4242, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOTTY),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_filter kill[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getppid, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = { sizeof(f) / sizeof(f[0]), f }, kprog = { sizeof(kill) / sizeof(kill[0]), kill };
+	int status, st_kill, st_strict, fds[2];
+	char c = 0;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		struct sigaction sa = { 0 };
+		int bad = 0;
+
+		sa.sa_sigaction = on_sigsys;
+		sa.sa_flags = SA_SIGINFO;
+		sigaction(SIGSYS, &sa, NULL);
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+		    syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog))
+			_exit(1);
+		errno = 0;
+		bad |= (syscall(SYS_getppid) != -1 || errno != EPERM) << 1;
+		errno = 0;
+		bad |= (close(4242) != -1 || errno != ENOTTY) << 2;
+		errno = 0;
+		bad |= (close(4243) != -1 || errno != EBADF) << 3;
+		syscall(SYS_getpgid, 0);
+		bad |= (sys_nr != SYS_getpgid || sys_arch != AUDIT_ARCH_AARCH64 || sys_code != SYS_SECCOMP ||
+			sys_errno != 7) << 4;
+		bad |= !file_has("/proc/self/status", "Seccomp:\t2") << 5;
+		bad |= (getpid() <= 0) << 6;
+		_exit(bad);
+	}
+	waitpid(pid, &status, 0);
+
+	pid = fork();
+	if (pid == 0) {
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &kprog))
+			_exit(1);
+		syscall(SYS_getppid);
+		_exit(2);
+	}
+	waitpid(pid, &st_kill, 0);
+
+	pipe(fds);
+	pid = fork();
+	if (pid == 0) {
+		if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT))
+			_exit(1);
+		syscall(SYS_write, fds[1], "w", 1);
+		syscall(SYS_getpid);
+		syscall(SYS_exit, 2);
+	}
+	close(fds[1]);
+	read(fds[0], &c, 1);
+	close(fds[0]);
+	waitpid(pid, &st_strict, 0);
+
+	CHECK(WIFEXITED(status) && !WEXITSTATUS(status) && WIFSIGNALED(st_kill) && WTERMSIG(st_kill) == SIGSYS &&
+	      c == 'w' && WIFSIGNALED(st_strict) && WTERMSIG(st_strict) == SIGKILL,
+	      "seccomp: filter %s (%#x), kill %s, strict %s", WIFEXITED(status) && !WEXITSTATUS(status) ? "ok" : "BAD",
+	      WIFEXITED(status) ? WEXITSTATUS(status) : 0x100 | WTERMSIG(status),
+	      WIFSIGNALED(st_kill) && WTERMSIG(st_kill) == SIGSYS ? "ok" : "BAD",
+	      c == 'w' && WIFSIGNALED(st_strict) && WTERMSIG(st_strict) == SIGKILL ? "ok" : "BAD");
 }
 
 /*
@@ -4075,6 +4182,7 @@ int main(int argc, char **argv)
 
 #ifdef __aarch64__
 	config_checks();
+	seccomp_checks();
 	net_config_checks();
 	uaccess_checks();
 	input_handler_checks();

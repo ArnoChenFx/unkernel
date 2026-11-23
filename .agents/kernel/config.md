@@ -62,8 +62,9 @@
 
 ## What is off
 
-- No netfilter. BPF_SYSCALL, KEYS, IPV6, SECCOMP, modules, swap and
-  kallsyms are off.
+- No netfilter. BPF_SYSCALL, KEYS, IPV6, modules, swap and kallsyms are
+  off. SECCOMP and SECCOMP_FILTER are on (filters run on the BPF
+  interpreter; syscalls a filter always allows skip it).
 - COREDUMP must stay off until the arch has `elf_core_copy_task_fpregs` and
   arm64 core notes (the registers from kwemu): without them a fault with a
   core limit is a wasm trap.

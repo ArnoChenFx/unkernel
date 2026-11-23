@@ -1,4 +1,4 @@
-From fc163bd15fcb5ba300d1e33d15ed1db5085f0602 Mon Sep 17 00:00:00 2001
+From b7e5e205b4760eb28aa448297c0099d6e3dc0afb Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 23 Nov 2026 09:01:35 +0000
 Subject: [PATCH] wasm: give each CPU's word of pending interrupts 128 bytes

@@ -457,9 +457,6 @@ The files are in `guest/distro/alpine/rootfs/`.
   kwtty gives programs it starts directly the same PATH. Per-user installs
   go there (`pip install --user`, the fx and claude installers, the
   shims).
-- **bwrap shim** (`/usr/local/bin/bwrap`): no
-  seccomp, so it drops `--seccomp FD` and runs `/usr/bin/bwrap` with the
-  rest. GTK programs need it to load images (Xfce).
 - **curl shim** (`/usr/local/bin/curl`) over busybox
   wget, because the real curl costs about 2.4 MB of download and 5 MB of
   RAM. It handles only GET requests with `-L` whose result it can

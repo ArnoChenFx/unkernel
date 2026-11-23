@@ -144,11 +144,6 @@
 //                                      off or automation drives the browser (navigator.webdriver,
 //                                      off by default there); read in autohide.ts
 //   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
-//   ?remote=0|1                        URL only: the kernel runs in the remote backend (remote/, the
-//                                      README's remote section): worker mode on one CPU, with the data
-//                                      disk, /work and the network on that computer. Not with GL,
-//                                      Wayland or suspend. ?remote=0: the kernel runs in this page.
-//                                      Default: on where the backend serves the page (its meta tag).
 import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, glUrl, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
 import { autoSuspendDefault, parseAutoSuspend } from "./autosuspend.ts";
@@ -229,15 +224,10 @@ export function saveSettings(s: Record<string, string>): boolean {
 	}
 }
 
-/** The backend's page carries this meta tag (remote/server.ts): its kernel runs in the backend by default. */
-function remoteDefault(): boolean {
-	return typeof document !== "undefined" && document.querySelector('meta[name="unkernel-remote"]')?.getAttribute("content") === "1";
-}
-
 export interface Config {
 	/** The settings this load read: the saved ones with the URL's on top (?net=0 as wisp=0). */
 	settings: Record<string, string>;
-	/** The kernel runs in the remote backend (?remote=1, or the backend's page; js/web/remote.ts): one CPU, a Web Worker's messages on a socket. */
+	/** The kernel runs in the remote backend (remote/web/page.ts remoteConfig()): one CPU, a Web Worker's messages on a socket. */
 	remote: boolean;
 	/** The kernel this page boots on one CPU: the base bundle unkernel.wasm (its UP kernel). */
 	kernelUrl: string;
@@ -307,7 +297,7 @@ export interface Config {
 	cpuMax: number;
 	/** The count the CPUs option suggests (half the threads, at most SUGGESTED_CPUS), or 0 when this device has too few threads to suggest one. */
 	cpuSuggested: number;
-	/** Worker mode: shared memory for input and frames where it works (?shared=0: messages; never remote). */
+	/** Worker mode: shared memory for input and frames where it works (?shared=0: messages). */
 	shared: boolean;
 	verbose: boolean;
 	simulate: string[];
@@ -429,7 +419,6 @@ export const isMobile = (): boolean => isCoarse() || isMobileUA();
 
 export function readConfig(search: string = location.search, saved: Record<string, string> = loadSettings()): Config {
 	const url = new URLSearchParams(search);
-	const remote = url.has("remote") ? url.get("remote") === "1" : remoteDefault();
 	const params = new URLSearchParams(saved);
 	for (const k of SETTING_NAMES) if (url.has(k)) params.set(k, url.get(k)!);
 	if (params.get("net") === "0") params.set("wisp", "0");
@@ -450,7 +439,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const inlineOnce = takeOnce(INLINE_ONCE_KEY);
 	const workerAsked = params.has("worker");
 	const workerDefault = !inlineOnce && typeof SharedArrayBuffer === "function" && crossOriginIsolated === true && typeof Worker === "function";
-	const workerParam = remote || (workerAsked ? params.get("worker") === "1" : workerDefault);
+	const workerParam = workerAsked ? params.get("worker") === "1" : workerDefault;
 	// CPUs: as many as asked where the page can, never more than the host's
 	// threads; by default the suggestion, in worker mode where the page can
 	// boot the SMP kernel. The suggestion leaves half the threads to the host
@@ -466,11 +455,11 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const smpParam = params.has("cpus") ? Math.max(1, Math.min(MAX_CPUS, Math.floor(Number(params.get("cpus"))) || 1)) : cpuDefault;
 	// Once, to resume a session suspended on that many CPUs (it needs exactly its count), where the page can.
 	const cpusOnce = Math.floor(Number(takeOnce(CPUS_ONCE_KEY))) || 0;
-	const resumeCpus = !remote && cpusOnce > 1 && !smpBlocked && cpusOnce <= cpuMax ? cpusOnce : 0;
+	const resumeCpus = cpusOnce > 1 && !smpBlocked && cpusOnce <= cpuMax ? cpusOnce : 0;
 	// A fallback to one CPU (boot.ts bootUpOnce()), also after a failed resume on several with ?cpus=1.
 	const upOnce = resumeCpus ? null : takeOnce(UP_ONCE_KEY) ?? (smpParam > 1 ? inlineOnce : null);
 	const smpWhy = resumeCpus || (smpParam < 2 && !upOnce) ? null : smpBlocked ?? upOnce;
-	const cpus = remote ? 1 : resumeCpus || (smpWhy ? 1 : Math.min(smpParam, cpuMax));
+	const cpus = resumeCpus || (smpWhy ? 1 : Math.min(smpParam, cpuMax));
 	// The distro: one of the images ("none": the base shell).
 	const distroAsked = params.get("distro");
 	let distroParam = DEFAULT_DISTRO, distroWhy: string | null = null;
@@ -484,10 +473,10 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const glAsked = params.has("gl");
 	const glParam = glAsked ? params.get("gl") === "1" : glDefault(params.get("display") !== "0");
 	const glBlocked = glBlocker();
-	const glWhy = !glParam ? null : remote ? "remote mode: guest GL is not carried over the link" : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
+	const glWhy = !glParam ? null : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
 	return {
 		settings: Object.fromEntries(params),
-		remote,
+		remote: false,
 		kernelUrl: kernelUrl.pathname,
 		distro,
 		distroParam,
@@ -516,21 +505,21 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		workerDefault,
 		workerAsked,
 		kernelSmpUrl: kernelSmpUrl?.pathname ?? null,
-		smpParam: remote ? 1 : smpParam,
-		cpuDefault: remote ? 1 : cpuDefault,
+		smpParam,
+		cpuDefault,
 		cpus,
 		resumeCpus,
 		smpBlocked,
 		smpWhy,
 		cpuMax,
 		cpuSuggested,
-		shared: !remote && params.get("shared") !== "0",
+		shared: params.get("shared") !== "0",
 		verbose: params.get("verbose") === "1",
 		simulate: (url.get("simulate") || "").split(",").filter(Boolean),
-		autosuspend: remote ? null : autosuspend.delayS,
-		autosuspendParam: remote ? "0" : autosuspend.value,
+		autosuspend: autosuspend.delayS,
+		autosuspendParam: autosuspend.value,
 		autosuspendDefault: autoSuspendDefault(mobile),
-		askLeave: !remote && params.get("askleave") !== "0",
+		askLeave: params.get("askleave") !== "0",
 		gl: glParam && !glWhy,
 		glParam,
 		glAsked,
@@ -541,7 +530,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		// Not settings (SETTING_NAMES): this load's URL only.
 		glStrictWaits: url.get("glwait") === "strict",
 		gpu: glParam && !glWhy && url.get("gpu") !== "0" && params.get("display") !== "0",
-		shm: !remote && url.get("shm") !== "0",
+		shm: url.get("shm") !== "0",
 		wlGpu: url.get("wlgpu") !== "0",
 		mobile,
 		coarse,

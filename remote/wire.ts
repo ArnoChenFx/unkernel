@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The remote kernel's wire format (js/node/remote.ts serves it, js/web/remote.ts
+// The remote kernel's wire format (remote/backend.ts serves it, remote/web/link.ts
 // speaks it): one WebSocket carries a kernel's messages (worker-protocol.ts)
 // and the calls of a host file system for /work (fs.ts), both as binary
 // frames. A frame is a little-endian u32 header length, the header (JSON: the
 // value, its binary parts as tags, and the length of each part) and the parts.
 // Universal: the browser and Node or Bun encode and decode the same bytes.
 
-import { ERRNO, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, type FsOpenFlags, type FsSetAttr, type FsStatFs } from "./fs.ts";
-import type { FromWorker, ToWorker } from "./worker-protocol.ts";
+import { ERRNO, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, type FsOpenFlags, type FsSetAttr, type FsStatFs } from "../js/core/fs.ts";
+import type { FromWorker, ToWorker } from "../js/core/worker-protocol.ts";
 
 /** The wire version: the page and the backend must agree on it (their hello). */
 export const REMOTE_WIRE = 1;

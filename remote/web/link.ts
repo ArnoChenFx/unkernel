@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The page's end of the remote kernel (js/node/remote.ts is the backend's): a
+// The page's end of the remote kernel (remote/backend.ts is the backend's): a
 // RemoteLink is one WebSocket to a backend that runs the kernel. It is the
 // kernel's WorkerEndpoint (createKernel({ worker: true }) posts to it as to a
 // Web Worker) and the host file system of /work (fs()), both over that socket.
 // connect() resolves once the backend has said hello, so the page knows what
 // the backend offers before it boots.
 
-import { BootError } from "../core/load.ts";
-import { FsError, type Fs } from "../core/fs.ts";
-import { REMOTE_WIRE, REMOTE_WS_PATH, decodeRemote, encodeRemote, remoteFs, type RemoteFsCaps, type RemoteFsOp, type RemoteReply, type RemoteRequest } from "../core/remote.ts";
-import type { FromWorker, ToWorker, WorkerEndpoint } from "../core/worker-protocol.ts";
+import { BootError } from "../../js/core/load.ts";
+import { FsError, type Fs } from "../../js/core/fs.ts";
+import { REMOTE_WIRE, REMOTE_WS_PATH, decodeRemote, encodeRemote, remoteFs, type RemoteFsCaps, type RemoteFsOp, type RemoteReply, type RemoteRequest } from "../wire.ts";
+import type { FromWorker, ToWorker, WorkerEndpoint } from "../../js/core/worker-protocol.ts";
 
 /** What the backend said first: its wire version, its file calls for /work (null: none), and the paths it shows. */
 export interface RemoteHello {

@@ -3,7 +3,7 @@
 // The remote kernel backend's server (Bun), on 127.0.0.1 only: the page's
 // files from the web build (its HTML says the page runs its kernel here, see
 // http.ts), /remote/info, and /remote/ws, the page's connection to the kernel
-// (js/node/remote.ts). Every request passes http.ts's sameSiteGuard, so a page
+// (remote/backend.ts). Every request passes http.ts's sameSiteGuard, so a page
 // on another site cannot reach the kernel. The kernel's files are looked up
 // only under the web build, the distro images are copied to the cache, and
 // the data disk is created from the kernel's template when missing.
@@ -12,9 +12,9 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { bundledBoot } from "../js/core/kernel.ts";
-import { REMOTE_INFO_PATH, REMOTE_WIRE, REMOTE_WS_PATH } from "../js/core/remote.ts";
+import { REMOTE_INFO_PATH, REMOTE_WIRE, REMOTE_WS_PATH } from "./wire.ts";
 import { createImageFromKwsparse } from "../js/node/disk.ts";
-import { RemoteHub, type RemoteHost, type RemoteKernel, type RemoteSocket } from "../js/node/remote.ts";
+import { RemoteHub, type RemoteHost, type RemoteKernel, type RemoteSocket } from "./backend.ts";
 import type { RemoteConfig } from "./config.ts";
 import { localNames, sameSiteGuard, withRemoteFlag } from "./http.ts";
 

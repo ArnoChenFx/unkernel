@@ -47,10 +47,11 @@ import { clearResumeRequest, setResumeRequest, takeResumeRequest } from "./ui.ts
 import { createTerminals, pasteText, setTermFont, termText, TERM_OPTIONS } from "./wterms.ts";
 import { attachWayland, waylandApi } from "./wayland.ts";
 import {
-	BootError, ConsoleRouter, KernelInstance, RemoteLink, SnapshotCommitError, WorkerKernel, bundledBoot, createKernel, createRemoteKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
+	BootError, ConsoleRouter, KernelInstance, SnapshotCommitError, WorkerKernel, bundledBoot, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
 	type BlockDevice, type DistroDisk, type BootProgress, type DiskSpec, type DiskState, type DownloadProgress, type Kernel, type KernelHandle, type KernelSnapshot, type SnapshotHoldDecision,
 	type GlStats, type VirglTotals,
 } from "./sdk.ts";
+import { connectRemote, createRemoteKernel, remoteDataError, type RemoteLink } from "../../remote/web/page.ts";
 
 /** The virtio-gpu device's 3D counters (vm.gl.stats.gpu). */
 type GpuRendererStats = NonNullable<GlStats["gpu"]>;
@@ -128,7 +129,6 @@ export function start(): void {
 	let vmExited = false;
 	/** Remote mode (cfg.remote): the connection to the backend that runs the kernel, made at boot. */
 	let remoteLink: RemoteLink | null = null;
-	const remoteDataError = () => new Error("remote mode: the data disk is a file on the backend's computer (its --data), which this page does not export, replace or reset");
 	/** createKernel() is running (in worker mode the worker may be opening the data disk). */
 	let kernelStarting = false;
 	/** The kernel has exited (inline: the moment it does; a worker: once its exit message arrived). */
@@ -1417,12 +1417,7 @@ export function start(): void {
 		ui.setState("loading", "Downloading");
 		setLive(" .... ", "Downloading");
 		const t0 = performance.now();
-		if (cfg.remote) {
-			remoteLink = await RemoteLink.connect(location.origin).catch((e: unknown) => { throw tag(e, "remote", "kernel"); });
-			const h = remoteLink.hello;
-			ui.check("remote", "Remote kernel", "pass", location.origin, `wire ${h.wire}; data disk ${h.data ?? "none"}; /work ${h.work ?? "none"}; network ${h.net ? "the backend's (direct host sockets)" : "none"}`);
-			ui.hostLog(`[host] remote kernel at ${location.origin}: data disk ${h.data ?? "none"}, /work ${h.work ?? "none"}`);
-		}
+		if (cfg.remote) remoteLink = await connectRemote(ui).catch((e: unknown) => { throw tag(e, "remote", "kernel"); });
 		// The kernel downloads and compiles on this thread in both modes (the engine compiles
 		// off-thread while it streams), so it overlaps the terminal's start and, in worker
 		// mode, the data disk lock; the worker then gets the compiled Module.

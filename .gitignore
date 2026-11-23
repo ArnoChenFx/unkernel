@@ -9,5 +9,4 @@ web/.wland-local/
 web/.vercel/
 web/kernel/
 web/public/distros/
-remote/unkernel-remote.json
 tmp/

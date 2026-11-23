@@ -49,8 +49,8 @@
   },
   "scripts": {
     "build": "obuild",
-    "typecheck": "tsc -p . && tsc -p remote",
-    "test": "pnpm typecheck && pnpm test:block && pnpm test:net && pnpm test:tty && pnpm test:http && pnpm test:ws && pnpm test:9p && pnpm test:distro && pnpm test:gl-gpu && pnpm test:remote",
+    "typecheck": "tsc -p .",
+    "test": "pnpm typecheck && pnpm test:block && pnpm test:net && pnpm test:tty && pnpm test:http && pnpm test:ws && pnpm test:9p && pnpm test:distro && pnpm test:gl-gpu",
     "test:block": "node --test test/block.test.ts",
     "test:net": "node --test test/net.test.ts",
     "test:tty": "node --test test/tty.test.ts",
@@ -63,7 +63,6 @@
     "test:api": "node --test test/api.test.ts",
     "test:distro": "node --test test/distro.test.ts",
     "test:gl-gpu": "node --test test/gl-gpu.test.ts",
-    "test:remote": "node --test test/remote.test.ts",
     "unkernel": "node js/cli.ts",
     "dev": "pnpm -C web dev",
     "build:web": "pnpm -C web build",

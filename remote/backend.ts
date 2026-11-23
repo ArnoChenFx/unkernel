@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The backend's end of the remote kernel, on Node or Bun (js/web/remote.ts is
+// The backend's end of the remote kernel, on Node or Bun (remote/web/link.ts is
 // the page's). A RemoteHub takes one page at a time, and the RemoteKernel for
 // it runs the kernel in a worker thread (worker.ts). The boot spec the page
 // sends is rewritten here rather than trusted: its kernel and distro are URLs
@@ -10,12 +10,12 @@
 // file calls of the wire (workFs).
 
 import { pathToFileURL } from "node:url";
-import { REMOTE_WIRE, decodeRemote, encodeRemote, remoteError, remoteFsServer, type RemoteFsOp, type RemoteFsServer, type RemoteReply, type RemoteRequest } from "../core/remote.ts";
-import { FsError, type Fs, type FsAttr, type FsFile } from "../core/fs.ts";
-import type { DiskSpec } from "../core/devices.ts";
-import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint } from "../core/worker-protocol.ts";
-import { spawnNodeWorker } from "./worker.ts";
-import { nodeFs } from "./nodefs.ts";
+import { REMOTE_WIRE, decodeRemote, encodeRemote, remoteError, remoteFsServer, type RemoteFsOp, type RemoteFsServer, type RemoteReply, type RemoteRequest } from "./wire.ts";
+import { FsError, type Fs, type FsAttr, type FsFile } from "../js/core/fs.ts";
+import type { DiskSpec } from "../js/core/devices.ts";
+import type { FromWorker, ToWorker, WorkerBootSpec, WorkerEndpoint } from "../js/core/worker-protocol.ts";
+import { spawnNodeWorker } from "../js/node/worker.ts";
+import { nodeFs } from "../js/node/nodefs.ts";
 
 /**
  * The host's side of one kernel: the files the page's URLs stand for, the

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // The remote kernel backend without a kernel or a browser: the wire codec and
-// the /work calls (core/remote.ts), /work's modes (node/remote.ts workFs), the
-// data disk's lock, the settings (remote/config.ts), and the page guard and
+// the /work calls (remote/wire.ts), /work's modes (remote/backend.ts workFs),
+// the data disk's lock, the settings (remote/config.ts), and the page guard and
 // the page's remote flag (remote/http.ts, which remote/server.ts serves with
 // Bun). Nothing here starts a server.
 //
-//   node --test test/remote.test.ts
+//   node --test remote/test/remote.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -14,12 +14,12 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
-import { REMOTE_WIRE, decodeRemote, encodeRemote, remoteFs, remoteFsServer } from "../js/core/remote.ts";
-import { workFs } from "../js/node/remote.ts";
-import { nodeFs } from "../js/node/nodefs.ts";
-import { ConfigError, loadConfig } from "../remote/config.ts";
-import { ImageInUseError, lockImage } from "../remote/lock.ts";
-import { sameSiteGuard, withRemoteFlag } from "../remote/http.ts";
+import { REMOTE_WIRE, decodeRemote, encodeRemote, remoteFs, remoteFsServer } from "../wire.ts";
+import { workFs } from "../backend.ts";
+import { nodeFs } from "../../js/node/nodefs.ts";
+import { ConfigError, loadConfig } from "../config.ts";
+import { ImageInUseError, lockImage } from "../lock.ts";
+import { sameSiteGuard, withRemoteFlag } from "../http.ts";
 
 const tmpDir = () => mkdtempSync(path.join(os.tmpdir(), "unkernel-remote-"));
 

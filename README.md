@@ -59,7 +59,7 @@ add python3` about 3.4 s. [Benchmarks](#-benchmarks) has the full numbers.
 Anything a program relies on, from `/proc` and `epoll` to cgroups and
 overlayfs, behaves as it does on a server, because it runs the same code.
 
-- **A real MMU** (`arch/wasm` with Sv39 page tables): `fork`, `mmap`,
+- **A real MMU** (`arch/wasm` with Sv48 page tables): `fork`, `mmap`,
   copy-on-write, shared memory, threads and signals behave as they do on
   hardware. This is not a NOMMU port where programs are limited to `vfork`.
 - **Linux's own file systems**: ext4, overlayfs, tmpfs, loop devices, FUSE,

@@ -2650,6 +2650,39 @@ static void *ua_wakeop(void *arg)
 	return NULL;
 }
 
+/*
+ * The user address space is 48 bits (four page-table levels): a reservation
+ * larger than 39 bits fits, and a page in the upper half is reached by user
+ * code (kwemu's walk) and by the kernel (the uaccess walk).
+ */
+static void vaspace_checks(void)
+{
+	size_t big = (4UL << 40) + (32UL << 30);
+	char *high = (char *)((1UL << 47) + (5UL << 39) + (3UL << 30) + (7UL << 21));
+	void *r = mmap(NULL, big, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	void *over = mmap((void *)(1UL << 48), 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	char *p = mmap(high, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	int fds[2], user = 0, kernel = 0;
+
+	if (r != MAP_FAILED)
+		munmap(r, big);
+	if (p == high) {
+		memset(p, 0x5a, 4096);
+		user = p[0] == 0x5a && p[4095] == 0x5a;
+		if (!pipe(fds)) {
+			kernel = write(fds[1], p, 4096) == 4096 && read(fds[0], p + 4096, 4096) == 4096 &&
+				 !memcmp(p, p + 4096, 4096);
+			close(fds[0]);
+			close(fds[1]);
+		}
+		munmap(p, 8192);
+	}
+	CHECK(r != MAP_FAILED && over == MAP_FAILED && p == high && user && kernel,
+	      "address space: 4 TiB reservation %s, nothing at 1 << 48 %s, a page above 1 << 47: mapped %s, user %s, kernel %s",
+	      r != MAP_FAILED ? "ok" : "BAD", over == MAP_FAILED ? "ok" : "BAD", p == high ? "ok" : "BAD",
+	      user ? "ok" : "BAD", kernel ? "ok" : "BAD");
+}
+
 static void uaccess_checks(void)
 {
 	long online = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4715,6 +4748,7 @@ int main(int argc, char **argv)
 	ptrace_checks();
 	net_config_checks();
 	uaccess_checks();
+	vaspace_checks();
 	input_handler_checks();
 	vsock_checks();
 	ninep_checks();

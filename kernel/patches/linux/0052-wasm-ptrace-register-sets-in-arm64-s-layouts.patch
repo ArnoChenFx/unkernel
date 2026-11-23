@@ -1,4 +1,4 @@
-From 9b9c781e098a46b4cc55363b85425b619b33d9b0 Mon Sep 17 00:00:00 2001
+From d2806628f8b8ccbb62161e2d49add14a730fd707 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Mon, 23 Nov 2026 22:47:49 +0000
 Subject: [PATCH] wasm: ptrace register sets in arm64's layouts
@@ -40,7 +40,7 @@ syscall runs with.
  7 files changed, 261 insertions(+), 21 deletions(-)
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
-index 49eea38d88b..64f7e476b5f 100644
+index b8754207352..ec1eda88f04 100644
 --- a/arch/wasm/Kconfig
 +++ b/arch/wasm/Kconfig
 @@ -21,6 +21,8 @@ config WASM

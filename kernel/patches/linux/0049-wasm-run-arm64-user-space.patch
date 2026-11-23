@@ -1,4 +1,4 @@
-From 3b4ddc78b5f7a13545300e684a61f037c90d56a9 Mon Sep 17 00:00:00 2001
+From c633e79036bb1dbaa575ac43771ba69fbc565f54 Mon Sep 17 00:00:00 2001
 From: kernel-wasm <kernel-wasm@localhost>
 Date: Wed, 18 Nov 2026 21:04:24 +0000
 Subject: [PATCH] wasm: run arm64 user space
@@ -50,13 +50,16 @@ The page tables keep the Sv39 format, and TASK_SIZE is 1 << 39, as on
 arm64 with 39-bit VAs: the whole range the three levels index, with no
 sign-extended upper half (kwemu faults addresses at or above it).
 ---
- arch/wasm/Kconfig                        |  15 +-
+ arch/wasm/Kconfig                        |  17 +-
  arch/wasm/Makefile                       |   4 +-
  arch/wasm/configs/kw_defconfig           |   2 +-
  arch/wasm/include/asm/elf.h              |  42 ++-
  arch/wasm/include/asm/futex.h            |   6 +-
  arch/wasm/include/asm/hwcap.h            |  15 +-
  arch/wasm/include/asm/kw_emu.h           | 253 +++++++------
+ arch/wasm/include/asm/page.h             |   5 +-
+ arch/wasm/include/asm/pgalloc.h          |   7 +
+ arch/wasm/include/asm/pgtable.h          |  56 ++-
  arch/wasm/include/asm/processor.h        |  13 +-
  arch/wasm/include/asm/ptrace.h           |  25 +-
  arch/wasm/include/asm/seccomp.h          |  17 +
@@ -90,10 +93,10 @@ sign-extended upper half (kwemu faults addresses at or above it).
  arch/wasm/kernel/sys_riscv.c             | 113 ------
  arch/wasm/kernel/syscall_table.c         |   5 +-
  arch/wasm/kernel/traps.c                 |  26 +-
- arch/wasm/mm/fault.c                     |   6 +-
+ arch/wasm/mm/fault.c                     |  13 +-
  arch/wasm/mm/sigpage.c                   |   7 +-
  arch/wasm/mm/tlb.c                       |  11 -
- 43 files changed, 1617 insertions(+), 1062 deletions(-)
+ 46 files changed, 1685 insertions(+), 1071 deletions(-)
  create mode 100644 arch/wasm/include/asm/seccomp.h
  delete mode 100644 arch/wasm/include/uapi/asm/elf.h
  create mode 100644 arch/wasm/include/uapi/asm/fcntl.h
@@ -108,7 +111,7 @@ sign-extended upper half (kwemu faults addresses at or above it).
  delete mode 100644 arch/wasm/kernel/sys_riscv.c
 
 diff --git a/arch/wasm/Kconfig b/arch/wasm/Kconfig
-index 27dd1dde5cd..49eea38d88b 100644
+index 27dd1dde5cd..b8754207352 100644
 --- a/arch/wasm/Kconfig
 +++ b/arch/wasm/Kconfig
 @@ -5,17 +5,22 @@ menu "Wasm-specific options"
@@ -121,7 +124,7 @@ index 27dd1dde5cd..49eea38d88b 100644
 +# (JavaScript Promise Integration). User mode is not Wasm: unmodified arm64
 +# (AArch64) Linux ELF programs run on a software CPU ("kwemu", see
 +# include/kw_emu.h in the unkernel repository) that walks the kernel's
-+# Sv39-format page tables.
++# Sv48-format page tables.
  #
  
  config WASM
@@ -147,6 +150,14 @@ index 27dd1dde5cd..49eea38d88b 100644
  # (fork, mmap, copy-on-write). The original linux-wasm NOMMU mode (programs
  # as Wasm modules) is not supported by this port.
  config MMU
+@@ -107,6 +112,6 @@ config ARCH_MMAP_RND_BITS_MAX
+ 
+ config PGTABLE_LEVELS
+ 	int
+-	default 3
++	default 4
+ 
+ endmenu
 diff --git a/arch/wasm/Makefile b/arch/wasm/Makefile
 index 49049055794..8512b7e3cae 100644
 --- a/arch/wasm/Makefile
@@ -302,7 +313,7 @@ index e116408e5c1..4fc957f3bba 100644
  
  #endif /* _ASM_WASM_HWCAP_H */
 diff --git a/arch/wasm/include/asm/kw_emu.h b/arch/wasm/include/asm/kw_emu.h
-index 3308c54e1fe..658460a555c 100644
+index 3308c54e1fe..7db679113bc 100644
 --- a/arch/wasm/include/asm/kw_emu.h
 +++ b/arch/wasm/include/asm/kw_emu.h
 @@ -1,21 +1,29 @@
@@ -336,9 +347,9 @@ index 3308c54e1fe..658460a555c 100644
   *
 - * Page-table format (RISC-V Sv39 layout, 4 KiB pages, 3 levels, 512
 - * entries per level, 8-byte little-endian PTEs):
-+ * Page-table format (the RISC-V Sv39 layout, independent of the guest ISA:
-+ * 4 KiB pages, 3 levels, 512 entries per level, 8-byte little-endian PTEs;
-+ * user virtual addresses below 2^39, all three levels' index bits, with no
++ * Page-table format (the RISC-V Sv48 layout, independent of the guest ISA:
++ * 4 KiB pages, 4 levels, 512 entries per level, 8-byte little-endian PTEs;
++ * user virtual addresses below 2^48, all four levels' index bits, with no
 + * sign-extended upper half):
   *   bit 0 V, 1 R, 2 W, 3 X, 4 U, 5 G, 6 A, 7 D, bits 8-9 software,
   *   bits 10..53 PPN (physical address >> 12).
@@ -660,8 +671,178 @@ index 3308c54e1fe..658460a555c 100644
   */
  
  #ifdef __cplusplus
+diff --git a/arch/wasm/include/asm/page.h b/arch/wasm/include/asm/page.h
+index 3ea450a5c2d..eb63d54ae8a 100644
+--- a/arch/wasm/include/asm/page.h
++++ b/arch/wasm/include/asm/page.h
+@@ -13,7 +13,7 @@
+  * "direct map": kernel virtual address == physical address == linear memory
+  * address. There is no hardware MMU and no way to alias memory, so kernel
+  * page tables are never consulted. User address spaces exist only in the
+- * (Sv39-format) page tables walked by the kwemu software CPU and by the
++ * (Sv48-format) page tables walked by the kwemu software CPU and by the
+  * uaccess routines (see arch/wasm/mm/uaccess.c).
+  */
+ #define WASM_PAGE_SHIFT		16
+@@ -35,17 +35,20 @@
+ 
+ typedef struct { unsigned long pte; } pte_t;
+ typedef struct { unsigned long pmd; } pmd_t;
++typedef struct { unsigned long pud; } pud_t;
+ typedef struct { unsigned long pgd; } pgd_t;
+ typedef struct { unsigned long pgprot; } pgprot_t;
+ typedef struct page *pgtable_t;
+ 
+ #define pte_val(x)	((x).pte)
+ #define pmd_val(x)	((x).pmd)
++#define pud_val(x)	((x).pud)
+ #define pgd_val(x)	((x).pgd)
+ #define pgprot_val(x)	((x).pgprot)
+ 
+ #define __pte(x)	((pte_t) { (x) })
+ #define __pmd(x)	((pmd_t) { (x) })
++#define __pud(x)	((pud_t) { (x) })
+ #define __pgd(x)	((pgd_t) { (x) })
+ #define __pgprot(x)	((pgprot_t) { (x) })
+ 
+diff --git a/arch/wasm/include/asm/pgalloc.h b/arch/wasm/include/asm/pgalloc.h
+index 888fb4f2525..0bc5c027c38 100644
+--- a/arch/wasm/include/asm/pgalloc.h
++++ b/arch/wasm/include/asm/pgalloc.h
+@@ -25,11 +25,18 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
+ 	set_pud(pud, __pud((virt_to_pfn(pmd) << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
+ }
+ 
++static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4d, pud_t *pud)
++{
++	set_p4d(p4d, __p4d((virt_to_pfn(pud) << _PAGE_PFN_SHIFT) | _PAGE_TABLE));
++}
++
+ extern pgd_t *pgd_alloc(struct mm_struct *mm);
+ 
+ #define __pte_free_tlb(tlb, pte, address) \
+ 	tlb_remove_ptdesc((tlb), page_ptdesc(pte))
+ #define __pmd_free_tlb(tlb, pmd, address) \
+ 	tlb_remove_ptdesc((tlb), virt_to_ptdesc(pmd))
++#define __pud_free_tlb(tlb, pud, address) \
++	tlb_remove_ptdesc((tlb), virt_to_ptdesc(pud))
+ 
+ #endif /* _ASM_WASM_PGALLOC_H */
+diff --git a/arch/wasm/include/asm/pgtable.h b/arch/wasm/include/asm/pgtable.h
+index 841c27fd516..784603b9ea5 100644
+--- a/arch/wasm/include/asm/pgtable.h
++++ b/arch/wasm/include/asm/pgtable.h
+@@ -4,35 +4,40 @@
+ #define _ASM_WASM_PGTABLE_H
+ 
+ /*
+- * User page tables in RISC-V Sv39 format (3 levels, 4 KiB pages, 512 x 8-byte
++ * User page tables in RISC-V Sv48 format (4 levels, 4 KiB pages, 512 x 8-byte
+  * entries per level). They are walked in software by the kwemu CPU (see
+  * kw_emu.h) and by the uaccess code. Physical address == linear address
+  * (kw_cpu.phys_base == 0). Kernel memory is never mapped by these tables.
+  */
+ 
+-#include <asm-generic/pgtable-nopud.h>
++#include <asm-generic/pgtable-nop4d.h>
+ 
+ #include <linux/const.h>
+ #include <linux/bits.h>
+ #include <asm/page.h>
+ #include <asm/processor.h>
+ 
+-#define PGDIR_SHIFT	30
++#define PGDIR_SHIFT	39
+ #define PGDIR_SIZE	(_AC(1, UL) << PGDIR_SHIFT)
+ #define PGDIR_MASK	(~(PGDIR_SIZE - 1))
+ 
++#define PUD_SHIFT	30
++#define PUD_SIZE	(_AC(1, UL) << PUD_SHIFT)
++#define PUD_MASK	(~(PUD_SIZE - 1))
++
+ #define PMD_SHIFT	21
+ #define PMD_SIZE	(_AC(1, UL) << PMD_SHIFT)
+ #define PMD_MASK	(~(PMD_SIZE - 1))
+ 
+ #define PTRS_PER_PGD	512
++#define PTRS_PER_PUD	512
+ #define PTRS_PER_PMD	512
+ #define PTRS_PER_PTE	512
+ 
+ #define USER_PTRS_PER_PGD	(TASK_SIZE / PGDIR_SIZE)
+ #define FIRST_USER_ADDRESS	0UL
+ 
+-/* Sv39 PTE bits (identical to arch/riscv/include/asm/pgtable-bits.h). */
++/* Sv48 PTE bits (identical to arch/riscv/include/asm/pgtable-bits.h). */
+ #define _PAGE_PRESENT	(1UL << 0)	/* V */
+ #define _PAGE_READ	(1UL << 1)
+ #define _PAGE_WRITE	(1UL << 2)
+@@ -169,7 +174,7 @@ static inline void pmd_clear(pmd_t *pmdp)
+ 	set_pmd(pmdp, __pmd(0));
+ }
+ 
+-/* --- PGD level (holds PMD tables; PUD/P4D folded) --------------------- */
++/* --- PUD level (holds PMD tables) ------------------------------------- */
+ 
+ static inline int pud_present(pud_t pud)
+ {
+@@ -210,6 +215,45 @@ static inline pmd_t *pud_pgtable(pud_t pud)
+ 
+ #define pud_page(pud)	pfn_to_page(pud_pfn(pud))
+ 
++/* --- PGD level (holds PUD tables; P4D folded) ------------------------- */
++
++static inline int p4d_present(p4d_t p4d)
++{
++	return p4d_val(p4d) & _PAGE_PRESENT;
++}
++
++static inline int p4d_none(p4d_t p4d)
++{
++	return p4d_val(p4d) == 0;
++}
++
++static inline int p4d_bad(p4d_t p4d)
++{
++	return !p4d_present(p4d) || (p4d_val(p4d) & _PAGE_LEAF);
++}
++
++static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
++{
++	WRITE_ONCE(*p4dp, p4d);
++}
++
++static inline void p4d_clear(p4d_t *p4dp)
++{
++	set_p4d(p4dp, __p4d(0));
++}
++
++static inline unsigned long p4d_pfn(p4d_t p4d)
++{
++	return __page_val_to_pfn(p4d_val(p4d));
++}
++
++static inline pud_t *p4d_pgtable(p4d_t p4d)
++{
++	return (pud_t *)pfn_to_virt(p4d_pfn(p4d));
++}
++
++#define p4d_page(p4d)	pfn_to_page(p4d_pfn(p4d))
++
+ /* --- PTE level -------------------------------------------------------- */
+ 
+ static inline int pte_present(pte_t pte)
+@@ -479,6 +523,8 @@ static inline pte_t pte_swp_clear_exclusive(pte_t pte)
+ 	pr_err("%s:%d: bad pte %016lx.\n", __FILE__, __LINE__, pte_val(e))
+ #define pmd_ERROR(e) \
+ 	pr_err("%s:%d: bad pmd %016lx.\n", __FILE__, __LINE__, pmd_val(e))
++#define pud_ERROR(e) \
++	pr_err("%s:%d: bad pud %016lx.\n", __FILE__, __LINE__, pud_val(e))
+ #define pgd_ERROR(e) \
+ 	pr_err("%s:%d: bad pgd %016lx.\n", __FILE__, __LINE__, pgd_val(e))
+ 
 diff --git a/arch/wasm/include/asm/processor.h b/arch/wasm/include/asm/processor.h
-index 67d9ec0deed..24d8affb806 100644
+index 67d9ec0deed..03757058309 100644
 --- a/arch/wasm/include/asm/processor.h
 +++ b/arch/wasm/include/asm/processor.h
 @@ -9,11 +9,14 @@
@@ -671,15 +852,15 @@ index 67d9ec0deed..24d8affb806 100644
 - * User address space: Sv39 lower half, as on riscv64 (256 GiB). User and
 - * kernel addresses overlap numerically; they are different address spaces
 - * (user memory is only reachable through page-table walks).
-+ * User address space: the whole 39 bits (512 GiB) that the three levels of
-+ * the Sv39-format page tables kwemu walks index (kw_emu.h), as arm64 with
-+ * 39-bit VAs gives user space. There is no sign-extended upper half: kernel
++ * User address space: the whole 48 bits (256 TiB) that the four levels of
++ * the Sv48-format page tables kwemu walks index (kw_emu.h), as arm64 with
++ * 48-bit VAs gives user space. There is no sign-extended upper half: kernel
 + * memory is never mapped in these tables. User and kernel addresses overlap
 + * numerically; they are different address spaces (user memory is only
 + * reachable through page-table walks).
   */
 -#define TASK_SIZE		(_AC(1, UL) << 38)
-+#define TASK_SIZE		(_AC(1, UL) << 39)
++#define TASK_SIZE		(_AC(1, UL) << 48)
  #define TASK_SIZE_MAX		TASK_SIZE
  #define DEFAULT_MAP_WINDOW	TASK_SIZE
  #define STACK_TOP		TASK_SIZE
@@ -3665,10 +3846,26 @@ index 017d8284512..9b2e701ea82 100644
  		 * the way to user mode, where a reschedule is honoured.
  		 */
 diff --git a/arch/wasm/mm/fault.c b/arch/wasm/mm/fault.c
-index 959f2396685..fd26889ddab 100644
+index 959f2396685..50f9d549818 100644
 --- a/arch/wasm/mm/fault.c
 +++ b/arch/wasm/mm/fault.c
-@@ -193,10 +193,10 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
+@@ -31,10 +31,13 @@
+ static pte_t *kw_walk(struct mm_struct *mm, unsigned long addr)
+ {
+ 	pgd_t *pgd = pgd_offset(mm, addr);
+-	p4d_t *p4d = p4d_offset(pgd, addr);
+-	pud_t pud = __pud(READ_ONCE(pud_val(*pud_offset(p4d, addr))));
++	p4d_t p4d = __p4d(READ_ONCE(p4d_val(*p4d_offset(pgd, addr))));
++	pud_t pud;
+ 	pmd_t pmd;
+ 
++	if (p4d_none(p4d) || !p4d_present(p4d))
++		return NULL;
++	pud = __pud(READ_ONCE(pud_val(*(p4d_pgtable(p4d) + pud_index(addr)))));
+ 	if (pud_none(pud) || !pud_present(pud))
+ 		return NULL;
+ 	pmd = __pmd(READ_ONCE(pmd_val(*(pud_pgtable(pud) + pmd_index(addr)))));
+@@ -193,10 +196,10 @@ void do_user_page_fault(struct pt_regs *regs, unsigned long addr,
  		force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)addr);
  	else {
  		if (show_unhandled_signals && unhandled_signal(current, SIGSEGV))

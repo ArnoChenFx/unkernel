@@ -43,7 +43,7 @@ test options (a64.md, Tests).
 What every interpreted instruction goes through; what an op is and how a
 block is shaped is the ISA's (a64/tier.md).
 
-- **MMU.** Walks Sv39-layout page tables (kw_emu.h; independent of the
+- **MMU.** Walks Sv48-layout page tables (kw_emu.h; independent of the
   guest ISA) straight out of linear memory and caches fully permitted
   translations in TLBs inside kw_cpu. It never writes PTEs (A = 0, or D =
   0 on a store, raises KW_EV_FAULT), so the kernel flushes on downgrades.

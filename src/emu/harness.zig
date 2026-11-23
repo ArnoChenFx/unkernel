@@ -3,7 +3,7 @@
 //! A tiny "kernel" that drives kwemu through the C ABI only (include/kw_emu.h
 //! via translate-c), the way the real wasm Linux kernel will:
 //!
-//!   * builds Sv39 page tables in its own "physical memory" buffer
+//!   * builds Sv48 page tables in its own "physical memory" buffer
 //!     (physical address 0x8000_0000 = first byte of the buffer, so
 //!     phys_base is non-trivial);
 //!   * loads a static aarch64 ELF, builds argv/envp/auxv on the stack;
@@ -140,7 +140,7 @@ pub const Machine = struct {
     /// Leaf PTE slot for `va`, creating intermediate tables if `create`.
     fn slot(m: *Machine, va: u64, create: bool) ?*u64 {
         var t = m.root;
-        var level: u6 = 2;
+        var level: u6 = 3;
         while (level > 0) : (level -= 1) {
             const e = &m.table(t)[@intCast((va >> (12 + 9 * level)) & 511)];
             if (e.* & pte_v == 0) {
@@ -155,7 +155,7 @@ pub const Machine = struct {
     fn protPte(prot: u64) u64 {
         var p: u64 = 0;
         if (prot & 1 != 0) p |= pte_r;
-        if (prot & 2 != 0) p |= pte_w | pte_r; // W requires R in Sv39
+        if (prot & 2 != 0) p |= pte_w | pte_r; // W requires R in Sv48
         if (prot & 4 != 0) p |= pte_x;
         return p;
     }

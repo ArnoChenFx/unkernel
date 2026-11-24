@@ -7,7 +7,8 @@
 // headless Chrome with WebGPU (SwiftShader), which plays a fake client:
 // hello, buffer round trip, a triangle (render pass, pipeline, dynamic
 // uniform offset, push constants) read back with copyImageToBuffer and
-// present, a scaled blit, and a compute dispatch. With glslangValidator and
+// present, a scaled blit, and a compute dispatch; failures that must reach
+// the guest (pipelines refused or unusable, lost devices). With glslangValidator and
 // vendor/build/vk/kwvk-naga.wasm it runs again on real SPIR-V through
 // js/core/vk-shader.ts. Exit 0 when every check passes.
 //
@@ -51,7 +52,7 @@ async function findChrome() {
 // SPIR-V for the real-translator suite
 const naga = join(root, "vendor/build/vk/kwvk-naga.wasm");
 const spirv = {};
-const SHADERS = ["tri.vert", "tri.frag", "double.comp", "quad.vert", "quad.frag", "fs.vert", "ia.frag", "arr.frag", "store.comp", "flat.vert", "flat.frag", "wide.comp", "dead.comp"];
+const SHADERS = ["tri.vert", "tri.frag", "double.comp", "quad.vert", "quad.frag", "fs.vert", "ia.frag", "arr.frag", "store.comp", "flat.vert", "flat.frag", "wide.comp", "dead.comp", "barrier.comp", "shared512.comp"];
 const work = await mkdtemp(join(tmpdir(), "kwvk-host-"));
 if (existsSync(naga) && existsSync(join(root, "js/core/vk-shader.ts"))) {
 	for (const name of SHADERS) {

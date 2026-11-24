@@ -16,7 +16,10 @@
 
 #define KW_EXPORT __attribute__((visibility("default")))
 
+/* KWVK_DEBUG=1: debugging lines on stderr */
 void kw_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* always on stderr, each distinct line once: errors and wrong-result warnings */
+void kw_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* growable byte/JSON buffer */
 struct jb {
@@ -49,7 +52,8 @@ struct kw_reply {
 };
 struct kw_link {
 	int fd;
-	int dead;
+	int dead; /* no more replies: every wait, submit and present returns VK_ERROR_DEVICE_LOST */
+	int lost; /* the reason was printed (link_lose) */
 	pthread_mutex_t send_mu;
 	pthread_mutex_t mu;
 	pthread_cond_t cv;
@@ -71,6 +75,10 @@ struct kw_reply *link_wait_timeout(struct kw_link *l, uint32_t r, int64_t timeou
 int link_poll(struct kw_link *l, uint32_t r);
 struct kw_reply *link_call(struct kw_link *l, struct jb *b, const void *bin, size_t binlen);
 void reply_free(struct kw_reply *rep);
+/* the device is lost (prints why once, ends every wait); call without l->mu */
+void link_lose(struct kw_link *l, const char *why);
+/* a reply that must not be an error: NULL (dead link) or "err" loses the device; 1 when it did */
+int kw_reply_lost(struct kw_link *l, struct kw_reply *rep, const char *what);
 
 /* objects */
 struct kw_instance;
@@ -85,6 +93,7 @@ struct kw_physical_device {
 	uint32_t timestamp_bits;
 	int f16;
 	uint64_t max_alloc;
+	uint64_t max_buffer; /* WebGPU's maxBufferSize */
 };
 struct kw_instance {
 	VK_LOADER_DATA loader;
@@ -152,11 +161,14 @@ struct kw_fence {
 };
 struct kw_shader {
 	uint32_t id;
+	int base; /* decorates BuiltIn BaseVertex, BaseInstance or DrawIndex */
 	int nw; /* writable storage bindings (set << 16 | binding), -1 unknown */
 	uint32_t w[];
 };
 struct kw_pipe {
 	uint32_t id;
+	int base; /* a stage reads BaseVertex, BaseInstance or DrawIndex (0 on WebGPU) */
+	char *bad; /* created but cannot run on WebGPU ("unusable" reply): why */
 	int nw;
 	uint32_t w[];
 };
@@ -171,6 +183,9 @@ struct kw_cmdbuf {
 	size_t nwritten, capwritten;
 	struct kw_pipe *pipe[2]; /* bound graphics, compute pipeline */
 	struct kw_dset *sets[2][KW_MAX_SETS];
+	/* recorded something the host cannot run (an unusable pipeline, a
+	 * non-zero dispatch base, ...): submitting it loses the device */
+	char bad[384];
 };
 struct kw_cmdpool {
 	struct kw_cmdbuf *bufs;

@@ -6,6 +6,7 @@
 #include "kwvk.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -394,6 +395,12 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 	uint64_t ram = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
 	m->memoryHeaps[0].size = ram >= (64ull << 20) ? ram / 2 : (1ull << 30);
 	pd->max_alloc = m->memoryHeaps[0].size < (1ull << 30) ? m->memoryHeaps[0].size : (1ull << 30);
+	/* no buffer can be larger than WebGPU's maxBufferSize (apps such as
+	 * ggml size their buffers by maxMemoryAllocationSize) */
+	double mb = js_num(js_get(L, "maxBufferSize"), 268435456);
+	pd->max_buffer = mb >= 1.8e19 ? UINT64_MAX : (uint64_t)mb;
+	if (pd->max_alloc > pd->max_buffer)
+		pd->max_alloc = pd->max_buffer;
 	m->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 	m->memoryTypeCount = 3;
 	m->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -529,7 +536,10 @@ static API VkResult CALL kw_vkGetPhysicalDeviceImageFormatProperties(VkPhysicalD
 	while ((dim >> mips) > 0)
 		mips++;
 	out->maxMipLevels = mips;
-	out->maxArrayLayers = type == VK_IMAGE_TYPE_3D ? 1 : l->maxImageArrayLayers;
+	/* WebGPU has no 1D arrays (nor 1D mip chains) */
+	out->maxArrayLayers = type == VK_IMAGE_TYPE_3D || type == VK_IMAGE_TYPE_1D ? 1 : l->maxImageArrayLayers;
+	if (type == VK_IMAGE_TYPE_1D)
+		out->maxMipLevels = 1;
 	out->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
 	if (type == VK_IMAGE_TYPE_2D && (c & (4 | 16)) && !(usage & VK_IMAGE_USAGE_STORAGE_BIT))
 		out->sampleCounts |= VK_SAMPLE_COUNT_4_BIT;
@@ -647,6 +657,8 @@ static API VkResult CALL kw_vkMapMemory(VkDevice dh, VkDeviceMemory mh, VkDevice
 	if (!m->shadow)
 		return VK_ERROR_MEMORY_MAP_FAILED;
 	kw_readback(d, m);
+	if (d->link->dead) /* what the GPU wrote cannot be read back: no stale bytes */
+		return VK_ERROR_MEMORY_MAP_FAILED;
 	pthread_mutex_lock(&d->mu);
 	if (!m->sent) {
 		/* the last-sent copy lives only while mapped: the shadow equals what
@@ -695,7 +707,7 @@ static API VkResult CALL kw_vkInvalidateMappedMemoryRanges(VkDevice dh, uint32_t
 {
 	for (uint32_t i = 0; i < n; i++)
 		kw_readback(DEV(dh), HANDLE(struct kw_memory, r[i].memory));
-	return VK_SUCCESS;
+	return DEV(dh)->link->dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static API void CALL kw_vkGetDeviceMemoryCommitment(VkDevice d, VkDeviceMemory m, VkDeviceSize *out)
@@ -794,8 +806,11 @@ void kw_readback(struct kw_device *d, struct kw_memory *only)
 			break;
 		for (int i = 0; i < n; i++) {
 			struct kw_reply *rep = link_wait(d->link, rs[i]);
-			if (!rep)
+			/* the shadow would keep stale bytes: the device is lost instead */
+			if (kw_reply_lost(d->link, rep, "reading back a buffer the GPU wrote")) {
+				reply_free(rep);
 				break;
+			}
 			kw_stats.read_bytes += rep->binlen;
 			pthread_mutex_lock(&d->mu);
 			struct kw_buffer *b = bs[i];
@@ -826,6 +841,11 @@ static API VkResult CALL kw_vkCreateBuffer(VkDevice dh, const VkBufferCreateInfo
 {
 	(void)a;
 	struct kw_device *d = DEV(dh);
+	if (ci->size > d->pd->max_buffer) {
+		kw_err("vkCreateBuffer: %llu bytes is over the device's maxBufferSize (%llu): VK_ERROR_OUT_OF_DEVICE_MEMORY",
+		       (unsigned long long)ci->size, (unsigned long long)d->pd->max_buffer);
+		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+	}
 	struct kw_buffer *b = calloc(1, sizeof *b);
 	b->id = link_id(d->link);
 	b->size = ci->size;
@@ -943,8 +963,15 @@ static API VkResult CALL kw_vkCreateImage(VkDevice dh, const VkImageCreateInfo *
 {
 	(void)a;
 	struct kw_device *d = DEV(dh);
+	uint32_t caps = ci->format > 0 && ci->format < 256 ? d->pd->fmtcaps[ci->format] : 0;
+	if (!(caps & ~64u)) { /* the host has no texture format for it */
+		kw_err("vkCreateImage: format %u is not supported (no format features): VK_ERROR_FORMAT_NOT_SUPPORTED", ci->format);
+		return VK_ERROR_FORMAT_NOT_SUPPORTED;
+	}
+	/* kept working as optimal (right while the app only renders to, copies
+	 * or samples it), but the memory the CPU maps is not the texels */
 	if (ci->tiling != VK_IMAGE_TILING_OPTIMAL)
-		kw_log("linear-tiling images are unsupported (format %u)", ci->format);
+		kw_err("vkCreateImage: linear tiling is unsupported (treated as optimal): the image's bound memory does not hold its texels");
 	struct kw_image *im = calloc(1, sizeof *im);
 	im->id = kw_create_image_msg(d, ci);
 	im->format = ci->format;
@@ -1038,6 +1065,11 @@ static API VkResult CALL kw_vkCreateBufferView(VkDevice dh, const VkBufferViewCr
 {
 	(void)a;
 	struct kw_device *d = DEV(dh);
+	/* texel buffers: no format has buffer view features, and the
+	 * translator refuses samplerBuffer/imageBuffer (a pipeline declaring
+	 * one is created unusable). Kept creatable for apps that make views
+	 * they never use. */
+	kw_err("vkCreateBufferView: texel buffers are unsupported (format %u): a pipeline that uses this view cannot run", ci->format);
 	struct kw_obj *o = new_obj(d);
 	struct jb j = {0};
 	jb_printf(&j, "{\"op\":\"vkCreateBufferView\",\"id\":%u,\"buffer\":%u,\"format\":%u,\"offset\":%llu,\"range\":", o->id,
@@ -1143,6 +1175,27 @@ static int spirv_writable(const uint32_t *w, size_t nw, uint32_t *out, int cap)
 	return bad ? -1 : n;
 }
 
+/* does the module decorate anything BuiltIn BaseVertex (4424), BaseInstance
+ * (4425) or DrawIndex (4426)? WGSL has none: the translator reads 0 */
+static int spirv_base(const uint32_t *w, size_t nw)
+{
+	if (nw < 5 || w[0] != 0x07230203)
+		return 0;
+	for (size_t i = 5; i < nw;) {
+		uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+		if (!len || i + len > nw)
+			return 0;
+		if (op == 71 && len >= 4 && w[i + 2] == 11 && w[i + 3] >= 4424 && w[i + 3] <= 4426)
+			return 1;
+		if (op == 72 && len >= 5 && w[i + 3] == 11 && w[i + 4] >= 4424 && w[i + 4] <= 4426)
+			return 1;
+		if (op == 54) /* OpFunction: past the annotations */
+			return 0;
+		i += len;
+	}
+	return 0;
+}
+
 static API VkResult CALL kw_vkCreateShaderModule(VkDevice dh, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out)
 {
 	(void)a;
@@ -1152,6 +1205,7 @@ static API VkResult CALL kw_vkCreateShaderModule(VkDevice dh, const VkShaderModu
 	struct kw_shader *o = calloc(1, sizeof *o + (nw > 0 ? nw : 0) * sizeof(uint32_t));
 	o->id = link_id(d->link);
 	o->nw = nw;
+	o->base = spirv_base(ci->pCode, ci->codeSize / 4);
 	if (nw > 0)
 		memcpy(o->w, tmp, nw * sizeof(uint32_t));
 	struct jb j = {0};
@@ -1186,6 +1240,11 @@ static struct kw_pipe *new_pipe(struct kw_device *d, const VkPipelineShaderStage
 	struct kw_pipe *p = calloc(1, sizeof *p + (total > 0 ? total : 0) * sizeof(uint32_t));
 	p->id = link_id(d->link);
 	p->nw = total;
+	for (uint32_t i = 0; i < n; i++) {
+		struct kw_shader *m = HANDLE(struct kw_shader, st[i].module);
+		if (m && m->base)
+			p->base = 1;
+	}
 	if (total > 0) {
 		int k = 0;
 		for (uint32_t i = 0; i < n; i++) {
@@ -1490,19 +1549,82 @@ static void j_graphics(struct jb *j, uint32_t id, const VkGraphicsPipelineCreate
 		  oid((uint64_t)(uintptr_t)ci->renderPass), ci->subpass);
 }
 
+static const char *vk_result_name(VkResult r)
+{
+	switch (r) {
+	case VK_ERROR_INVALID_SHADER_NV: return "VK_ERROR_INVALID_SHADER_NV";
+	case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+	case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+	case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+	case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+	default: return "error";
+	}
+}
+
+/*
+ * Pipelines are requests with a reply: the host answers once it knows the
+ * pipeline compiles (translation, WGSL compilation, WebGPU's pipeline
+ * validation), with "err" (and maybe "result", a VkResult) when it cannot
+ * be made, or "unusable" when it is made but cannot run (it declares a
+ * resource kind WebGPU lacks: binding it in a submitted command buffer then
+ * loses the device). All of a call's pipelines are sent before the first
+ * wait, so they compile together. Failed ones are VK_NULL_HANDLE.
+ */
+static VkResult pipes_wait(struct kw_device *d, const char *call, uint32_t n, struct kw_pipe **ps, const uint32_t *rs, VkPipeline *out)
+{
+	VkResult res = VK_SUCCESS;
+	for (uint32_t i = 0; i < n; i++) {
+		struct kw_pipe *o = ps[i];
+		struct kw_reply *rep = link_wait(d->link, rs[i]);
+		VkResult r = VK_SUCCESS;
+		const char *e = rep ? js_get(rep->json, "err") : NULL, *u = rep ? js_get(rep->json, "unusable") : NULL;
+		char why[768];
+		if (!rep) {
+			r = VK_ERROR_DEVICE_LOST;
+		} else if (e) {
+			js_strcpy(e, why, sizeof why);
+			r = (VkResult)js_num(js_get(rep->json, "result"), VK_ERROR_INVALID_SHADER_NV);
+			if (r >= 0)
+				r = VK_ERROR_INVALID_SHADER_NV;
+			kw_err("%s: pipeline (id %u) not created: %s: %s", call, o->id, why, vk_result_name(r));
+		} else if (u) {
+			js_strcpy(u, why, sizeof why);
+			o->bad = strdup(why);
+			kw_err("%s: pipeline (id %u) cannot run on WebGPU (%s): created, but submitting a command buffer that binds it loses the device",
+			       call, o->id, why);
+		}
+		reply_free(rep);
+		if (r != VK_SUCCESS) {
+			destroy_id(d, o->id);
+			free(o);
+			out[i] = VK_NULL_HANDLE;
+			if (res == VK_SUCCESS)
+				res = r;
+		} else {
+			out[i] = (VkPipeline)(uintptr_t)o;
+		}
+	}
+	return res;
+}
+
 static API VkResult CALL kw_vkCreateGraphicsPipelines(VkDevice dh, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
 	const VkAllocationCallbacks *a, VkPipeline *out)
 {
 	(void)c, (void)a;
 	struct kw_device *d = DEV(dh);
+	struct kw_pipe **ps = calloc(n ? n : 1, sizeof *ps);
+	uint32_t *rs = calloc(n ? n : 1, sizeof *rs);
 	for (uint32_t i = 0; i < n; i++) {
-		struct kw_pipe *o = new_pipe(d, ci[i].pStages, ci[i].stageCount);
+		ps[i] = new_pipe(d, ci[i].pStages, ci[i].stageCount);
 		struct jb j = {0};
-		j_graphics(&j, o->id, &ci[i]);
-		send_msg(d, &j, NULL, 0);
-		out[i] = (VkPipeline)(uintptr_t)o;
+		j_graphics(&j, ps[i]->id, &ci[i]);
+		rs[i] = link_send(d->link, &j, NULL, 0, 1);
+		jb_free(&j);
 	}
-	return VK_SUCCESS;
+	VkResult res = pipes_wait(d, "vkCreateGraphicsPipelines", n, ps, rs, out);
+	free(ps);
+	free(rs);
+	return res;
 }
 
 static API VkResult CALL kw_vkCreateComputePipelines(VkDevice dh, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo *ci,
@@ -1510,18 +1632,33 @@ static API VkResult CALL kw_vkCreateComputePipelines(VkDevice dh, VkPipelineCach
 {
 	(void)c, (void)a;
 	struct kw_device *d = DEV(dh);
+	struct kw_pipe **ps = calloc(n ? n : 1, sizeof *ps);
+	uint32_t *rs = calloc(n ? n : 1, sizeof *rs);
 	for (uint32_t i = 0; i < n; i++) {
-		struct kw_pipe *o = new_pipe(d, &ci[i].stage, 1);
+		ps[i] = new_pipe(d, &ci[i].stage, 1);
 		struct jb j = {0};
-		jb_printf(&j, "{\"op\":\"vkCreateComputePipelines\",\"id\":%u,\"flags\":%u,\"stage\":", o->id, ci[i].flags);
+		jb_printf(&j, "{\"op\":\"vkCreateComputePipelines\",\"id\":%u,\"flags\":%u,\"stage\":", ps[i]->id, ci[i].flags);
 		j_stage(&j, &ci[i].stage);
 		jb_printf(&j, ",\"layout\":%u}", oid((uint64_t)(uintptr_t)ci[i].layout));
-		send_msg(d, &j, NULL, 0);
-		out[i] = (VkPipeline)(uintptr_t)o;
+		rs[i] = link_send(d->link, &j, NULL, 0, 1);
+		jb_free(&j);
 	}
-	return VK_SUCCESS;
+	VkResult res = pipes_wait(d, "vkCreateComputePipelines", n, ps, rs, out);
+	free(ps);
+	free(rs);
+	return res;
 }
-DESTROY_FN(Pipeline, VkPipeline)
+
+static API void CALL kw_vkDestroyPipeline(VkDevice dh, VkPipeline ph, const VkAllocationCallbacks *a)
+{
+	(void)a;
+	struct kw_pipe *p = HANDLE(struct kw_pipe, ph);
+	if (!p)
+		return;
+	destroy_id(DEV(dh), p->id);
+	free(p->bad);
+	free(p);
+}
 
 /* pipeline cache: guest-only, empty */
 static API VkResult CALL kw_vkCreatePipelineCache(VkDevice d, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out)
@@ -1760,15 +1897,15 @@ static API VkResult CALL kw_vkGetFenceStatus(VkDevice dh, VkFence fh)
 {
 	struct kw_device *d = DEV(dh);
 	struct kw_fence *f = HANDLE(struct kw_fence, fh);
-	if (f->signaled)
-		return VK_SUCCESS;
 	if (d->link->dead)
 		return VK_ERROR_DEVICE_LOST;
+	if (f->signaled)
+		return VK_SUCCESS;
 	if (f->r && link_poll(d->link, f->r) && fence_wait_slice(d, f, 0)) {
 		kw_readback(d, NULL);
-		return VK_SUCCESS;
+		return d->link->dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 	}
-	return VK_NOT_READY;
+	return d->link->dead ? VK_ERROR_DEVICE_LOST : VK_NOT_READY;
 }
 
 static int64_t mono_ns(void)
@@ -1790,6 +1927,11 @@ static int fence_wait_slice(struct kw_device *d, struct kw_fence *f, int64_t sli
 	int to = 0;
 	struct kw_reply *rep = link_wait_timeout(d->link, r, slice_ns, &to);
 	if (rep || !to) { /* the reply, or a dead link */
+		/* an "err" reply: the submit did not run (the host has also ended
+		 * the link): the device is lost, the fence counts as signaled so no
+		 * waiter hangs, and every wait reports VK_ERROR_DEVICE_LOST */
+		if (rep)
+			kw_reply_lost(d->link, rep, "vkQueueSubmit");
 		reply_free(rep);
 		uint32_t exp = r;
 		__atomic_compare_exchange_n(&f->r, &exp, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
@@ -1846,16 +1988,64 @@ static API VkResult CALL kw_vkWaitForFences(VkDevice dh, uint32_t n, const VkFen
 		}
 	}
 	kw_stats.wait_ns += kw_now() - t0;
-	if (waited || res == VK_SUCCESS)
+	if ((waited || res == VK_SUCCESS) && !d->link->dead)
 		kw_readback(d, NULL);
-	return res;
+	return d->link->dead ? VK_ERROR_DEVICE_LOST : res;
 }
+
+/*
+ * Semaphores. The one queue runs in submission order, so waits and signals
+ * between submits need nothing. Timeline semaphores (timelineSemaphore is
+ * reported false, but ggml-vulkan makes them anyway) keep their values
+ * guest-side: `submitted` is the highest value a submit signals, reached
+ * once the work submitted so far is done; host waits and counter queries
+ * wait for that work (kw_sync) rather than answer early.
+ */
+struct kw_sem {
+	int timeline;
+	uint64_t value; /* reached */
+	uint64_t submitted; /* signalled by submitted work */
+};
+static pthread_mutex_t sem_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static API VkResult CALL kw_vkCreateSemaphore(VkDevice d, const VkSemaphoreCreateInfo *ci, const VkAllocationCallbacks *a, VkSemaphore *out)
 {
-	(void)d, (void)ci, (void)a;
-	*out = (VkSemaphore)(uintptr_t)calloc(1, 8);
+	(void)d, (void)a;
+	struct kw_sem *sem = calloc(1, sizeof *sem);
+	for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext)
+		if (s->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO &&
+		    ((const VkSemaphoreTypeCreateInfo *)s)->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) {
+			sem->timeline = 1;
+			sem->value = sem->submitted = ((const VkSemaphoreTypeCreateInfo *)s)->initialValue;
+		}
+	*out = (VkSemaphore)(uintptr_t)sem;
 	return VK_SUCCESS;
+}
+
+/* at vkQueueSubmit: the timeline values its batches signal */
+static void sem_submitted(const VkSubmitInfo *si, uint32_t n)
+{
+	pthread_mutex_lock(&sem_mu);
+	for (uint32_t i = 0; i < n; i++)
+		for (const VkBaseInStructure *s = si[i].pNext; s; s = s->pNext) {
+			if (s->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+				continue;
+			const VkTimelineSemaphoreSubmitInfo *t = (const void *)s;
+			for (uint32_t k = 0; k < t->signalSemaphoreValueCount && k < si[i].signalSemaphoreCount; k++) {
+				struct kw_sem *sem = HANDLE(struct kw_sem, si[i].pSignalSemaphores[k]);
+				if (sem && sem->timeline && t->pSignalSemaphoreValues[k] > sem->submitted)
+					sem->submitted = t->pSignalSemaphoreValues[k];
+			}
+			/* a wait for a value no submit or host signal has given yet would
+			 * need the queue to stall: this queue runs it at once */
+			for (uint32_t k = 0; k < t->waitSemaphoreValueCount && k < si[i].waitSemaphoreCount; k++) {
+				struct kw_sem *sem = HANDLE(struct kw_sem, si[i].pWaitSemaphores[k]);
+				if (sem && sem->timeline && t->pWaitSemaphoreValues[k] > sem->submitted && t->pWaitSemaphoreValues[k] > sem->value)
+					kw_err("vkQueueSubmit: a wait for timeline value %llu that nothing has signalled yet does not stall the queue (unsupported)",
+					       (unsigned long long)t->pWaitSemaphoreValues[k]);
+			}
+		}
+	pthread_mutex_unlock(&sem_mu);
 }
 static API void CALL kw_vkDestroySemaphore(VkDevice d, VkSemaphore s, const VkAllocationCallbacks *a)
 {
@@ -1942,9 +2132,7 @@ static API VkResult CALL kw_vkGetQueryPoolResults(VkDevice dh, VkQueryPool qh, u
 	jb_printf(&j, "{\"op\":\"getQueryPoolResults\",\"queryPool\":%u,\"firstQuery\":%u,\"queryCount\":%u}", q->id, first, n);
 	struct kw_reply *rep = link_call(d->link, &j, NULL, 0);
 	jb_free(&j);
-	if (!rep)
-		return VK_ERROR_DEVICE_LOST;
-	if (js_get(rep->json, "err")) {
+	if (kw_reply_lost(d->link, rep, "vkGetQueryPoolResults")) {
 		reply_free(rep);
 		return VK_ERROR_DEVICE_LOST;
 	}
@@ -2008,6 +2196,20 @@ static void cb_reset(struct kw_cmdbuf *cb)
 	cb->nwritten = 0;
 	memset(cb->pipe, 0, sizeof cb->pipe);
 	memset(cb->sets, 0, sizeof cb->sets);
+	cb->bad[0] = 0;
+}
+
+/* the command buffer cannot run as recorded: vkQueueSubmit of it loses the device */
+static void cb_bad(struct kw_cmdbuf *cb, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void cb_bad(struct kw_cmdbuf *cb, const char *fmt, ...)
+{
+	if (cb->bad[0])
+		return;
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(cb->bad, sizeof cb->bad, fmt, ap);
+	va_end(ap);
+	kw_err("a command buffer %s: submitting it will lose the device", cb->bad);
 }
 
 static void cb_free(struct kw_cmdbuf *cb)
@@ -2138,8 +2340,11 @@ static API void CALL kw_vkCmdEndRenderPass(VkCommandBuffer c) { JS(cmd(c, "vkCmd
 static API void CALL kw_vkCmdBindPipeline(VkCommandBuffer c, VkPipelineBindPoint bp, VkPipeline p)
 {
 	jb_printf(cmd(c, "vkCmdBindPipeline"), ",\"pipelineBindPoint\":%u,\"pipeline\":%u}", bp, OID(p));
+	struct kw_pipe *kp = HANDLE(struct kw_pipe, p);
 	if (bp <= 1)
-		CB(c)->pipe[bp] = HANDLE(struct kw_pipe, p);
+		CB(c)->pipe[bp] = kp;
+	if (kp && kp->bad)
+		cb_bad(CB(c), "binds pipeline (id %u), which cannot run on WebGPU (%s)", kp->id, kp->bad);
 }
 
 /* at a draw or dispatch: the bound sets' storage buffers that the bound
@@ -2269,13 +2474,25 @@ static API void CALL kw_vkCmdSetStencilReference(VkCommandBuffer c, VkStencilFac
 	jb_printf(cmd(c, "vkCmdSetStencilReference"), ",\"faceMask\":%u,\"reference\":%u}", f, r);
 }
 
+/* BaseVertex/BaseInstance read 0 on WebGPU: rendering approximations are
+ * kept (vkd3d needs VK_KHR_shader_draw_parameters), with this warning */
+static void base_warn(VkCommandBuffer c, const char *call, int nonzero)
+{
+	struct kw_pipe *p = CB(c)->pipe[0];
+	if (nonzero && p && p->base)
+		kw_err("%s: the pipeline's shaders read BaseVertex/BaseInstance, which read 0 on WebGPU: wrong values with a non-zero "
+		       "first vertex, vertex offset or first instance", call);
+}
+
 static API void CALL kw_vkCmdDraw(VkCommandBuffer c, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi)
 {
+	base_warn(c, "vkCmdDraw", fv || fi);
 	mark_written(c, 0);
 	jb_printf(cmd(c, "vkCmdDraw"), ",\"vertexCount\":%u,\"instanceCount\":%u,\"firstVertex\":%u,\"firstInstance\":%u}", vc, ic, fv, fi);
 }
 static API void CALL kw_vkCmdDrawIndexed(VkCommandBuffer c, uint32_t n, uint32_t ic, uint32_t fi, int32_t vo, uint32_t finst)
 {
+	base_warn(c, "vkCmdDrawIndexed", vo || finst);
 	mark_written(c, 0);
 	jb_printf(cmd(c, "vkCmdDrawIndexed"), ",\"indexCount\":%u,\"instanceCount\":%u,\"firstIndex\":%u,\"vertexOffset\":%d,\"firstInstance\":%u}",
 		  n, ic, fi, vo, finst);
@@ -2491,6 +2708,8 @@ static API void CALL kw_vkCmdExecuteCommands(VkCommandBuffer c, uint32_t n, cons
 		jb_put(&p->cmds, s->cmds.p, s->cmds.n);
 		for (size_t k = 0; k < s->nwritten; k++)
 			cb_written(p, s->written[k]);
+		if (s->bad[0] && !p->bad[0])
+			snprintf(p->bad, sizeof p->bad, "%s", s->bad);
 	}
 }
 
@@ -2538,6 +2757,21 @@ static API VkResult CALL kw_vkQueueSubmit(VkQueue qh, uint32_t n, const VkSubmit
 {
 	struct kw_device *d = ((struct kw_queue *)qh)->dev;
 	struct kw_fence *f = HANDLE(struct kw_fence, fh);
+	if (d->link->dead)
+		return VK_ERROR_DEVICE_LOST;
+	/* a command buffer recorded something the host cannot run: the work
+	 * would be wrong or missing, so the device is lost instead */
+	for (uint32_t i = 0; i < n; i++)
+		for (uint32_t k = 0; k < si[i].commandBufferCount; k++) {
+			struct kw_cmdbuf *cb = CB(si[i].pCommandBuffers[k]);
+			if (cb->bad[0]) {
+				char why[512];
+				snprintf(why, sizeof why, "vkQueueSubmit: the command buffer %s", cb->bad);
+				link_lose(d->link, why);
+				return VK_ERROR_DEVICE_LOST;
+			}
+		}
+	sem_submitted(si, n);
 	kw_flush_writes(d, NULL);
 	int64_t t0 = kw_now();
 	struct jb j = {0};
@@ -2586,11 +2820,12 @@ static VkResult kw_sync(struct kw_device *d)
 	JS(&j, "{\"op\":\"sync\"}");
 	struct kw_reply *rep = link_call(d->link, &j, NULL, 0);
 	jb_free(&j);
-	if (!rep)
-		return VK_ERROR_DEVICE_LOST;
+	int lost = kw_reply_lost(d->link, rep, "waiting for the queue");
 	reply_free(rep);
+	if (lost || d->link->dead)
+		return VK_ERROR_DEVICE_LOST;
 	kw_readback(d, NULL);
-	return VK_SUCCESS;
+	return d->link->dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static API VkResult CALL kw_vkQueueWaitIdle(VkQueue q) { return kw_sync(((struct kw_queue *)q)->dev); }
@@ -2683,8 +2918,8 @@ static API void CALL kw_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhys
 			ZBODY(s, VkPhysicalDeviceSamplerYcbcrConversionFeatures);
 			break;
 		case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
-			/* the capability is accepted; a shader reading BaseVertex,
-			 * BaseInstance or DrawIndex fails at translation (logged) */
+			/* the capability is accepted (vkd3d requires it); BaseVertex and
+			 * BaseInstance read 0 (a draw with non-zero bases warns) */
 			((VkPhysicalDeviceShaderDrawParametersFeatures *)s)->shaderDrawParameters = VK_TRUE;
 			break;
 		default:
@@ -2875,8 +3110,9 @@ static API void CALL kw_vkGetDeviceGroupPeerMemoryFeatures(VkDevice d, uint32_t 
 static API void CALL kw_vkCmdSetDeviceMask(VkCommandBuffer c, uint32_t m) { (void)c, (void)m; }
 static API void CALL kw_vkCmdDispatchBase(VkCommandBuffer c, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z)
 {
+	/* WebGPU has no base workgroup: dispatching from 0 would compute the wrong part */
 	if (bx || by || bz)
-		kw_log("vkCmdDispatchBase: a non-zero base is unsupported");
+		cb_bad(CB(c), "records vkCmdDispatchBase with a non-zero base (%u, %u, %u), which is unsupported", bx, by, bz);
 	kw_vkCmdDispatch(c, x, y, z);
 }
 
@@ -2909,8 +3145,11 @@ static API VkResult CALL kw_vkCreateDescriptorUpdateTemplate(VkDevice d, const V
 	VkDescriptorUpdateTemplate *out)
 {
 	(void)d, (void)a;
-	if (ci->templateType != VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET)
-		kw_log("push descriptor templates are unsupported");
+	if (ci->templateType != VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET) {
+		kw_err("vkCreateDescriptorUpdateTemplate: push descriptor templates are unsupported (no VK_KHR_push_descriptor): "
+		       "VK_ERROR_FEATURE_NOT_PRESENT");
+		return VK_ERROR_FEATURE_NOT_PRESENT;
+	}
 	struct kw_dtemplate *t = malloc(sizeof *t + ci->descriptorUpdateEntryCount * sizeof t->e[0]);
 	t->n = ci->descriptorUpdateEntryCount;
 	memcpy(t->e, ci->pDescriptorUpdateEntries, t->n * sizeof t->e[0]);
@@ -2965,27 +3204,80 @@ static API void CALL kw_vkUpdateDescriptorSetWithTemplate(VkDevice d, VkDescript
 }
 
 /* Vulkan 1.2 core entry points whose features are reported false */
-static API VkResult CALL kw_vkGetSemaphoreCounterValue(VkDevice d, VkSemaphore s, uint64_t *v)
+
+/* timeline semaphores (see struct kw_sem): values signalled by submitted work count once that work is done */
+static VkResult sem_settle(struct kw_device *d, struct kw_sem *sem)
 {
-	(void)d, (void)s;
-	*v = 0;
+	pthread_mutex_lock(&sem_mu);
+	uint64_t want = sem->submitted, have = sem->value;
+	pthread_mutex_unlock(&sem_mu);
+	if (want <= have)
+		return VK_SUCCESS;
+	VkResult r = kw_sync(d);
+	if (r != VK_SUCCESS)
+		return r;
+	pthread_mutex_lock(&sem_mu);
+	if (sem->value < want)
+		sem->value = want;
+	pthread_mutex_unlock(&sem_mu);
 	return VK_SUCCESS;
 }
-static API VkResult CALL kw_vkWaitSemaphores(VkDevice d, const VkSemaphoreWaitInfo *i, uint64_t t)
+static API VkResult CALL kw_vkGetSemaphoreCounterValue(VkDevice d, VkSemaphore s, uint64_t *v)
 {
-	(void)d, (void)i, (void)t;
-	kw_log("timeline semaphores are unsupported");
-	return VK_SUCCESS;
+	struct kw_sem *sem = HANDLE(struct kw_sem, s);
+	VkResult r = sem_settle(DEV(d), sem);
+	pthread_mutex_lock(&sem_mu);
+	*v = sem->value;
+	pthread_mutex_unlock(&sem_mu);
+	return r;
+}
+static API VkResult CALL kw_vkWaitSemaphores(VkDevice dh, const VkSemaphoreWaitInfo *i, uint64_t t)
+{
+	struct kw_device *d = DEV(dh);
+	int64_t end = t >= (uint64_t)INT64_MAX / 2 ? INT64_MAX : mono_ns() + (int64_t)t;
+	for (;;) {
+		uint32_t ok = 0;
+		for (uint32_t k = 0; k < i->semaphoreCount; k++) {
+			struct kw_sem *sem = HANDLE(struct kw_sem, i->pSemaphores[k]);
+			pthread_mutex_lock(&sem_mu);
+			int reached = sem->value >= i->pValues[k], coming = sem->submitted >= i->pValues[k];
+			pthread_mutex_unlock(&sem_mu);
+			if (!reached && coming) { /* signalled by submitted work: wait for it */
+				VkResult r = sem_settle(d, sem);
+				if (r != VK_SUCCESS)
+					return r;
+				reached = 1;
+			}
+			ok += reached;
+		}
+		if (ok == i->semaphoreCount || (ok && (i->flags & VK_SEMAPHORE_WAIT_ANY_BIT)))
+			return VK_SUCCESS;
+		if (d->link->dead)
+			return VK_ERROR_DEVICE_LOST;
+		/* a value only a host signal (another thread) can give */
+		int64_t left = end - mono_ns();
+		if (left <= 0)
+			return VK_TIMEOUT;
+		struct timespec ts = {0, left < 1000000 ? left : 1000000};
+		nanosleep(&ts, NULL);
+	}
 }
 static API VkResult CALL kw_vkSignalSemaphore(VkDevice d, const VkSemaphoreSignalInfo *i)
 {
-	(void)d, (void)i;
+	(void)d;
+	struct kw_sem *sem = HANDLE(struct kw_sem, i->semaphore);
+	pthread_mutex_lock(&sem_mu);
+	if (i->value > sem->value)
+		sem->value = i->value;
+	if (i->value > sem->submitted)
+		sem->submitted = i->value;
+	pthread_mutex_unlock(&sem_mu);
 	return VK_SUCCESS;
 }
 static API VkDeviceAddress CALL kw_vkGetBufferDeviceAddress(VkDevice d, const VkBufferDeviceAddressInfo *i)
 {
 	(void)d, (void)i;
-	kw_log("buffer device addresses are unsupported");
+	kw_err("vkGetBufferDeviceAddress: buffer device addresses are unsupported (bufferDeviceAddress is false): returning 0");
 	return 0;
 }
 static API uint64_t CALL kw_vkGetBufferOpaqueCaptureAddress(VkDevice d, const VkBufferDeviceAddressInfo *i)
@@ -3000,13 +3292,13 @@ static API uint64_t CALL kw_vkGetDeviceMemoryOpaqueCaptureAddress(VkDevice d, co
 }
 static API void CALL kw_vkCmdDrawIndirectCount(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, VkBuffer cb, VkDeviceSize co, uint32_t m, uint32_t s)
 {
-	(void)c, (void)b, (void)o, (void)cb, (void)co, (void)m, (void)s;
-	kw_log("vkCmdDrawIndirectCount is unsupported (dropped)");
+	(void)b, (void)o, (void)cb, (void)co, (void)m, (void)s;
+	cb_bad(CB(c), "records vkCmdDrawIndirectCount, which is unsupported (drawIndirectCount is false)");
 }
 static API void CALL kw_vkCmdDrawIndexedIndirectCount(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, VkBuffer cb, VkDeviceSize co, uint32_t m, uint32_t s)
 {
-	(void)c, (void)b, (void)o, (void)cb, (void)co, (void)m, (void)s;
-	kw_log("vkCmdDrawIndexedIndirectCount is unsupported (dropped)");
+	(void)b, (void)o, (void)cb, (void)co, (void)m, (void)s;
+	cb_bad(CB(c), "records vkCmdDrawIndexedIndirectCount, which is unsupported (drawIndirectCount is false)");
 }
 
 /* ---- render pass 2 ---- */

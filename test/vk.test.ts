@@ -97,6 +97,37 @@ test("VkHost: lazy load, one renderer connection per stream, bytes both ways", a
 	assert.ok(b.wasReset(), "shutdown resets the open connections");
 });
 
+test("VkHost: a stream the renderer ends is closed after its last frame (the reason) is written", async () => {
+	let onConn: ((c: VsockConnection) => void) | undefined;
+	const vsock = { listen: (_p: number, h: (c: VsockConnection) => void) => ((onConn = h), { close() {} }) } as unknown as Vsock;
+	class FakeRenderer {
+		connect(send: (b: Uint8Array) => void, close?: () => void) {
+			return {
+				// a lost device: the {"lost"} frame, then the close, at once
+				feed: () => {
+					send(new TextEncoder().encode('{"r":0,"lost":"why"}'));
+					close?.();
+				},
+				close() {},
+			};
+		}
+	}
+	const modules: VkModules = { VkRenderer: FakeRenderer, loadVkShader: async () => ({ translate() {} }) };
+	const device = { lost: new Promise(() => {}), features: [] } as unknown as VkGpuDevice;
+	const prep = prepareVk({ device }, true, { shaderWasm: new URL("file:///none.wasm"), load: async () => modules }, () => {});
+	const host = startVk(prep, vsock, () => {})!;
+	const a = fakeConn();
+	const order: string[] = [];
+	// writes complete a tick late, as the vsock's do once the guest gives credit
+	(a.conn as unknown as { writable: WritableStream }).writable = new WritableStream({ write: () => new Promise((r) => setTimeout(() => (order.push("written"), r(undefined)), 5)) });
+	(a.conn as unknown as { close(): void }).close = () => void order.push("closed");
+	onConn!(a.conn);
+	a.push(new Uint8Array([1]));
+	for (let i = 0; i < 50 && !order.includes("closed"); i++) await new Promise((r) => setTimeout(r, 10));
+	assert.deepEqual(order, ["written", "closed"]);
+	host.shutdown();
+});
+
 test("VkHost: a lost device cuts its programs off, the next one gets a new device and renderer", async () => {
 	let onConn: ((c: VsockConnection) => void) | undefined;
 	const vsock = { listen: (_p: number, h: (c: VsockConnection) => void) => ((onConn = h), { close() {} }) } as unknown as Vsock;

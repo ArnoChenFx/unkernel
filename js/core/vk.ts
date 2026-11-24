@@ -283,9 +283,23 @@ export class VkHost {
 			if (!this.#down) this.#log(`[host] vk: ${what}: ${(e as Error)?.message ?? e}`);
 			conn.reset();
 		};
+		// writes not yet taken by the stream: a close waits for them (the
+		// renderer's last frame before it ends a stream says why: {"lost"})
+		let inflight = 0;
+		let drained: (() => void) | undefined;
 		const send = (bytes: Uint8Array) => {
 			stats.bytesOut += bytes.length;
-			writer.write(bytes).catch((e) => fail("a write to the guest failed", e));
+			inflight++;
+			writer
+				.write(bytes)
+				.catch((e) => fail("a write to the guest failed", e))
+				.finally(() => {
+					if (--inflight === 0) drained?.();
+				});
+		};
+		const closeAfterWrites = () => {
+			if (!inflight) conn.close();
+			else drained = () => conn.close();
 		};
 		const run = async () => {
 			const reader = conn.readable.getReader();
@@ -298,7 +312,7 @@ export class VkHost {
 				return;
 			}
 			// The renderer ends a stream itself on a device loss or a bad frame: close it towards the guest.
-			link = renderer.connect(send, () => conn.close());
+			link = renderer.connect(send, closeAfterWrites);
 			for (;;) {
 				const { value, done } = await reader.read();
 				if (done) break;

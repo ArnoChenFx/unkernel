@@ -5,9 +5,11 @@
 // vkCmdUpdateBuffer, vkCmdFillBuffer patterns, blit parameters) goes into
 // one upload buffer per submit, written while encoding and copied or bound
 // from there, so it keeps its place in the command order (queue.writeBuffer
-// would run before the whole submit).
+// would run before the whole submit). A command that cannot be encoded
+// fails the whole submit (VkDeviceLost: the guest's device is lost) rather
+// than being skipped.
 
-import { BU, TU, UNUSED, isWhole, dkey, pipelineVariant, computeVariant, effectiveExt, type Conn } from "./vk-host.ts";
+import { BU, TU, UNUSED, isWhole, dkey, pipelineVariant, computeVariant, effectiveExt, VkDeviceLost, type Conn } from "./vk-host.ts";
 import { hasDepth, hasStencil, texFormatInfo } from "./vk-formats.ts";
 
 const ALIGN = 256;
@@ -880,6 +882,7 @@ class Exec {
 				break;
 			case "vkCmdBindPipeline": {
 				const p = this.c.get(k.pipeline, "pipeline");
+				if (p.failed) throw new Error(`pipeline ${k.pipeline} cannot run: ${p.failed}`);
 				if (p.kind === "compute") this.comp.pipeline = p;
 				else {
 					this.gfx.pipeline = p;
@@ -1079,7 +1082,8 @@ class Exec {
 				break;
 			}
 			case "vkCmdDispatchIndirect":
-				if (this.comp.pipeline?.stage?.res?.dispatchScale) this.c.log("kwvk: vkCmdDispatchIndirect with a shrunk workgroup (dispatchScale) is unsupported: the group counts are not scaled");
+				// the group counts live in GPU memory and cannot be scaled: 1/k of the work would run
+				if (this.comp.pipeline?.stage?.res?.dispatchScale) throw new Error("vkCmdDispatchIndirect of a pipeline whose workgroup was split to fit the device (dispatchScale) is unsupported");
 				this.flushDispatch().dispatchWorkgroupsIndirect(this.buffer(k.buffer).buf, k.offset || 0);
 				break;
 			case "vkCmdCopyBuffer": {
@@ -1175,11 +1179,30 @@ class Exec {
 	}
 }
 
-/** Replay a submit; resolves when the GPU has finished it. */
+/**
+ * Replay a submit; resolves when the GPU has finished it. A command that
+ * cannot be encoded throws VkDeviceLost naming it (the submit is dropped).
+ */
 export function runSubmit(c: Conn, cmds: any[]): Promise<void> {
-	if (!Array.isArray(cmds)) throw new Error("cmds is not an array");
+	if (!Array.isArray(cmds)) throw new VkDeviceLost("cmds is not an array");
 	const t0 = performance.now();
 	const ex = new Exec(c, cmds);
+	const abandon = (what: string, e: unknown) => {
+		try {
+			if (ex.pass) ex.pass.end();
+		} catch {}
+		try {
+			ex.up.buf.unmap();
+			ex.up.buf.destroy();
+		} catch {}
+		for (const t of ex.scratch) {
+			try {
+				t.destroy();
+			} catch {}
+		}
+		c.stats.encodeMs += performance.now() - t0;
+		return new VkDeviceLost(`${what}: ${(e as Error)?.message ?? e}`);
+	};
 	for (let i = 0; i < cmds.length; i++) {
 		const k = cmds[i];
 		ex.index = i;
@@ -1187,13 +1210,13 @@ export function runSubmit(c: Conn, cmds: any[]): Promise<void> {
 			if (!k || typeof k !== "object" || typeof k.c !== "string") throw new Error("bad command");
 			ex.run(k);
 		} catch (e) {
-			c.log(`kwvk: ${typeof k?.c === "string" ? k.c.slice(0, 64) : "command"}: ${(e as Error).message}`);
+			throw abandon(`command ${i} (${typeof k?.c === "string" ? k.c.slice(0, 64) : "?"})`, e);
 		}
 	}
 	try {
 		if (ex.pass) ex.endPass();
 	} catch (e) {
-		c.log(`kwvk: vkQueueSubmit: ${(e as Error).message}`);
+		throw abandon("the end of the command list", e);
 	}
 	ex.finishQueries();
 	ex.up.buf.unmap();

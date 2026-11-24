@@ -9,7 +9,14 @@
 // Nothing throws out of the message loop: each op runs in a WebGPU error
 // scope and a try block, failures are logged once per distinct text
 // ("kwvk: <op>: <error>") and answered with "err" when the request has
-// "r".
+// "r". What the guest cannot be told at the call that caused it is never
+// left as a silently wrong result: a failed submit (a command the host
+// cannot encode, or a WebGPU validation error, which drops the whole
+// submit) or a failed request without "r" ends the connection as a lost
+// device (deviceLost: a {"lost"} frame with the reason, then the close); an
+// object whose creation failed is kept as a tombstone, so that its first
+// use fails with the reason. Pipelines are requests with a reply that waits
+// for WGSL compilation and pipeline validation (pipelineCheck).
 
 import { formatTable, formatCaps, CAP_FILTER, vkFormat, texFormatInfo, hasDepth, hasStencil, srgbTwin, type VkFormatInfo } from "./vk-formats.ts";
 import { runSubmit } from "./vk-exec.ts";
@@ -86,6 +93,8 @@ export interface VkStats {
 	pipelines: number;
 	/** failed ops and WebGPU validation errors */
 	errors: number;
+	/** connections the host ended as a lost device for the guest (a failed submit or request it could not answer; WebGPU device losses not counted) */
+	lost: number;
 	/** CPU time spent encoding submits (vk-exec.ts), ms */
 	encodeMs: number;
 	/** CPU time spent parsing frames (JSON), ms */
@@ -99,7 +108,7 @@ export interface VkStats {
 const GAUGES = new Set(["liveObjects", "liveGpu"]);
 
 export function newStats(): VkStats {
-	return { messages: 0, submits: 0, draws: 0, dispatches: 0, presents: 0, bytesWritten: 0, bytesRead: 0, translations: 0, translateMs: 0, pipelines: 0, errors: 0, encodeMs: 0, parseMs: 0, liveObjects: 0, liveGpu: 0 };
+	return { messages: 0, submits: 0, draws: 0, dispatches: 0, presents: 0, bytesWritten: 0, bytesRead: 0, translations: 0, translateMs: 0, pipelines: 0, errors: 0, lost: 0, encodeMs: 0, parseMs: 0, liveObjects: 0, liveGpu: 0 };
 }
 
 export interface VkRendererOptions {
@@ -146,6 +155,40 @@ const VIEW_DIM = ["1d", "2d", "3d", "cube", "2d-array", "2d-array", "cube-array"
 
 // Vulkan descriptor types
 export const DT = { SAMPLER: 0, COMBINED: 1, SAMPLED_IMAGE: 2, STORAGE_IMAGE: 3, UNIFORM_TEXEL: 4, STORAGE_TEXEL: 5, UNIFORM: 6, STORAGE: 7, UNIFORM_DYN: 8, STORAGE_DYN: 9, INPUT_ATTACHMENT: 10 };
+
+/** A failure that makes the device lost for the guest whatever the request (thrown by runSubmit). */
+export class VkDeviceLost extends Error {}
+
+/** An error whose reply carries the VkResult the ICD should return ("result"). */
+export class VkResultError extends Error {
+	result: number;
+	constructor(message: string, result: number) {
+		super(message);
+		this.result = result;
+	}
+}
+export const VK_ERROR_FEATURE_NOT_PRESENT = -8;
+
+/** Ops that create objects by id: when one fails without a reply, its ids become tombstones (failing at first use). */
+const CREATE_OPS = new Set([
+	"vkCreateBuffer", "vkCreateImage", "vkCreateImageView", "vkCreateSampler", "vkCreateShaderModule", "vkCreateDescriptorSetLayout",
+	"vkCreatePipelineLayout", "vkCreateRenderPass", "vkCreateRenderPass2", "vkCreateFramebuffer", "vkCreateGraphicsPipelines",
+	"vkCreateComputePipelines", "vkCreateQueryPool", "vkCreateBufferView", "vkAllocateDescriptorSets",
+]);
+
+/**
+ * Pipeline failures that make the pipeline unusable rather than refused:
+ * resource kinds WebGPU lacks (texel buffers, 1D-array storage images),
+ * which apps such as vkd3d declare in pipelines they make at start-up and
+ * may never run. Binding one in a submit loses the device.
+ */
+const UNUSABLE = /texel buffers|_1d_array/;
+
+/** The first line of a WebGPU message (they are multi-line chains). */
+export function firstLine(text: string): string {
+	const l = String(text).split("\n").map((x) => x.trim()).filter(Boolean);
+	return (l[0] || "").slice(0, 400);
+}
 
 /** Strip Vulkan's pointer prefixes from keys, in place: pStages -> stages, pName -> name. */
 function normalize(v: any, depth = 0): any {
@@ -234,7 +277,7 @@ export class VkRenderer {
 			const i = { reason: info?.reason, message: info?.message };
 			this.isLost = true;
 			this.log(`kwvk: device lost (${i.reason ?? "?"}: ${i.message ?? ""}): failing ${this.conns.size} connection(s)`);
-			for (const c of [...this.conns.values()]) c.lose(`device lost: ${i.message || i.reason || ""}`);
+			for (const c of [...this.conns.values()]) c.lose(`the WebGPU device was lost (${i.message || i.reason || "?"})`);
 			try {
 				this.onLost?.(i);
 			} catch {}
@@ -265,7 +308,7 @@ export class VkRenderer {
 	 */
 	connect(send: (bytes: Uint8Array) => void, close?: () => void): VkConnection {
 		const c = new Conn(this, send, this.nextConn++, close);
-		if (this.isLost) c.lose("device lost");
+		if (this.isLost) c.lose("the WebGPU device was lost");
 		else this.conns.set(c.id, c);
 		return c;
 	}
@@ -369,6 +412,8 @@ export class Conn implements VkConnection {
 	closeFn?: () => void;
 	/** "r" of deferred replies not sent yet (answered with err at device loss) */
 	pending = new Set<number>();
+	/** settles once the WebGPU validation of every submit so far is known (a failed one lost the device first) */
+	checked: Promise<unknown> = Promise.resolve();
 
 	constructor(r: VkRenderer, send: (bytes: Uint8Array) => void, id: number, close?: () => void) {
 		this.r = r;
@@ -397,9 +442,10 @@ export class Conn implements VkConnection {
 		this.r.fanIndex = v;
 	}
 
-	/** Fail the connection (device loss, protocol abuse): answer what is pending with err, drop everything, end the stream. */
+	/** Fail the connection (device loss, protocol abuse): say why ({"lost"}), answer what is pending with err, drop everything, end the stream. */
 	lose(why: string): void {
 		if (this.closed) return;
+		this.send({ r: 0, lost: why });
 		for (const r of this.pending) this.send({ r, err: why });
 		this.pending.clear();
 		this.close();
@@ -410,6 +456,19 @@ export class Conn implements VkConnection {
 
 	log(line: string): void {
 		this.r.log(line);
+	}
+
+	/**
+	 * The guest's work went wrong in a way no reply can report (a failed
+	 * submit, a failed request without "r"): rather than let the program go
+	 * on with wrong or missing results, its device is lost (VK_ERROR_DEVICE_LOST
+	 * from its next wait, submit or present; the ICD prints `why`).
+	 */
+	deviceLost(why: string): void {
+		if (this.closed) return;
+		this.stats.lost++;
+		this.log(`kwvk: connection ${this.id}: device lost for the guest: ${why}`);
+		this.lose(why);
 	}
 
 	feed(bytes: Uint8Array): void {
@@ -479,7 +538,8 @@ export class Conn implements VkConnection {
 			msg = normalize(JSON.parse(dec.decode(body.subarray(0, Math.min(jlen, body.length)))));
 			this.stats.parseMs += performance.now() - t0;
 		} catch (e) {
-			this.log(`kwvk: frame: bad JSON: ${(e as Error).message}`);
+			// the guest may be waiting on this request: no silent drop
+			this.deviceLost(`a frame with bad JSON (${(e as Error).message})`);
 			return;
 		}
 		const rest = body.subarray(Math.min(padded, body.length));
@@ -519,13 +579,43 @@ export class Conn implements VkConnection {
 		}
 	}
 
+	/**
+	 * An op failed: a request with "r" is answered with err (and a VkResult
+	 * when the error has one); a creation without "r" leaves tombstones under
+	 * its ids; anything else (or a VkDeviceLost) loses the device.
+	 */
 	fail(msg: any, e: unknown): void {
 		const text = (e as Error)?.message ?? String(e);
+		const op = String(msg?.op);
 		this.stats.errors++;
-		this.log(`kwvk: ${msg?.op}: ${text}`);
-		if (msg?.r) {
+		this.log(`kwvk: ${op}: ${text}`);
+		if (e instanceof VkDeviceLost) {
+			if (msg?.r) this.pending.add(msg.r);
+			this.deviceLost(`${op}: ${text}`);
+		} else if (msg?.r) {
 			this.pending.delete(msg.r);
-			this.send({ r: msg.r, err: text });
+			const reply: any = { r: msg.r, err: text };
+			if (e instanceof VkResultError) reply.result = e.result;
+			this.send(reply);
+		} else if (CREATE_OPS.has(op)) {
+			this.tombstone(msg, `${op}: ${text}`);
+		} else {
+			this.deviceLost(`${op}: ${text}`);
+		}
+	}
+
+	/** The ids a creation message makes. */
+	createdIds(msg: any): number[] {
+		if (msg?.op === "vkAllocateDescriptorSets") return (Array.isArray(msg.sets) ? msg.sets : []).map((s: any) => s?.id);
+		return [msg?.id];
+	}
+
+	/** Objects whose creation failed: kept so that their first use fails with the reason, not as an unknown id. */
+	tombstone(msg: any, why: string): void {
+		try {
+			for (const id of this.createdIds(msg)) if (Number.isInteger(id) && id > 0 && id <= 0xffffffff) this.put(id, { t: "failed", why });
+		} catch (e) {
+			this.deviceLost(`${why} (${(e as Error).message})`);
 		}
 	}
 
@@ -546,13 +636,20 @@ export class Conn implements VkConnection {
 		} catch (e) {
 			out = undefined;
 			this.fail(msg, e);
-			msg = { ...msg, r: 0 };
+			msg = { ...msg, r: 0, failed: true };
 		}
+		// a creation WebGPU refuses (asynchronously) leaves a tombstone; any
+		// other op without a reply that WebGPU refuses loses the device
+		const made = !msg.r && !msg.failed && CREATE_OPS.has(op) ? this.createdIds(msg).map((id) => [id, this.objs.get(id)] as const) : undefined;
 		dev.popErrorScope().then(
 			(err: any) => {
 				if (!err) return;
 				this.stats.errors++;
 				this.log(`kwvk: ${op}: ${err.message}`);
+				if (msg.r || msg.failed || op === "destroy") return;
+				const why = `${op}: ${firstLine(err.message)}`;
+				if (!made) return this.deviceLost(why);
+				for (const [id, o] of made) if (o && this.objs.get(id) === o) this.put(id, { t: "failed", why });
 			},
 			() => {},
 		);
@@ -568,6 +665,7 @@ export class Conn implements VkConnection {
 	get(id: number, what?: string): any {
 		const o = this.objs.get(id);
 		if (!o) throw new Error(`no ${what || "object"} ${id}`);
+		if (o.t === "failed") throw new Error(`${what || "object"} ${id} failed at its creation (${o.why})`);
 		if (what && o.t !== what) throw new Error(`object ${id} is a ${o.t}, not a ${what}`);
 		return o;
 	}
@@ -631,7 +729,7 @@ export class Conn implements VkConnection {
 
 	// --- shaders and layouts -----------------------------------------------
 
-	translate(moduleId: number, opts: VkShaderOpts): { module: any; res: VkShaderResult } {
+	translate(moduleId: number, opts: VkShaderOpts): { module: any; res: VkShaderResult; check: Promise<string | undefined> } {
 		const m = this.get(moduleId, "shader");
 		const key = JSON.stringify(opts);
 		let t = m.cache.get(key);
@@ -658,23 +756,25 @@ export class Conn implements VkConnection {
 			} catch (e) {
 				// Debugging: globalThis.KWVK_DUMP_SPIRV = true logs the module.
 				if ((globalThis as { KWVK_DUMP_SPIRV?: boolean }).KWVK_DUMP_SPIRV) this.log(`kwvk: shader ${moduleId} ${opts.stage} SPIR-V (base64): ${b64(m.code)}`);
-				throw e;
+				throw new Error(`${opts.stage} stage of shader module ${moduleId}: ${(e as Error)?.message ?? e}`);
 			}
 			this.stats.translations++;
 			this.stats.translateMs += performance.now() - t0;
 			// WebGPU features the shader needs (vk-shader.ts result.requires).
 			const missing = (res.requires || []).filter((f) => !this.dev.features?.has?.(f));
-			if (missing.length) throw new Error(`shader needs WebGPU features the device lacks: ${missing.join(", ")}`);
+			if (missing.length) throw new Error(`${opts.stage} stage of shader module ${moduleId}: shader needs WebGPU features the device lacks: ${missing.join(", ")}`);
 			const module = this.dev.createShaderModule({ code: res.wgsl, label: `kwvk shader ${moduleId} ${opts.stage}` });
-			module.getCompilationInfo?.().then(
-				(info: any) => {
-					for (const m of info.messages || []) {
-						if (m.type === "error") this.log(`kwvk: shader ${moduleId} ${opts.stage}: WGSL ${m.lineNum}:${m.linePos}: ${m.message}`);
-					}
-				},
-				() => {},
-			);
-			t = { module, res };
+			// the first WGSL error (Tint's, e.g. its uniformity analysis), or undefined: pipelines wait for it (pipelineCheck)
+			const check: Promise<string | undefined> = module.getCompilationInfo
+				? module.getCompilationInfo().then(
+						(info: any) => {
+							const m = (info.messages || []).find((x: any) => x.type === "error");
+							return m ? `${opts.stage} stage of shader module ${moduleId}: WGSL ${m.lineNum}:${m.linePos}: ${firstLine(m.message)}` : undefined;
+						},
+						() => undefined,
+					)
+				: Promise.resolve(undefined);
+			t = { module, res, check };
 			m.cache.set(key, t);
 		}
 		return t;
@@ -930,7 +1030,7 @@ export class Conn implements VkConnection {
 	}
 
 	/** Translate the stages of a pipeline message. */
-	stages(msg: any, pushGroupOf: number, setLayouts: number[] = []): { stage: number; kind: string; module: any; res: VkShaderResult; moduleId: number; opts: VkShaderOpts }[] {
+	stages(msg: any, pushGroupOf: number, setLayouts: number[] = []): { stage: number; kind: string; module: any; res: VkShaderResult; moduleId: number; opts: VkShaderOpts; check: Promise<string | undefined> }[] {
 		const out: any[] = [];
 		let arrays: Record<string, { base: number; count: number }> | undefined;
 		setLayouts.forEach((id, s) => {
@@ -965,10 +1065,53 @@ export class Conn implements VkConnection {
 					if (Object.keys(fm.inputs).length) (opts as any).relink = fm.inputs;
 				}
 			}
-			const { module, res } = this.translate(st.module, opts);
-			out.push({ stage: kind === "vertex" ? SS.VERTEX : kind === "fragment" ? SS.FRAGMENT : SS.COMPUTE, kind, module, res, moduleId: st.module, opts });
+			const { module, res, check } = this.translate(st.module, opts);
+			out.push({ stage: kind === "vertex" ? SS.VERTEX : kind === "fragment" ? SS.FRAGMENT : SS.COMPUTE, kind, module, res, moduleId: st.module, opts, check });
 		}
 		return out;
+	}
+
+	/**
+	 * Create a pipeline's GPU objects inside an error scope of its own, then
+	 * answer once its WGSL compiled and WebGPU validated it: {} (made), err
+	 * (refused: the ICD returns VK_ERROR_INVALID_SHADER_NV, or the VkResult
+	 * thrown) or {unusable} (UNUSABLE: made, but it cannot run). A pipeline
+	 * that failed keeps `failed`, so binding it fails the submit. Once per
+	 * pipeline (variants made at draw time are checked by their submit).
+	 */
+	makePipeline(msg: any, make: () => any): Reply | Deferred | undefined {
+		this.dev.pushErrorScope("validation");
+		let p: any;
+		let scope: Promise<any>;
+		try {
+			p = make();
+		} catch (e) {
+			const why = (e as Error)?.message ?? String(e);
+			if (!UNUSABLE.test(why)) throw e;
+			// made, but it cannot run (vkd3d makes such pipelines at start-up)
+			this.stats.errors++;
+			this.log(`kwvk: ${msg.op} (pipeline ${msg.id}): ${why}`);
+			this.put(msg.id, { t: "pipeline", kind: msg.op === "vkCreateComputePipelines" ? "compute" : "graphics", failed: why, stages: [] });
+			return msg.r ? { json: { unusable: why } } : undefined;
+		} finally {
+			scope = this.dev.popErrorScope();
+		}
+		this.put(msg.id, p);
+		const checks: Promise<string | undefined>[] = p.stages.map((st: any) => st.check);
+		checks.push(scope.then((e: any) => (e ? firstLine(e.message) : undefined), (e: any) => firstLine(e?.message ?? String(e))));
+		const defer = Promise.all(checks).then((errs) => {
+			const why = errs.find(Boolean);
+			if (!why) return msg.r ? { json: {} } : undefined;
+			p.failed = why;
+			if (msg.r && !UNUSABLE.test(why)) throw new Error(why); // fail() logs and answers err
+			this.stats.errors++;
+			this.log(`kwvk: ${msg.op} (pipeline ${msg.id}): ${why}`);
+			// an ICD without replies: binding it fails the submit
+			return msg.r ? { json: { unusable: why } } : undefined;
+		});
+		if (msg.r) return { defer };
+		defer.catch(() => {});
+		return undefined;
 	}
 }
 
@@ -1266,7 +1409,7 @@ const handlers: Record<string, Handler> = {
 	},
 
 	sync(c) {
-		return { defer: c.dev.queue.onSubmittedWorkDone().then(() => undefined) };
+		return { defer: Promise.all([c.dev.queue.onSubmittedWorkDone(), c.checked]).then(() => undefined) };
 	},
 
 	destroy(c, msg) {
@@ -1325,7 +1468,8 @@ const handlers: Record<string, Handler> = {
 		e.copyBufferToBuffer(b.buf, start, stage, 0, end - start);
 		c.dev.queue.submit([e.finish()]);
 		return {
-			defer: stage.mapAsync(MAP_READ).then(() => {
+			// after the validation of earlier submits: a failed one loses the device before stale bytes go out
+			defer: Promise.all([stage.mapAsync(MAP_READ), c.checked]).then(() => {
 				// framed straight from the mapped range (the only copy), then unmapped
 				const out = new Uint8Array(stage.getMappedRange()).subarray(off - start, off - start + size);
 				c.stats.bytesRead += out.length;
@@ -1406,6 +1550,9 @@ const handlers: Record<string, Handler> = {
 		if (msg.anisotropyEnable && msg.maxAnisotropy > 1 && desc.magFilter === "linear" && desc.minFilter === "linear" && desc.mipmapFilter === "linear") {
 			desc.maxAnisotropy = Math.min(16, Math.floor(msg.maxAnisotropy));
 		}
+		// rendering approximations WebGPU forces (logged once each)
+		if ([msg.addressModeU, msg.addressModeV, msg.addressModeW].includes(3)) c.log("kwvk: vkCreateSampler: CLAMP_TO_BORDER is approximated as clamp-to-edge (no border colour)");
+		if (msg.unnormalizedCoordinates) c.log("kwvk: vkCreateSampler: unnormalizedCoordinates is unsupported (coordinates are taken as normalized)");
 		const filtering = desc.magFilter === "linear" || desc.minFilter === "linear" || desc.mipmapFilter === "linear";
 		c.put(msg.id, { t: "sampler", gpu: c.dev.createSampler(desc), filtering });
 		return undefined;
@@ -1544,69 +1691,19 @@ const handlers: Record<string, Handler> = {
 	},
 
 	vkCreateGraphicsPipelines(c, msg) {
-		const pl = c.get(msg.layout, "pipelineLayout");
-		const stages = c.stages(msg, pl.setLayouts.length, pl.setLayouts);
-		const layout = c.pipelineLayout(msg.layout, stages);
-		const vi = msg.vertexInputState || {};
-		const bindings = (vi.vertexBindingDescriptions || []).slice().sort((a: any, b: any) => a.binding - b.binding);
-		const buffers = bindings.map((b: any) => ({
-			binding: b.binding,
-			desc: {
-				arrayStride: b.stride,
-				stepMode: b.inputRate === 1 ? "instance" : "vertex",
-				attributes: (vi.vertexAttributeDescriptions || [])
-					.filter((a: any) => a.binding === b.binding)
-					.map((a: any) => {
-						const f = vkFormat(a.format)?.vtx;
-						if (!f) throw new Error(`unsupported vertex format ${a.format}`);
-						return { format: f, offset: a.offset, shaderLocation: a.location };
-					}),
-			},
-		}));
-		const topo = msg.inputAssemblyState?.topology ?? 3;
-		if (topo > 5) c.log(`kwvk: vkCreateGraphicsPipelines: topology ${topo} is unsupported`);
-		const rs = msg.rasterizationState || {};
-		if (rs.polygonMode) c.log("kwvk: vkCreateGraphicsPipelines: polygon modes other than FILL are unsupported");
-		if (rs.cullMode === 3) c.log("kwvk: vkCreateGraphicsPipelines: cullMode FRONT_AND_BACK is unsupported");
-		const p = {
-			t: "pipeline",
-			kind: "graphics",
-			msg,
-			layout,
-			stages,
-			buffers,
-			topology: topo,
-			dynamic: new Set<number>(msg.dynamicState?.dynamicStates || []),
-			variants: new Map<string, any>(),
-			// BaseVertex / BaseInstance / DrawIndex: WGSL has none, the translator reads 0
-			usesBase: stages.some((st: any) => c.objs.get(st.moduleId)?.baseBuiltins),
-		};
-		c.put(msg.id, p);
-		// build the variant of the render pass it was created for, so errors show here
-		const rp = msg.renderPass ? c.objs.get(msg.renderPass) : undefined;
-		let sp = rp?.subpasses?.[msg.subpass || 0];
-		if (!msg.renderPass && msg.rendering) {
-			// dynamic rendering: the formats come with the pipeline (same key as vkCmdBeginRendering's)
-			const r = msg.rendering;
-			const colorFormats = (r.colorAttachmentFormats || []).map((f: number) => (f ? vkFormat(f)?.tex || null : null));
-			const df = r.depthAttachmentFormat || r.stencilAttachmentFormat;
-			const depthFormat = df ? vkFormat(df)?.tex || null : null;
-			const samples = msg.multisampleState?.rasterizationSamples || 1;
-			sp = { colorFormats, depthFormat, samples, key: `${colorFormats.join(",")}|${depthFormat}|${samples}` };
-		}
-		if (sp) pipelineVariant(c, p, sp, {}, undefined);
-		return undefined;
+		return c.makePipeline(msg, () => graphicsPipeline(c, msg));
 	},
 
 	vkCreateComputePipelines(c, msg) {
-		const pl = c.get(msg.layout, "pipelineLayout");
-		const stages = c.stages({ stages: [msg.stage] }, pl.setLayouts.length, pl.setLayouts);
-		const layout = c.pipelineLayout(msg.layout, stages);
-		const st = stages[0]!;
-		c.stats.pipelines++;
-		const gpu = c.dev.createComputePipeline({ label: `kwvk pipeline ${msg.id}`, layout: layout.layout, compute: { module: st.module, entryPoint: st.res.entryPoint } });
-		c.put(msg.id, { t: "pipeline", kind: "compute", layout, gpu, stage: st, stages, layoutId: msg.layout, variants: new Map() });
-		return undefined;
+		return c.makePipeline(msg, () => {
+			const pl = c.get(msg.layout, "pipelineLayout");
+			const stages = c.stages({ stages: [msg.stage] }, pl.setLayouts.length, pl.setLayouts);
+			const layout = c.pipelineLayout(msg.layout, stages);
+			const st = stages[0]!;
+			c.stats.pipelines++;
+			const gpu = c.dev.createComputePipeline({ label: `kwvk pipeline ${msg.id}`, layout: layout.layout, compute: { module: st.module, entryPoint: st.res.entryPoint } });
+			return { t: "pipeline", kind: "compute", layout, gpu, stage: st, stages, layoutId: msg.layout, variants: new Map() };
+		});
 	},
 
 	vkCreateQueryPool(c, msg) {
@@ -1647,7 +1744,7 @@ const handlers: Record<string, Handler> = {
 		c.dev.queue.submit([e.finish()]);
 		const available = [...p.avail.subarray(first, first + n)];
 		return {
-			defer: stage.mapAsync(MAP_READ).then(() => {
+			defer: Promise.all([stage.mapAsync(MAP_READ), c.checked]).then(() => {
 				const out = new Uint8Array(stage.getMappedRange().slice(0));
 				stage.unmap();
 				stage.destroy();
@@ -1670,8 +1767,27 @@ const handlers: Record<string, Handler> = {
 
 	vkQueueSubmit(c, msg) {
 		c.stats.submits++;
-		const done = runSubmit(c, msg.cmds || []);
-		return { defer: done.then(() => undefined) };
+		// a command the host cannot encode throws VkDeviceLost (nothing of the
+		// submit runs); a WebGPU validation error drops the whole submit: both
+		// lose the device rather than leave the guest with missing results
+		c.dev.pushErrorScope("validation");
+		let done: Promise<void>;
+		try {
+			done = runSubmit(c, msg.cmds || []);
+		} finally {
+			const scope = c.dev.popErrorScope();
+			c.checked = scope.then(
+				(err: any) => {
+					if (!err) return;
+					c.stats.errors++;
+					c.log(`kwvk: vkQueueSubmit: ${err.message}`);
+					c.deviceLost(`vkQueueSubmit: WebGPU refused the submit (none of it ran): ${firstLine(err.message)}`);
+				},
+				() => {},
+			);
+		}
+		const check = c.checked;
+		return { defer: Promise.all([done, check]).then(() => undefined) };
 	},
 
 	present(c, msg) {
@@ -1689,13 +1805,69 @@ const handlers: Record<string, Handler> = {
 		if (msg.readback === 0) return { json: { width: w, height: h, stride: w * img.info.bpb } };
 		const json = { width: w, height: h, stride: w * img.info.bpb };
 		return {
-			defer: readTexture(c, img, 0, 0, w, h).then((bin) => {
+			defer: Promise.all([readTexture(c, img, 0, 0, w, h), c.checked]).then(([bin]) => {
 				c.stats.bytesRead += bin.length;
 				return { json, bin };
 			}),
 		};
 	},
 };
+
+/** vkCreateGraphicsPipelines: the stages translated, the layout, and the variant of the render pass it names (so its errors show at creation). */
+function graphicsPipeline(c: Conn, msg: any): any {
+	const pl = c.get(msg.layout, "pipelineLayout");
+	const stages = c.stages(msg, pl.setLayouts.length, pl.setLayouts);
+	const layout = c.pipelineLayout(msg.layout, stages);
+	const vi = msg.vertexInputState || {};
+	const bindings = (vi.vertexBindingDescriptions || []).slice().sort((a: any, b: any) => a.binding - b.binding);
+	const buffers = bindings.map((b: any) => ({
+		binding: b.binding,
+		desc: {
+			arrayStride: b.stride,
+			stepMode: b.inputRate === 1 ? "instance" : "vertex",
+			attributes: (vi.vertexAttributeDescriptions || [])
+				.filter((a: any) => a.binding === b.binding)
+				.map((a: any) => {
+					const f = vkFormat(a.format)?.vtx;
+					if (!f) throw new Error(`unsupported vertex format ${a.format}`);
+					return { format: f, offset: a.offset, shaderLocation: a.location };
+				}),
+		},
+	}));
+	const topo = msg.inputAssemblyState?.topology ?? 3;
+	// adjacency and patch lists: drawing them as lists would make wrong primitives
+	if (!(topo >= 0 && topo <= 5)) throw new VkResultError(`primitive topology ${topo} (adjacency or patch list) is unsupported`, VK_ERROR_FEATURE_NOT_PRESENT);
+	const rs = msg.rasterizationState || {};
+	// fillModeNonSolid is false: drawn filled (visible, not silent), logged
+	if (rs.polygonMode) c.log("kwvk: vkCreateGraphicsPipelines: polygon modes other than FILL are unsupported (drawn filled)");
+	const p = {
+		t: "pipeline",
+		kind: "graphics",
+		msg,
+		layout,
+		stages,
+		buffers,
+		topology: topo,
+		dynamic: new Set<number>(msg.dynamicState?.dynamicStates || []),
+		variants: new Map<string, any>(),
+		// BaseVertex / BaseInstance / DrawIndex: WGSL has none, the translator reads 0
+		usesBase: stages.some((st: any) => c.objs.get(st.moduleId)?.baseBuiltins),
+	};
+	// build the variant of the render pass it was created for, so errors show here
+	const rp = msg.renderPass ? c.objs.get(msg.renderPass) : undefined;
+	let sp = rp?.subpasses?.[msg.subpass || 0];
+	if (!msg.renderPass && msg.rendering) {
+		// dynamic rendering: the formats come with the pipeline (same key as vkCmdBeginRendering's)
+		const r = msg.rendering;
+		const colorFormats = (r.colorAttachmentFormats || []).map((f: number) => (f ? vkFormat(f)?.tex || null : null));
+		const df = r.depthAttachmentFormat || r.stencilAttachmentFormat;
+		const depthFormat = df ? vkFormat(df)?.tex || null : null;
+		const samples = msg.multisampleState?.rasterizationSamples || 1;
+		sp = { colorFormats, depthFormat, samples, key: `${colorFormats.join(",")}|${depthFormat}|${samples}` };
+	}
+	if (sp) pipelineVariant(c, p, sp, {}, undefined);
+	return p;
+}
 
 /** Read level `mip`, layer `layer` of an image as tightly packed rows. */
 export async function readTexture(c: Conn, img: any, mip: number, layer: number, w: number, h: number): Promise<Uint8Array> {
@@ -1759,7 +1931,8 @@ export function effectiveExt(p: any, ext: Record<string, any> | undefined): Reco
 export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, stripFormat: string | undefined, refined?: any): any {
 	const eff = effectiveExt(p, dyn.ext);
 	const topoN = eff.topology ?? p.topology;
-	const topo = TOPOLOGY[topoN] || "triangle-list";
+	const topo = TOPOLOGY[topoN];
+	if (!topo) throw new Error(`primitive topology ${topoN} (adjacency or patch list) is unsupported`);
 	const strip = topo.endsWith("strip") ? stripFormat : undefined;
 	const useBias = p.dynamic.has(3) ? dyn.bias : undefined;
 	const rm = p.dynamic.has(6) ? dyn.readMask : undefined;
@@ -1787,6 +1960,8 @@ export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, strip
 	}
 	const buffers = p.buffers.map((b: any) => (eff.strides?.[b.binding] !== undefined ? { ...b.desc, arrayStride: eff.strides[b.binding] } : b.desc));
 	const tri = topo.startsWith("triangle");
+	// cullMode FRONT_AND_BACK culls every triangle (WebGPU has no such mode): no attachment writes
+	const cullAll = tri && rs.cullMode === 3;
 	const desc: any = {
 		label: `kwvk pipeline ${m.id}`,
 		layout: (refined || p.layout).layout,
@@ -1813,7 +1988,7 @@ export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, strip
 			targets: sp.colorFormats.map((f: string | null, i: number) => {
 				if (!f) return null;
 				const a = cb.attachments?.[i] || cb.attachments?.[0] || { colorWriteMask: 15 };
-				const t: any = { format: f, writeMask: a.colorWriteMask ?? 15 };
+				const t: any = { format: f, writeMask: cullAll ? 0 : (a.colorWriteMask ?? 15) };
 				const fi = texFormatInfo(f);
 				if (a.blendEnable && fi && fi.caps & 8) {
 					const comp = (src: number, dst: number, op: number) => {
@@ -1844,14 +2019,14 @@ export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, strip
 				: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "keep" };
 		const ds: any = {
 			format: df,
-			depthWriteEnabled: depth && !!d.depthTestEnable && !!d.depthWriteEnable,
+			depthWriteEnabled: depth && !cullAll && !!d.depthTestEnable && !!d.depthWriteEnable,
 			depthCompare: depth && d.depthTestEnable ? COMPARE[d.depthCompareOp] || "less" : "always",
 		};
 		if (stencil) {
 			ds.stencilFront = face(d.front);
 			ds.stencilBack = face(d.back);
 			ds.stencilReadMask = rm ?? d.front?.compareMask ?? 0xff;
-			ds.stencilWriteMask = d.stencilTestEnable ? (wm ?? d.front?.writeMask ?? 0xff) : 0;
+			ds.stencilWriteMask = d.stencilTestEnable && !cullAll ? (wm ?? d.front?.writeMask ?? 0xff) : 0;
 		}
 		if (tri && depth) {
 			const b = useBias || (rs.depthBiasEnable ? [rs.depthBiasConstantFactor || 0, rs.depthBiasClamp || 0, rs.depthBiasSlopeFactor || 0] : undefined);

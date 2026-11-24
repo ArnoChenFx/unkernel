@@ -46,6 +46,35 @@ void kw_log(const char *fmt, ...)
 	va_end(ap);
 }
 
+/* Errors and warnings an app or its user must see: always on stderr, each
+ * distinct line once per process (no per-frame repeats), the first 256. */
+void kw_err(const char *fmt, ...)
+{
+	static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+	static uint32_t seen[256];
+	static int nseen;
+	char line[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof line, fmt, ap);
+	va_end(ap);
+	uint32_t h = 2166136261u; /* FNV-1a of the text */
+	for (const char *p = line; *p; p++)
+		h = (h ^ (uint8_t)*p) * 16777619u;
+	pthread_mutex_lock(&mu);
+	int dup = 0;
+	for (int i = 0; i < nseen && !dup; i++)
+		dup = seen[i] == h;
+	int over = !dup && nseen == 256;
+	if (!dup && !over)
+		seen[nseen++] = h;
+	else if (over && nseen++ == 256)
+		fprintf(stderr, "kwvk: further errors are not shown\n");
+	if (!dup && !over)
+		fprintf(stderr, "kwvk: %s\n", line);
+	pthread_mutex_unlock(&mu);
+}
+
 /* ---- jb ---- */
 
 static void jb_grow(struct jb *b, size_t add)
@@ -415,7 +444,42 @@ static struct kw_reply *read_frame(struct kw_link *l)
 	const char *e = js_get(rep->json, "err");
 	if (e)
 		kw_log("host error (r=%u): %.200s", rep->r, e);
+	/* the host ends the stream as a lost device and says why first */
+	const char *lost = rep->r ? NULL : js_get(rep->json, "lost");
+	if (lost) {
+		char why[768];
+		js_strcpy(lost, why, sizeof why);
+		link_lose(l, why);
+	}
 	return rep;
+}
+
+void link_lose(struct kw_link *l, const char *why)
+{
+	pthread_mutex_lock(&l->mu);
+	int first = !l->lost;
+	l->lost = 1;
+	l->dead = 1;
+	pthread_cond_broadcast(&l->cv);
+	pthread_mutex_unlock(&l->mu);
+	if (first)
+		kw_err("device lost: %s", why);
+}
+
+int kw_reply_lost(struct kw_link *l, struct kw_reply *rep, const char *what)
+{
+	if (!rep) {
+		link_lose(l, "the host closed the link");
+		return 1;
+	}
+	const char *e = js_get(rep->json, "err");
+	if (!e)
+		return 0;
+	char why[768], msg[900];
+	js_strcpy(e, why, sizeof why);
+	snprintf(msg, sizeof msg, "%s failed on the host: %s", what, why);
+	link_lose(l, msg);
+	return 1;
 }
 
 void reply_free(struct kw_reply *rep)
@@ -448,8 +512,9 @@ static void read_one(struct kw_link *l)
 	pthread_mutex_lock(&l->mu);
 	l->reading = 0;
 	if (!rep) {
-		if (!l->dead)
-			kw_log("link closed");
+		if (!l->lost) /* no reason given (a renderer that predates "lost", or a reset stream) */
+			kw_err("device lost: the host closed the link");
+		l->lost = 1;
 		l->dead = 1;
 	} else if (rep->r) {
 		rep->next = l->done;

@@ -62,6 +62,23 @@ struct B { v: array<f32> }
 		pushConstantSize: 4,
 		dispatchScale: [2, 1, 1],
 	}),
+	"barrier.comp": () => ({
+		wgsl: `struct B { v: array<u32> }
+@group(0) @binding(0) var<storage, read_write> b: B;
+var<workgroup> s: array<u32, 64>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_id) id: vec3u) {
+	s[id.x] = b.v[id.x];
+	if (b.v[id.x] > 5u) { workgroupBarrier(); }
+	b.v[id.x] = s[63u - id.x];
+}`,
+		bindings: [{ set: 0, binding: 0, group: 0, wgslBinding: 0, kind: "storage" }],
+	}),
+	"shared512.comp": () => {
+		throw new Error("workgroup size 512x1x1 exceeds the device's limits (maxComputeWorkgroupSize 256x256x64, maxComputeInvocationsPerWorkgroup 256) and the shader uses var<workgroup>");
+	},
+	"texel.comp": () => {
+		throw new Error("texel buffers (OpTypeImage Dim Buffer: samplerBuffer, imageBuffer) are not supported by WebGPU");
+	},
 	"double.comp": (o) => ({
 		wgsl: `const MUL = ${o.spec?.[0] ?? 1}u;
 struct B { v: array<u32> }
@@ -87,7 +104,13 @@ class Client {
 		this.pending = new Map();
 		this.nextR = 1;
 		this.buf = new Uint8Array(0);
-		this.conn = renderer.connect((bytes) => this.onBytes(bytes));
+		this.closedByHost = 0;
+		// the host ended the stream: what is pending fails, as the ICD's waits do on a dead link
+		this.conn = renderer.connect((bytes) => this.onBytes(bytes), () => {
+			this.closedByHost++;
+			for (const p of this.pending.values()) p.reject(new Error(`link closed${this.lost ? ` (lost: ${this.lost})` : ""}`));
+			this.pending.clear();
+		});
 		this.chunky = true;
 	}
 	onBytes(bytes) {
@@ -103,10 +126,11 @@ class Client {
 			const json = JSON.parse(new TextDecoder().decode(this.buf.subarray(8, 8 + jlen)));
 			const bin = this.buf.slice(8 + ((jlen + 3) & ~3), 8 + total);
 			this.buf = this.buf.slice(8 + total);
+			if (json.lost) this.lost = json.lost;
 			const p = this.pending.get(json.r);
 			if (p) {
 				this.pending.delete(json.r);
-				if (json.err) p.reject(new Error(json.err));
+				if (json.err) p.reject(Object.assign(new Error(json.err), { result: json.result }));
 				else p.resolve({ json, bin });
 			}
 		}
@@ -830,16 +854,6 @@ async function suite(device, adapter, translator, label, shaderBytes) {
 	const after = await cl.req({ op: "readBuffer", buffer: buf, offset: 0, size: 4 });
 	check(`${label} error reply then continue`, err.includes("9999") && after.bin.length === 4, err);
 
-	// WebGPU validation errors reach the log with the op that caused them
-	cl.post({ op: "vkQueueSubmit", cmds: [
-		{ c: "vkCmdBindPipeline", pipelineBindPoint: 1, pipeline: cpipe },
-		{ c: "vkCmdBindDescriptorSets", pipelineBindPoint: 1, layout: cpl, firstSet: 0, descriptorSets: [cset], dynamicOffsets: [] },
-		{ c: "vkCmdDispatch", groupCountX: 1 << 20, groupCountY: 1, groupCountZ: 1 },
-	] });
-	await cl.req({ op: "sync" });
-	await new Promise((r) => setTimeout(r, 200));
-	check(`${label} validation error logged`, logs.some((l) => l.startsWith(`[${label}] kwvk: vkQueueSubmit:`)), logs.filter((l) => l.includes("vkQueueSubmit")).join(" | "));
-
 	if (label === "fake") {
 		// (p) many draws per submit: per-draw descriptor set binds (dynamic offsets) and push constants
 		const N = 2000;
@@ -872,9 +886,101 @@ async function suite(device, adapter, translator, label, shaderBytes) {
 		check(`${label} perf: ${perf}`, per1k < 50);
 	}
 
-	cl.post({ op: "destroy", ids: [buf, img, view, out, out2, sbo] });
+	cl.post({ op: "destroy", ids: [buf, img, view, out, out2] });
 	await cl.req({ op: "sync" });
+
+	// a submit WebGPU refuses (none of it runs): the guest's device is lost,
+	// the reason in a {"lost"} frame, pending requests answered with err
+	cl.post({ op: "vkQueueSubmit", cmds: [
+		{ c: "vkCmdBindPipeline", pipelineBindPoint: 1, pipeline: cpipe },
+		{ c: "vkCmdBindDescriptorSets", pipelineBindPoint: 1, layout: cpl, firstSet: 0, descriptorSets: [cset], dynamicOffsets: [] },
+		{ c: "vkCmdDispatch", groupCountX: 1 << 20, groupCountY: 1, groupCountZ: 1 },
+	] });
+	let serr = "";
+	try {
+		await cl.req({ op: "sync" });
+	} catch (e) {
+		serr = e.message;
+	}
+	check(`${label} refused submit loses the device`, /vkQueueSubmit/.test(cl.lost) && /vkQueueSubmit/.test(serr) && cl.closedByHost === 1 && logs.some((l) => l.startsWith(`[${label}] kwvk: vkQueueSubmit:`)), `lost ${cl.lost} | sync ${serr} | closed ${cl.closedByHost}`);
 	cl.conn.close();
+	await loud(renderer, label, shaderBytes);
+}
+
+/**
+ * Failures the guest must see: pipelines the host cannot make answer err
+ * (the ICD returns a VkResult) or "unusable"; what no reply can report
+ * (an unusable pipeline bound, an object whose creation failed used in a
+ * submit, a command that cannot be encoded) loses the device. Each case
+ * on a connection of its own.
+ */
+async function loud(renderer, label, shaderBytes) {
+	const computePipe = async (name, extra = {}) => {
+		const cl = new Client(renderer);
+		cl.chunky = false;
+		cl.post({ op: "vkCreateShaderModule", id: 1 }, shaderBytes(name));
+		cl.post({ op: "vkCreateDescriptorSetLayout", id: 2, bindings: [{ binding: 0, descriptorType: 7, descriptorCount: 1, stageFlags: 0x20 }] });
+		cl.post({ op: "vkCreatePipelineLayout", id: 3, setLayouts: [2], pushConstantRanges: [] });
+		let err;
+		let reply;
+		try {
+			reply = await cl.req({ op: "vkCreateComputePipelines", id: 4, layout: 3, stage: { stage: 0x20, module: 1, pName: "main" }, ...extra });
+		} catch (e) {
+			err = e;
+		}
+		return { cl, err, reply };
+	};
+	// a barrier in non-uniform control flow: Tint's uniformity analysis refuses the WGSL
+	{
+		const { cl, err } = await computePipe("barrier.comp");
+		check(`${label} pipeline refused: barrier in non-uniform control flow`, err && /uniform/.test(err.message) && /WGSL \d+:\d+/.test(err.message) && err.result === undefined && !cl.closedByHost, err?.message ?? "created");
+		// the connection goes on: a good pipeline after it
+		const ok = await cl.req({ op: "vkCreateComputePipelines", id: 5, layout: 3, stage: { stage: 0x20, module: 6, pName: "main" } }).then(() => "made", (e) => e.message);
+		check(`${label} refused pipeline: the connection goes on`, /no shader 6/.test(ok) && !cl.closedByHost, ok);
+		cl.conn.close();
+	}
+	// 512 invocations sharing memory on a 256-invocation device: no split possible
+	if (renderer.device.limits.maxComputeInvocationsPerWorkgroup < 512) {
+		const { cl, err } = await computePipe("shared512.comp");
+		check(`${label} pipeline refused: 512-wide workgroup with shared memory`, err && /workgroup size 512/.test(err.message), err?.message ?? "created");
+		cl.conn.close();
+	}
+	if (label !== "fake") return;
+	// a graphics pipeline with an adjacency topology: refused with VK_ERROR_FEATURE_NOT_PRESENT (-8)
+	{
+		const cl = new Client(renderer);
+		cl.chunky = false;
+		cl.post({ op: "vkCreateShaderModule", id: 1 }, shaderBytes("tri.vert"));
+		cl.post({ op: "vkCreatePipelineLayout", id: 3, setLayouts: [], pushConstantRanges: [] });
+		const err = await cl.req({ op: "vkCreateGraphicsPipelines", id: 4, layout: 3, stages: [{ stage: 1, module: 1, pName: "main" }], inputAssemblyState: { topology: 8 } }).then(() => undefined, (e) => e);
+		check("fake pipeline refused: adjacency topology (VK_ERROR_FEATURE_NOT_PRESENT)", err && err.result === -8 && /topology 8/.test(err.message), err ? `${err.message} (${err.result})` : "created");
+		cl.conn.close();
+	}
+	// a pipeline declaring a texel buffer: made "unusable"; binding it in a submit loses the device
+	{
+		const { cl, err, reply } = await computePipe("texel.comp");
+		check("fake pipeline unusable: texel buffer", !err && /texel buffers/.test(reply?.json?.unusable), err?.message ?? JSON.stringify(reply?.json));
+		const serr = await cl.req({ op: "vkQueueSubmit", cmds: [{ c: "vkCmdBindPipeline", pipelineBindPoint: 1, pipeline: 4 }, { c: "vkCmdDispatch", groupCountX: 1 }] }).then(() => "ran", (e) => e.message);
+		check("fake unusable pipeline bound: device lost", /cannot run/.test(cl.lost) && /cannot run/.test(serr) && cl.closedByHost === 1, `lost ${cl.lost} | submit ${serr}`);
+	}
+	// an image whose creation failed (no reply to tell): its first use in a submit loses the device, naming the cause
+	{
+		const cl = new Client(renderer);
+		cl.chunky = false;
+		const lost0 = renderer.stats.lost;
+		cl.post({ op: "vkCreateImage", id: 1, imageType: 1, format: 9999, extent: { width: 4, height: 4, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, usage: 0x2 });
+		cl.post({ op: "vkQueueSubmit", cmds: [{ c: "vkCmdClearColorImage", image: 1, color: { float32: [1, 0, 0, 1] }, ranges: [{ aspectMask: 1, levelCount: 1, layerCount: 1 }] }] });
+		const serr = await cl.req({ op: "sync" }).then(() => "answered", (e) => e.message);
+		check("fake failed creation used: device lost, the cause named", /failed at its creation \(vkCreateImage: unsupported image format 9999\)/.test(cl.lost) && serr !== "answered" && cl.closedByHost === 1 && renderer.stats.lost === lost0 + 1, `lost ${cl.lost} | sync ${serr}`);
+	}
+	// a request without a reply that fails (a write to no buffer): device lost
+	{
+		const cl = new Client(renderer);
+		cl.chunky = false;
+		cl.post({ op: "writeBuffer", buffer: 77, offset: 0 }, new Uint8Array(8));
+		const serr = await cl.req({ op: "sync" }).then(() => "answered", (e) => e.message);
+		check("fake failed writeBuffer: device lost", /writeBuffer: no buffer 77/.test(cl.lost) && serr !== "answered" && cl.closedByHost === 1, `lost ${cl.lost} | sync ${serr}`);
+	}
 }
 
 let perf = "";
@@ -955,10 +1061,18 @@ async function robustness(device, adapter) {
 		if (rand() < 0.3) o.c = pick(cmdNames);
 		return o;
 	};
-	let closedByHost = 0;
-	const fz = new Client(renderer);
-	fz.conn = renderer.connect((b) => fz.onBytes(b), () => closedByHost++);
+	// a malformed message the host cannot answer (no "r") loses the device:
+	// the connection is ended (with a {"lost"} frame) and the fuzzer makes a new one
+	let fz = new Client(renderer);
+	let losses = 0;
+	let lostFrames = 0;
 	for (let i = 0; i < 3000; i++) {
+		if (i % 25 === 0) await new Promise((r) => setTimeout(r, 0)); // let the host run what was fed
+		if (fz.closedByHost) {
+			losses++;
+			if (fz.lost) lostFrames++;
+			fz = new Client(renderer);
+		}
 		const m = obj(0);
 		m.op = pick(ops);
 		if (m.op === "vkQueueSubmit") m.cmds = Array.from({ length: Math.floor(rand() * 8) }, () => ({ ...obj(1), c: pick(cmdNames) }));
@@ -972,20 +1086,26 @@ async function robustness(device, adapter) {
 	new DataView(bad.buffer).setUint32(0, 8, true);
 	new DataView(bad.buffer).setUint32(4, 4, true);
 	bad.set([0x7b, 0x7b, 0x7b, 0x7b], 8);
+	fz = new Client(renderer);
 	fz.conn.feed(bad);
+	await new Promise((r) => setTimeout(r, 100));
+	const badJsonLost = fz.closedByHost === 1 && /bad JSON/.test(fz.lost);
 	let alive = false;
 	try {
-		await Promise.race([fz.req({ op: "hello", version: 1 }), new Promise((_, j) => setTimeout(() => j(new Error("no reply")), 20000))]);
+		const fresh = new Client(renderer);
+		await Promise.race([fresh.req({ op: "hello", version: 1 }), new Promise((_, j) => setTimeout(() => j(new Error("no reply")), 20000))]);
 		alive = true;
+		fresh.conn.close();
 	} catch (e) {
 		logs.push(`[robust] ${e.message}`);
 	}
-	check("fuzz: 3000 random messages, the connection still answers", alive && closedByHost === 0, `alive ${alive} closed ${closedByHost}`);
+	check("fuzz: 3000 random messages: each connection the host ended said why, a new one answers", alive && losses > 0 && lostFrames === losses && badJsonLost, `alive ${alive} losses ${losses} with reason ${lostFrames} bad JSON lost ${badJsonLost}`);
 	// absurd frame length: the host ends the stream instead of buffering 4 GiB
+	fz = new Client(renderer);
 	const huge = new Uint8Array(8);
 	new DataView(huge.buffer).setUint32(0, 0xfffffff0, true);
 	fz.conn.feed(huge);
-	check("fuzz: absurd frame length closes the stream", closedByHost === 1);
+	check("fuzz: absurd frame length closes the stream", fz.closedByHost === 1);
 	await device.queue.onSubmittedWorkDone();
 	await new Promise((r) => setTimeout(r, 300));
 	st = renderer.stats;

@@ -28,8 +28,10 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   pre-multiplied alpha), VK_KHR_xcb_surface and VK_KHR_xlib_surface
   (XPutImage), VK_EXT_headless_surface; Wayland, xcb and Xlib are
   `dlopen`ed. `KWVK_LINK` picks the link (`vsock:2:1018` default, `tcp:`,
-  `unix:`); `KWVK_TRACE`, `KWVK_STATS` and `KWVK_SPIRV_DIR=DIR` (keeps
-  every module) are for debugging. Built by `vk/icd/build.sh` (aarch64
+  `unix:`); `KWVK_DEBUG`, `KWVK_TRACE`, `KWVK_STATS` and
+  `KWVK_SPIRV_DIR=DIR` (keeps every module) are for debugging. Errors and
+  wrong-result warnings go to stderr whatever `KWVK_DEBUG` says, each
+  distinct line once (`kw_err`; Errors below). Built by `vk/icd/build.sh` (aarch64
   glibc, `$KW_BUILD/vk/libvulkan_kw.so`, `kw_icd.json`, the test programs
   `test/vk/guest/vk-*.c`) or `vk/icd/build.sh native` (this host,
   `$KW_BUILD/vk/native/`, for `test/vk/relay.mjs`), against the Vulkan
@@ -45,13 +47,15 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   Swapchain images are read back at present (the `present` reply carries
   the pixels; the last presented texture is kept for the page,
   `renderer.image()`). A lost device fails and closes every stream, then
-  calls `onLost`.
+  calls `onLost`; a failure of one stream's work that no reply can report
+  loses the device for that stream only (Errors below).
 - **SDK** (`js/core/vk.ts`; js.md, Guest Vulkan): the web entry only.
   Nothing loads before the guest's first VkInstance: then the adapter (every
   feature it has, its maximum limits), the renderer's modules (chunks of
   their own) and the translator. `vm.vk`: `status` (idle, loading, ready,
   lost, failed), `stats` (streams, bytes, `losses`, `renderer`: the host's
-  counters, e.g. `presents`), `device`, `loaded`, `load()`. After a lost
+  counters, e.g. `presents`, `errors`, `lost`), `device`, `loaded`,
+  `load()`. After a lost
   device the next program gets a new device and renderer. Snapshots hold
   no renderer state: a restore drops the connections. Ignored with a log
   line on Node.
@@ -77,13 +81,15 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
 
 - `pnpm test:vk` (no browser, part of `pnpm test`): `VkHost` on a fake
   vsock with a fake renderer and device (lazy load, a renderer connection
-  per stream, bytes both ways, close and shutdown, a lost device and a new
-  one for the next program), `prepareVk`'s refusals, distinct host vsock
+  per stream, bytes both ways, close and shutdown, a stream the renderer
+  ends closed only after its last frame, a lost device and a new one for
+  the next program), `prepareVk`'s refusals, distinct host vsock
   ports (9p, GL, commands, WASI exec, tty, Vulkan, the page's Wayland), and
   the translator on `test/vk/guest/double.comp` (skipped without
   `kwvk-naga.wasm`).
 - `node test/vk/host/check.mjs`: the host renderer alone in headless Chrome
-  with a fake client. `vk/naga/test/run.ts`: the translator on the shaders
+  with a fake client (95 cases, the failures that must reach the guest
+  included: refused and unusable pipelines, lost devices). `vk/naga/test/run.ts`: the translator on the shaders
   in `vk/naga/test/shaders/`, validated in a real WebGPU; `corpus.sh`: a
   real-world corpus (Sascha Willems' examples, vkmark, GTK 4, SDL 3).
 - `node test/vk/relay.mjs -- CMD` runs CMD (e.g. `vulkaninfo --summary`,
@@ -99,7 +105,8 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   `--kernel FILE`: another bundle). Steps: h (a raw hello over `kwbox
   vsock`), a (`vulkaninfo --summary` names kwvk), b (every
   `$KW_BUILD/vk/vk-*` test program exits 0: compute, triangle, headless,
-  dynamic state, threads, depth, flat varyings), c (`vkcube --wsi wayland`
+  dynamic state, threads, depth, flat varyings, loud failures: refused
+  pipelines and lost devices), c (`vkcube --wsi wayland`
   under `weston --backend=headless --renderer=pixman --debug`, started by
   the page's `/usr/local/bin/kwvk-wl CMD`; then a running vkcube's frame
   taken by `weston-screenshooter` and judged: many colours, the LunarG
@@ -142,7 +149,10 @@ host's CPU, with the guest under kwemu.
   kwvk and generates. stories260K (F32, `-ngl 99`, temperature 0) gives the
   CPU backend's text: 1.8 tokens/s in the guest on a loaded host against
   0.25 on the emulated CPU, 9.5 natively through the relay. stories15M
-  q4_0 gives wrong text (below). Compute shaders wider than the device's
+  q4_0 no longer gives wrong text: it aborts at its first pipeline the host
+  cannot make ("ggml_vulkan: compute pipeline creation failed for
+  rms_norm_mul_f32_512: ... ErrorInvalidShaderNV", after the ICD's reason;
+  below). Compute shaders wider than the device's
   workgroup limit (ggml's are 512, SwiftShader allows 256) are split by
   the translator where they have no barriers or shared memory. 139 of
   ggml's 156 shader variants translate and compile. Its
@@ -170,12 +180,12 @@ host's CPU, with the guest under kwemu.
   VK_EXT_physical_device_drm. Before offering either, export
   `LIBGL_KOPPER_DISABLE=1` in the base profile (and keep zink off EGL), or
   GL would draw through zink on kwvk.
-- llama.cpp: quantized models (q4_0) give wrong text and MUL_MAT partly
-  fails: about 29 shader variants fail Tint's uniformity analysis
-  (`workgroupBarrier` outside uniform control flow); the norm family
-  (norm, rms_norm, group_norm, l2_norm) reduces across a 512-wide
-  workgroup through shared memory and cannot be split on a 256-limit
-  device. Eval is bound by GPU time on SwiftShader and, for q4_0, by
+- llama.cpp: quantized models (q4_0) and part of MUL_MAT cannot run (their
+  pipelines are refused, so ggml aborts): about 29 shader variants fail
+  Tint's uniformity analysis (`workgroupBarrier` outside uniform control
+  flow); the norm family (norm, rms_norm, group_norm, l2_norm, the fused
+  rms_norm_mul) reduces across a 512-wide workgroup through shared memory
+  and cannot be split on a 256-limit device. Eval is bound by GPU time on SwiftShader and, for q4_0, by
   several small readbacks a token (not batched). Never run on a real GPU.
 - Chrome-specific reliances: WGSL's `uniform_buffer_standard_layout`
   (push constant blocks stay std430 in a uniform buffer) and the
@@ -183,3 +193,37 @@ host's CPU, with the guest under kwemu.
   without it, logged).
 - A descriptor set that the pipeline's shaders declare but the app never
   binds (GTK binds no set 1) gets placeholder resources, logged once.
+- Rendering approximations kept, logged by the host (not errors): polygon
+  modes drawn filled, logic ops, component swizzles without the feature,
+  view formats other than the image's (or its sRGB twin), indexed triangle
+  fans drawn as lists, CLAMP_TO_BORDER as clamp-to-edge,
+  unnormalizedCoordinates ignored, timestamps inside render passes read 0,
+  layered rendering to layer 0 only. Not logged: events set by a command
+  buffer never reach vkGetEventStatus.
+
+## Errors (2026-11-24)
+
+What the host cannot do reaches the app as a Vulkan error and the user as
+a line on the guest's stderr (`kwvk: ...`) and on the host's log
+(`[vk] kwvk: ...`, counted in `stats.renderer.errors`); vk/PROTOCOL.md,
+Amendments, "Loud failures", is the contract.
+
+- At the call: pipelines are requests whose reply waits for WGSL
+  compilation and WebGPU's validation, so vkCreate{Compute,Graphics}Pipelines
+  returns VK_ERROR_INVALID_SHADER_NV (translation or Tint errors, e.g. a
+  barrier in non-uniform control flow, a 512-wide workgroup with shared
+  memory on a 256-invocation device) or VK_ERROR_FEATURE_NOT_PRESENT
+  (adjacency or patch topologies), with the reason. Pipelines that only
+  declare texel buffers or 1D-array storage images are made "unusable" (vkd3d
+  makes such pipelines at start-up and never runs them): binding one makes
+  vkQueueSubmit lose the device. The ICD refuses buffers over maxBufferSize
+  and images of unlisted formats.
+- Later: a submit the host cannot encode or WebGPU refuses (it drops the
+  whole submit), a failed request without a reply, or the use of an object
+  whose creation failed loses the device for that connection only
+  (`stats.renderer.lost`): the next wait, submit or present returns
+  VK_ERROR_DEVICE_LOST, and the program can make a new device. Replies that
+  carry data wait for the validation of earlier submits.
+- Measured 2026-11-24 natively through the relay (SwiftShader): llama.cpp
+  stories260K F32 gives the same text at the same speed (eval 9.7-9.8
+  tokens/s, prompt 4.9-5.1 s; 9.4 and 5.0 before).

@@ -10,8 +10,9 @@ app -> Vulkan loader (libvulkan1) -> libvulkan_kw.so (vk/icd, the guest's ICD)
 No kernel changes, no Mesa. The ICD is thin: it keeps guest-side state
 (device memory shadows, fences, command recording) and sends everything
 else to the host, which implements it in TypeScript on WebGPU. Browser
-only. Vulkan 1.0 subset; what is unsupported is refused at the ICD or
-logged by the host, never silently wrong where avoidable.
+only. Vulkan 1.0 subset; what is unsupported is refused at the ICD, or
+reaches the app as a Vulkan error (a refused pipeline, a lost device), never
+as a silently wrong result where avoidable (Amendments, "Loud failures").
 
 This file is the contract between the ICD, the host and the shader
 translator. If you must deviate, change this file in the same edit and add
@@ -33,7 +34,10 @@ json[jsonLen], zero padding to a multiple of 4, then binary (total - padded json
 
 A request with `"r": N` (N > 0, unique per connection) gets exactly one
 reply `{"r": N, ...}` (maybe with binary), or `{"r": N, "err": "text"}`.
-Requests without `r` get no reply; the host logs their errors and goes on.
+Requests without `r` get no reply: when one fails the host ends the
+connection as a lost device (`{"r":0,"lost":"why"}`, then the close), except
+creations, whose ids become tombstones that fail at first use (Amendments,
+"Loud failures").
 Replies may come in any order relative to other replies. The host
 processes requests strictly in order.
 
@@ -578,3 +582,67 @@ path.
   and offset writes exactly [dstOffset, dstOffset+size): the aligned part
   with copyBufferToBuffer, the rest through a small compute pass (all
   buffers now carry STORAGE usage host-side).
+
+- Loud failures (2026-11-24, round 7; overrides "logged and the loop goes
+  on" of round 3 for requests without `r`, and the logged-only
+  vkCmdDispatchBase and vkCmdDispatchIndirect-with-scale above). A host
+  failure reaches the app as a Vulkan error, never as missing or stale
+  results:
+  - Pipelines are requests: the ICD sends `vkCreateGraphicsPipelines` and
+    `vkCreateComputePipelines` with `r` (all of a call's pipelines before
+    the first wait). The host creates the GPU objects in an error scope of
+    their own and replies once each stage's WGSL compiled
+    (`getCompilationInfo`) and the scope popped: `{"r":N}` (made),
+    `{"r":N,"err":"why"}` (refused: translation, a WGSL error such as Tint's
+    uniformity analysis, a pipeline or layout WebGPU refuses; the ICD
+    returns VK_ERROR_INVALID_SHADER_NV, or the reply's `result`, and
+    VK_NULL_HANDLE for that pipeline, and sends `destroy` for its id), or
+    `{"r":N,"unusable":"why"}` (made but cannot run: resource kinds WebGPU
+    lacks, texel buffers and 1D-array storage images, which vkd3d declares
+    in pipelines it makes at start-up: the ICD returns VK_SUCCESS and a
+    command buffer that binds it makes vkQueueSubmit lose the device). Without
+    `r` (older ICDs) the host marks a failed pipeline and binding it fails
+    the submit. Pipeline variants made at draw time are checked with their
+    submit. Adjacency and patch-list topologies are refused with `result`
+    -8 (VK_ERROR_FEATURE_NOT_PRESENT).
+  - Any `err` reply may carry `result`: the VkResult the ICD should return.
+  - `{"r":0,"lost":"why"}` is the host's last frame before it ends a stream
+    as a lost device (also at a WebGPU device loss and a bad frame); then
+    pending requests get `err` and the stream closes. The host loses the
+    device for a connection when a submit fails (a command it cannot encode,
+    an unknown or failed object, or a WebGPU validation error: WebGPU drops
+    the whole submit), when a request without `r` fails (other than a
+    creation), and at a frame with bad JSON. A creation without `r` that
+    fails, synchronously or by WebGPU validation, leaves tombstones under its
+    ids: a later use fails with "failed at its creation (op: why)". Replies
+    to readBuffer, getQueryPoolResults, present (with readback) and sync are
+    sent only once the validation of every earlier submit is known.
+  - ICD: `lost` prints `kwvk: device lost: why` once on stderr, and from
+    then on every wait, submit, acquire, present and query returns
+    VK_ERROR_DEVICE_LOST (a fence signalled before the loss included;
+    vkMapMemory returns VK_ERROR_MEMORY_MAP_FAILED, as GPU writes can no
+    longer be read back). An
+    `err` reply to a submit, sync, readBuffer, present or
+    getQueryPoolResults is a lost device too (never success with stale
+    data). Refused guest-side, with a stderr line: vkCreateBuffer over the
+    hello's maxBufferSize (VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    maxMemoryAllocationSize is at most maxBufferSize), vkCreateImage of a
+    format the hello does not list (VK_ERROR_FORMAT_NOT_SUPPORTED), push
+    descriptor templates (VK_ERROR_FEATURE_NOT_PRESENT). 1D images report
+    maxArrayLayers and maxMipLevels 1 (WebGPU has neither). A command buffer
+    recording vkCmdDispatchBase with a non-zero base or
+    vkCmdDraw(Indexed)IndirectCount is marked; vkQueueSubmit of it returns
+    VK_ERROR_DEVICE_LOST and loses the device. Timeline semaphores
+    (timelineSemaphore stays false, ggml-vulkan makes them anyway) keep
+    their values guest-side: a value a submit signals counts once the work
+    submitted so far is done (vkWaitSemaphores and
+    vkGetSemaphoreCounterValue wait for it with `sync`), vkSignalSemaphore
+    sets it. Wrong-result approximations that stay warn once on stderr:
+    linear-tiling images (treated as optimal), buffer views (texel
+    buffers), BaseVertex/BaseInstance read as 0 in a draw with non-zero
+    bases, buffer device addresses (0). Errors and these warnings are
+    printed whatever `KWVK_DEBUG` says, each distinct line once.
+  - Host: vkCmdDispatchIndirect of a pipeline whose workgroup was split
+    (dispatchScale) fails the submit; cullMode FRONT_AND_BACK draws nothing
+    to the attachments (it drew unculled). VkStats adds `lost` (connections
+    the host ended as a lost device).

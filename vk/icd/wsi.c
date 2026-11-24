@@ -685,8 +685,10 @@ static VkResult present_one(struct kw_swapchain *sc, uint32_t idx)
 	jb_printf(&j, "{\"op\":\"present\",\"image\":%u,\"readback\":%d}", sc->imgs[idx].id, wayland || x11 || dump);
 	struct kw_reply *rep = link_call(d->link, &j, NULL, 0);
 	jb_free(&j);
-	if (!rep)
+	if (kw_reply_lost(d->link, rep, "vkQueuePresentKHR")) {
+		reply_free(rep);
 		return VK_ERROR_DEVICE_LOST;
+	}
 	if (!rep->bin) {
 		reply_free(rep);
 		return VK_SUCCESS;

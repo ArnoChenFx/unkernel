@@ -148,7 +148,8 @@ ws.addEventListener("message", (ev) => {
 			const r = await renderer(dec.decode(payload));
 			if (!r.renderer) { log("relay: connection " + id + " refused: " + r.error); msg(id, 2, new Uint8Array(0)); return; }
 			try {
-				conns.set(id, r.renderer.connect((bytes) => msg(id, 1, bytes)));
+				// the renderer ends a stream itself (a lost device): close the socket after what it sent
+				conns.set(id, r.renderer.connect((bytes) => msg(id, 1, bytes), () => { conns.delete(id); msg(id, 2, new Uint8Array(0)); }));
 			} catch (e) { log("relay: connect threw: " + (e?.stack ?? e)); msg(id, 2, new Uint8Array(0)); }
 		} else if (kind === 1) {
 			const c = conns.get(id);

@@ -82,3 +82,14 @@ test("the served distro name is the upstream name and the first 16 hex of its sh
 test("release URLs encode the tag and the file name", () => {
 	assert.equal(releaseUrl("o/r", "remote-v1 beta", "a b.zip"), "https://github.com/o/r/releases/download/remote-v1%20beta/a%20b.zip");
 });
+
+test("an extra distro with a url is listed under that url, not upstream's", () => {
+	const base = input([file("remote/unkernel-remote.js", "server")]);
+	const url = "https://github.com/owner/fork/releases/download/omarchy-1/omarchy.erofs";
+	const extra = { name: "omarchy", file: "omarchy.erofs", size: 5, sha256: "c".repeat(64), served: servedDistroName("omarchy", "c".repeat(64), "omarchy.erofs"), url };
+	const m = buildManifest({ ...base, distros: [...base.distros, extra] });
+	assert.equal(m.files.find((f) => f.asset === "omarchy.erofs")!.url, url);
+	assert.equal(m.assets.find((a) => a.name === "omarchy.erofs")!.url, url);
+	assert.equal(m.assets.find((a) => a.name === "omarchy.erofs")!.kind, "distro");
+	assert.equal(parseManifest(serializeManifest(m)).files.length, m.files.length);
+});

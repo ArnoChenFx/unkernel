@@ -227,6 +227,17 @@ const CREATE_OPS = new Set([
  */
 const UNUSABLE = /texel buffers|_1d_array/;
 
+/**
+ * Debugging only, never set by the SDK: globalThis.KWVK_NO_GPU = true makes
+ * the host encode every dispatch but run none (results are garbage) and
+ * compile workgroups over the device's limits clamped, so a model's
+ * per-token overhead (guest, protocol, host) can be timed on software
+ * WebGPU without its GPU time.
+ */
+export function noGpu(): boolean {
+	return (globalThis as { KWVK_NO_GPU?: boolean }).KWVK_NO_GPU === true;
+}
+
 /** The first line of a WebGPU message (they are multi-line chains). */
 export function firstLine(text: string): string {
 	const l = String(text).split("\n").map((x) => x.trim()).filter(Boolean);
@@ -842,6 +853,17 @@ export class Conn implements VkConnection {
 						wgsl: res.wgsl.replace(/var<storage(, ?read)?>/g, "var<storage, read_write>"),
 						bindings: res.bindings.map((b) => (b.kind === "read-only-storage" ? { ...b, kind: "storage" as const, ro: true } : b)),
 					};
+				// KWVK_NO_GPU (debugging): no dispatch runs, so a workgroup over the device's limits only needs to compile
+				if (topts.stage === "compute" && noGpu()) {
+					const l = this.dev.limits;
+					res = { ...res, wgsl: res.wgsl.replace(/@workgroup_size\((\d+)(?:, ?(\d+))?(?:, ?(\d+))?\)/, (_s, x, y, z) => {
+						let [a, b, c] = [Number(x), Number(y || 1), Number(z || 1)];
+						while (a * b * c > l.maxComputeInvocationsPerWorkgroup || a > l.maxComputeWorkgroupSizeX) a = Math.max(1, a >> 1);
+						while (a * b * c > l.maxComputeInvocationsPerWorkgroup || b > l.maxComputeWorkgroupSizeY) b = Math.max(1, b >> 1);
+						while (a * b * c > l.maxComputeInvocationsPerWorkgroup || c > l.maxComputeWorkgroupSizeZ) c = Math.max(1, c >> 1);
+						return `@workgroup_size(${a}, ${b}, ${c})`;
+					}) };
+				}
 			} catch (e) {
 				// Debugging: globalThis.KWVK_DUMP_SPIRV = true logs the module.
 				if ((globalThis as { KWVK_DUMP_SPIRV?: boolean }).KWVK_DUMP_SPIRV) this.log(`kwvk: shader ${moduleId} ${opts.stage} SPIR-V (base64): ${b64(m.code)}`);
@@ -850,8 +872,10 @@ export class Conn implements VkConnection {
 			this.stats.translations++;
 			this.stats.translateMs += performance.now() - t0;
 			// WebGPU features the shader needs (vk-shader.ts result.requires).
-			const missing = (res.requires || []).filter((f) => !this.dev.features?.has?.(f));
-			if (missing.length) throw new Error(`${opts.stage} stage of shader module ${moduleId}: shader needs WebGPU features the device lacks: ${missing.join(", ")}`);
+			// uniform_buffer_standard_layout is a WGSL language feature (Chrome's; not Firefox's or Safari's).
+			const lang = (globalThis as { navigator?: { gpu?: { wgslLanguageFeatures?: { has(f: string): boolean } } } }).navigator?.gpu?.wgslLanguageFeatures;
+			const missing = (res.requires || []).filter((f) => !this.dev.features?.has?.(f) && !lang?.has?.(f));
+			if (missing.length) throw new Error(`${opts.stage} stage of shader module ${moduleId}: shader needs WebGPU features the device lacks: ${missing.map((f) => (f.includes("_") ? `${f} (a WGSL language feature this browser lacks)` : f)).join(", ")}`);
 			const module = this.dev.createShaderModule({ code: res.wgsl, label: `kwvk shader ${moduleId} ${opts.stage}` });
 			// the first WGSL error (Tint's, e.g. its uniformity analysis), or undefined: pipelines wait for it (pipelineCheck)
 			const check: Promise<string | undefined> = module.getCompilationInfo
@@ -1136,6 +1160,8 @@ export class Conn implements VkConnection {
 				// a larger workgroup may be shrunk (res.dispatchScale, applied at dispatch in vk-exec.ts)
 				const l = this.dev.limits;
 				opts.limits = { maxComputeWorkgroupSizeX: l.maxComputeWorkgroupSizeX, maxComputeWorkgroupSizeY: l.maxComputeWorkgroupSizeY, maxComputeWorkgroupSizeZ: l.maxComputeWorkgroupSizeZ, maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup };
+				// KWVK_NO_GPU (debugging): every workgroup size translates; translate() clamps it
+				if (noGpu()) opts.limits = { maxComputeWorkgroupSizeX: 1024, maxComputeWorkgroupSizeY: 1024, maxComputeWorkgroupSizeZ: 64, maxComputeInvocationsPerWorkgroup: 1024 };
 			}
 			if (arrays) opts.arrays = arrays;
 			if (kind === "vertex") opts.flipY = true;

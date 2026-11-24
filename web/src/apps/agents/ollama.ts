@@ -28,16 +28,17 @@
 // Three switches make Ollama use kwvk (read in its source at that tag):
 // OLLAMA_IGPU_ENABLE=1, as it drops integrated GPUs other than CUDA's and
 // kwvk is one; LLAMA_ARG_FIT_TARGET=64, as llama-server's -fit keeps 1 GiB
-// of device memory free by default and kwvk's heap is half the guest's RAM
-// (498 MiB with 1 GiB), so it put no layer on the GPU (Ollama's ps:
+// of device memory free by default and kwvk's heap was half the guest's RAM
+// (498 MiB with 1 GiB; its device-only heap is 4 GiB now, KWVK_HEAP_MB), so it put no layer on the GPU (Ollama's ps:
 // "75%/25% CPU/GPU", the log's "offloaded 0/6 layers to GPU"); and
 // OLLAMA_NO_CLOUD=1 (no requests to ollama.com). Its discovery runs
 // llama-server --list-devices through the Vulkan loader and finds "kwvk
 // (WebGPU)" with no other requirement (no memory budget extension, no sysfs).
 //
-// The default model is Qwen2.5-Coder 0.5B Instruct (MODEL=qwen-coder, below;
-// the fx (local model) app's default too, so the two compare), which loads
-// on a real GPU only. MODEL=stories260K, as in llama.ts (F32, 1.1 MiB,
+// On a terminal ollama.sh asks which model (its list: SmolLM2 135M first,
+// Qwen2.5 0.5B and 1.5B, Qwen2.5-Coder 0.5B, Llama 3.2 1B, Qwen3.5 0.8B,
+// stories260K); MODEL= names one, and SmolLM2 is the default without a
+// terminal. All but the story model load on a real GPU only. MODEL=stories260K, as in llama.ts (F32, 1.1 MiB,
 // fetched by the page into the installer), runs on software WebGPU too:
 // made an Ollama model by `ollama create` from a
 // Modelfile (FROM the GGUF, num_predict 128), which keeps its F32 weights;
@@ -47,12 +48,12 @@
 // Wider models need ggml's 512-wide norm shaders (rms_norm_mul_f32_512 is
 // the first refused), which SwiftShader's WebGPU (256 invocations) refuses
 // and the renderer, asking for the adapter's best limits, gets on most real
-// GPUs (1024); so the coding models are MODEL= choices, untried on a real
+// GPUs (1024); so the chat models need a real
 // GPU: MODEL=smollm2 (SmolLM2 135M Instruct, Ollama's
-// smollm2:135m-instruct-fp16, 271 MiB, Apache-2.0; try it first) and
+// smollm2:135m-instruct-fp16, 271 MiB, Apache-2.0; served as smollm2-tools,
+// the same weights under a ChatML template with a tool section) and
 // MODEL=qwen-coder (Qwen2.5-Coder 0.5B Instruct,
-// qwen2.5-coder:0.5b-instruct-fp16, 994 MiB, Apache-2.0; kwvk's heap, half
-// the guest's RAM, must hold it: 3 GiB of guest memory or more), fetched
+// qwen2.5-coder:0.5b-instruct-fp16, 994 MiB, Apache-2.0; 3 GiB of guest memory or more), fetched
 // from Ollama's registry by ollama.sh with curl into Ollama's store (manifest
 // and blobs, checked): ollama pull cannot, as it refuses redirects to hosts
 // that resolve to non-public addresses, and the page's network answers DNS
@@ -101,11 +102,16 @@ export const OLLAMA_MODEL_TOOLS = false;
 const OLLAMA_SH = String.raw`#!/bin/bash
 # Ollama with llama.cpp's Vulkan backend on guest Vulkan (kwvk: this page's
 # WebGPU). Written by the unkernel launcher's Ollama app.
-#   ./ollama.sh                     Qwen2.5-Coder 0.5B Instruct (F16, 994 MiB): a small coding chat model; guest memory 3 GiB or more
-#   MODEL=smollm2 ./ollama.sh       SmolLM2 135M Instruct (F16, 271 MiB): a smaller chat model that writes simple code
+#   ./ollama.sh                     asks which model (on a terminal); Enter: SmolLM2 135M Instruct (F16, 271 MiB): a small, fast chat model that writes simple code (fx's default too; as smollm2-tools, with a tool-call template)
+#   MODEL=qwen-coder ./ollama.sh    Qwen2.5-Coder 0.5B Instruct (F16, 994 MiB): a small coding chat model; guest memory 3 GiB or more
+#   MODEL=qwen ./ollama.sh          Qwen2.5 0.5B Instruct (F16, 994 MiB): the general model of that size, better at tool calls
+#   MODEL=qwen1.5 ./ollama.sh       Qwen2.5 1.5B Instruct (F16, 2950 MiB): three times the size, far better at tool calls; guest memory 4 GiB
+#   MODEL=llama3.2 ./ollama.sh      Llama 3.2 1B Instruct (F16, 2364 MiB): tool calls too
 #   MODEL=stories260K ./ollama.sh   stories260K (F32, 1.1 MiB): a story, then you type story starts; runs on software WebGPU too
 #                                   (both need a GPU whose WebGPU allows 512-wide workgroups: not SwiftShader)
 #   MODEL=PATH.gguf ./ollama.sh     another GGUF here (ollama create), F32 or F16
+#   TEMP=0 ./ollama.sh              the sampling temperature as the model's default (a derived model NAME-tN)
+#   THINK=0 ./ollama.sh             a thinking model (Qwen3, Qwen3.5) answers without reasoning first (as /set nothink)
 #   SERVE=1 ./ollama.sh             the server only, for other programs: once the model is on kwvk,
 #                                   its Ollama name goes to ollama.ready; Ctrl-C stops the server
 #   MODEL=NAME ./ollama.sh          another model of Ollama's registry ([user/]name[:tag], fetched by curl): an fp16 tag, as the default ones are quantized
@@ -138,6 +144,38 @@ die() { printf "$R%s$N\n" "$*" >&2; exit 1; }
 # Exit status: 3 a download failed, 4 guest Vulkan refused a shader, 5 the
 # WebGPU device was lost, 1 anything else.
 fail() { local st=$1; shift; printf "$R%s$N\n" "$*" >&2; exit $st; }
+
+# No MODEL= on a terminal: ask. Enter takes the first; a number, or any
+# other name ollama.sh takes (an Ollama name with an fp16 tag, a .gguf).
+pick_model() {
+	local i=0 k l ans
+	printf "$B%s$N\n" "Which model? (Enter: 1; or type an Ollama name or a .gguf path; MODEL=... skips this)"
+	while IFS='|' read -r k l; do
+		i=$((i + 1))
+		printf '  %d) %s\n' $i "$l"
+	done <<MENU
+$1
+MENU
+	printf '> '
+	read -r ans || ans=
+	[ -n "$ans" ] || ans=1
+	case $ans in
+	[0-9] | [0-9][0-9])
+		MODEL=$(printf '%s\n' "$1" | sed -n "$ans"p | cut -d'|' -f1)
+		[ -n "$MODEL" ] || die "No such choice: $ans"
+		;;
+	*) MODEL=$ans ;;
+	esac
+}
+if [ -z "$MODEL" ] && [ -z "$SERVE" ] && [ -t 0 ]; then
+	pick_model 'smollm2|SmolLM2 135M (271 MiB): the fastest; simple code
+qwen|Qwen2.5 0.5B (994 MiB): general chat
+qwen-coder|Qwen2.5-Coder 0.5B (994 MiB): code
+llama3.2|Llama 3.2 1B (2364 MiB)
+qwen1.5|Qwen2.5 1.5B (2950 MiB): the best here; guest memory 4 GiB
+qwen3.5|Qwen3.5 0.8B (1684 MiB, BF16): newer, untried on guest Vulkan
+stories260K|stories260K (1.1 MiB): stories only; runs on software WebGPU too'
+fi
 
 # Guest Vulkan: the base's ICD, and a device named kwvk.
 [ -e /usr/share/vulkan/icd.d/kw_icd.json ] || die "This guest has no kwvk ICD (/usr/share/vulkan/icd.d/kw_icd.json): the page's kernel bundle has no guest Vulkan."
@@ -189,7 +227,7 @@ export OLLAMA_HOST=127.0.0.1:11434
 # kwvk is an integrated GPU, which Ollama drops unless told.
 export OLLAMA_IGPU_ENABLE=1
 # llama-server keeps 1 GiB of device memory free by default, more than kwvk
-# has (half the guest's RAM), and would put every layer on the CPU.
+# had (half the guest's RAM; its device-only heap is 4 GiB now, KWVK_HEAP_MB), and put every layer on the CPU.
 export LLAMA_ARG_FIT_TARGET=64
 # No ollama.com (cloud models, recommendations).
 export OLLAMA_NO_CLOUD=1
@@ -202,9 +240,12 @@ if [ -s "$PIDF" ] && grep -qa 'ollama' "/proc/$(cat "$PIDF")/cmdline" 2>/dev/nul
 	for i in $(seq 50); do kill -0 "$(cat "$PIDF")" 2>/dev/null || break; sleep 0.2; done
 fi
 ! curl -fs "$OLLAMA_HOST/api/version" >/dev/null 2>&1 || die "Another server answers on $OLLAMA_HOST (an ollama serve of yours?): stop it, then run ./ollama.sh again."
-setsid "$OLLAMA" serve >"$LOG" 2>&1 </dev/null &
-SRV=$!
-echo $SRV >"$PIDF"
+serve() {
+	setsid "$OLLAMA" serve >"$LOG" 2>&1 </dev/null &
+	SRV=$!
+	echo $SRV >"$PIDF"
+}
+serve
 stop() {
 	rm -f "$READY"
 	kill $SRV 2>/dev/null || return 0
@@ -216,12 +257,23 @@ trap stop EXIT
 trap 'exit 129' HUP
 trap 'exit 143' TERM
 say "Starting the server (ollama serve; its log: ollama.log)"
-for i in $(seq 300); do
-	grep -qa 'msg="inference compute"' "$LOG" && curl -fs "$OLLAMA_HOST/api/version" >/dev/null 2>&1 && break
-	kill -0 $SRV 2>/dev/null || { tail -n 5 "$LOG" >&2; die "ollama serve ended (ollama.log has its log)."; }
-	sleep 0.2
+# Ollama gives its GPU discovery (a llama-server it starts) 30 s. A first
+# start, with the libraries just unpacked and nothing of them in memory, can
+# take longer here; the next start is faster, so the server is started again.
+for try in 1 2 3; do
+	for i in $(seq 300); do
+		grep -qa 'msg="inference compute"' "$LOG" && curl -fs "$OLLAMA_HOST/api/version" >/dev/null 2>&1 && break
+		kill -0 $SRV 2>/dev/null || { tail -n 5 "$LOG" >&2; die "ollama serve ended (ollama.log has its log)."; }
+		sleep 0.2
+	done
+	gpu=$(grep -a 'msg="inference compute"' "$LOG" | grep -a 'library=Vulkan' | grep -a kwvk | head -n 1)
+	[ -z "$gpu" ] && [ $try -lt 3 ] && grep -qa 'timed out' "$LOG" || break
+	say "Ollama's GPU discovery timed out (a cold start): starting the server again"
+	kill $SRV 2>/dev/null || true
+	for i in $(seq 50); do kill -0 $SRV 2>/dev/null || break; sleep 0.2; done
+	kill -9 $SRV 2>/dev/null || true
+	serve
 done
-gpu=$(grep -a 'msg="inference compute"' "$LOG" | grep -a 'library=Vulkan' | grep -a kwvk | head -n 1)
 if [ -z "$gpu" ]; then
 	grep -aE 'msg="inference compute"|dropping integrated|failure during|timed out' "$LOG" >&2 || true
 	die "Ollama did not take kwvk as its GPU, and would run on the CPU: see ollama.log."
@@ -250,10 +302,20 @@ fetch_model() {
 	case $path in library/*) mir=ollama/v2/$path ;; *) mir=no-mirror/$path ;; esac
 	dl "$reg/manifests/$tag" "$mir/manifests/$tag" -fsSL -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' -o "$man.part" ||
 		{ rm -f "$man.part"; fail 3 "Download failed: the manifest of $path:$tag ($reg/manifests/$tag): no such model or tag, or no network."; }
+	# Room for it? A full data disk fails the download midway, and a write the
+	# browser's storage refuses turns the disk read-only until the next boot.
+	local need have
+	need=$((($(grep -o '"size" *: *[0-9]*' "$man.part" | sed 's/.*: *//' | paste -sd+ - | sed 's/^$/0/')) / 1048576))
+	have=$(($(df -Pk "$store" | awk 'NR==2 {print $4}') / 1024))
+	[ "$have" -gt $((need + 64)) ] ||
+		{ rm -f "$man.part"; fail 3 "No room for $path:$tag: it is $need MiB and $store has $have MiB free. Remove models you do not use ($OLLAMA list, $OLLAMA rm NAME) or raise the disk size (Settings)."; }
 	for d in $(grep -o '"digest" *: *"sha256:[0-9a-f]\{64\}"' "$man.part" | sed 's/.*sha256://; s/"$//'); do
 		f=$store/blobs/sha256-$d
 		if [ -s "$f" ] && echo "$d  $f" | sha256sum -c --quiet >/dev/null 2>&1; then continue; fi
-		dl "$reg/blobs/sha256:$d" "$mir/blobs/sha256:$d" -fL# -C - -o "$f.part" || fail 3 "Download failed: blob sha256:$d of $path:$tag (run ./ollama.sh again to resume)."
+		dl "$reg/blobs/sha256:$d" "$mir/blobs/sha256:$d" -fL# -C - -o "$f.part" || {
+			touch "$store/.w" 2>/dev/null && rm -f "$store/.w" || fail 3 "Download failed: the disk under $store has turned read-only (a failed write: the browser's storage for this site is probably full). Restart the machine, then free space before running ./ollama.sh again."
+			fail 3 "Download failed: blob sha256:$d of $path:$tag ($(df -Ph "$store" | awk 'NR==2 {print $4}') free on its disk; run ./ollama.sh again to resume)."
+		}
 		echo "$d  $f.part" | sha256sum -c --quiet >/dev/null 2>&1 || { rm -f "$f.part"; fail 3 "Download failed: blob sha256:$d of $path:$tag has the wrong SHA-256, deleted (run ./ollama.sh again)."; }
 		mv "$f.part" "$f"
 	done
@@ -261,14 +323,19 @@ fetch_model() {
 	mv "$man.part" "$man"
 }
 
-# The model: Qwen2.5-Coder by default (the fx (local model) app's too), from Ollama's
+# The model: SmolLM2 135M by default (the fx (local model) app's too), from Ollama's
 # registry; stories260K from the page (models/), made an Ollama model once.
 M=$MODEL
-[ -n "$M" ] || M=qwen-coder
+[ -n "$M" ] || M=smollm2
+BASE=
 case $M in
 stories260K) F=models/stories260K.gguf NAME=stories260k ;;
-smollm2) F= NAME=smollm2:135m-instruct-fp16 ;;
+smollm2) F= NAME=smollm2-tools BASE=smollm2:135m-instruct-fp16 ;;
 qwen-coder) F= NAME=qwen2.5-coder:0.5b-instruct-fp16 ;;
+qwen) F= NAME=qwen2.5:0.5b-instruct-fp16 ;;
+qwen1.5) F= NAME=qwen2.5:1.5b-instruct-fp16 ;;
+llama3.2) F= NAME=llama3.2:1b-instruct-fp16 ;;
+qwen3.5) F= NAME=qwen3.5:0.8b-bf16 ;;
 *.gguf) F=$M NAME=$(basename "$M" .gguf | tr 'A-Z' 'a-z' | tr -c 'a-z0-9._\n-' -) ;;
 *) F= NAME=$M ;;
 esac
@@ -285,8 +352,85 @@ else
 	*fp16* | *f16* | *fp32* | *f32*) ;;
 	*) say "$NAME: Ollama's library models are quantized unless the tag says fp16; quantized ones abort on guest Vulkan for now (their shaders do not translate yet)." ;;
 	esac
+	if [ -n "$BASE" ]; then
+		# Ollama's SmolLM2 template declares no tools, so Ollama refuses requests
+		# that carry them (fx's all do): the same weights under a ChatML template
+		# with Qwen2.5's tool section (<tool_call> JSON), which Ollama parses.
+		"$OLLAMA" show "$BASE" >/dev/null 2>&1 || fetch_model "$BASE"
+		if ! "$OLLAMA" show "$NAME" >/dev/null 2>&1; then
+			mkdir -p models
+			{
+				printf 'FROM %s\nTEMPLATE """' "$BASE"
+				cat <<'TPL'
+{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}
+TPL
+				printf '"""\nPARAMETER stop <|im_start|>\nPARAMETER stop <|im_end|>\n'
+			} >"models/$NAME.Modelfile"
+			out=$("$OLLAMA" create "$NAME" -f "models/$NAME.Modelfile" 2>&1) || { printf '%s\n' "$out" | tail -n 3 >&2; die "ollama create failed"; }
+		fi
+	fi
 	"$OLLAMA" show "$NAME" >/dev/null 2>&1 || fetch_model "$NAME"
 	"$OLLAMA" show "$NAME" >/dev/null 2>&1 || die "Ollama does not see $NAME after its download (ollama.log has the server's log)."
+fi
+# TEMP=N: the same model with that sampling temperature as its default (a
+# derived Ollama model, the weights shared), for clients that send none, as fx.
+if [ -n "$TEMP" ]; then
+	TN=$(printf '%s' "$NAME" | tr ':' '-')-t$TEMP
+	if ! "$OLLAMA" show "$TN" >/dev/null 2>&1; then
+		mkdir -p models
+		printf 'FROM %s\nPARAMETER temperature %s\n' "$NAME" "$TEMP" >"models/$TN.Modelfile"
+		out=$("$OLLAMA" create "$TN" -f "models/$TN.Modelfile" 2>&1) || { printf '%s\n' "$out" | tail -n 3 >&2; die "ollama create failed"; }
+	fi
+	NAME=$TN
 fi
 case $NAME in *[Qq][2-8]_* | *[Ii][Qq][1-4]*) say "A quantized model: these abort on guest Vulkan for now (their shaders do not translate yet); F32 and F16 ones run." ;; esac
 
@@ -304,7 +448,9 @@ hint() {
 # Load it now, and check that its layers are on kwvk: a model on the CPU
 # would be a misleading demo.
 say "Loading $NAME on kwvk"
+t0=$(date +%s%N)
 r=$(curl -s "$OLLAMA_HOST/api/generate" -d "{\"model\":\"$NAME\",\"keep_alive\":-1}") || true
+t1=$(date +%s%N)
 case $r in *'"done":true'*) ;; *) hint "Loading $NAME failed: $(printf '%s' "$r" | head -c 300)" ;; esac
 off=$(grep -ao 'offloaded [0-9]*/[0-9]* layers to GPU' "$LOG" | tail -n 1)
 case $off in
@@ -313,7 +459,10 @@ case $off in
 esac
 # (llama.cpp prints that line on a CPU-only run too: the weights must be in a Vulkan buffer.)
 grep -qa 'Vulkan0 model buffer size' "$LOG" || die "$NAME loaded on the CPU, not on kwvk (no Vulkan0 model buffer): see ollama.log."
-say "On kwvk: $off ($("$OLLAMA" ps | awk 'NR == 2 { for (i = 1; i <= NF; i++) if ($i == "GPU" || $i ~ /GPU$/) { print $(i - 1), $i; exit } }'))"
+# The load time (the request above: the weights read and uploaded, the
+# first pipelines made), to compare GPUs and builds; ollama run --verbose
+# prints the eval rate (tokens per second) after each reply.
+say "On kwvk: $off ($("$OLLAMA" ps | awk 'NR == 2 { for (i = 1; i <= NF; i++) if ($i == "GPU" || $i ~ /GPU$/) { print $(i - 1), $i; exit } }')), loaded in $(( (t1 - t0) / 100000000 / 10 )).$(( (t1 - t0) / 100000000 % 10 )) s"
 
 # SERVE=1: the server only (another app talks to it), until this script is
 # stopped; the traps above stop the server.
@@ -347,15 +496,19 @@ if [ -n "$F" ] && ! head -c 16777216 "$F" | grep -qa tokenizer.chat_template; th
 	done
 	echo
 else
+	# THINK=0: a thinking model (Qwen3, Qwen3.5) answers without its reasoning
+	# first, which is most of a reply's tokens; THINK=1 asks for it.
+	TA=
+	case $THINK in 0 | false | no | off) TA=--think=false ;; '') ;; *) TA=--think=true ;; esac
 	say "Type a message and press Enter. Ctrl-D or /bye quits and stops the server."
-	"$OLLAMA" run --verbose "$NAME" || hint "ollama run failed"
+	"$OLLAMA" run --verbose $TA "$NAME" || hint "ollama run failed"
 fi
 `;
 
 export default {
 	id: "ollama",
 	title: "Ollama",
-	desc: "Ollama on the GPU: its server and ollama run on llama.cpp's Vulkan backend, on this browser's WebGPU (guest Vulkan); Qwen2.5-Coder 0.5B (994 MiB; guest memory 3 GiB or more, a real GPU), Ollama (12 MiB) and llama.cpp (29 MiB) on first run; small F16 coding models with MODEL=",
+	desc: "Ollama on the GPU: its server and ollama run on llama.cpp's Vulkan backend, on this browser's WebGPU (guest Vulkan); asks which model (SmolLM2 135M, 271 MiB, to Qwen2.5 1.5B, 2950 MiB; a real GPU), fetched with Ollama (12 MiB) and llama.cpp (29 MiB) on first run",
 	// A speech bubble with three dots (crafted).
 	icon: { svg: '<path d="M5.5 4h13Q20 4 20 5.5v9q0 1.5-1.5 1.5H11l-4.6 3.7q-.4.3-.4-.2V16h-.5Q4 16 4 14.5v-9Q4 4 5.5 4Z"/><circle cx="8.5" cy="10" r="1.2" fill="#0f766e"/><circle cx="12" cy="10" r="1.2" fill="#0f766e"/><circle cx="15.5" cy="10" r="1.2" fill="#0f766e"/>' },
 	colors: ["#0f766e", "#1e1b4b"],
@@ -366,14 +519,16 @@ export default {
 		"ollama.sh": { content: OLLAMA_SH, mode: 0o755 },
 		README: "Ollama runs this model on the guest's Vulkan, which is this browser's WebGPU\n" +
 			"(guest Vulkan in Options): its server (ollama serve, while ollama.sh runs; its\n" +
-			"log: ollama.log) loads every layer on the GPU. The default model is\n" +
-			"Qwen2.5-Coder 0.5B Instruct (F16, 994 MiB, fetched once), a small coding chat\n" +
-			"model: ask it, e.g., Write a Python function that reverses a string.\n" +
-			"It needs guest memory of 3 GiB or more (Settings) and a real GPU (software\n" +
-			"WebGPU refuses its 512-wide workgroups). Ctrl-D or /bye quits and stops the\n" +
+			"log: ollama.log) loads every layer on the GPU. ollama.sh asks which model\n" +
+			"(Enter: SmolLM2 135M Instruct, F16, 271 MiB, fetched once; MODEL=NAME skips\n" +
+			"the question): ask it, e.g., Write a Python function that reverses a string.\n" +
+			"The larger ones need more guest memory (Settings: 3 GiB for the 0.5B models,\n" +
+			"4 GiB above), and all a real GPU (software WebGPU refuses their 512-wide\n" +
+			"workgroups). THINK=0 turns a thinking model's reasoning off, TEMP=N sets the\n" +
+			"temperature. Ctrl-D or /bye quits and stops the\n" +
 			"server. Quantized models (Ollama's library: q4_K_M ...) abort on guest Vulkan\n" +
 			"for now; F32 and F16 ones run. Others:\n" +
-			"  MODEL=smollm2 ./ollama.sh              (SmolLM2 135M Instruct, 271 MiB: simple code)\n" +
+			"  MODEL=qwen1.5 ./ollama.sh              (Qwen2.5 1.5B Instruct, 2950 MiB: the best here)\n" +
 			"  MODEL=stories260K ./ollama.sh          (a tiny F32 story model, 1.1 MiB, no chat\n" +
 			"                                          template: type story starts; runs on\n" +
 			"                                          software WebGPU too)\n" +

@@ -956,17 +956,27 @@ external buffer), else as wl_shm windows (frames read back).
   in its own session (log in `ollama.log`) with these settings:
   - `OLLAMA_IGPU_ENABLE=1`: Ollama drops integrated GPUs, and kwvk is one.
   - `LLAMA_ARG_FIT_TARGET=64`: llama-server's `-fit` keeps 1 GiB of device
-    memory free, more than kwvk's heap (half the guest's RAM), and would
+    memory free, more than kwvk's heap was (half the guest's RAM then; 4 GiB of device-only memory now), and would
     otherwise put every layer on the CPU.
   - `OLLAMA_NO_CLOUD=1` and `OLLAMA_KEEP_ALIVE=-1`.
 
   It stops with a message unless three checks pass: Ollama's "inference
   compute" line names kwvk, a Vulkan0 model buffer exists after `ollama
   create` (F32 kept) and a load, and llama-server reports offloaded
-  layers. The default model is `MODEL=qwen-coder` (Qwen2.5-Coder 0.5B
-  Instruct, F16, 994 MiB; guest memory of 3 GiB or more; the fx (local
-  model) app's default too), which gets `ollama run`'s chat, as any model
-  with a chat template. Models:
+  layers. Its "On kwvk" line gives the load time (the load request: the
+  weights read and uploaded, the first pipelines made), and `ollama run
+  --verbose` ends each reply with Ollama's timings (eval rate: tokens per
+  second), the numbers to compare GPUs and builds by. On a terminal ollama.sh asks which model (a numbered list; Enter takes
+  the first, SmolLM2 135M, which is also the default without a terminal;
+  `MODEL=` skips the question); a model with a chat template gets `ollama
+  run`'s chat. `THINK=0` runs a thinking model without its reasoning,
+  `TEMP=N` serves a derived model with that temperature, a model that does
+  not fit the data disk is refused before its download, and the server is
+  started again when Ollama's GPU discovery (30 s) times out on a cold
+  start. Short names: `smollm2` (served as `smollm2-tools`: a ChatML
+  template with a tool section), `qwen`, `qwen-coder`, `qwen1.5` (Qwen2.5
+  1.5B, 2950 MiB), `llama3.2` (1B, 2364 MiB), `qwen3.5` (0.8B, BF16),
+  `stories260K`. Models:
   - `MODEL=stories260K`, the story model, runs on software WebGPU too: the
     script writes a story from "Once upon a time" and reads the user's
     story starts, sending each as `ollama run --verbose stories260k
@@ -1027,9 +1037,17 @@ external buffer), else as wl_shm windows (frames read back).
   `supports_tool_use` and `supports_vision`) is merged with jq into an
   app-private `FX_HOME` (`~/.apps/fx-local/fx-home/settings.json`), so the
   user's `~/.fx` is untouched; fx runs with `FX_PROVIDER=local`,
-  `FX_MODEL` and `FX_AUTO_UPGRADE=0` in `~/.apps/fx-local/work`. The
-  default model is `MODEL=qwen-coder` (the smallest one ollama.sh offers
-  that can call tools; CTX 16384; guest memory 3 GiB or more). fx sends
+  `FX_MODEL` and `FX_AUTO_UPGRADE=0` in `~/.apps/fx-local/work`. fx-local.sh
+  asks which model on a terminal as ollama.sh does, runs it at temperature
+  0 (`TEMP=`) and a thinking model with `reasoning_effort: "none"` in the
+  connection's per-model request fields (`THINK=1` for thinking; untested
+  in fx). The
+  first and default model is `MODEL=qwen` (Qwen2.5 0.5B Instruct,
+  `qwen2.5:0.5b-instruct-fp16`: the smallest one ollama.sh offers that
+  calls fx's tools; CTX 16384; guest memory 3 GiB or more). Qwen2.5-Coder
+  0.5B (`MODEL=qwen-coder`, the same size) answered fx with JSON in a code
+  block instead of tool calls (3 tasks of 3; Qwen2.5 0.5B called tools in
+  2; host CPU, 2026-11-24). fx sends
   its tools with every request whatever `supports_tool_use` says, and
   Ollama answers HTTP 400 for a model without them (SmolLM2, the story
   model), so fx-local.sh stops before fx with such a model. The
@@ -1037,7 +1055,7 @@ external buffer), else as wl_shm windows (frames read back).
   `/api/show` reports, and tool use follows its capabilities
   (`OLLAMA_MODEL_TOOLS` for the story model; `TOOLS=0|1` overrides). On
   a real GPU (the user's, 2026-11-24) SmolLM2 loaded and fx reached it
-  (and got that 400); Qwen2.5-Coder with fx is untried. The field names
+  (and got that 400); Qwen2.5 with fx on a GPU is untried. The field names
   follow fx's docs for 0.0.17.
 - The page needs a base bundle with the ICD (vk.md). `test/vk/page-check.mjs`:
   the dev server on a free port with `KW_KERNEL=$KW_BUILD/vk/base/unkernel.wasm`

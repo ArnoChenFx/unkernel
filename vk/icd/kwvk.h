@@ -31,6 +31,12 @@ void jb_put(struct jb *b, const void *s, size_t n);
 #define JS(b, lit) jb_put(b, lit, sizeof(lit) - 1)
 void jb_printf(struct jb *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void jb_float(struct jb *b, double f);
+/* decimal numbers without printf (hot paths: command recording) */
+void jb_u64(struct jb *b, uint64_t v);
+void jb_i64(struct jb *b, int64_t v);
+void jb_bytes(struct jb *b, const uint8_t *p, size_t n);
+/* "key":value, the key a string literal with its punctuation, e.g. JU(b, ",\"x\":", 1) */
+#define JU(b, lit, v) (JS(b, lit), jb_u64(b, (uint64_t)(v)))
 void jb_str(struct jb *b, const char *s);
 void jb_free(struct jb *b);
 void jb_reset(struct jb *b);
@@ -93,6 +99,7 @@ struct kw_physical_device {
 	uint32_t timestamp_bits;
 	int f16;
 	uint64_t max_alloc;
+	char adapter[128]; /* the WebGPU adapter, for driverInfo */
 	uint64_t max_buffer; /* WebGPU's maxBufferSize */
 	uint32_t ext_token; /* the hello's external.token: the host resolves external buffers (0: it does not) */
 };
@@ -109,6 +116,13 @@ struct kw_device {
 	struct kw_queue *queue;
 	pthread_mutex_t mu; /* buffer and memory lists */
 	pthread_mutex_t rb_mu; /* one readback at a time */
+	/* replies of submits whose fences were signaled at submit, oldest
+	 * first (vk/PROTOCOL.md, Amendments, "Fences at submit") */
+#define KW_INFLIGHT 8
+	pthread_mutex_t fl_mu;
+	uint32_t inflight[KW_INFLIGHT];
+	int ninflight;
+	int fence_sync; /* KWVK_FENCE_SYNC=1: fences signal at their submit's reply */
 	struct kw_buffer *buffers;
 	struct kw_memory *mems;
 };
@@ -168,13 +182,14 @@ struct kw_dslot {
 	struct kw_buffer *buf;
 	VkDeviceSize offset, range;
 	int dyn; /* index of its dynamic offset in the set, -1: not dynamic */
+	int storage; /* a storage buffer (else a uniform buffer: read only) */
 };
 struct kw_dset {
 	uint32_t id;
 	struct kw_dpool *pool;
 	struct kw_dsl *layout;
 	struct kw_dset *next, *prev;
-	struct kw_dslot *slots; /* storage buffers written into this set */
+	struct kw_dslot *slots; /* uniform and storage buffers written into this set */
 	size_t nslots;
 };
 struct kw_dpool {
@@ -183,6 +198,7 @@ struct kw_dpool {
 struct kw_fence {
 	int signaled;
 	uint32_t r; /* pending submit reply */
+	uint32_t polls; /* vkGetFenceStatus calls that found r pending */
 };
 struct kw_shader {
 	uint32_t id;
@@ -211,6 +227,10 @@ struct kw_cmdbuf {
 	struct jb cmds; /* comma-separated command objects */
 	struct kw_written *written; /* buffers and ranges the GPU may write */
 	size_t nwritten, capwritten;
+	/* buffers and ranges the GPU may read: with `written`, what vkQueueSubmit
+	 * flushes of host-visible memory */
+	struct kw_written *reads;
+	size_t nreads, capreads;
 	struct kw_pipe *pipe[2]; /* bound graphics, compute pipeline */
 	struct kw_dset *sets[2][KW_MAX_SETS];
 	uint32_t dyn[2][KW_MAX_SETS][KW_MAX_DYN]; /* their dynamic offsets */

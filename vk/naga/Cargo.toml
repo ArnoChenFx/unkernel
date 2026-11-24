@@ -18,6 +18,15 @@ path = "src/lib.rs"
 # the GLSL writer itself is dead code that LTO drops.
 naga = { version = "=30.0.2", default-features = false, features = ["spv-in", "wgsl-out", "glsl-out"] }
 
+[features]
+# The native WGSL checker (examples/check.rs): naga's WGSL
+# front end, as Firefox parses the translator's output.
+check = ["naga/wgsl-in"]
+
+[[example]]
+name = "check"
+required-features = ["check"]
+
 [profile.release]
 opt-level = "z"
 lto = true

@@ -47,7 +47,7 @@ export interface VkShaderResult {
 	entryPoint: string;
 	bindings: VkShaderBinding[];
 	pushConstantSize?: number;
-	/** WebGPU features the WGSL needs ("shader-f16", "subgroups", "clip-distances", "dual-source-blending"; anything else cannot run on WebGPU). */
+	/** WebGPU features the WGSL needs ("shader-f16", "subgroups", "clip-distances", "dual-source-blending", "primitive-index"), or the WGSL language feature "uniform_buffer_standard_layout" (a uniform block the translator could not repack; navigator.gpu.wgslLanguageFeatures); anything else cannot run on WebGPU. */
 	requires?: string[];
 	/** Compute: multiply each dispatch's group counts by these (the workgroup was shrunk to fit opts.limits). */
 	dispatchScale?: [number, number, number];

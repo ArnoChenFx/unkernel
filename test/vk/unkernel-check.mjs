@@ -43,6 +43,7 @@
 //
 //   node test/vk/unkernel-check.mjs [--worker] [--skip h,a,b,c,w] [--tests DIR] [--no-push] [--kernel FILE] [--apps] [--snapshot] [--lose] [--cpus N] [--capture-shaders] [--disk FILE]
 //        [--relay FILE] [--wsizes WxH,...] [--wsecs S] [--device-re REGEX] [--cmd SHELL] [--out DIR] [--browser BIN] [--timeout S] [--no-build | --source]
+//        [--mem MIB] [--nogpu] [--profile N]
 //
 // --lose adds step l: the renderer's WebGPU device destroyed (vm.vk.device)
 // while vkcube runs: vkcube must end, vm.vk.status must say lost, and
@@ -56,7 +57,14 @@
 // isolated). --capture-shaders (with --source) writes every SPIR-V module
 // the translator refuses to --out (shader-fail-N.spv, .json: the options and
 // the error). --disk FILE boots another prepared disk (made on the same
-// Debian image). --kernel boots another bundle than dist's (e.g. one whose base carries
+// Debian image). --mem MIB: the guest's memory (default 1024). --nogpu
+// (debugging, timing): the renderer encodes every dispatch but runs none
+// (vk-host.ts noGpu: wrong results; workgroups over the device's limits
+// compile clamped), so a model's per-token overhead can be timed without
+// SwiftShader's GPU time. --profile N: an instruction sample every N guest
+// user instructions (js/core/profile.ts) while --cmd runs, written to
+// profile.json in the out dir (symbolizeProfile reads it with a host copy of
+// the guest's files). --kernel boots another bundle than dist's (e.g. one whose base carries
 // the ICD: KW_BASE_OUT=DIR guest/build.sh base, then kernel/tools/bundle.mjs;
 // with --no-push). --source runs the SDK from its sources instead of dist/ (no pnpm build):
 // js/ served as JavaScript through Node's module.stripTypeScriptTypes, and
@@ -260,6 +268,9 @@ if (opt("--cpus")) query.set("cpus", opt("--cpus"));
 if (relay) query.set("relay", "1");
 if (opt("--wsizes")) query.set("wsizes", opt("--wsizes"));
 if (opt("--wsecs")) query.set("wsecs", opt("--wsecs"));
+if (opt("--mem")) query.set("mem", opt("--mem"));
+if (has("--nogpu")) query.set("nogpu", "1");
+if (opt("--profile")) query.set("profile", opt("--profile"));
 const pageUrl = `http://127.0.0.1:${server.address().port}/test/unkernel.html?${query}`;
 console.log(`== ${pageUrl}\n   output in ${out}`);
 const t0 = Date.now();

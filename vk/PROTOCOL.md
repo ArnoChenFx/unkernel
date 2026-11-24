@@ -85,10 +85,12 @@ HOST_COHERENT (a malloc'd shadow); no DEVICE_LOCAL | HOST_VISIBLE type
 - `vkCreateBuffer {id,size,usage}`: the host makes a GPUBuffer (size
   rounded up to 4, COPY_SRC | COPY_DST always added).
 - `{"op":"writeBuffer","buffer":id,"offset":o}` + binary: guest to host.
-  The ICD sends it for every buffer bound to host-visible memory whose
-  bytes changed since it last sent them (it keeps a last-sent copy and
-  diffs; unmapped and never-written memory sends nothing), before each
-  vkQueueSubmit, and at vkUnmapMemory and vkFlushMappedMemoryRanges.
+  The ICD sends the bytes of host-visible memory that changed since it last
+  sent them (it keeps a last-sent copy and diffs; unmapped and never-written
+  memory sends nothing): before each vkQueueSubmit, for the ranges of
+  buffers that the submitted commands may read or write (Amendments,
+  "Submit flush"), and at vkUnmapMemory and vkFlushMappedMemoryRanges, for
+  the whole memory.
 - `{"op":"readBuffer","r":N,"buffer":id,"offset":o,"size":s}` -> reply
   with the bytes as binary. The ICD tracks the byte ranges of buffers the
   GPU may have written (copy destinations, storage buffers in descriptor
@@ -132,7 +134,9 @@ command's fields are the Vulkan parameter names (no `commandBuffer`);
 (`vkCmdPushConstants.values`, `vkCmdUpdateBuffer.data`) is an array of
 byte values. With `r` the host replies `{"r":N}` once the GPU has finished
 this submission (`queue.onSubmittedWorkDone()`): the ICD sends `r` when
-the submit has a fence and signals it at the reply. `{"op":"sync","r":N}`
+the submit has a fence and signals it at the reply (or at the submit, when
+its commands write no host-visible memory: Amendments, "Fences at
+submit"). `{"op":"sync","r":N}`
 replies when everything submitted so far is done (vkQueueWaitIdle,
 vkDeviceWaitIdle).
 
@@ -491,14 +495,31 @@ sides can (Amendments, "External present").
   bases). Texel buffers remain unsupported (they need translator work).
 - Translator: every result has `requires`, the WebGPU features its WGSL
   enables: "shader-f16" (float16_t, 16-bit float storage), "subgroups",
-  "clip-distances", "dual-source-blending". Any other entry is not a
-  WebGPU feature (e.g. naga's "wgpu_int16" for uint16_t) and cannot run.
-  The host checks them against the device and fails the pipeline with
-  "shader needs WebGPU features the device lacks: ...".
-- Translator: struct layouts are no longer checked by naga, only by
-  WebGPU: push constant blocks are std430 (e.g. `uint a[4]`, stride 4) and
-  stay a uniform buffer, which needs WGSL's uniform_buffer_standard_layout
-  (Chrome has it).
+  "clip-distances", "dual-source-blending", "primitive-index", and
+  "uniform_buffer_standard_layout", a WGSL language feature (below). Any
+  other entry is not a WebGPU feature (e.g. naga's "wgpu_int16" for
+  uint16_t) and cannot run. The host checks them against the device's
+  features and `navigator.gpu.wgslLanguageFeatures` and fails the
+  pipeline with "shader needs WebGPU features the device lacks: ...".
+- Translator: the WGSL is valid under WebGPU's core rules on every engine
+  (Chrome's Tint, Firefox's naga, Safari's WGSL). A uniform block (push
+  constants included) whose Vulkan layout WGSL's uniform address space
+  cannot express (std430 push constants: arrays of stride 4 or 8 such as
+  llama.cpp's rope parameters, 4-byte-aligned structs; non-square
+  row-major matrices; members inside a struct's 16-byte rounding) becomes
+  `struct kw_words { w: array<vec4<u32>, N> }` over the same bytes, every
+  load rebuilt from words (vk/naga/src/uniform.rs); the push constant
+  size is then rounded up to 16. Blocks WGSL can lay out keep their
+  struct. naga validates with WebGPU's capabilities and struct layouts;
+  a block the pass cannot repack (8/16-bit or bool members, a pointer
+  used other than by access chains and loads) passes only with
+  uniform_buffer_standard_layout (Chrome) and lists it in `requires`.
+- Translator: an integer division or remainder by a constant zero
+  (undefined in Vulkan, typically in a branch the specialization makes
+  dead: llama.cpp's mul_mm `k_pair / (TK / 2)` with TK = 1) becomes
+  WGSL's run-time result, x / 0 = x and x % 0 = 0, so no zero divisor
+  reaches the WGSL (naga and Tint refuse one even unreachable); spec
+  constant expressions fold the same way.
 - Translator: compute shaders are compacted (naga's wrapper inlined so
   WGSL's uniformity rule accepts barriers after workgroup-uniform early
   exits): their `bindings` list only the resources the entry point uses.
@@ -529,8 +550,10 @@ sides can (Amendments, "External present").
   shaderInt8/Int16, timeline semaphores, buffer device address and
   descriptor indexing false; subgroups reported as size 1, basic only); the 1.2 entry
   points exist (timeline/BDA ones are inert, the draw-indirect-count ones
-  are dropped and logged). The memory heap is half of the guest's RAM
-  (sysconf), maxMemoryAllocationSize min(heap, 1 GiB). writeBuffer frames
+  are dropped and logged). Two memory heaps: device-only memory's is
+  4 GiB (`KWVK_HEAP_MB` sets it, as `KWVK_DEVICE_NAME` sets the device name, which is "kwvk (WebGPU: ADAPTER)" otherwise, with "apple", "metal", "cuda", "rocm" and "hip" spelled apart ("a.p.p.l.e"), as Ollama takes a device so named for a Metal, CUDA or ROCm one (driverInfo has the adapter as it is); WebGPU tells no size, and that memory has
+  no copy in the guest), host-visible memory's half of the guest's RAM
+  (sysconf); maxMemoryAllocationSize min(maxBufferSize, maxStorageBufferBindingSize); a host-visible allocation over its heap fails (VK_ERROR_OUT_OF_DEVICE_MEMORY). writeBuffer frames
   carry at most 16 MiB each (a multi-MiB upload is several frames).
 - ICD (round 4): GPU-written buffers are now marked at each draw or
   dispatch, only for the storage buffers the bound pipeline's shaders may
@@ -748,3 +771,38 @@ sides can (Amendments, "External present").
     that take the first type with the flags they need (GTK's GSK, VMA for
     GPU-only allocations) get type 0 for GPU-only resources as before.
     memoryTypeBits is 3 for buffers and images.
+
+- Submit flush (2026-11-24, ICD): at vkQueueSubmit the ICD diffs and sends
+  only the host-visible ranges the submitted command buffers may read or
+  write, recorded with each command: uniform and storage buffer
+  descriptors as bound at each draw or dispatch (offset plus dynamic
+  offset, range; VK_WHOLE_SIZE to the end; a dynamic offset the ICD does
+  not keep: the whole buffer), vkCmdCopyBuffer sources and destinations
+  (the regions), vertex buffers (offset to the end, or `size`), index and
+  indirect buffers (offset to the end), vkCmdCopyBufferToImage sources
+  (each region's `bufferOffset` to the end) and every range the
+  GPU-written tracking ("Device memory tracking") marks. Device-only memory
+  is never listed. Other CPU writes stay pending until a submit uses them,
+  vkUnmapMemory or vkFlushMappedMemoryRanges: the GPU reads nothing else
+  of host-visible memory. Before, every mapped byte was diffed at every
+  submit, which for ggml-vulkan (its token embeddings and staging buffers
+  kept mapped, 60 MiB for SmolLM2 135M, 300 MiB for Qwen2.5 0.5B) cost
+  tens of milliseconds per submit in the guest.
+
+- Fences at submit (2026-11-24, ICD): a fence given to a vkQueueSubmit
+  whose command buffers write no host-visible memory (nothing the app can
+  read changes; the GPU-written tracking of "Device memory tracking" finds
+  none) is signaled at the submit. The submit still carries `r`; the ICD
+  collects those replies later (the ones that have come at each fence wait,
+  vkGetFenceStatus, wait-idle and submit; a 9th unanswered one waits for the
+  oldest), and an `err` among them loses the device, which the next wait,
+  submit or present reports instead of that fence. What earlier work wrote
+  to mapped memory is read back after the wait as before, by readBuffer
+  requests the host answers in order, after that work, once its validation
+  is known. A submit that may write host-visible memory signals its fence
+  at its reply. `KWVK_FENCE_SYNC=1` makes every fence wait for its reply. A
+  fence still pending: vkGetFenceStatus waits up to 1 ms in the kernel for
+  the reply from the second call on (callers that spin on it, as
+  ggml-vulkan does, would keep the guest's CPU from the host in inline
+  mode). ggml-vulkan's waited uploads of each token's inputs went from 7
+  round trips a token (Qwen2.5 0.5B) to none.

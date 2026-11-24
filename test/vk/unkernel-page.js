@@ -9,7 +9,8 @@
 // printed; the harness judges. Query: worker=1 (worker mode), skip=a,b,c,
 // tests=NAME,NAME (the guest test programs served at /files/test/NAME),
 // push=0 (use the base's ICD), cmd=SHELL (one more step, "cmd"), kernel=URL (another
-// bundle), src=1 (the SDK from its sources, /js/web.ts, instead of /dist/web.mjs).
+// bundle), mem=MIB (guest memory), nogpu=1 (vk-host.ts noGpu), profile=N
+// (instruction samples of the guest during cmd: profile.json), src=1 (the SDK from its sources, /js/web.ts, instead of /dist/web.mjs).
 const q = new URLSearchParams(location.search);
 const { createKernel } = await import(q.has("src") ? "/js/web.ts" : "/dist/web.mjs");
 const skip = new Set((q.get("skip") || "").split(",").filter(Boolean));
@@ -214,6 +215,8 @@ async function wlandStep(vm, run, put, result) {
 }
 
 async function main() {
+	// nogpu=1 (debugging): dispatches encoded but not run (vk-host.ts noGpu)
+	if (q.has("nogpu")) globalThis.KWVK_NO_GPU = true;
 	const adapter = await navigator.gpu?.requestAdapter();
 	const result = { worker: q.has("worker"), steps: {}, webgpu: adapter ? {} : null };
 	for (const k of ["vendor", "architecture", "device", "description"]) if (adapter) result.webgpu[k] = adapter.info?.[k];
@@ -226,7 +229,9 @@ async function main() {
 		...(q.get("cpus") ? { cpus: Number(q.get("cpus")) } : {}),
 		vk: true,
 		worker: q.has("worker"),
-		memoryMiB: 1024,
+		memoryMiB: Number(q.get("mem")) || 1024,
+		// profile=N: an instruction sample every N guest user instructions (profile.ts), posted as profile.json
+		...(q.get("profile") ? { profile: { hz: 0, insns: Number(q.get("profile")) } } : {}),
 		log,
 	};
 	let vm = await createKernel(vmOpts);
@@ -304,6 +309,7 @@ async function main() {
 
 	if (q.get("cmd")) {
 		await run("cmd", q.get("cmd"));
+		if (q.get("profile")) await post("/file/profile.json", JSON.stringify(await vm.profile()));
 		// files the command left in /tmp/kwvk-out (e.g. screenshots) go to the harness's --out
 		const r = await vm.exec("sh", ["-c", "ls /tmp/kwvk-out 2>/dev/null"]);
 		for (const f of r.stdout.split("\n").filter((f) => /^[\w.-]+$/.test(f))) {

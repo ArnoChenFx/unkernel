@@ -116,6 +116,47 @@ void jb_printf(struct jb *b, const char *fmt, ...)
 	b->n += n;
 }
 
+void jb_u64(struct jb *b, uint64_t v)
+{
+	char tmp[20];
+	int n = 0;
+	do
+		tmp[sizeof tmp - ++n] = (char)('0' + v % 10);
+	while ((v /= 10));
+	jb_put(b, tmp + sizeof tmp - n, n);
+}
+
+void jb_i64(struct jb *b, int64_t v)
+{
+	if (v < 0) {
+		JS(b, "-");
+		jb_u64(b, (uint64_t)0 - (uint64_t)v);
+	} else
+		jb_u64(b, (uint64_t)v);
+}
+
+/* [n bytes as decimal numbers], e.g. push constants (no printf per byte) */
+void jb_bytes(struct jb *b, const uint8_t *p, size_t n)
+{
+	jb_grow(b, n * 4 + 2);
+	char *o = b->p + b->n;
+	*o++ = '[';
+	for (size_t i = 0; i < n; i++) {
+		unsigned v = p[i];
+		if (i)
+			*o++ = ',';
+		if (v >= 100) {
+			*o++ = (char)('0' + v / 100);
+			*o++ = (char)('0' + v / 10 % 10);
+		} else if (v >= 10)
+			*o++ = (char)('0' + v / 10);
+		*o++ = (char)('0' + v % 10);
+	}
+	*o++ = ']';
+	b->n = (size_t)(o - b->p);
+	b->p[b->n] = 0;
+}
+
 void jb_float(struct jb *b, double f)
 {
 	char tmp[64];

@@ -782,13 +782,15 @@ pub fn fold_spec_ops(words: Vec<u32>) -> Vec<u32> {
 				128 => Some(u(0)?.wrapping_add(u(1)?)),
 				130 => Some(u(0)?.wrapping_sub(u(1)?)),
 				132 => Some(u(0)?.wrapping_mul(u(1)?)),
-				134 => u(0)?.checked_div(u(1)?),
-				135 => s(0)?.checked_div(s(1)?).map(|v| v as u32),
-				137 => u(0)?.checked_rem(u(1)?),
-				138 => s(0)?.checked_rem(s(1)?).map(|v| v as u32),
+				// By zero (undefined in Vulkan): x / 0 = x, x % 0 = 0, as
+				// WGSL defines it at run time.
+				134 => Some(u(0)?.checked_div(u(1)?).unwrap_or(u(0)?)),
+				135 => Some(if s(1)? == 0 { u(0)? } else { s(0)?.wrapping_div(s(1)?) as u32 }),
+				137 => Some(u(0)?.checked_rem(u(1)?).unwrap_or(0)),
+				138 => Some(if s(1)? == 0 { 0 } else { s(0)?.wrapping_rem(s(1)?) as u32 }),
 				139 => {
 					let (p, q) = (s(0)?, s(1)?);
-					if q == 0 { None } else { Some((((p % q) + q) % q) as u32) }
+					Some(if q == 0 { 0 } else { p.wrapping_rem(q).wrapping_add(q).wrapping_rem(q) as u32 })
 				}
 				194 => Some(u(0)?.wrapping_shr(u(1)?)),
 				195 => Some(s(0)?.wrapping_shr(u(1)?) as u32),

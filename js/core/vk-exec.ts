@@ -9,7 +9,7 @@
 // fails the whole submit (VkDeviceLost: the guest's device is lost) rather
 // than being skipped.
 
-import { BU, TU, UNUSED, isWhole, dkey, pipelineVariant, computeVariant, effectiveExt, VkDeviceLost, type Conn } from "./vk-host.ts";
+import { BU, TU, UNUSED, isWhole, dkey, pipelineVariant, computeVariant, effectiveExt, noGpu, VkDeviceLost, type Conn } from "./vk-host.ts";
 import { hasDepth, hasStencil, texFormatInfo } from "./vk-formats.ts";
 
 const ALIGN = 256;
@@ -1078,7 +1078,8 @@ class Exec {
 			case "vkCmdDispatch": {
 				// a workgroup shrunk to the device's limits runs more groups (vk-shader.ts dispatchScale)
 				const ds = this.comp.pipeline?.stage?.res?.dispatchScale || [1, 1, 1];
-				this.flushDispatch().dispatchWorkgroups((k.groupCountX ?? 1) * ds[0], (k.groupCountY ?? 1) * ds[1], (k.groupCountZ ?? 1) * ds[2]);
+				const pass = this.flushDispatch();
+				if (!noGpu()) pass.dispatchWorkgroups((k.groupCountX ?? 1) * ds[0], (k.groupCountY ?? 1) * ds[1], (k.groupCountZ ?? 1) * ds[2]);
 				break;
 			}
 			case "vkCmdDispatchIndirect":

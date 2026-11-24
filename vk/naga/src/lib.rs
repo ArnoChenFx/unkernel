@@ -14,7 +14,8 @@
 //
 // Before naga (spirv.rs): spec constants are baked and OpSpecConstantOp
 // folded, combined image samplers split, every binding doubled, output
-// blocks given per-member locations, std140 scalar/vec2 arrays wrapped.
+// blocks given per-member locations, std140 scalar/vec2 arrays wrapped,
+// uniform blocks WGSL cannot lay out repacked into u32 words (uniform.rs).
 // On naga's IR: gl_PointSize dropped, input blocks split, push constants
 // become a uniform buffer, only the requested entry point kept. On the
 // WGSL text: struct padding for Vulkan offsets, and fragment shaders turn
@@ -22,6 +23,7 @@
 
 mod small;
 mod spirv;
+mod uniform;
 
 use naga::{AddressSpace, ImageClass, ImageDimension, ScalarKind, StorageAccess, TypeInner};
 use std::fmt::Write as _;
@@ -78,6 +80,7 @@ struct Opts {
 impl Opts {
 	fn parse(s: &str) -> Opts {
 		NO_VALIDATE.store(false, std::sync::atomic::Ordering::Relaxed);
+		STD_LAYOUT.store(false, std::sync::atomic::Ordering::Relaxed);
 		let mut o = Opts { stage: naga::ShaderStage::Vertex, entry: "main".into(), flip_y: false, push_group: 0, spec: Vec::new(), arrays: Vec::new(), dump: false, link: Vec::new(), storage_formats: Vec::new(), features: Vec::new(), limits: None };
 		for line in s.lines() {
 			let Some((k, v)) = line.split_once('=') else { continue };
@@ -152,19 +155,42 @@ fn err_chain(e: &dyn std::error::Error) -> String {
 
 static NO_VALIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// What WGSL allows on WebGPU, as Firefox's naga grants it: the core
+// language and every optional WebGPU feature the translator may enable
+// (the WGSL's `enable`s become result.requires, which the host checks
+// against the device). Nothing naga-only (push constants, binding arrays,
+// 64-bit types, early_depth_test...).
+pub fn webgpu_capabilities() -> naga::valid::Capabilities {
+	use naga::valid::Capabilities as C;
+	C::MULTISAMPLED_SHADING | C::CUBE_ARRAY_TEXTURES | C::SHADER_FLOAT16_IN_FLOAT32 | C::SHADER_FLOAT16 | C::SUBGROUP | C::CLIP_DISTANCES | C::DUAL_SOURCE_BLENDING | C::PRIMITIVE_INDEX
+}
+
+// Set when a module passed only without naga's struct layout checks: a
+// uniform block uniform.rs could not repack, which WGSL accepts only with
+// the uniform_buffer_standard_layout language feature (Chrome).
+static STD_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn validate(module: &naga::Module) -> Result<naga::valid::ModuleInfo, String> {
-	// Layouts are left to WebGPU: push constants are std430 (arrays of
-	// stride 4 in a uniform buffer), which WGSL's
-	// uniform_buffer_standard_layout allows (Chrome has it) and naga's
-	// check refuses.
-	let mut flags = naga::valid::ValidationFlags::all() & !naga::valid::ValidationFlags::CONTROL_FLOW_UNIFORMITY & !naga::valid::ValidationFlags::STRUCT_LAYOUTS;
+	// Struct layouts are checked as WGSL requires them (uniform blocks
+	// WGSL cannot lay out were repacked: uniform.rs). Uniformity is left
+	// to WebGPU (naga's analysis differs from Tint's).
+	use naga::valid::ValidationFlags as F;
+	let mut flags = F::all() & !F::CONTROL_FLOW_UNIFORMITY;
 	if NO_VALIDATE.load(std::sync::atomic::Ordering::Relaxed) {
 		// Debugging (opts noValidate=1): see the WGSL naga would reject.
-		flags = naga::valid::ValidationFlags::empty();
+		flags = F::empty();
 	}
-	naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
-		.validate(module)
-		.map_err(|e| format!("validation: {}", err_chain(&e)))
+	let strict = naga::valid::Validator::new(flags, webgpu_capabilities()).validate(module);
+	match strict {
+		Ok(i) => Ok(i),
+		Err(e) => match naga::valid::Validator::new(flags & !F::STRUCT_LAYOUTS, webgpu_capabilities()).validate(module) {
+			Ok(i) => {
+				STD_LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+				Ok(i)
+			}
+			Err(_) => Err(format!("validation: {}", err_chain(&e))),
+		},
+	}
 }
 
 fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
@@ -190,6 +216,7 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 	let words = spirv::split_combined_samplers(words, &fixed)?;
 	let words = spirv::wrap_strided_arrays(words)?;
 	let words = spirv::split_misaligned_vectors(words);
+	let words = uniform::repack_uniform_blocks(words);
 	if o.dump {
 		// Debugging: the pre-passes' SPIR-V instead of a translation.
 		return Err(format!("dump:{}", words.iter().map(|w| format!("{:08x}", w)).collect::<String>()));
@@ -210,6 +237,7 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 	}
 
 	drop_point_size(&mut module)?;
+	defuse_zero_division(&mut module);
 	if o.stage == naga::ShaderStage::Compute && inline_compute_main(&mut module) {
 		// Branches on constants (baked spec constants) go, so resources
 		// only they use drop out of the reflection with the compaction.
@@ -232,6 +260,10 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 		fix_switch_fallthrough(&mut ep.function.body);
 	}
 	for (_, gv) in module.global_variables.iter_mut() {
+		// WGSL has no `coherent`/`volatile` (naga's @coherent is its own
+		// extension; llama.cpp's top_k_mask): storage stays as WGSL's
+		// memory model and barriers make it.
+		gv.memory_decorations = naga::MemoryDecorations::empty();
 		// WGSL has no write-only storage buffers.
 		if let AddressSpace::Storage { access } = &mut gv.space {
 			if !access.contains(StorageAccess::LOAD) {
@@ -275,6 +307,7 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 	};
 
 	let mut module = module.into_owned();
+	declare_f16(&mut module);
 	let pads = struct_paddings(&mut module)?;
 	let mut wgsl = naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
 		.map_err(|e| format!("WGSL: {}", err_chain(&e)))?;
@@ -424,11 +457,17 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 				"subgroups" => "subgroups",
 				"clip_distances" => "clip-distances",
 				"dual_source_blending" => "dual-source-blending",
+				"primitive_index" => "primitive-index",
 				other => other, // not a WebGPU feature (e.g. naga's wgpu_*): cannot run
 			};
 			let _ = write!(s, "{}\"{}\"", if first { "" } else { "," }, feat);
 			first = false;
 		}
+	}
+	if STD_LAYOUT.load(std::sync::atomic::Ordering::Relaxed) {
+		// A WGSL language feature, not a device feature: the host checks
+		// navigator.gpu.wgslLanguageFeatures.
+		let _ = write!(s, "{}\"uniform_buffer_standard_layout\"", if first { "" } else { "," });
 	}
 	s.push(']');
 	if let Some(n) = push_size {
@@ -436,6 +475,81 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 	}
 	s.push('}');
 	Ok(s)
+}
+
+// Integer division or remainder by a constant zero (llama.cpp's mul_mm:
+// `k_pair / (TK / 2)` in a_shmem_index with TK's default 1, in a branch
+// dead for that specialization) is undefined in Vulkan but an error for
+// naga and Tint, even unreachable. It becomes WGSL's run-time result, so
+// no zero divisor reaches the WGSL: x / 0 = x (an identity bitcast) and
+// x % 0 = 0 (x - x). Only all-zero divisors (vectors: every component).
+fn defuse_zero_division(module: &mut naga::Module) {
+	use naga::{BinaryOperator as B, Expression as E, Literal as L};
+	fn zero(ex: &naga::Arena<E>, h: naga::Handle<E>, m: &naga::Module, depth: u32) -> Option<ScalarKind> {
+		if depth > 8 {
+			return None;
+		}
+		match &ex[h] {
+			E::Literal(L::U32(0) | L::U64(0) | L::U16(0)) => Some(ScalarKind::Uint),
+			E::Literal(L::I32(0) | L::I64(0) | L::I16(0) | L::AbstractInt(0)) => Some(ScalarKind::Sint),
+			E::ZeroValue(ty) => match m.types[*ty].inner {
+				TypeInner::Scalar(sc) | TypeInner::Vector { scalar: sc, .. } if matches!(sc.kind, ScalarKind::Uint | ScalarKind::Sint) => Some(sc.kind),
+				_ => None,
+			},
+			E::Constant(c) => zero(&m.global_expressions, m.constants[*c].init, m, depth + 1),
+			E::Splat { value, .. } => zero(ex, *value, m, depth + 1),
+			E::Compose { components, .. } => {
+				let ks: Vec<Option<ScalarKind>> = components.iter().map(|&c| zero(ex, c, m, depth + 1)).collect();
+				if !ks.is_empty() && ks.iter().all(|k| k.is_some()) { ks[0] } else { None }
+			}
+			_ => None,
+		}
+	}
+	let fix = |ex: &naga::Arena<E>, m: &naga::Module| -> Vec<(naga::Handle<E>, E)> {
+		let mut v = Vec::new();
+		for (h, e) in ex.iter() {
+			if let E::Binary { op: op @ (B::Divide | B::Modulo), left, right } = e {
+				if let Some(kind) = zero(ex, *right, m, 0) {
+					v.push((h, if *op == B::Divide { E::As { expr: *left, kind, convert: None } } else { E::Binary { op: B::Subtract, left: *left, right: *left } }));
+				}
+			}
+		}
+		v
+	};
+	let mut fns: Vec<(naga::Handle<naga::Function>, Vec<(naga::Handle<E>, E)>)> = Vec::new();
+	for (fh, f) in module.functions.iter() {
+		fns.push((fh, fix(&f.expressions, module)));
+	}
+	let eps: Vec<Vec<(naga::Handle<E>, E)>> = module.entry_points.iter().map(|ep| fix(&ep.function.expressions, module)).collect();
+	for (fh, v) in fns {
+		for (h, e) in v {
+			module.functions[fh].expressions[h] = e;
+		}
+	}
+	for (i, v) in eps.into_iter().enumerate() {
+		for (h, e) in v {
+			module.entry_points[i].function.expressions[h] = e;
+		}
+	}
+}
+
+// naga's WGSL writer emits `enable f16;` only for f16 in the type arena,
+// but f16 may appear in expressions alone (`f32(f16(x))`, the rounding
+// of float16 storage lowered to u32 words: llama.cpp's quantized
+// shaders with shader-f16), which every WGSL compiler refuses without
+// it. Such a module gets the f16 type, and so the directive.
+fn declare_f16(module: &mut naga::Module) {
+	use naga::{Expression, Literal, Scalar};
+	let f16 = TypeInner::Scalar(Scalar::F16);
+	if module.types.iter().any(|(_, t)| t.inner == f16) {
+		return;
+	}
+	let uses = |ex: &naga::Arena<Expression>| {
+		ex.iter().any(|(_, e)| matches!(e, Expression::As { kind: ScalarKind::Float, convert: Some(2), .. } | Expression::Literal(Literal::F16(_))))
+	};
+	if uses(&module.global_expressions) || module.functions.iter().any(|(_, f)| uses(&f.expressions)) || module.entry_points.iter().any(|ep| uses(&ep.function.expressions)) {
+		module.types.insert(naga::Type { name: None, inner: f16 }, naga::Span::UNDEFINED);
+	}
 }
 
 // naga's WGSL writer ignores member offsets, so a buffer struct whose

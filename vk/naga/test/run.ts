@@ -158,7 +158,40 @@ const dp = run("drawparams.vert", "drawparams.vert.spv", { stage: "vertex", entr
 check("drawparams.vert: BaseVertex/BaseInstance/DrawIndex read as 0", !!dp && !/builtin\((base|draw)/.test(dp.wgsl));
 
 const fd = run("fastdiv.comp", "fastdiv.comp.spv", { stage: "compute", entryPoint: "main", pushGroup: 1, spec: { 0: 128 } });
-check("fastdiv.comp: umulExtended lowered, std430 push array, no inf, spec-sized shared array", !!fd && !/inf/i.test(fd.wgsl) && has(fd, /ne: array<u32, 4>/) && has(fd, /array<f32, 64>/) && has(fd, /@workgroup_size\(128, 1, 1\)/) && JSON.stringify(fd.requires) === "[]", fd?.wgsl.slice(0, 0));
+check("fastdiv.comp: umulExtended lowered, std430 push array repacked, no inf, spec-sized shared array", !!fd && !/inf/i.test(fd.wgsl) && has(fd, /var<uniform> \w+: kw_words;/) && has(fd, /array<f32, 64>/) && has(fd, /@workgroup_size\(128, 1, 1\)/) && JSON.stringify(fd.requires) === "[]", fd?.wgsl.slice(0, 0));
+
+// A std430 push block WGSL's uniform address space cannot lay out
+// (Firefox and Safari refuse arrays of stride 4 there): vec4<u32> words,
+// run below with known bytes. A block that fits keeps its struct.
+const pk = run("pushpack.comp", "pushpack.comp.spv", { stage: "compute", entryPoint: "main", pushGroup: 1 });
+check("pushpack.comp: push block repacked into vec4<u32> words", has(pk, /var<uniform> p: kw_words;/) && has(pk, /w: array<vec4<u32>, 8>,/) && pk?.pushConstantSize === 128, String(pk?.pushConstantSize));
+check("push.vert: a push block that fits keeps its struct", !!pv && !/kw_words/.test(pv.wgsl));
+const pushpack = (() => {
+	const buf = new ArrayBuffer(128);
+	const f = new Float32Array(buf), u = new Uint32Array(buf), s = new Int32Array(buf);
+	u[0] = 7;
+	[f[1], f[2]] = [1.5, -2.25];
+	s.set([10, -20, 30, -40], 3);
+	f.set([0.5, 0.25, 0.125, 3, 100], 8);
+	u.set([1, 2, 3], 13);
+	f.set([5, 6, 7, 8, 1, 2, 3, 4], 16);
+	for (let c = 0; c < 2; c++) for (let r = 0; r < 3; r++) f[(96 + 8 * r + 4 * c) / 4] = 10 * c + r + 0.5; // row-major mat2x3: rm[c][r]
+	const want: number[] = [];
+	const rm = (c: number, r: number) => 10 * c + r + 0.5;
+	for (let i = 0; i < 4; i++) {
+		const m = [[1, 2], [3, 4]];
+		want.push(7, [1.5, -2.25][i % 2], [10, -20, 30, -40][i], [0.5, 0.25, 0.125][i % 3], 3, 100 + [1, 2, 3][i % 3], [6, 8][i % 2], m[i % 2][1 - (i % 2)], 7, 10, -0.75, rm(i % 2, i % 3), rm(0, 0) + rm(1, 0), rm(0, 1) + rm(1, 1), rm(0, 2) + rm(1, 2), [10, -20, 30, -40][3 - i]);
+	}
+	return { push: [...u], want };
+})();
+
+// Division by a constant zero in a branch dead for the specialization
+// (llama.cpp's mul_mm with TK = 1): allowed by Vulkan, refused by naga and
+// Tint, so no zero divisor may reach the WGSL (compiled below).
+const zd = run("zerodiv.comp", "zerodiv.comp.spv", { stage: "compute", entryPoint: "main" });
+check("zerodiv.comp: no constant zero divisor left", !!zd && !/[/%] *\(?(0[iu]|w)\b/.test(zd.wgsl), zd?.wgsl.match(/.*[/%] *\(?(0[iu]|w)\b.*/)?.[0]);
+const zd4 = run("zerodiv.comp.tk4", "zerodiv.comp.spv", { stage: "compute", entryPoint: "main", spec: { 0: 4, 1: true } });
+check("zerodiv.comp with TK = 4: divisions kept", has(zd4, /\/ w\b/) && has(zd4, /% w\b/));
 
 const sm = run("small.comp", "small.comp.spv", { stage: "compute", entryPoint: "main" });
 check("small.comp: 8/16-bit buffers as u32 words (one per binding), f16 via unpack2x16float, 16-bit stores atomic", has(sm, /unpack2x16float/) && has(sm, /atomicAnd\(/) && has(sm, /atomicOr\(/) && !!sm && !/enable f16/.test(sm.wgsl) && sm.bindings.filter((b) => b.wgslBinding === 0).length === 1 && sm.bindings.find((b) => b.wgslBinding === 0)?.kind === "read-only-storage", JSON.stringify(sm?.bindings));
@@ -239,10 +272,12 @@ const pipelines: [string, string, string | undefined][] = [
 	["specwg", "specwg.comp", undefined],
 	["fastdiv", "fastdiv.comp", undefined],
 	["small", "small.comp", undefined],
+	["zerodiv", "zerodiv.comp", undefined],
 ];
 const page = `<!doctype html><meta charset="utf-8"><title>vk-shader</title><script type="module">
 const out = ${JSON.stringify(out)};
 const pipelines = ${JSON.stringify(pipelines)};
+const pushpack = ${JSON.stringify(pushpack)};
 const res = [];
 function layout(device, results, pushGroup) {
 	const groups = [];
@@ -306,6 +341,33 @@ try {
 			await device.popErrorScope();
 			res.push({ name: "WebGPU pipeline " + name, ok: false, detail: String(e.message ?? e) });
 		}
+	}
+	// Run the repacked push block (plain and spirv-opt -O SPIR-V) and compare every output.
+	for (const [name, pushGroup] of [["pushpack.comp", 1], ["pushpack.comp.opt.spv", 2]]) {
+		const r = out[name];
+		if (!r) continue;
+		const bgls = [];
+		for (let g = 0; g <= pushGroup; g++) {
+			const entries = g === 0 ? [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }] : g === pushGroup ? [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }] : [];
+			bgls.push(device.createBindGroupLayout({ entries }));
+		}
+		const pl = await device.createComputePipelineAsync({ layout: device.createPipelineLayout({ bindGroupLayouts: bgls }), compute: { module: mods[name], entryPoint: r.entryPoint } });
+		const o = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+		const pc = device.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+		const rb = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+		device.queue.writeBuffer(pc, 0, new Uint32Array(pushpack.push));
+		const enc = device.createCommandEncoder();
+		const pass = enc.beginComputePass();
+		pass.setPipeline(pl);
+		bgls.forEach((l, g) => pass.setBindGroup(g, device.createBindGroup({ layout: l, entries: g === 0 ? [{ binding: 0, resource: { buffer: o } }] : g === pushGroup ? [{ binding: 0, resource: { buffer: pc } }] : [] })));
+		pass.dispatchWorkgroups(1);
+		pass.end();
+		enc.copyBufferToBuffer(o, 0, rb, 0, 256);
+		device.queue.submit([enc.finish()]);
+		await rb.mapAsync(GPUMapMode.READ);
+		const got = [...new Float32Array(rb.getMappedRange())];
+		const bad = pushpack.want.map((w, i) => (got[i] === w ? "" : "o[" + i + "] " + got[i] + " != " + w)).filter(Boolean);
+		res.push({ name: "WebGPU run " + name + ": every value at its Vulkan offset", ok: !bad.length, detail: bad.slice(0, 6).join(", ") });
 	}
 	res.push({ name: "WebGPU adapter " + (adapter.info?.description || adapter.info?.vendor || "?"), ok: true });
 } catch (e) {

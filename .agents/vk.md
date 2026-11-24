@@ -22,7 +22,8 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   fences, semaphores, command recording and
   presentation are guest-side; every other object is made on the host by a
   message. Command buffers go as JSON at submit; host-visible memory is
-  diffed and sent before each submit; the ranges of mapped buffers that
+  diffed and sent before each submit, over the ranges the submit's commands
+  may read or write (vk/PROTOCOL.md, Amendments, "Submit flush"); the ranges of mapped buffers that
   submitted work may write (copy regions, storage buffers the bound
   pipeline's SPIR-V may write, as bound) are read back at fence waits. Its physical device is an
   integrated GPU whose limits, features and formats come from the host's
@@ -31,7 +32,8 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   Presentation below), VK_KHR_xcb_surface and VK_KHR_xlib_surface
   (XPutImage), VK_EXT_headless_surface; Wayland, xcb and Xlib are
   `dlopen`ed. `KWVK_LINK` picks the link (`vsock:2:1018` default, `tcp:`,
-  `unix:`); `KWVK_DEBUG`, `KWVK_TRACE`, `KWVK_STATS` and
+  `unix:`); `KWVK_DEBUG`, `KWVK_TRACE`, `KWVK_STATS`,
+  `KWVK_FENCE_SYNC=1` (every fence waits for its submit's reply) and
   `KWVK_SPIRV_DIR=DIR` (keeps every module) are for debugging. Errors and
   wrong-result warnings go to stderr whatever `KWVK_DEBUG` says, each
   distinct line once (`kw_err`; Errors below). Built by `vk/icd/build.sh` (aarch64
@@ -73,7 +75,12 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   NonWritable (or NonReadable), as older glslang marks `readonly buffer`,
   is read-only (write-only) as a whole: naga reads only the variable's
   decorations, and WebGPU refuses a read_write buffer bound over the range
-  of another binding. `vk/naga/build.sh` ->
+  of another binding. Uniform blocks WGSL cannot lay out (std430 push
+  constants with arrays of stride 4, as llama.cpp's rope, which Firefox
+  and Safari refused) are repacked into `array<vec4<u32>, N>` words
+  (`src/uniform.rs`; vk/PROTOCOL.md, Amendments), and naga validates
+  with WebGPU's capabilities and WGSL's struct layouts, so the WGSL is
+  meant for every engine, not only Chrome. `vk/naga/build.sh` ->
   `$KW_BUILD/vk/kwvk-naga.wasm` (about 0.9 MB) -> `dist/kwvk-naga.wasm`.
 
 ## Build
@@ -101,8 +108,16 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   past a binding's end; external present:
   tokens, export ids, pictures premultiplied and opaque, every ref that
   must resolve to null). `vk/naga/test/run.ts`: the translator on the shaders
-  in `vk/naga/test/shaders/`, validated in a real WebGPU; `corpus.sh`: a
-  real-world corpus (Sascha Willems' examples, vkmark, GTK 4, SDL 3).
+  in `vk/naga/test/shaders/`, validated in a real WebGPU (pushpack.comp
+  also runs and compares every value of a repacked push block);
+  `corpus.sh`: a real-world corpus (Sascha Willems' examples, vkmark,
+  GTK 4, SDL 3). `cargo run --release --features check --example check
+  --manifest-path vk/naga/Cargo.toml -- DIR...` parses and validates
+  WGSL files with naga's WGSL front end under WebGPU's capabilities, as
+  Firefox does (2026-11-24: every translated ggml-vulkan variant of
+  llama.cpp's b12674 release and source builds, with and without
+  `shader-f16`, and the corpus pass; subgroup variants are skipped,
+  naga 30 refuses `enable subgroups`).
 - `node test/vk/relay.mjs -- CMD` runs CMD (e.g. `vulkaninfo --summary`,
   `vendor/build/vk/native/vk-compute`) on this host against the renderer
   in headless Chrome, with `KWVK_LINK` and the native manifest set;
@@ -138,7 +153,11 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   gtk-4-examples, SDL 2 and 3 tests, vkd3d demos, Xvfb, x11-apps) for
   `--cmd '...'` runs, whose files in `/tmp/kwvk-out` come back to the out
   dir; `--capture-shaders` (with `--source`) writes SPIR-V the translator
-  refuses; `--disk FILE` boots another prepared disk.
+  refuses; `--disk FILE` boots another prepared disk; `--mem MIB` sets the
+  guest's memory; `--nogpu` encodes dispatches without running them
+  (timing only: wrong results; workgroups over the device's limits
+  compile clamped); `--profile N` writes instruction samples of the guest
+  during `--cmd` to profile.json (symbolizeProfile).
 - `node test/vk/page-check.mjs`: the page's option (web.md, Guest Vulkan).
 - WebGPU in headless Chrome here: only the Playwright Chromium
   (`~/.cache/ms-playwright/chromium-1234/`) with `--enable-unsafe-webgpu
@@ -176,9 +195,9 @@ host's CPU, with the guest under kwemu.
   llama.cpp app runs; web.md, Guest Vulkan; its older glslang's shaders
   need the translator's member-decoration rule above, without which WebGPU
   refused its first submit for binding aliasing). stories260K (F32, `-ngl
-  99`, temperature 0) gives the CPU backend's text: 1.8 tokens/s in the
-  guest on a loaded host against 0.25 on the emulated CPU, 9.5 natively
-  through the relay; the release build's llama-completion 5.1-6.9 tokens/s
+  99`, temperature 0) gives the CPU backend's text: 8.5 tokens/s in the
+  guest (llama-simple, inline mode, one CPU; Performance below) against
+  0.25 on the emulated CPU, 9.5 natively through the relay; the release build's llama-completion 5.1-6.9 tokens/s
   in the page (one CPU). stories15M, q4_0 and F32 alike, aborts at its
   first pipeline the host cannot make ("ggml_vulkan: compute pipeline
   creation failed for rms_norm_mul_f32_512: ... ErrorInvalidShaderNV",
@@ -196,8 +215,10 @@ host's CPU, with the guest under kwemu.
   (`llama-server --list-devices` through the loader) finds "kwvk (WebGPU)"
   as an integrated GPU. It puts layers there only with
   `OLLAMA_IGPU_ENABLE=1` and `LLAMA_ARG_FIT_TARGET=64`, since
-  llama-server's default target of 1 GiB free exceeds kwvk's heap (half
-  the guest's RAM). stories260K, made an Ollama model with F32 kept:
+  llama-server's default target of 1 GiB free was more than kwvk's heap
+  when that was half the guest's RAM (the device-only heap is 4 GiB now,
+  `KWVK_HEAP_MB`: with half of a 2 GiB guest's RAM, Ollama put 18 of
+  Qwen2.5 0.5B's 25 layers on the GPU, 2026-11-24). stories260K, made an Ollama model with F32 kept:
   - 6/6 layers on kwvk ("100% GPU") and right text.
   - 2.7-6.0 tokens/s in the guest (one CPU, the page and `/sh` runs).
   - 43 tokens/s on the guest's CPU, no layers offloaded.
@@ -217,7 +238,9 @@ vk/PROTOCOL.md, Amendments, "Device memory tracking", is the contract.
 - Memory type 0 is DEVICE_LOCAL without a shadow, type 1 HOST_VISIBLE |
   HOST_COHERENT with one; there is no DEVICE_LOCAL | HOST_VISIBLE type.
   CPU writes to mapped memory are found by diffing the shadow against a
-  last-sent copy at each submit; GPU writes are known only from the
+  last-sent copy at each submit, over the ranges its commands may read or
+  write (descriptors as bound, copy regions, vertex, index and indirect
+  buffers); GPU writes are known only from the
   commands, so the ICD tracks per buffer the byte ranges submitted work
   may write and reads them back when the app can look (a fence wait or
   wait-idle for mapped memory, else at vkMapMemory). Storage buffers
@@ -256,17 +279,73 @@ vk/PROTOCOL.md, Amendments, "Device memory tracking", is the contract.
   ggml's pinned staging) re-reading the whole 1 MB weight buffer. Now
   ggml uploads each per-token input tensor (tokens, positions, mask, ...)
   with its own copy and fence wait: 405 submits (260 with a fence) for
-  the run against 180 (67), which costs nothing natively and about 6 ms a
-  wait in the guest's inline mode, hence the slower guest eval on this
-  tiny model; per-token readback no longer grows with the model. The diff
-  scan at submit fell from 1405 KiB (0.7-0.9 ms) to 141 KiB (0.07 ms) a
-  submit, the weights no longer being host-visible.
-- Open: a fence whose submit (and everything before it) writes nothing
-  mapped could signal without the round trip, bounded to a few submits in
-  flight so a program pacing itself by fences cannot queue unbounded work;
-  not done (it changes when a failed submit is reported). Two VkBuffers
-  bound to overlapping ranges of one memory are two GPU buffers on the
-  host: a GPU write through one is not seen through the other.
+  the run against 180 (67); per-token readback no longer grows with the
+  model. Those fences now signal at their submit (Performance below), as
+  the copies write device-only memory.
+- Fences: a fence of a submit that writes no host-visible memory signals
+  at the submit (its reply is collected later, an error losing the device
+  at the next wait or submit; at most 8 unanswered), the others at the
+  reply; vkGetFenceStatus of a pending fence waits up to 1 ms in the
+  kernel from its second call (vk/PROTOCOL.md, Amendments, "Fences at
+  submit"; `KWVK_FENCE_SYNC=1` waits for every reply).
+- Open: two VkBuffers bound to overlapping ranges of one memory are two
+  GPU buffers on the host: a GPU write through one is not seen through the
+  other.
+
+## Performance (2026-11-24)
+
+Language models through ggml-vulkan (llama.cpp, Ollama) were slow for
+reasons that do not depend on the GPU: on the user's GPU (Chrome,
+Qwen2.5-Coder 0.5B F16, Ollama) a decode pass took 565 ms (1.8 tokens/s)
+and the load minutes. Measured on this host's SwiftShader with
+`test/vk/unkernel-check.mjs --nogpu` (dispatches encoded but not run, so
+the time is the guest's, the link's and the host's alone; vk-host.ts
+`noGpu`), `--mem 3072`, `--disk` a copy of the prepared disk with
+llama.cpp's cross-built `llama-completion` and the models written into its
+upper layer under /opt/llm by `debugfs -w`, and `llama-completion -ngl 99
+-c 1024 --temp 0 --ignore-eos -n 104 -p "Once upon a time"`; `--profile N`
+for instruction samples of the guest (diffed between an 8- and a 104-token
+run to keep the load out).
+
+| Qwen2.5-Coder 0.5B F16, no GPU work | load | prompt (4 tokens) | eval |
+| --- | --- | --- | --- |
+| before, inline, one CPU | 137.5 s | 740 ms a token | 1588 ms a token |
+| submit flush by ranges | 16.5 s | 228 | 88.5 |
+| and the fence status wait, merge fast path | 17.2 | 233 | 41.7 |
+| now (and fences at submit, coarser diff), inline | 16.2 | 217 | 41.4 |
+| before, worker mode, 4 CPUs | 145.0 | 717 | 1649 |
+| now, worker mode, 4 CPUs | 15.5 | 203 | 39.1 |
+
+Fences at submit save little here, where a round trip costs 0.3-0.8 ms
+(no GPU work, the host on the same thread); on a real GPU each saved one
+also waited for the GPU's queue (`onSubmittedWorkDone`).
+
+- Where it went: every vkQueueSubmit diffed every mapped byte of
+  host-visible memory, and ggml keeps its CPU-side tensors (the token
+  embeddings: 272 MiB for Qwen, 57 MiB for SmolLM2 135M) and its staging
+  in mapped pinned memory: 102 ms a submit for Qwen, 14 submits a token
+  and one per uploaded weight chunk at load. The flush now covers only
+  what the submit's commands may read or write (vk/PROTOCOL.md,
+  Amendments, "Submit flush").
+- Then: ggml spins on vkGetFenceStatus at the end of each graph (44% of
+  the guest's instructions per token), and in inline mode the host cannot
+  answer while the guest's CPU is busy; each token had 9 round trips (7
+  fence waits, among them 5 waited input uploads, and the logits
+  readback). Now one readback a token.
+- Left per token (instruction samples): ggml's graph building and fusion
+  checks, llama.cpp's sampling over Qwen's 151936 tokens (10%), the
+  ICD's JSON (about 12%: push constants as decimal byte arrays, 16 KiB of
+  JSON a submit, 470 dispatches a token), the readback of 608 KB of
+  logits. Of the load, 6.3 s is reading the 994 MB file from the disk
+  (HTTP in the test; IndexedDB on the page), most of the rest llama.cpp
+  and the upload (995 MB of writeBuffer frames).
+- stories260K F32 with its GPU work (llama-simple, 32 tokens, inline):
+  5.9 tokens/s before, 8.5 now, the same text. SmolLM2 135M F16 without
+  GPU work: eval 529 ms a token before, 91 ms after the flush alone; load
+  20.1 s, then 9.5 s.
+- Not measured on a real GPU: its decode time adds the GPU's work and the
+  latency of one readback (mapAsync) a token. Pipelines are made as ggml
+  asks, one request each (the first prompt waits for them).
 
 ## Presentation (2026-11-24)
 
@@ -337,10 +416,13 @@ vk/PROTOCOL.md, Amendments, "Device memory tracking", is the contract.
   than stories260K there too. Eval is bound by GPU time on SwiftShader
   natively, and in the guest also by ggml's waited copies (Device memory
   below). Never run on a real GPU.
-- Chrome-specific reliances: WGSL's `uniform_buffer_standard_layout`
-  (push constant blocks stay std430 in a uniform buffer) and the
-  `texture-component-swizzle` feature (image view swizzles; identity
-  without it, logged).
+- Chrome-specific reliances: the `texture-component-swizzle` feature
+  (image view swizzles; identity without it, logged), and WGSL's
+  `uniform_buffer_standard_layout` only for a uniform block the
+  translator cannot repack (none in ggml's shaders or the corpus; then
+  `requires` names it and other browsers refuse the pipeline with that
+  name). Firefox and Safari have not been run: the WGSL is checked
+  against naga's WGSL front end (Firefox's compiler) only.
 - A descriptor set that the pipeline's shaders declare but the app never
   binds (GTK binds no set 1) gets placeholder resources, logged once.
 - Rendering approximations kept, logged by the host (not errors): polygon

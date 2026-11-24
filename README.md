@@ -559,6 +559,23 @@ if (vm.gl.gpu.drawFrame(ctx) === null) { /* show vm.frame() as above */ }
 vm.updateDisplaySize({ width: 1600, height: 900 });
 ```
 
+### Vulkan in the guest (browsers with WebGPU)
+
+```js
+const vm = await createKernel({ distro: "/distros/debian.erofs", vk: true });
+await vm.exec("sudo", ["apt-get", "install", "-y", "libvulkan1", "vulkan-tools"]);
+const r = await vm.exec("vulkaninfo", ["--summary"]);   // deviceName = kwvk (WebGPU)
+```
+
+The base carries a Vulkan driver (an ICD the Vulkan loader finds by
+itself) that sends the guest's Vulkan calls to a renderer on the page's
+WebGPU device; SPIR-V shaders become WGSL through `kwvk-naga.wasm`.
+Nothing loads before the guest's first Vulkan program (`vm.vk.status`).
+Vulkan 1.2 with Wayland, X11 and headless presentation (frames come back
+by readback); vkcube, vkmark, SDL's GPU API and GTK 4's Vulkan renderer run
+on it. Node has no WebGPU, so there `vk` is ignored with a log line.
+[vk/PROTOCOL.md](vk/PROTOCOL.md) has the design.
+
 ### Run it in a worker
 
 ```js
@@ -694,6 +711,8 @@ The npm package ships a Linux kernel (GPL-2.0) with a small base system
 (Alpine's static busybox, GPL-2.0, and unkernel's own tools), so it is `MIT
 AND GPL-2.0-only`. It also ships the guest GL renderer (`virgl.wasm`:
 virglrenderer and Emscripten's runtime, MIT, with unkernel's glue,
+GPL-2.0-or-later) and the guest Vulkan translator (`kwvk-naga.wasm`: naga
+and its Rust dependencies, MIT or Apache-2.0, with unkernel's glue,
 GPL-2.0-or-later). [THIRD-PARTY.md](THIRD-PARTY.md), in the package and on
 the page at `/licenses.md`, lists what is not unkernel's, with the notices
 its licenses ask for. The distro images it downloads hold the distributions'

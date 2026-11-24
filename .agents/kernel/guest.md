@@ -15,7 +15,7 @@ overlay root are in data-disk.md.
 `vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
 rdinit=/init`, the data disk template, the SMP patch) and copies that to
 `web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
-1508 KiB (844 KiB gzipped), bundle 11.0 MiB with base.cpio uncompressed (2026-11-22).
+1508 KiB (844 KiB gzipped), bundle 11.0 MiB with base.cpio uncompressed (2026-11-22); 1607 KiB (885 KiB gzipped) with guest Vulkan's ICD (2026-11-24).
 
 - Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
   with its own Alpine release), every applet linked in `/bin` (names from
@@ -60,6 +60,12 @@ with one floor: an image from before kwbox does not boot on a base with it
 - `kwbox vtest` (Guest tools, below): the guest GL forwarder, in
   the layer for the same reason (its link protocol belongs to the SDK's
   `gl` option).
+- `/usr/lib/kw/libvulkan_kw.so` and `/usr/share/vulkan/icd.d/kw_icd.json`:
+  guest Vulkan's ICD (`vk/icd/build.sh`, aarch64 glibc; vk.md), in the
+  layer for the same reason (its link protocol belongs to the SDK's `vk`
+  option); the manifest is in the loader's default search path, so
+  Debian's `libvulkan1` finds it with no environment variables. Alpine's
+  musl loader cannot load it. `KW_VK=0` builds the base without it.
 - `/usr/lib/kw/bin/wland`: Wayland apps as windows on the page (web.md,
   Wayland desktop) through wland's relay `/usr/lib/kw/wlandr`
   (https://github.com/pithings/wland, MPL-2.0 and MIT), which only the

@@ -15,9 +15,10 @@
 // installScript()). About 68 MiB to download and 397 MiB installed (the
 // repository's index, 2026-11-23), besides the Debian libraries it needs.
 // As installed it paints on the CPU (it says so in a bar): GPU painting
-// and WebGL need Vulkan, which the guest has only as Mesa's lavapipe,
-// Vulkan in software on the emulated CPU that pulls in LLVM, so that is
-// left to the user (the line it prints). Its sandbox denies its GPU process a few reads
+// and WebGL need Vulkan: guest Vulkan (the page's option, .agents/vk.md;
+// Ladybird on it is untested) or Mesa's lavapipe, Vulkan in software on the
+// emulated CPU that pulls in LLVM, which is left to the user (the line it
+// prints). Its sandbox denies its GPU process a few reads
 // (/proc/cpuinfo, Mesa's shader cache): warnings, left as they are. No
 // sound: it speaks only PulseAudio, which the guest does not run.
 import type { TerminalApp } from "../types.ts";

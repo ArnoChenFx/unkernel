@@ -42,7 +42,14 @@ parts that are easy to get wrong.
   (`gl/wasm/build.sh`; `UNKERNEL_GL=dir` takes another build), goes along
   the same way as `dist/virgl.mjs` and `dist/virgl.wasm` (exports
   `unkernel/virgl.mjs`, `unkernel/virgl.wasm`; `js/virgl.mjs` and
-  `js/virgl.wasm` are symlinks), and the build fails without it.
+  `js/virgl.wasm` are symlinks), and the build fails without it. Guest
+  Vulkan's SPIR-V translator, `vendor/build/vk/kwvk-naga.wasm`
+  (`vk/naga/build.sh`; `UNKERNEL_VK=file` takes another), goes along as
+  `dist/kwvk-naga.wasm` (export `unkernel/kwvk-naga.wasm`), with a warning
+  instead of a failure where it is missing; the web entry finds it with
+  `new URL("./kwvk-naga.wasm", import.meta.url)` and imports the renderer
+  (`vk-host.ts`, `vk-shader.ts`) dynamically, so they are chunks of their
+  own that only `createKernel({ vk })` loads.
 - The build checks that `dist/web.mjs` reaches no Node built-in, that
   each entry (not a shared chunk) computes
   `new URL("./unkernel.wasm", import.meta.url)`, and that `dist/node.mjs`
@@ -912,6 +919,27 @@ parts that are easy to get wrong.
   LIBGL_ALWAYS_SOFTWARE=1` for the guest's shells where there is no DRM
   render node (with `gpu` Mesa finds `/dev/dri` itself; the page adds
   `kw.gl=1` with its GL option); `gl` alone does not add it.
+
+## Guest Vulkan (`js/core/vk.ts`; vk.md)
+
+- `createKernel({ vk })`: `prepareVk()` before the boot (ignored with a
+  `[host]` log line without vsock, without `navigator.gpu` (Node) unless
+  `vk.device` gives one, or on an entry without the renderer: only the web
+  entry has `Platform.vk`), then `startVk()` makes a `VkHost` (`vm.vk`) on
+  the thread that owns the VM, in both modes, listening on vsock port 1018
+  (`VK_PORT`). The first connection requests the adapter and the device
+  (every adapter feature, its maximum limits), imports the renderer and
+  loads the translator; each connection gets its own `VkConnection`
+  (`VkRenderer.connect()`), fed with what the guest sends. `vm.vk.status`
+  (idle, loading, ready, lost, failed), `stats` (streams, bytes, `losses`,
+  and `renderer`: the current renderer's counters, vk-host.ts `VkStats`,
+  e.g. `presents` for a frame rate), `device` (the GPUDevice in use),
+  `loaded`, `load()`. The renderer ends a stream itself on a device loss or
+  a bad frame (`connect(send, close)`): the vsock stream is closed then. A
+  lost device (`onLost`, once every program on it was cut off) drops the
+  renderer; the next program's connection makes a new device and renderer
+  (with `vk.device`, which cannot be replaced, the state stays failed).
+  Renderer state is not in snapshots: a restore drops the connections.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 

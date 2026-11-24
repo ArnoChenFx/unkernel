@@ -74,6 +74,16 @@
 //                                      3D on the device where it gets one. Off with another
 //                                      distro, without WebGL2 on the page's thread, or in a build
 //                                      without the renderer (glBlocker()).
+//   ?vk=0 | ?vk=1                      guest Vulkan (Debian only; default on where the page's
+//                                      thread has WebGPU, navigator.gpu): the guest's Vulkan
+//                                      loader finds the base's ICD (libvulkan_kw.so), which
+//                                      talks over vsock port 1018 to a renderer on this
+//                                      browser's WebGPU (the SDK's createKernel({ vk }),
+//                                      .agents/vk.md). Nothing of it (the renderer's modules,
+//                                      kwvk-naga.wasm) is fetched before the guest's first
+//                                      Vulkan instance. Off with another distro, without
+//                                      navigator.gpu, or in a build without kwvk-naga.wasm
+//                                      (vkBlocker()).
 //   ?gpu=0                             with guest GL, this load only: no virtio-gpu device, so the
 //                                      guest's shells use the vtest link (guest GL as it was
 //                                      before the device, for comparison). Also none with
@@ -144,7 +154,7 @@
 //                                      off or automation drives the browser (navigator.webdriver,
 //                                      off by default there); read in autohide.ts
 //   ?simulate=nojspi,oom,lowmem        URL only: fake a failure (for tests)
-import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, glUrl, kernelSmpUrl, kernelUrl, webCpuBlocker } from "./sdk.ts";
+import { DEFAULT_MEMORY_FALLBACK_MIB, autoMemoryMiB, glUrl, kernelSmpUrl, kernelUrl, vkShaderUrl, webCpuBlocker } from "./sdk.ts";
 import { distros as DISTROS } from "virtual:unkernel-kernel";
 import { autoSuspendDefault, parseAutoSuspend } from "./autosuspend.ts";
 
@@ -201,7 +211,7 @@ export const DEFAULT_CMDLINE = "console=hvc0 rdinit=/init";
 /** localStorage: the saved settings (the header above), a JSON object of strings. */
 export const SETTINGS_KEY = "kw.settings";
 /** The settings' names. ?net=0 is read as ?wisp=0 and never saved. */
-export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "datasize", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave", "gl"];
+export const SETTING_NAMES: readonly string[] = ["mem", "append", "net", "wisp", "jit", "verbose", "display", "sound", "data", "datasize", "distro", "root", "worker", "shared", "cpus", "autosuspend", "askleave", "gl", "vk"];
 
 /** The saved settings ({} where there are none or localStorage refuses). */
 export function loadSettings(): Record<string, string> {
@@ -323,6 +333,16 @@ export interface Config {
 	glStrictWaits: boolean;
 	/** With guest GL, the virtio-gpu device (createKernel({ gpu })): unless ?gpu=0 or ?display=0. */
 	gpu: boolean;
+	/** Guest Vulkan this load (the Vulkan option, on a distro of VK_DISTROS, where vkBlocker() allows). */
+	vk: boolean;
+	/** The Vulkan option: ?vk=1, or by default (?vk=0: off). */
+	vkParam: boolean;
+	/** The Vulkan option was set (?vk= in the URL or the saved settings), not the default. */
+	vkAsked: boolean;
+	/** Why this page cannot offer guest Vulkan (vkBlocker()), or null. */
+	vkBlocked: string | null;
+	/** Why this load runs without Vulkan although the option asks for it, or null. */
+	vkWhy: string | null;
 	/** kwshm, for the Wayland desktop (wayland.ts): unless ?shm=0 (this load's URL only). */
 	shm: boolean;
 	/** The Wayland desktop shows GPU apps' buffers by resource (wayland.ts): unless ?wlgpu=0 (this load's URL only). */
@@ -354,6 +374,22 @@ export function glDefault(display: boolean): boolean {
 export function glBlocker(): string | null {
 	if (!glUrl) return "this page's build has no GL renderer (virgl.mjs: gl/wasm/build.sh, or a release that carries it)";
 	if (typeof OffscreenCanvas !== "function" || typeof WebGL2RenderingContext !== "function") return "this browser has no WebGL2 on the page's thread (OffscreenCanvas)";
+	return null;
+}
+
+/** The distros the page offers guest Vulkan on (Debian's loader and vulkan-tools; Alpine is untested). */
+export const VK_DISTROS: readonly string[] = ["debian"];
+
+/**
+ * Why this page cannot offer guest Vulkan, or null: no translator in the
+ * page's build (sdk.ts vkShaderUrl; web/scripts/kernel.ts), or no WebGPU on
+ * the page's thread, where the renderer runs in both modes (navigator.gpu;
+ * whether the browser then gives an adapter shows at the guest's first
+ * Vulkan instance).
+ */
+export function vkBlocker(): string | null {
+	if (!vkShaderUrl) return "this page's build has no Vulkan translator (kwvk-naga.wasm: vk/naga/build.sh, or a release that carries it)";
+	if (!(navigator as { gpu?: unknown }).gpu) return "this browser has no WebGPU on the page's thread (navigator.gpu)";
 	return null;
 }
 
@@ -472,6 +508,11 @@ export function readConfig(search: string = location.search, saved: Record<strin
 	const glParam = glAsked ? params.get("gl") === "1" : glDefault(params.get("display") !== "0");
 	const glBlocked = glBlocker();
 	const glWhy = !glParam ? null : glBlocked ?? (GL_DISTROS.includes(distro?.name ?? "none") ? null : `guest GL needs ${GL_DISTROS.join(" or ")} (its Mesa has the virgl driver), not ${distro?.name ?? "the base shell"}`);
+	// Guest Vulkan: on by default where WebGPU is (the renderer loads on the guest's first Vulkan instance).
+	const vkAsked = params.has("vk");
+	const vkParam = vkAsked ? params.get("vk") === "1" : true;
+	const vkBlocked = vkBlocker();
+	const vkWhy = !vkParam ? null : vkBlocked ?? (VK_DISTROS.includes(distro?.name ?? "none") ? null : `guest Vulkan needs ${VK_DISTROS.join(" or ")}, not ${distro?.name ?? "the base shell"}`);
 	return {
 		settings: Object.fromEntries(params),
 		kernelUrl: kernelUrl.pathname,
@@ -527,6 +568,11 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		// Not settings (SETTING_NAMES): this load's URL only.
 		glStrictWaits: url.get("glwait") === "strict",
 		gpu: glParam && !glWhy && url.get("gpu") !== "0" && params.get("display") !== "0",
+		vk: vkParam && !vkWhy,
+		vkParam,
+		vkAsked,
+		vkBlocked,
+		vkWhy,
 		shm: url.get("shm") !== "0",
 		wlGpu: url.get("wlgpu") !== "0",
 		mobile,

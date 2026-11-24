@@ -1,0 +1,1889 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
+// kwvk host renderer: the Vulkan subset of vk/PROTOCOL.md on a GPUDevice.
+// One VkConnection per guest stream (VkInstance): it reassembles frames
+// from arbitrary chunks, runs requests strictly in order through an async
+// queue, keeps the guest's objects by id and answers requests that carry
+// "r". Command lists of vkQueueSubmit are replayed by vk-exec.ts.
+//
+// Nothing throws out of the message loop: each op runs in a WebGPU error
+// scope and a try block, failures are logged once per distinct text
+// ("kwvk: <op>: <error>") and answered with "err" when the request has
+// "r".
+
+import { formatTable, formatCaps, CAP_FILTER, vkFormat, texFormatInfo, hasDepth, hasStencil, srgbTwin, type VkFormatInfo } from "./vk-formats.ts";
+import { runSubmit } from "./vk-exec.ts";
+
+// The translator's interface (js/core/vk-shader.ts), restated so this
+// module does not depend on the wasm loader.
+export interface VkShaderOpts {
+	stage: "vertex" | "fragment" | "compute";
+	entryPoint: string;
+	flipY?: boolean;
+	pushGroup?: number;
+	spec?: Record<number, number | boolean>;
+	/** descriptor arrays, "set.binding" -> element i at wgslBinding base + 2*i */
+	arrays?: Record<string, { base: number; count: number }>;
+	/** fragment: the vertex stage's varyings (interpolation matched per location) */
+	link?: { location: number; interpolation: string; sampling: string }[];
+	/** storage images declared without a format, "set.binding" -> WebGPU format */
+	storageFormats?: Record<string, string>;
+	/** the device's WebGPU features that change the translation ("shader-f16") */
+	features?: string[];
+	limits?: { maxComputeWorkgroupSizeX: number; maxComputeWorkgroupSizeY: number; maxComputeWorkgroupSizeZ: number; maxComputeInvocationsPerWorkgroup: number };
+}
+export interface VkShaderBinding {
+	set: number;
+	binding: number;
+	group: number;
+	wgslBinding: number;
+	kind: "uniform" | "storage" | "read-only-storage" | "sampler" | "comparison-sampler" | "texture" | "storage-texture";
+	viewDimension?: string;
+	sampleType?: string;
+	multisampled?: boolean;
+	format?: string;
+	access?: string;
+	arrayIndex?: number;
+}
+export interface VkShaderResult {
+	wgsl: string;
+	entryPoint: string;
+	bindings: VkShaderBinding[];
+	pushConstantSize?: number;
+	varyings?: { location: number; interpolation: string; sampling: string }[];
+	requires?: string[];
+	dispatchScale?: [number, number, number];
+}
+export interface VkShaderTranslator {
+	translate(spirv: Uint8Array, opts: VkShaderOpts): VkShaderResult;
+}
+
+export interface VkPresentInfo {
+	connection: VkConnection;
+	image: number;
+	texture: any;
+	width: number;
+	height: number;
+	format: string;
+}
+
+/** Counters per connection (`connection.stats`) and summed over the renderer's connections (`renderer.stats`). */
+export interface VkStats {
+	/** protocol messages handled */
+	messages: number;
+	submits: number;
+	draws: number;
+	dispatches: number;
+	presents: number;
+	/** guest -> host buffer bytes (writeBuffer) */
+	bytesWritten: number;
+	/** host -> guest bytes (readBuffer, present readback) */
+	bytesRead: number;
+	/** SPIR-V -> WGSL translations and the time they took */
+	translations: number;
+	translateMs: number;
+	/** GPURenderPipeline / GPUComputePipeline creations (variants included) */
+	pipelines: number;
+	/** failed ops and WebGPU validation errors */
+	errors: number;
+	/** CPU time spent encoding submits (vk-exec.ts), ms */
+	encodeMs: number;
+	/** CPU time spent parsing frames (JSON), ms */
+	parseMs: number;
+	/** gauge: guest objects alive (ids held) */
+	liveObjects: number;
+	/** gauge: GPU buffers and textures held for guests, deferred destroys included (renderer-wide) */
+	liveGpu: number;
+}
+
+const GAUGES = new Set(["liveObjects", "liveGpu"]);
+
+export function newStats(): VkStats {
+	return { messages: 0, submits: 0, draws: 0, dispatches: 0, presents: 0, bytesWritten: 0, bytesRead: 0, translations: 0, translateMs: 0, pipelines: 0, errors: 0, encodeMs: 0, parseMs: 0, liveObjects: 0, liveGpu: 0 };
+}
+
+export interface VkRendererOptions {
+	device: any;
+	adapter?: any;
+	shaders: VkShaderTranslator;
+	log?: (line: string) => void;
+	/** called after each present, with the presented texture (valid until the next present of that image) */
+	onPresent?: (info: VkPresentInfo) => void;
+	/** called once when the GPUDevice is lost, after every connection was failed and closed */
+	onLost?: (info: { reason?: string; message?: string }) => void;
+}
+
+/** Limits on what one guest stream may make the host hold (the guest is untrusted). */
+export const VK_MAX_FRAME = 1 << 28;
+export const VK_MAX_OBJECTS = 1 << 20;
+/** Frames above this get a buffer of their own while they arrive. */
+const BIG_FRAME = 1 << 20;
+
+export interface VkConnection {
+	feed(bytes: Uint8Array): void;
+	close(): void;
+	/** unique per renderer */
+	readonly id: number;
+	readonly stats: VkStats;
+	/** the last presented image, for a later zero-copy path */
+	lastPresented?: VkPresentInfo;
+}
+
+// GPUBufferUsage / GPUTextureUsage / GPUShaderStage / GPUMapMode values
+export const BU = { MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16, VERTEX: 32, UNIFORM: 64, STORAGE: 128, INDIRECT: 256, QUERY_RESOLVE: 512 };
+export const TU = { COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16 };
+export const SS = { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 };
+const MAP_READ = 1;
+
+export const UNUSED = 0xffffffff;
+export function isWhole(v: any): boolean {
+	return v === undefined || v === null || v < 0 || v >= 2 ** 52;
+}
+
+const COMPARE = ["never", "less", "equal", "less-equal", "greater", "not-equal", "greater-equal", "always"];
+const ADDRESS = ["repeat", "mirror-repeat", "clamp-to-edge", "clamp-to-edge", "mirror-repeat"];
+const VIEW_DIM = ["1d", "2d", "3d", "cube", "2d-array", "2d-array", "cube-array"];
+
+// Vulkan descriptor types
+export const DT = { SAMPLER: 0, COMBINED: 1, SAMPLED_IMAGE: 2, STORAGE_IMAGE: 3, UNIFORM_TEXEL: 4, STORAGE_TEXEL: 5, UNIFORM: 6, STORAGE: 7, UNIFORM_DYN: 8, STORAGE_DYN: 9, INPUT_ATTACHMENT: 10 };
+
+/** Strip Vulkan's pointer prefixes from keys, in place: pStages -> stages, pName -> name. */
+function normalize(v: any, depth = 0): any {
+	if (depth > 64) throw new Error("JSON nested too deeply");
+	if (Array.isArray(v)) {
+		if (v.length && typeof v[0] !== "object") return v;
+		for (let i = 0; i < v.length; i++) {
+			const e = v[i];
+			if (e && typeof e === "object") normalize(e, depth + 1);
+		}
+		return v;
+	}
+	if (v && typeof v === "object") {
+		for (const k in v) {
+			const e = v[k];
+			const c1 = k.charCodeAt(1);
+			if (k.charCodeAt(0) === 112 /* p */ && ((c1 >= 65 && c1 <= 90) || (c1 === 112 && k.charCodeAt(2) >= 65 && k.charCodeAt(2) <= 90))) {
+				let key = k.slice(c1 === 112 ? 2 : 1);
+				key = key[0]!.toLowerCase() + key.slice(1);
+				delete v[k];
+				v[key] = e;
+			}
+			if (e && typeof e === "object") normalize(e, depth + 1);
+		}
+	}
+	return v;
+}
+
+/** WebGPU features the renderer uses when the device has them (each widens the format table or the pipeline state it can map). */
+export const VK_FEATURES = [
+	"depth-clip-control", "depth32float-stencil8", "texture-compression-bc", "texture-compression-etc2", "texture-compression-astc",
+	"indirect-first-instance", "rg11b10ufloat-renderable", "bgra8unorm-storage", "float32-filterable", "float32-blendable", "dual-source-blending",
+	"clip-distances", "texture-component-swizzle", "shader-f16", "subgroups",
+];
+
+/** A GPUDeviceDescriptor for adapter.requestDevice(): the features above the adapter has and its best limits. */
+export function vkDeviceDescriptor(adapter: any): any {
+	const requiredLimits: Record<string, number> = {};
+	for (const k in adapter.limits) {
+		const v = adapter.limits[k];
+		if (typeof v === "number") requiredLimits[k] = v;
+	}
+	return { label: "kwvk", requiredFeatures: VK_FEATURES.filter((f) => adapter.features.has(f)), requiredLimits };
+}
+
+export class VkRenderer {
+	device: any;
+	adapter: any;
+	shaders: VkShaderTranslator;
+	onPresent?: (info: VkPresentInfo) => void;
+	logged = new Set<string>();
+	logFn: (line: string) => void;
+	/** shared helper pipelines (blit, clears), keyed */
+	helpers = new Map<string, any>();
+	conns = new Map<number, Conn>();
+	nextConn = 1;
+	retired: VkStats = newStats();
+	canvases = new Map<string, any>();
+	/** GPU buffers/textures created for guests and not yet destroyed */
+	liveGpu = 0;
+	bglCache = new Map<string, any>();
+	emptyBGL: any;
+	emptyBG: any;
+	pushBGL: any;
+	/** indices 0,i,i+1 for drawing triangle fans as lists */
+	fanIndex?: { buf: any; count: number };
+	/** resolves when the device is lost (every connection is then failed and closed); the SDK makes a new device and renderer for new programs */
+	lost: Promise<{ reason?: string; message?: string }>;
+	isLost = false;
+	onLost?: (info: { reason?: string; message?: string }) => void;
+
+	constructor(opts: VkRendererOptions) {
+		this.device = opts.device;
+		this.adapter = opts.adapter;
+		this.shaders = opts.shaders;
+		if (opts.onPresent) this.onPresent = opts.onPresent;
+		if (opts.onLost) this.onLost = opts.onLost;
+		this.logFn = opts.log || ((line) => console.warn(line));
+		this.emptyBGL = this.device.createBindGroupLayout({ entries: [] });
+		this.emptyBG = this.device.createBindGroup({ layout: this.emptyBGL, entries: [] });
+		this.pushBGL = this.device.createBindGroupLayout({
+			entries: [{ binding: 0, visibility: SS.VERTEX | SS.FRAGMENT | SS.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true } }],
+		});
+		const lost: Promise<any> = this.device.lost && typeof this.device.lost.then === "function" ? this.device.lost : new Promise(() => {});
+		this.lost = lost.then((info: any) => {
+			const i = { reason: info?.reason, message: info?.message };
+			this.isLost = true;
+			this.log(`kwvk: device lost (${i.reason ?? "?"}: ${i.message ?? ""}): failing ${this.conns.size} connection(s)`);
+			for (const c of [...this.conns.values()]) c.lose(`device lost: ${i.message || i.reason || ""}`);
+			try {
+				this.onLost?.(i);
+			} catch {}
+			return i;
+		});
+		try {
+			this.device.addEventListener?.("uncapturederror", (e: any) => {
+				this.retired.errors++;
+				this.log(`kwvk: webgpu: ${e?.error?.message ?? e}`);
+			});
+		} catch {}
+	}
+
+	log(line: string): void {
+		// WebGPU messages are multi-line chains: one line each
+		line = line.split("\n").map((l) => l.trim()).filter(Boolean).join(" / ");
+		if (line.length > 600) line = line.slice(0, 600) + "...";
+		if (this.logged.has(line)) return;
+		if (this.logged.size > 4096) this.logged.clear();
+		this.logged.add(line);
+		this.logFn(line);
+	}
+
+	/**
+	 * One connection per guest stream. `close`, if given, is called when the
+	 * host ends the stream itself (device loss, a malformed or oversized
+	 * frame): the SDK should then close the vsock stream.
+	 */
+	connect(send: (bytes: Uint8Array) => void, close?: () => void): VkConnection {
+		const c = new Conn(this, send, this.nextConn++, close);
+		if (this.isLost) c.lose("device lost");
+		else this.conns.set(c.id, c);
+		return c;
+	}
+
+	/** Totals over all connections, closed ones included. */
+	get stats(): VkStats {
+		const out = { ...this.retired };
+		for (const c of this.conns.values()) for (const k in out) if (!GAUGES.has(k)) (out as any)[k] += (c.stats as any)[k];
+		out.liveObjects = 0;
+		for (const c of this.conns.values()) out.liveObjects += c.objs.size;
+		out.liveGpu = this.liveGpu;
+		return out;
+	}
+
+	gpuCreated(): void {
+		this.liveGpu++;
+	}
+
+	/** Destroy a guest GPU buffer/texture once the work submitted so far is done. */
+	gpuDestroy(gpu: any): void {
+		const done = () => {
+			try {
+				gpu.destroy();
+			} catch {}
+			this.liveGpu--;
+		};
+		if (this.isLost) done();
+		else this.device.queue.onSubmittedWorkDone().then(done, done);
+	}
+
+	/**
+	 * An image of a connection as an ImageBitmap (GPU to GPU: a copy into an
+	 * OffscreenCanvas configured for the device, then transferToImageBitmap),
+	 * for a page compositor. The image is level 0, layer 0. undefined when
+	 * the connection or image is gone or the format cannot go to a canvas.
+	 */
+	image(connection: VkConnection | number, imageId: number): ImageBitmap | undefined {
+		const c = typeof connection === "number" ? this.conns.get(connection) : (connection as Conn);
+		const img = c?.objs.get(imageId);
+		if (!c || !img || img.t !== "image" || img.samples > 1) return undefined;
+		const base = img.format.replace(/-srgb$/, "");
+		if (base !== "bgra8unorm" && base !== "rgba8unorm" && base !== "rgba16float") return undefined;
+		const OC = (globalThis as any).OffscreenCanvas;
+		if (!OC) return undefined;
+		const key = `${img.width}x${img.height}:${img.format}`;
+		let cv = this.canvases.get(key);
+		if (!cv) {
+			const canvas = new OC(img.width, img.height);
+			const ctx = canvas.getContext("webgpu");
+			if (!ctx) return undefined;
+			ctx.configure({ device: this.device, format: base, usage: TU.COPY_DST | TU.RENDER_ATTACHMENT, alphaMode: "premultiplied" });
+			cv = { canvas, ctx };
+			if (this.canvases.size > 8) this.canvases.clear();
+			this.canvases.set(key, cv);
+		}
+		const e = this.device.createCommandEncoder({ label: "kwvk image" });
+		e.copyTextureToTexture({ texture: img.tex }, { texture: cv.ctx.getCurrentTexture() }, [img.width, img.height, 1]);
+		this.device.queue.submit([e.finish()]);
+		return cv.canvas.transferToImageBitmap();
+	}
+}
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+export function frame(json: any, bin?: Uint8Array): Uint8Array {
+	const j = enc.encode(JSON.stringify(json));
+	const padded = (j.length + 3) & ~3;
+	const blen = bin ? bin.length : 0;
+	const out = new Uint8Array(8 + padded + blen);
+	const dv = new DataView(out.buffer);
+	dv.setUint32(0, padded + blen, true);
+	dv.setUint32(4, j.length, true);
+	out.set(j, 8);
+	if (bin) out.set(bin, 8 + padded);
+	return out;
+}
+
+interface Reply {
+	json?: any;
+	bin?: Uint8Array;
+	/** runs once the reply was framed (bin may be a mapped range until then) */
+	after?: () => void;
+}
+interface Deferred {
+	defer: Promise<Reply | undefined>;
+}
+
+export class Conn implements VkConnection {
+	r: VkRenderer;
+	id: number;
+	stats: VkStats = newStats();
+	dev: any;
+	sendFn: (bytes: Uint8Array) => void;
+	buf = new Uint8Array(4096);
+	len = 0;
+	chain: Promise<void> = Promise.resolve();
+	closed = false;
+	objs = new Map<number, any>();
+	lastPresented?: VkPresentInfo;
+	closeFn?: () => void;
+	/** "r" of deferred replies not sent yet (answered with err at device loss) */
+	pending = new Set<number>();
+
+	constructor(r: VkRenderer, send: (bytes: Uint8Array) => void, id: number, close?: () => void) {
+		this.r = r;
+		this.id = id;
+		this.dev = r.device;
+		this.sendFn = send;
+		if (close) this.closeFn = close;
+	}
+
+	get bglCache(): Map<string, any> {
+		return this.r.bglCache;
+	}
+	get emptyBGL(): any {
+		return this.r.emptyBGL;
+	}
+	get emptyBG(): any {
+		return this.r.emptyBG;
+	}
+	get pushBGL(): any {
+		return this.r.pushBGL;
+	}
+	get fanIndex(): { buf: any; count: number } | undefined {
+		return this.r.fanIndex;
+	}
+	set fanIndex(v: { buf: any; count: number } | undefined) {
+		this.r.fanIndex = v;
+	}
+
+	/** Fail the connection (device loss, protocol abuse): answer what is pending with err, drop everything, end the stream. */
+	lose(why: string): void {
+		if (this.closed) return;
+		for (const r of this.pending) this.send({ r, err: why });
+		this.pending.clear();
+		this.close();
+		try {
+			this.closeFn?.();
+		} catch {}
+	}
+
+	log(line: string): void {
+		this.r.log(line);
+	}
+
+	feed(bytes: Uint8Array): void {
+		if (this.closed || !bytes.length) return;
+		let src = bytes;
+		while (src.length && !this.closed) {
+			// a large frame (writeBuffer of a big buffer) fills a buffer of its own: one copy, no regrowing
+			const big = this.big;
+			if (big) {
+				const n = Math.min(src.length, big.data.length - big.filled);
+				big.data.set(src.subarray(0, n), big.filled);
+				big.filled += n;
+				src = src.subarray(n);
+				if (big.filled < big.data.length) return;
+				this.big = undefined;
+				this.frameBody(big.data, big.jlen, true);
+				continue;
+			}
+			// a growable buffer (doubling), so frames that arrive in many small chunks cost O(n)
+			if (this.len + src.length > this.buf.length) {
+				const n = new Uint8Array(Math.max(this.buf.length * 2, this.len + src.length, 4096));
+				n.set(this.buf.subarray(0, this.len));
+				this.buf = n;
+			}
+			this.buf.set(src, this.len);
+			this.len += src.length;
+			src = src.subarray(src.length);
+			let off = 0;
+			while (this.len - off >= 8) {
+				const dv = new DataView(this.buf.buffer, this.buf.byteOffset + off, 8);
+				const total = dv.getUint32(0, true);
+				const jlen = dv.getUint32(4, true);
+				if (total > VK_MAX_FRAME || jlen > total) {
+					this.log(`kwvk: frame: bad lengths (total ${total}, json ${jlen}): closing the connection`);
+					this.lose("bad frame");
+					return;
+				}
+				if (this.len - off - 8 < total) {
+					if (total > BIG_FRAME) {
+						const data = new Uint8Array(total);
+						data.set(this.buf.subarray(off + 8, this.len));
+						this.big = { data, filled: this.len - off - 8, jlen };
+						off = this.len;
+					}
+					break;
+				}
+				const body = this.buf.subarray(off + 8, off + 8 + total);
+				off += 8 + total;
+				this.frameBody(body, jlen, false);
+			}
+			if (off) {
+				this.buf.copyWithin(0, off, this.len);
+				this.len -= off;
+				if (this.len === 0 && this.buf.length > 1 << 20) this.buf = new Uint8Array(4096);
+			}
+		}
+	}
+
+	big?: { data: Uint8Array; filled: number; jlen: number };
+
+	/** Queue one frame's message; `owned` bodies are not reused, so the binary is a view of them. */
+	frameBody(body: Uint8Array, jlen: number, owned: boolean): void {
+		const padded = (jlen + 3) & ~3;
+		let msg: any;
+		const t0 = performance.now();
+		try {
+			msg = normalize(JSON.parse(dec.decode(body.subarray(0, Math.min(jlen, body.length)))));
+			this.stats.parseMs += performance.now() - t0;
+		} catch (e) {
+			this.log(`kwvk: frame: bad JSON: ${(e as Error).message}`);
+			return;
+		}
+		const rest = body.subarray(Math.min(padded, body.length));
+		const bin = owned ? rest : rest.slice();
+		this.chain = this.chain.then(() => this.run(msg, bin));
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.r.conns.delete(this.id);
+		for (const k in this.stats) if (!GAUGES.has(k)) (this.r.retired as any)[k] += (this.stats as any)[k];
+		this.buf = new Uint8Array(0);
+		this.big = undefined;
+		this.len = 0;
+		// not through the queue: a closed connection runs nothing more, and the GPU objects go now (deferred past in-flight work)
+		for (const id of [...this.objs.keys()]) this.destroyOne(id);
+		this.stats.liveObjects = 0;
+	}
+
+	send(json: any, bin?: Uint8Array): void {
+		if (this.closed) return;
+		try {
+			this.sendFn(frame(json, bin));
+		} catch (e) {
+			this.log(`kwvk: send: ${(e as Error).message}`);
+		}
+	}
+
+	replyTo(msg: any, res: Reply | undefined): void {
+		try {
+			if (!msg.r) return;
+			this.pending.delete(msg.r);
+			this.send({ ...(res?.json || {}), r: msg.r }, res?.bin);
+		} finally {
+			res?.after?.();
+		}
+	}
+
+	fail(msg: any, e: unknown): void {
+		const text = (e as Error)?.message ?? String(e);
+		this.stats.errors++;
+		this.log(`kwvk: ${msg?.op}: ${text}`);
+		if (msg?.r) {
+			this.pending.delete(msg.r);
+			this.send({ r: msg.r, err: text });
+		}
+	}
+
+	async run(msg: any, bin: Uint8Array): Promise<void> {
+		if (this.closed) return;
+		if (!msg || typeof msg !== "object" || Array.isArray(msg)) msg = { op: "?" };
+		if (msg.r !== undefined && !(Number.isInteger(msg.r) && msg.r > 0)) msg.r = 0;
+		const op = String(msg.op);
+		const dev = this.dev;
+		this.stats.messages++;
+		dev.pushErrorScope("validation");
+		let out: any;
+		try {
+			const h = (handlers as any)[op];
+			if (!h) throw new Error("unsupported op");
+			out = h(this, msg, bin);
+			if (out && typeof out.then === "function") out = await out;
+		} catch (e) {
+			out = undefined;
+			this.fail(msg, e);
+			msg = { ...msg, r: 0 };
+		}
+		dev.popErrorScope().then(
+			(err: any) => {
+				if (!err) return;
+				this.stats.errors++;
+				this.log(`kwvk: ${op}: ${err.message}`);
+			},
+			() => {},
+		);
+		if (out && out.defer) {
+			if (msg.r) this.pending.add(msg.r);
+			(out as Deferred).defer.then(
+				(res) => this.replyTo(msg, res),
+				(e) => this.fail(msg, e),
+			);
+		} else if (msg.r) this.replyTo(msg, out as Reply | undefined);
+	}
+
+	get(id: number, what?: string): any {
+		const o = this.objs.get(id);
+		if (!o) throw new Error(`no ${what || "object"} ${id}`);
+		if (what && o.t !== what) throw new Error(`object ${id} is a ${o.t}, not a ${what}`);
+		return o;
+	}
+
+	put(id: number, o: any): void {
+		if (!Number.isInteger(id) || id <= 0 || id > 0xffffffff) throw new Error(`bad id ${id}`);
+		if (this.objs.has(id)) this.destroyOne(id);
+		else if (this.objs.size >= VK_MAX_OBJECTS) throw new Error("too many objects");
+		this.objs.set(id, o);
+		this.stats.liveObjects = this.objs.size;
+	}
+
+	destroyOne(id: number): void {
+		const o = this.objs.get(id);
+		if (!o) return;
+		this.objs.delete(id);
+		this.stats.liveObjects = this.objs.size;
+		const gpu = o.t === "buffer" ? o.buf : o.t === "image" ? o.tex : undefined;
+		if (gpu) this.r.gpuDestroy(gpu);
+		if (o.t === "queryPool") {
+			if (o.set) this.r.gpuDestroy(o.set);
+			this.r.gpuDestroy(o.results);
+		}
+	}
+
+	// --- views -----------------------------------------------------------
+
+	/** A GPUTextureView of an image view for binding ("bind"), attachment ("att") or storage ("storage"). */
+	viewFor(v: any, use: string, sampleType?: string, dimension?: string): any {
+		const key = `${use}:${sampleType || ""}:${dimension || ""}`;
+		let gv = v.cache.get(key);
+		if (gv) return gv;
+		const img = v.image;
+		const r = v.range;
+		const desc: any = { format: v.tex, baseMipLevel: r.baseMipLevel, baseArrayLayer: r.baseArrayLayer };
+		const levels = isWhole(r.levelCount) || r.levelCount === UNUSED ? img.mipLevels - r.baseMipLevel : r.levelCount;
+		const layers = isWhole(r.layerCount) || r.layerCount === UNUSED ? img.layers - r.baseArrayLayer : r.layerCount;
+		const ds = hasDepth(v.tex) && hasStencil(v.tex);
+		if (use === "att") {
+			desc.dimension = "2d";
+			desc.mipLevelCount = 1;
+			desc.arrayLayerCount = 1;
+			desc.aspect = "all";
+		} else {
+			desc.dimension = dimension || VIEW_DIM[v.viewType] || "2d";
+			if (v.viewType === 4) this.log("kwvk: vkCreateImageView: 1D array views are unsupported");
+			desc.mipLevelCount = use === "storage" ? 1 : levels;
+			desc.arrayLayerCount = desc.dimension === "3d" ? 1 : desc.dimension === "2d" || desc.dimension === "1d" ? 1 : layers;
+			// swizzles apply to sampled views only (WebGPU requires identity for storage)
+			if (v.swizzle && use === "bind") desc.swizzle = v.swizzle;
+			if (ds || hasDepth(v.tex) || hasStencil(v.tex)) {
+				const m = r.aspectMask;
+				if (sampleType === "uint" || (m & 4 && !(m & 2))) desc.aspect = hasDepth(v.tex) ? "stencil-only" : "all";
+				else desc.aspect = ds ? "depth-only" : "all";
+			}
+		}
+		gv = img.tex.createView(desc);
+		v.cache.set(key, gv);
+		return gv;
+	}
+
+	// --- shaders and layouts -----------------------------------------------
+
+	translate(moduleId: number, opts: VkShaderOpts): { module: any; res: VkShaderResult } {
+		const m = this.get(moduleId, "shader");
+		const key = JSON.stringify(opts);
+		let t = m.cache.get(key);
+		if (!t) {
+			const t0 = performance.now();
+			let res: VkShaderResult;
+			// relink is the host's own post-pass, not a translator option
+			const { relink, ...topts } = opts as VkShaderOpts & { relink?: Record<number, string> };
+			try {
+				res = this.r.shaders.translate(m.code, topts);
+				if (relink) res = { ...res, wgsl: relinkVertexOutputs(res.wgsl, relink) };
+				res = pruneDeadBindings(res);
+				// Compute: read-only storage buffers become read_write. A Vulkan app
+				// may bind one buffer (at other offsets) both read-only and writable
+				// in one dispatch (ggml-vulkan does); WebGPU refuses read-only +
+				// writable storage of one buffer in a usage scope, but allows
+				// writable + writable. (Vertex stages cannot have writable storage.)
+				if (topts.stage === "compute")
+					res = {
+						...res,
+						wgsl: res.wgsl.replace(/var<storage(, ?read)?>/g, "var<storage, read_write>"),
+						bindings: res.bindings.map((b) => (b.kind === "read-only-storage" ? { ...b, kind: "storage" as const, ro: true } : b)),
+					};
+			} catch (e) {
+				// Debugging: globalThis.KWVK_DUMP_SPIRV = true logs the module.
+				if ((globalThis as { KWVK_DUMP_SPIRV?: boolean }).KWVK_DUMP_SPIRV) this.log(`kwvk: shader ${moduleId} ${opts.stage} SPIR-V (base64): ${b64(m.code)}`);
+				throw e;
+			}
+			this.stats.translations++;
+			this.stats.translateMs += performance.now() - t0;
+			// WebGPU features the shader needs (vk-shader.ts result.requires).
+			const missing = (res.requires || []).filter((f) => !this.dev.features?.has?.(f));
+			if (missing.length) throw new Error(`shader needs WebGPU features the device lacks: ${missing.join(", ")}`);
+			const module = this.dev.createShaderModule({ code: res.wgsl, label: `kwvk shader ${moduleId} ${opts.stage}` });
+			module.getCompilationInfo?.().then(
+				(info: any) => {
+					for (const m of info.messages || []) {
+						if (m.type === "error") this.log(`kwvk: shader ${moduleId} ${opts.stage}: WGSL ${m.lineNum}:${m.linePos}: ${m.message}`);
+					}
+				},
+				() => {},
+			);
+			t = { module, res };
+			m.cache.set(key, t);
+		}
+		return t;
+	}
+
+	bgl(entries: any[]): { key: string; layout: any } {
+		entries.sort((a, b) => a.binding - b.binding);
+		const key = JSON.stringify(entries);
+		let layout = this.bglCache.get(key);
+		if (!layout) {
+			layout = entries.length ? this.dev.createBindGroupLayout({ entries }) : this.emptyBGL;
+			this.bglCache.set(key, layout);
+		}
+		return { key, layout };
+	}
+
+	/**
+	 * The bind group layouts of a pipeline: per set from the reflected
+	 * bindings of its stages (falling back to the Vulkan set layout), then
+	 * the push constant group.
+	 */
+	pipelineLayout(layoutId: number, stages: { stage: number; res: VkShaderResult }[]): any {
+		const pl = this.get(layoutId, "pipelineLayout");
+		const sets: any[] = [];
+		const reflected = stages.some((s) => Array.isArray(s.res.bindings));
+		for (let s = 0; s < pl.setLayouts.length; s++) {
+			const dsl = pl.setLayouts[s] ? this.get(pl.setLayouts[s], "setLayout") : { bindings: new Map() };
+			const byWgsl = new Map<number, any>();
+			// wgslBinding -> [Vulkan binding, array element]
+			const src = new Map<number, [number, number]>();
+			if (reflected) {
+				for (const st of stages) {
+					for (const b of st.res.bindings || []) {
+						if (b.group !== s) continue;
+						const prev = byWgsl.get(b.wgslBinding);
+						if (prev) {
+							prev.visibility |= st.stage;
+							continue;
+						}
+						byWgsl.set(b.wgslBinding, entryFromReflection(b, st.stage, dsl));
+						src.set(b.wgslBinding, [b.binding ?? b.wgslBinding >> 1, b.arrayIndex ?? 0]);
+					}
+				}
+			} else {
+				const vis = stages.reduce((a, s) => a | s.stage, 0);
+				for (const [binding, d] of dsl.bindings) {
+					for (const e of entriesFromVk(binding, d, vis)) {
+						byWgsl.set(e.binding, e);
+						src.set(e.binding, [binding, 0]);
+					}
+				}
+			}
+			const entries = [...byWgsl.values()];
+			const { key, layout } = this.bgl(entries);
+			// dynamic buffers of this set as WebGPU orders them, as indices into the Vulkan order
+			const dynIdx: number[] = [];
+			const vkDyn = dsl.dynamic as string[] | undefined;
+			for (const e of [...entries].sort((a, b) => a.binding - b.binding)) {
+				if (e.buffer?.hasDynamicOffset) {
+					const [b, el] = src.get(e.binding)!;
+					dynIdx.push(vkDyn ? vkDyn.indexOf(`${b}:${el}`) : 0);
+				}
+			}
+			sets.push({ key, layout, entries, dynIdx, src });
+		}
+		const pushSize = Math.max(pl.pushSize, ...stages.map((s) => s.res.pushConstantSize || 0));
+		const groups = sets.map((s) => s.layout);
+		let pushGroup = -1;
+		if (pushSize > 0) {
+			pushGroup = sets.length;
+			groups.push(this.pushBGL);
+		}
+		const layout = this.dev.createPipelineLayout({ bindGroupLayouts: groups });
+		const hasFloatTex = sets.some((s) => s.entries.some((e: any) => e.texture?.sampleType === "float"));
+		const hasStorageTex = sets.some((s) => s.entries.some((e: any) => e.storageTexture));
+		return { layout, sets, pushGroup, pushSize, hasFloatTex, hasStorageTex };
+	}
+
+	placeholders = new Map<string, any>();
+	unwrittenBufs = new Map<number, any>();
+	/**
+	 * A set the pipeline's shaders declare but the app never bound (GTK 4:
+	 * a set its shaders only use under a specialization it does not take;
+	 * the translator reflects unused bindings too): a bind group of
+	 * placeholder resources (a zeroed buffer, a 1x1 texture, a sampler), so
+	 * that the draw goes on; logged once per set.
+	 */
+	placeholderBindGroup(s: number, slot: any): any {
+		let bg = this.placeholders.get(slot.key);
+		if (bg) return bg;
+		this.log(`kwvk: descriptor set ${s} not bound but declared by the pipeline's shaders: placeholder resources bound`);
+		const formats: Record<string, string> = { float: "rgba8unorm", "unfilterable-float": "r32float", uint: "r32uint", sint: "r32sint", depth: "depth32float" };
+		const entries: any[] = [];
+		for (const e of slot.entries) {
+			if (e.buffer) {
+				const buf = this.dev.createBuffer({ size: 65536, usage: 64 | 128 });
+				entries.push({ binding: e.binding, resource: { buffer: buf } });
+			} else if (e.sampler) {
+				entries.push({ binding: e.binding, resource: this.dev.createSampler(e.sampler.type === "comparison" ? { compare: "less" } : {}) });
+			} else if (e.texture || e.storageTexture) {
+				const t = e.texture || e.storageTexture;
+				const dim = t.viewDimension || "2d";
+				const layers = dim === "cube" || dim === "cube-array" ? 6 : 1;
+				const tex = this.dev.createTexture({
+					size: [1, 1, layers],
+					dimension: dim === "1d" ? "1d" : dim === "3d" ? "3d" : "2d",
+					format: e.texture ? formats[t.sampleType] || "rgba8unorm" : t.format,
+					sampleCount: e.texture?.multisampled ? 4 : 1,
+					usage: e.texture ? (e.texture.multisampled ? 4 | 16 : 4) : 8,
+				});
+				entries.push({ binding: e.binding, resource: tex.createView({ dimension: dim }) });
+			}
+		}
+		bg = this.dev.createBindGroup({ layout: slot.layout, entries });
+		this.placeholders.set(slot.key, bg);
+		return bg;
+	}
+
+	/** The bind group of a descriptor set for a pipeline's set slot. */
+	bindGroup(set: any, slot: any, override?: Map<number, any>): any {
+		if (!slot.entries.length) return this.emptyBG;
+		if (!set) throw new Error("descriptor set not bound");
+		let bg = override ? undefined : set.cache.get(slot.key);
+		if (bg) return bg;
+		const entries: any[] = [];
+		for (const e of slot.entries) {
+			const [vkb, el] = slot.src.get(e.binding) || [e.binding >> 1, 0];
+			const d = set.desc.get(dkey(vkb, el));
+			if (!d && e.buffer) {
+				// Vulkan lets a binding the shader does not access stay unwritten
+				// (ggml-vulkan leaves its unused operands): a zeroed placeholder
+				// one per WGSL binding number, so two of them never alias in a dispatch
+				let ub = this.unwrittenBufs.get(e.binding);
+				if (!ub) {
+					if (!this.unwrittenBufs.size) this.log(`kwvk: set binding ${vkb}${el ? `[${el}]` : ""} not written: a placeholder buffer bound (logged once)`);
+					ub = this.dev.createBuffer({ size: 65536, usage: BU.STORAGE | BU.UNIFORM, label: "kwvk unwritten binding" });
+					this.unwrittenBufs.set(e.binding, ub);
+				}
+				entries.push({ binding: e.binding, resource: { buffer: ub } });
+				continue;
+			}
+			if (!d) throw new Error(`set binding ${vkb}${el ? `[${el}]` : ""} not written`);
+			if (e.buffer) {
+				const b = this.get(d.buffer, "buffer");
+				const size = isWhole(d.range) ? b.size - d.offset : d.range;
+				const sub = override?.get(e.binding);
+				if (sub) entries.push({ binding: e.binding, resource: { buffer: sub.buf, offset: 0, size: sub.size } });
+				else entries.push({ binding: e.binding, resource: { buffer: b.buf, offset: d.offset, size: Math.min((size + 3) & ~3, b.buf.size - d.offset) } });
+			} else if (e.sampler) {
+				const sid = d.sampler || set.layout.bindings.get(vkb)?.immutable?.[el];
+				entries.push({ binding: e.binding, resource: this.get(sid, "sampler").gpu });
+			} else if (e.texture) {
+				const v = this.get(d.imageView, "imageView");
+				entries.push({ binding: e.binding, resource: this.viewFor(v, "bind", e.texture.sampleType, e.texture.viewDimension) });
+			} else if (e.storageTexture) {
+				const v = this.get(d.imageView, "imageView");
+				entries.push({ binding: e.binding, resource: this.viewFor(v, "storage", undefined, e.storageTexture.viewDimension) });
+			}
+		}
+		bg = this.dev.createBindGroup({ layout: slot.layout, entries });
+		if (!override) set.cache.set(slot.key, bg);
+		return bg;
+	}
+
+	/**
+	 * Layouts from reflection say "float" for every sampled float texture,
+	 * but WebGPU binds depth and other unfilterable formats only as
+	 * "unfilterable-float" with "non-filtering" samplers. Given the bound
+	 * descriptor sets, return a refined copy of a pipeline layout (cached
+	 * on it) when any bound view needs that, else undefined.
+	 */
+	refine(pl: any, sets: any[]): any {
+		if (!pl.hasFloatTex) return undefined;
+		let key = "";
+		pl.sets.forEach((slot: any, s: number) => {
+			const set = sets[s];
+			if (!set) return;
+			for (const e of slot.entries) {
+				if (e.texture?.sampleType !== "float") continue;
+				const [vkb, el] = slot.src?.get(e.binding) || [e.binding >> 1, 0];
+				const d = set.desc.get(dkey(vkb, el));
+				const v = d?.imageView && this.objs.get(d.imageView);
+				if (v && !(formatFilterable(v.tex, this.dev.features))) key += `${s}:${e.binding},`;
+			}
+		});
+		if (!key) return undefined;
+		let r = pl.refined?.get(key);
+		if (r) return r;
+		const marks = new Set(key.split(",").filter(Boolean));
+		const sl = pl.sets.map((slot: any, s: number) => {
+			const hit = slot.entries.some((e: any) => marks.has(`${s}:${e.binding}`));
+			if (!hit) return slot;
+			const entries = slot.entries.map((e: any) => {
+				if (e.texture && marks.has(`${s}:${e.binding}`)) return { ...e, texture: { ...e.texture, sampleType: "unfilterable-float" } };
+				if (e.sampler?.type === "filtering") {
+					const paired = marks.has(`${s}:${e.binding - 1}`);
+					const [vkb, el] = slot.src?.get(e.binding) || [e.binding >> 1, 0];
+					const d = sets[s]?.desc.get(dkey(vkb, el));
+					const smp = d?.sampler && this.objs.get(d.sampler);
+					if (paired || (smp && !smp.filtering)) return { ...e, sampler: { type: "non-filtering" } };
+				}
+				return e;
+			});
+			const { key: k, layout } = this.bgl(entries);
+			return { ...slot, key: k, layout, entries };
+		});
+		const groups = sl.map((x: any) => x.layout);
+		if (pl.pushGroup >= 0) groups.push(this.pushBGL);
+		r = { ...pl, sets: sl, layout: this.dev.createPipelineLayout({ bindGroupLayouts: groups }), refineKey: key, refined: undefined };
+		(pl.refined ||= new Map()).set(key, r);
+		return r;
+	}
+
+	/**
+	 * Storage images the shader declares without a format take the bound
+	 * view's (vk-shader.ts opts.storageFormats): a pipeline variant per
+	 * combination of bound formats that differ from the default the
+	 * pipeline was made with. Returns the pipeline itself when none differ.
+	 */
+	storageVariant(p: any, sets: any[]): any {
+		if (!p.layout.hasStorageTex) return p;
+		let key = "";
+		const formats: Record<string, string> = { ...(p.storageFormats || {}) };
+		p.layout.sets.forEach((slot: any, s: number) => {
+			for (const e of slot.entries) {
+				if (!e.storageTexture) continue;
+				const [b, el] = slot.src?.get(e.binding) || [e.binding >> 1, 0];
+				const d = sets[s]?.desc.get(dkey(b, el));
+				const v = d?.imageView && this.objs.get(d.imageView);
+				if (v && v.tex !== e.storageTexture.format) {
+					formats[`${s}.${b}`] = v.tex;
+					key += `${s}.${b}=${v.tex},`;
+				}
+			}
+		});
+		if (!key) return p;
+		const root = p.root || p;
+		let v = root.storageVariants?.get(key);
+		if (v) return v;
+		const stages = root.stages.map((st: any) => {
+			const opts = { ...st.opts, storageFormats: formats };
+			return { ...st, opts, ...this.translate(st.moduleId, opts) };
+		});
+		const layout = this.pipelineLayout(root.layoutId ?? root.msg.layout, stages);
+		v = { ...root, root, stages, layout, storageFormats: formats, variants: new Map(), storageVariants: undefined };
+		if (root.kind === "compute") {
+			this.stats.pipelines++;
+			v.stage = stages[0];
+			v.gpu = this.dev.createComputePipeline({ label: "kwvk pipeline (storage formats)", layout: layout.layout, compute: { module: stages[0].module, entryPoint: stages[0].res.entryPoint } });
+		}
+		(root.storageVariants ||= new Map()).set(key, v);
+		return v;
+	}
+
+	/** Translate the stages of a pipeline message. */
+	stages(msg: any, pushGroupOf: number, setLayouts: number[] = []): { stage: number; kind: string; module: any; res: VkShaderResult; moduleId: number; opts: VkShaderOpts }[] {
+		const out: any[] = [];
+		let arrays: Record<string, { base: number; count: number }> | undefined;
+		setLayouts.forEach((id, s) => {
+			const dsl = id ? this.objs.get(id) : undefined;
+			for (const b in dsl?.arrays || {}) (arrays ||= {})[`${s}.${b}`] = dsl.arrays[b];
+		});
+		for (const st of msg.stages || []) {
+			const kind = st.stage === 1 ? "vertex" : st.stage === 0x10 ? "fragment" : st.stage === 0x20 ? "compute" : "";
+			if (!kind) throw new Error(`unsupported shader stage ${st.stage}`);
+			const opts: VkShaderOpts = { stage: kind as any, entryPoint: st.name || "main", pushGroup: pushGroupOf };
+			// "shader-f16" keeps float16_t native; without it 16-bit storage is emulated (vk-shader.ts)
+			if (this.dev.features?.has?.("shader-f16")) opts.features = ["shader-f16"];
+			if (kind === "compute" && this.dev.limits) {
+				// a larger workgroup may be shrunk (res.dispatchScale, applied at dispatch in vk-exec.ts)
+				const l = this.dev.limits;
+				opts.limits = { maxComputeWorkgroupSizeX: l.maxComputeWorkgroupSizeX, maxComputeWorkgroupSizeY: l.maxComputeWorkgroupSizeY, maxComputeWorkgroupSizeZ: l.maxComputeWorkgroupSizeZ, maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup };
+			}
+			if (arrays) opts.arrays = arrays;
+			if (kind === "vertex") opts.flipY = true;
+			const sm = this.get(st.module, "shader");
+			if (st.specializationInfo && !sm.specTypes) sm.specTypes = specTypes(sm.code);
+			const spec = specValues(st.specializationInfo, sm.specTypes);
+			if (spec) opts.spec = spec;
+			// WebGPU wants equal interpolation per location across stages; in
+			// Vulkan the fragment inputs' decorations decide: the vertex
+			// outputs take them (relinkVertexOutputs).
+			if (kind === "vertex") {
+				const fst = (msg.stages || []).find((x: any) => x.stage === 0x10);
+				const fm = fst && this.objs.get(fst.module);
+				if (fm?.t === "shader") {
+					fm.inputs ||= fragmentInputs(fm.code);
+					if (Object.keys(fm.inputs).length) (opts as any).relink = fm.inputs;
+				}
+			}
+			const { module, res } = this.translate(st.module, opts);
+			out.push({ stage: kind === "vertex" ? SS.VERTEX : kind === "fragment" ? SS.FRAGMENT : SS.COMPUTE, kind, module, res, moduleId: st.module, opts });
+		}
+		return out;
+	}
+}
+
+function b64(bytes: Uint8Array): string {
+	let s = "";
+	for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+	return btoa(s);
+}
+
+/**
+ * A fragment shader's input interpolation per location from its SPIR-V
+ * (Flat 14, NoPerspective 13, Centroid 16, Sample 17 on Input variables):
+ * location -> WGSL `@interpolate` arguments.
+ */
+export function fragmentInputs(code: Uint8Array): Record<number, string> {
+	const out: Record<number, string> = {};
+	if (code.length < 20 || code.length & 3) return out;
+	const w = new Uint32Array(code.buffer.slice(code.byteOffset, code.byteOffset + code.length));
+	if (w[0] !== 0x07230203) return out;
+	const loc = new Map<number, number>();
+	const deco = new Map<number, Set<number>>();
+	const inputs = new Set<number>();
+	for (let i = 5; i < w.length; ) {
+		const op = w[i]! & 0xffff;
+		const n = w[i]! >>> 16 || 1;
+		if (op === 71) {
+			const id = w[i + 1]!;
+			const d = w[i + 2]!;
+			if (d === 30) loc.set(id, w[i + 3]!);
+			else if (d === 13 || d === 14 || d === 16 || d === 17) (deco.get(id) || deco.set(id, new Set()).get(id)!).add(d);
+		} else if (op === 59 && w[i + 3] === 1) inputs.add(w[i + 2]!); // OpVariable ... Input
+		else if (op === 54) break;
+		i += n;
+	}
+	for (const id of inputs) {
+		const l = loc.get(id);
+		if (l === undefined) continue;
+		const d = deco.get(id) || new Set();
+		if (d.has(14)) out[l] = "flat";
+		else out[l] = `${d.has(13) ? "linear" : "perspective"}, ${d.has(17) ? "sample" : d.has(16) ? "centroid" : "center"}`;
+	}
+	return out;
+}
+
+/** The index of the "}" closing the block whose "{" is at `open`. */
+function blockEnd(t: string, open: number): number {
+	let depth = 0;
+	for (let i = open; i < t.length; i++) {
+		if (t[i] === "{") depth++;
+		else if (t[i] === "}" && --depth === 0) return i;
+	}
+	return -1;
+}
+
+/**
+ * Drop branches a baked specialization constant made constant (naga
+ * leaves `if false { ... }`) and leave out of the reflection the bindings
+ * nothing references then: WebGPU validates every bound resource (ggml
+ * binds one buffer range to two writable bindings, only one of them live).
+ */
+export function pruneDeadBindings(res: VkShaderResult): VkShaderResult {
+	let t = res.wgsl;
+	if (!/\bif (false|true) \{/.test(t)) return res;
+	for (let guard = 0; guard < 1000; guard++) {
+		const m = /\bif (false|true) \{/.exec(t);
+		if (!m) break;
+		const open = m.index + m[0].length - 1;
+		const close = blockEnd(t, open);
+		if (close < 0) return res;
+		const thenBody = t.slice(open + 1, close);
+		const rest = /^\s*else\s*/.exec(t.slice(close + 1));
+		let elseBody = "";
+		let end = close + 1;
+		if (rest) {
+			const after = close + 1 + rest[0].length;
+			if (t[after] === "{") {
+				const ec = blockEnd(t, after);
+				if (ec < 0) return res;
+				elseBody = t.slice(after + 1, ec);
+				end = ec + 1;
+			} else {
+				// else if: a dead head goes, the chain goes on; a live head is left alone (marked so it is not matched again)
+				t = m[1] === "false" ? t.slice(0, m.index) + t.slice(after) : t.slice(0, m.index) + "if (true) {" + t.slice(open + 1);
+				continue;
+			}
+		}
+		t = t.slice(0, m.index) + `{${m[1] === "true" ? thenBody : elseBody}}` + t.slice(end);
+	}
+	const bindings = res.bindings.filter((b) => {
+		const d = new RegExp(`@group\\(${b.group}\\)\\s*@binding\\(${b.wgslBinding}\\)\\s*var(<[^>]*>)?\\s+(\\w+)`).exec(t);
+		if (!d) return true;
+		const name = d[2]!;
+		const uses = t.match(new RegExp(`\\b${name}\\b`, "g"))?.length ?? 0;
+		return uses > 1;
+	});
+	return { ...res, wgsl: t, bindings };
+}
+
+/**
+ * Give the vertex entry point's outputs the fragment inputs' interpolation
+ * (a WGSL text pass over the entry's output struct). Integer outputs stay
+ * flat, as WGSL requires.
+ */
+export function relinkVertexOutputs(wgsl: string, inputs: Record<number, string>): string {
+	const m = /@vertex\s*fn\s+\w+\s*\([^]*?\)\s*->\s*(\w+)/.exec(wgsl);
+	if (!m) return wgsl;
+	const start = wgsl.search(new RegExp(`struct\\s+${m[1]}\\s*\\{`));
+	if (start < 0) return wgsl;
+	const end = wgsl.indexOf("}", start);
+	if (end < 0) return wgsl;
+	const body = wgsl.slice(start, end).replace(/@location\((\d+)\)(\s*@interpolate\([^)]*\))?(\s*)(\w+\s*:\s*[^,\n]+)/g, (all, l, _interp, sp, decl) => {
+		const want = inputs[Number(l)];
+		if (!want || /\b[iu]32\b|vec\d<[iu]32>|vec\di\b|vec\du\b/.test(decl)) return all;
+		return want === "perspective, center" ? `@location(${l})${sp}${decl}` : `@location(${l}) @interpolate(${want})${sp}${decl}`;
+	});
+	return wgsl.slice(0, start) + body + wgsl.slice(end);
+}
+
+/** Whether a SPIR-V module decorates anything BuiltIn BaseVertex (4424), BaseInstance (4425) or DrawIndex (4426). */
+function usesBaseBuiltins(code: Uint8Array): boolean {
+	if (code.length < 20 || code.length & 3) return false;
+	const w = new Uint32Array(code.buffer, code.byteOffset, code.length >> 2);
+	if (w[0] !== 0x07230203) return false;
+	for (let i = 5; i < w.length; ) {
+		const op = w[i]! & 0xffff;
+		const n = w[i]! >>> 16 || 1;
+		if (op === 71 && w[i + 2] === 11 && w[i + 3]! >= 4424 && w[i + 3]! <= 4426) return true;
+		if (op === 72 && w[i + 3] === 11 && w[i + 4]! >= 4424 && w[i + 4]! <= 4426) return true;
+		if (op === 54) break; // OpFunction: past the annotations
+		i += n;
+	}
+	return false;
+}
+
+/** SpecId -> "f" | "i" | "u" | "b" from the module's SPIR-V (OpDecorate SpecId, OpSpecConstant*). */
+function specTypes(code: Uint8Array): Map<number, string> {
+	const out = new Map<number, string>();
+	if (code.length < 20 || code.length & 3) return out;
+	const w = new Uint32Array(code.buffer.slice(code.byteOffset, code.byteOffset + code.length));
+	if (w[0] !== 0x07230203) return out;
+	const specId = new Map<number, number>();
+	const types = new Map<number, string>();
+	for (let i = 5; i < w.length; ) {
+		const op = w[i]! & 0xffff;
+		const n = w[i]! >>> 16 || 1;
+		if (op === 71 && w[i + 2] === 1) specId.set(w[i + 1]!, w[i + 3]!); // OpDecorate id SpecId n
+		else if (op === 20) types.set(w[i + 1]!, "b"); // OpTypeBool
+		else if (op === 21) types.set(w[i + 1]!, w[i + 3] ? "i" : "u"); // OpTypeInt
+		else if (op === 22) types.set(w[i + 1]!, "f"); // OpTypeFloat
+		else if (op === 48 || op === 49 || op === 50) {
+			const id = specId.get(w[i + 2]!);
+			if (id !== undefined) out.set(id, types.get(w[i + 1]!) || "u");
+		}
+		i += n;
+	}
+	return out;
+}
+
+/** Specialization constants as constantID -> value, typed by the SPIR-V's declarations. */
+function specValues(info: any, types: Map<number, string>): Record<number, number | boolean> | undefined {
+	if (!info || !info.mapEntries?.length) return undefined;
+	const data = Uint8Array.from(info.data || []);
+	const dv = new DataView(data.buffer);
+	const out: Record<number, number | boolean> = {};
+	for (const m of info.mapEntries) {
+		const size = m.size || 4;
+		if (m.offset + Math.min(size, 4) > data.length) continue;
+		const t = types.get(m.constantID) || "u";
+		if (size === 1) out[m.constantID] = t === "b" ? dv.getUint8(m.offset) !== 0 : dv.getUint8(m.offset);
+		else if (size === 2) out[m.constantID] = dv.getUint16(m.offset, true);
+		else if (size === 8) out[m.constantID] = t === "f" ? dv.getFloat64(m.offset, true) : Number(dv.getBigInt64(m.offset, true));
+		else if (t === "f") out[m.constantID] = dv.getFloat32(m.offset, true);
+		else if (t === "i") out[m.constantID] = dv.getInt32(m.offset, true);
+		else if (t === "b") out[m.constantID] = dv.getUint32(m.offset, true) !== 0;
+		else out[m.constantID] = dv.getUint32(m.offset, true);
+	}
+	return out;
+}
+
+/** Descriptor set storage key of (binding, array element). */
+export function dkey(binding: number, element: number): number {
+	return binding + element * 2 ** 21;
+}
+
+function entryFromReflection(b: VkShaderBinding, stage: number, dsl: any): any {
+	const e: any = { binding: b.wgslBinding, visibility: stage };
+	const vkd = dsl.bindings.get(b.binding);
+	const dyn = vkd && (vkd.type === DT.UNIFORM_DYN || vkd.type === DT.STORAGE_DYN);
+	switch (b.kind) {
+		case "uniform":
+			e.buffer = { type: "uniform", hasDynamicOffset: !!dyn };
+			break;
+		case "storage":
+			e.buffer = { type: "storage", hasDynamicOffset: !!dyn };
+			// read-only in the app's shader (promoted for compute): may be copied
+			// aside when it aliases a writable binding (vk-exec.ts aliasFix)
+			if ((b as any).ro) e.kwRO = true;
+			break;
+		case "read-only-storage":
+			e.buffer = { type: "read-only-storage", hasDynamicOffset: !!dyn };
+			break;
+		case "sampler":
+			e.sampler = { type: "filtering" };
+			break;
+		case "comparison-sampler":
+			e.sampler = { type: "comparison" };
+			break;
+		case "texture": {
+			let sampleType = b.sampleType || "float";
+			if (b.multisampled && sampleType === "float") sampleType = "unfilterable-float";
+			e.texture = { sampleType, viewDimension: b.viewDimension || "2d", multisampled: !!b.multisampled };
+			break;
+		}
+		case "storage-texture":
+			e.storageTexture = { access: b.access || "write-only", format: b.format || "rgba8unorm", viewDimension: b.viewDimension || "2d" };
+			break;
+	}
+	return e;
+}
+
+function entriesFromVk(binding: number, d: any, visibility: number): any[] {
+	const w = 2 * binding;
+	switch (d.type) {
+		case DT.UNIFORM:
+		case DT.UNIFORM_DYN:
+			return [{ binding: w, visibility, buffer: { type: "uniform", hasDynamicOffset: d.type === DT.UNIFORM_DYN } }];
+		case DT.STORAGE:
+		case DT.STORAGE_DYN:
+			return [{ binding: w, visibility: visibility & ~SS.VERTEX, buffer: { type: "storage", hasDynamicOffset: d.type === DT.STORAGE_DYN } }];
+		case DT.SAMPLER:
+			return [{ binding: w, visibility, sampler: { type: "filtering" } }];
+		case DT.SAMPLED_IMAGE:
+			return [{ binding: w, visibility, texture: { sampleType: "float", viewDimension: "2d" } }];
+		case DT.COMBINED:
+			return [
+				{ binding: w, visibility, texture: { sampleType: "float", viewDimension: "2d" } },
+				{ binding: w + 1, visibility, sampler: { type: "filtering" } },
+			];
+	}
+	return [];
+}
+
+function makeTexture(c: Conn, msg: any, info: VkFormatInfo): any {
+	const ext = msg.extent || { width: 1, height: 1, depth: 1 };
+	const samples = msg.samples || 1;
+	const dim = msg.imageType === 0 ? "1d" : msg.imageType === 2 ? "3d" : "2d";
+	const tex = info.tex!;
+	let usage = TU.TEXTURE_BINDING;
+	const renderable = (info.caps & 20) !== 0 && dim === "2d";
+	if (samples > 1) usage |= TU.RENDER_ATTACHMENT;
+	else {
+		usage |= TU.COPY_SRC | TU.COPY_DST;
+		if (renderable) usage |= TU.RENDER_ATTACHMENT;
+		if (msg.usage & 8 && info.caps & 32) usage |= TU.STORAGE_BINDING;
+	}
+	const desc: any = {
+		label: `kwvk image ${msg.id}`,
+		size: [ext.width, dim === "1d" ? 1 : ext.height, dim === "3d" ? ext.depth : msg.arrayLayers || 1],
+		mipLevelCount: msg.mipLevels || 1,
+		sampleCount: samples,
+		dimension: dim,
+		format: tex,
+		usage,
+	};
+	const twin = srgbTwin(tex);
+	if (twin && samples === 1) desc.viewFormats = [twin];
+	const texture = c.dev.createTexture(desc);
+	c.r.gpuCreated();
+	return texture;
+}
+
+const SAMPLER_FILTER = ["nearest", "linear"];
+
+type Handler = (c: Conn, msg: any, bin: Uint8Array) => Reply | Deferred | undefined | Promise<Reply | Deferred | undefined>;
+
+const handlers: Record<string, Handler> = {
+	hello(c) {
+		const dev = c.dev;
+		const limits: Record<string, number> = {};
+		for (const k in dev.limits) {
+			const v = dev.limits[k];
+			if (typeof v === "number") limits[k] = v;
+		}
+		const features = [...dev.features];
+		const ai = dev.adapterInfo || c.r.adapter?.info || {};
+		return {
+			json: {
+				version: 1,
+				adapter: { vendor: ai.vendor || "", architecture: ai.architecture || "", device: ai.device || "", description: ai.description || "" },
+				limits,
+				features,
+				formats: formatTable(dev.features),
+			},
+		};
+	},
+
+	sync(c) {
+		return { defer: c.dev.queue.onSubmittedWorkDone().then(() => undefined) };
+	},
+
+	destroy(c, msg) {
+		for (const id of msg.ids || []) c.destroyOne(id);
+		return undefined;
+	},
+
+	vkCreateBuffer(c, msg) {
+		const size = Math.max(4, (msg.size + 3) & ~3);
+		// STORAGE always: vkCmdCopyBuffer patches unaligned bytes with a compute pass (vk-exec.ts byteCopy)
+		let usage = BU.COPY_SRC | BU.COPY_DST | BU.STORAGE;
+		const u = msg.usage || 0;
+		if (u & 0x10) usage |= BU.UNIFORM;
+		if (u & 0x20) usage |= BU.STORAGE;
+		if (u & 0x40) usage |= BU.INDEX;
+		if (u & 0x80) usage |= BU.VERTEX;
+		if (u & 0x100) usage |= BU.INDIRECT;
+		if (u & 0x8) usage |= BU.UNIFORM; // uniform texel: unsupported, keep valid
+		if (u & 0x4) usage |= BU.STORAGE;
+		if (!(size <= c.dev.limits.maxBufferSize)) throw new Error(`buffer size ${msg.size} over maxBufferSize`);
+		const buf = c.dev.createBuffer({ size, usage, label: `kwvk buffer ${msg.id}` });
+		c.r.gpuCreated();
+		c.put(msg.id, { t: "buffer", buf, size: msg.size });
+		return undefined;
+	},
+
+	writeBuffer(c, msg, bin) {
+		const b = c.get(msg.buffer, "buffer");
+		const off = msg.offset || 0;
+		if (off & 3 || bin.length & 3) {
+			// pad an unaligned tail with zeros only where it lies past the Vulkan size
+			if (off & 3) throw new Error(`unaligned offset ${off}`);
+			const end = off + bin.length;
+			if (end >= b.size) {
+				const p = new Uint8Array((bin.length + 3) & ~3);
+				p.set(bin);
+				bin = p;
+			} else throw new Error(`unaligned size ${bin.length}`);
+		}
+		if (off + bin.length > b.buf.size) throw new Error(`write past the end (${off}+${bin.length} > ${b.buf.size})`);
+		c.dev.queue.writeBuffer(b.buf, off, bin);
+		c.stats.bytesWritten += bin.length;
+		return undefined;
+	},
+
+	readBuffer(c, msg) {
+		const b = c.get(msg.buffer, "buffer");
+		const off = msg.offset || 0;
+		if (!(off >= 0 && off <= b.size)) throw new Error(`offset ${off} out of range`);
+		const size = Math.min(isWhole(msg.size) ? b.size - off : msg.size, b.size - off);
+		const start = off & ~3;
+		const end = Math.min((off + size + 3) & ~3, b.buf.size);
+		const len = Math.max(4, end - start);
+		const stage = c.dev.createBuffer({ size: len, usage: BU.MAP_READ | BU.COPY_DST });
+		const e = c.dev.createCommandEncoder();
+		e.copyBufferToBuffer(b.buf, start, stage, 0, end - start);
+		c.dev.queue.submit([e.finish()]);
+		return {
+			defer: stage.mapAsync(MAP_READ).then(() => {
+				// framed straight from the mapped range (the only copy), then unmapped
+				const out = new Uint8Array(stage.getMappedRange()).subarray(off - start, off - start + size);
+				c.stats.bytesRead += out.length;
+				return {
+					bin: out,
+					after: () => {
+						stage.unmap();
+						stage.destroy();
+					},
+				};
+			}),
+		};
+	},
+
+	vkCreateImage(c, msg) {
+		const info = vkFormat(msg.format);
+		if (!info?.tex) throw new Error(`unsupported image format ${msg.format}`);
+		if (msg.tiling === 1) c.log("kwvk: vkCreateImage: linear tiling is unsupported (treated as optimal)");
+		const tex = makeTexture(c, msg, info);
+		c.put(msg.id, {
+			t: "image",
+			tex,
+			info,
+			format: info.tex,
+			width: msg.extent?.width || 1,
+			height: msg.extent?.height || 1,
+			depth: msg.imageType === 2 ? msg.extent?.depth || 1 : 1,
+			is3D: msg.imageType === 2,
+			mipLevels: msg.mipLevels || 1,
+			layers: msg.arrayLayers || 1,
+			samples: msg.samples || 1,
+		});
+		return undefined;
+	},
+
+	vkCreateImageView(c, msg) {
+		const image = c.get(msg.image, "image");
+		const info = vkFormat(msg.format);
+		let tex = info?.tex || image.format;
+		if (tex !== image.format && tex !== srgbTwin(image.format)) {
+			c.log(`kwvk: vkCreateImageView: view format ${tex} of a ${image.format} image is unsupported, using the image's`);
+			tex = image.format;
+		}
+		const r = msg.subresourceRange || {};
+		// VkComponentSwizzle -> WebGPU's view swizzle ("texture-component-swizzle"): IDENTITY, ZERO, ONE, R, G, B, A
+		const sw = msg.components || {};
+		const letter = (v: number, own: string) => (!v ? own : ["", "0", "1", "r", "g", "b", "a"][v] || own);
+		let swizzle: string | undefined = letter(sw.r, "r") + letter(sw.g, "g") + letter(sw.b, "b") + letter(sw.a, "a");
+		if (swizzle === "rgba") swizzle = undefined;
+		else if (!c.dev.features.has("texture-component-swizzle")) {
+			c.log("kwvk: vkCreateImageView: component swizzles need WebGPU's texture-component-swizzle (identity used)");
+			swizzle = undefined;
+		}
+		c.put(msg.id, {
+			t: "imageView",
+			image,
+			tex,
+			swizzle,
+			viewType: msg.viewType ?? 1,
+			range: { aspectMask: r.aspectMask ?? 1, baseMipLevel: r.baseMipLevel || 0, levelCount: r.levelCount ?? -1, baseArrayLayer: r.baseArrayLayer || 0, layerCount: r.layerCount ?? -1 },
+			cache: new Map(),
+		});
+		return undefined;
+	},
+
+	vkCreateSampler(c, msg) {
+		const desc: any = {
+			magFilter: SAMPLER_FILTER[msg.magFilter] || "nearest",
+			minFilter: SAMPLER_FILTER[msg.minFilter] || "nearest",
+			mipmapFilter: SAMPLER_FILTER[msg.mipmapMode] || "nearest",
+			addressModeU: ADDRESS[msg.addressModeU] || "repeat",
+			addressModeV: ADDRESS[msg.addressModeV] || "repeat",
+			addressModeW: ADDRESS[msg.addressModeW] || "repeat",
+			lodMinClamp: Math.max(0, msg.minLod || 0),
+			lodMaxClamp: Math.min(32, Math.max(msg.minLod || 0, msg.maxLod ?? 32)),
+		};
+		if (msg.compareEnable) desc.compare = COMPARE[msg.compareOp] || "less";
+		if (msg.anisotropyEnable && msg.maxAnisotropy > 1 && desc.magFilter === "linear" && desc.minFilter === "linear" && desc.mipmapFilter === "linear") {
+			desc.maxAnisotropy = Math.min(16, Math.floor(msg.maxAnisotropy));
+		}
+		const filtering = desc.magFilter === "linear" || desc.minFilter === "linear" || desc.mipmapFilter === "linear";
+		c.put(msg.id, { t: "sampler", gpu: c.dev.createSampler(desc), filtering });
+		return undefined;
+	},
+
+	vkCreateShaderModule(c, msg, bin) {
+		let code = bin;
+		if (!code.length && Array.isArray(msg.code)) code = Uint8Array.from(msg.code);
+		code = code.slice();
+		c.put(msg.id, { t: "shader", code, cache: new Map(), baseBuiltins: usesBaseBuiltins(code) });
+		return undefined;
+	},
+
+	vkCreateDescriptorSetLayout(c, msg) {
+		const bindings = new Map<number, any>();
+		for (const b of msg.bindings || []) {
+			if (b.descriptorType === DT.UNIFORM_TEXEL || b.descriptorType === DT.STORAGE_TEXEL) c.log("kwvk: vkCreateDescriptorSetLayout: texel buffers are unsupported");
+			bindings.set(b.binding, { type: b.descriptorType, count: b.descriptorCount ?? 1, stages: b.stageFlags, immutable: b.immutableSamplers });
+		}
+		const order = [...bindings.keys()].sort((a, b) => a - b);
+		// dynamic offsets come in binding order, one per array element
+		const dynamic: string[] = [];
+		for (const b of order) {
+			const d = bindings.get(b);
+			if (d.type === DT.UNIFORM_DYN || d.type === DT.STORAGE_DYN) for (let i = 0; i < Math.min(d.count, 1024); i++) dynamic.push(`${b}:${i}`);
+		}
+		// descriptor arrays get WGSL bindings after 2 * (the highest binding + 1): element i at base + 2i (vk-shader.ts opts.arrays)
+		const arrays: Record<number, { base: number; count: number }> = {};
+		let next = 2 * ((order[order.length - 1] ?? -1) + 1);
+		for (const b of order) {
+			const d = bindings.get(b);
+			if (d.count > 1) {
+				arrays[b] = { base: next, count: d.count };
+				next += 2 * d.count;
+			}
+		}
+		if (next > 1000) c.log("kwvk: vkCreateDescriptorSetLayout: descriptor arrays past WebGPU's binding numbers (1000)");
+		c.put(msg.id, { t: "setLayout", bindings, dynamic, order, arrays });
+		return undefined;
+	},
+
+	vkCreatePipelineLayout(c, msg) {
+		const setLayouts: number[] = msg.setLayouts || [];
+		let pushSize = 0;
+		for (const r of msg.pushConstantRanges || []) pushSize = Math.max(pushSize, r.offset + r.size);
+		if (pushSize && setLayouts.length > 3) c.log("kwvk: vkCreatePipelineLayout: push constants with more than 3 sets are unsupported");
+		c.put(msg.id, { t: "pipelineLayout", setLayouts, pushSize });
+		return undefined;
+	},
+
+	vkAllocateDescriptorSets(c, msg) {
+		for (const s of msg.sets || []) {
+			const layout = c.get(s.layout, "setLayout");
+			c.put(s.id, { t: "set", layout, desc: new Map(), cache: new Map() });
+		}
+		return undefined;
+	},
+
+	vkUpdateDescriptorSets(c, msg) {
+		for (const w of msg.descriptorWrites || []) {
+			const set = c.get(w.dstSet, "set");
+			set.cache.clear();
+			const infos: any[] = w.imageInfo?.length ? w.imageInfo : w.bufferInfo?.length ? w.bufferInfo : w.texelBufferView || [];
+			const n = Math.min(w.descriptorCount ?? infos.length, infos.length);
+			let b = w.dstBinding | 0;
+			let el = w.dstArrayElement | 0;
+			for (let i = 0; i < n; i++) {
+				// past a binding's last element the write goes on in the next binding (Vulkan's consecutive binding updates)
+				while (el >= (set.layout.bindings.get(b)?.count ?? 1)) {
+					const nb = set.layout.order.find((x: number) => x > b);
+					if (nb === undefined) throw new Error("descriptor write past the last binding");
+					b = nb;
+					el = 0;
+				}
+				const info = infos[i];
+				const d: any = { type: w.descriptorType };
+				if (w.imageInfo?.length) Object.assign(d, { sampler: info.sampler, imageView: info.imageView });
+				else if (w.bufferInfo?.length) Object.assign(d, { buffer: info.buffer, offset: info.offset || 0, range: info.range });
+				const k = dkey(b, el);
+				const prev = set.desc.get(k);
+				// a sampler-only write keeps a combined binding's view and vice versa
+				set.desc.set(k, prev && w.descriptorType === DT.SAMPLER ? { ...prev, sampler: d.sampler } : d);
+				el++;
+			}
+		}
+		for (const cp of msg.descriptorCopies || []) {
+			const src = c.get(cp.srcSet, "set");
+			const dst = c.get(cp.dstSet, "set");
+			const n = Math.min(cp.descriptorCount ?? 1, 4096);
+			for (let i = 0; i < n; i++) {
+				const d = src.desc.get(dkey(cp.srcBinding, (cp.srcArrayElement | 0) + i));
+				if (d) dst.desc.set(dkey(cp.dstBinding, (cp.dstArrayElement | 0) + i), { ...d });
+			}
+			dst.cache.clear();
+		}
+		return undefined;
+	},
+
+	vkCreateRenderPass(c, msg) {
+		const atts = (msg.attachments || []).map((a: any) => ({ ...a, tex: vkFormat(a.format)?.tex }));
+		const subpasses = (msg.subpasses || []).map((s: any) => ({
+			colors: (s.colorAttachments || []).map((r: any) => r.attachment),
+			resolves: (s.resolveAttachments || []).map((r: any) => r.attachment),
+			depth: s.depthStencilAttachment ? s.depthStencilAttachment.attachment : UNUSED,
+			inputs: (s.inputAttachments || []).map((r: any) => r.attachment),
+		}));
+		const first = new Map<number, number>();
+		const last = new Map<number, number>();
+		subpasses.forEach((s: any, i: number) => {
+			for (const a of [...s.colors, ...s.resolves, s.depth]) {
+				if (a === UNUSED || a === undefined) continue;
+				if (!first.has(a)) first.set(a, i);
+				last.set(a, i);
+			}
+			if (s.inputs?.some?.((a: number) => a !== UNUSED && (s.colors.includes(a) || s.depth === a))) {
+				c.log("kwvk: vkCreateRenderPass: an input attachment that is also written in the same subpass is unsupported");
+			}
+		});
+		for (const s of subpasses) {
+			const colors = s.colors.map((a: number) => (a === UNUSED ? null : atts[a]?.tex || null));
+			const depth = s.depth === UNUSED ? null : atts[s.depth]?.tex || null;
+			let samples = 1;
+			for (const a of [...s.colors, s.depth]) if (a !== UNUSED && atts[a]) samples = atts[a].samples || 1;
+			s.colorFormats = colors;
+			s.depthFormat = depth;
+			s.samples = samples;
+			s.key = `${colors.join(",")}|${depth}|${samples}`;
+		}
+		c.put(msg.id, { t: "renderPass", atts, subpasses, first, last });
+		return undefined;
+	},
+
+	vkCreateFramebuffer(c, msg) {
+		c.put(msg.id, { t: "framebuffer", views: msg.attachments || [], width: msg.width, height: msg.height, layers: msg.layers || 1 });
+		return undefined;
+	},
+
+	vkCreateGraphicsPipelines(c, msg) {
+		const pl = c.get(msg.layout, "pipelineLayout");
+		const stages = c.stages(msg, pl.setLayouts.length, pl.setLayouts);
+		const layout = c.pipelineLayout(msg.layout, stages);
+		const vi = msg.vertexInputState || {};
+		const bindings = (vi.vertexBindingDescriptions || []).slice().sort((a: any, b: any) => a.binding - b.binding);
+		const buffers = bindings.map((b: any) => ({
+			binding: b.binding,
+			desc: {
+				arrayStride: b.stride,
+				stepMode: b.inputRate === 1 ? "instance" : "vertex",
+				attributes: (vi.vertexAttributeDescriptions || [])
+					.filter((a: any) => a.binding === b.binding)
+					.map((a: any) => {
+						const f = vkFormat(a.format)?.vtx;
+						if (!f) throw new Error(`unsupported vertex format ${a.format}`);
+						return { format: f, offset: a.offset, shaderLocation: a.location };
+					}),
+			},
+		}));
+		const topo = msg.inputAssemblyState?.topology ?? 3;
+		if (topo > 5) c.log(`kwvk: vkCreateGraphicsPipelines: topology ${topo} is unsupported`);
+		const rs = msg.rasterizationState || {};
+		if (rs.polygonMode) c.log("kwvk: vkCreateGraphicsPipelines: polygon modes other than FILL are unsupported");
+		if (rs.cullMode === 3) c.log("kwvk: vkCreateGraphicsPipelines: cullMode FRONT_AND_BACK is unsupported");
+		const p = {
+			t: "pipeline",
+			kind: "graphics",
+			msg,
+			layout,
+			stages,
+			buffers,
+			topology: topo,
+			dynamic: new Set<number>(msg.dynamicState?.dynamicStates || []),
+			variants: new Map<string, any>(),
+			// BaseVertex / BaseInstance / DrawIndex: WGSL has none, the translator reads 0
+			usesBase: stages.some((st: any) => c.objs.get(st.moduleId)?.baseBuiltins),
+		};
+		c.put(msg.id, p);
+		// build the variant of the render pass it was created for, so errors show here
+		const rp = msg.renderPass ? c.objs.get(msg.renderPass) : undefined;
+		let sp = rp?.subpasses?.[msg.subpass || 0];
+		if (!msg.renderPass && msg.rendering) {
+			// dynamic rendering: the formats come with the pipeline (same key as vkCmdBeginRendering's)
+			const r = msg.rendering;
+			const colorFormats = (r.colorAttachmentFormats || []).map((f: number) => (f ? vkFormat(f)?.tex || null : null));
+			const df = r.depthAttachmentFormat || r.stencilAttachmentFormat;
+			const depthFormat = df ? vkFormat(df)?.tex || null : null;
+			const samples = msg.multisampleState?.rasterizationSamples || 1;
+			sp = { colorFormats, depthFormat, samples, key: `${colorFormats.join(",")}|${depthFormat}|${samples}` };
+		}
+		if (sp) pipelineVariant(c, p, sp, {}, undefined);
+		return undefined;
+	},
+
+	vkCreateComputePipelines(c, msg) {
+		const pl = c.get(msg.layout, "pipelineLayout");
+		const stages = c.stages({ stages: [msg.stage] }, pl.setLayouts.length, pl.setLayouts);
+		const layout = c.pipelineLayout(msg.layout, stages);
+		const st = stages[0]!;
+		c.stats.pipelines++;
+		const gpu = c.dev.createComputePipeline({ label: `kwvk pipeline ${msg.id}`, layout: layout.layout, compute: { module: st.module, entryPoint: st.res.entryPoint } });
+		c.put(msg.id, { t: "pipeline", kind: "compute", layout, gpu, stage: st, stages, layoutId: msg.layout, variants: new Map() });
+		return undefined;
+	},
+
+	vkCreateQueryPool(c, msg) {
+		const count = msg.queryCount | 0;
+		if (!(count >= 1 && count <= 4096)) throw new Error(`queryCount ${msg.queryCount} out of range (1..4096)`);
+		const type = msg.queryType | 0;
+		let set: any;
+		if (type === 0) set = c.dev.createQuerySet({ type: "occlusion", count, label: `kwvk queries ${msg.id}` });
+		else if (type === 2 && c.dev.features.has("timestamp-query")) set = c.dev.createQuerySet({ type: "timestamp", count, label: `kwvk queries ${msg.id}` });
+		else c.log(`kwvk: vkCreateQueryPool: query type ${type} ${type === 2 ? "without timestamp-query" : ""} reads as zeros`);
+		if (set) c.r.gpuCreated();
+		const results = c.dev.createBuffer({ size: count * 8, usage: BU.COPY_SRC | BU.COPY_DST, label: `kwvk query results ${msg.id}` });
+		c.r.gpuCreated();
+		c.put(msg.id, { t: "queryPool", type, count, set, results, avail: new Uint8Array(count) });
+		return undefined;
+	},
+
+	vkResetQueryPool(c, msg) {
+		const p = c.get(msg.queryPool, "queryPool");
+		const first = msg.firstQuery | 0;
+		const n = Math.min(msg.queryCount | 0, p.count - first);
+		if (first < 0 || n <= 0) return undefined;
+		p.avail.fill(0, first, first + n);
+		const e = c.dev.createCommandEncoder();
+		e.clearBuffer(p.results, first * 8, n * 8);
+		c.dev.queue.submit([e.finish()]);
+		return undefined;
+	},
+
+	getQueryPoolResults(c, msg) {
+		const p = c.get(msg.queryPool, "queryPool");
+		const first = msg.firstQuery | 0;
+		const n = Math.min(msg.queryCount | 0, p.count - first);
+		if (first < 0 || n <= 0) throw new Error("query range out of range");
+		const stage = c.dev.createBuffer({ size: n * 8, usage: BU.MAP_READ | BU.COPY_DST });
+		const e = c.dev.createCommandEncoder();
+		e.copyBufferToBuffer(p.results, first * 8, stage, 0, n * 8);
+		c.dev.queue.submit([e.finish()]);
+		const available = [...p.avail.subarray(first, first + n)];
+		return {
+			defer: stage.mapAsync(MAP_READ).then(() => {
+				const out = new Uint8Array(stage.getMappedRange().slice(0));
+				stage.unmap();
+				stage.destroy();
+				if (p.type === 0) {
+					// occlusion: WebGPU's values are only zero / non-zero
+					const v = new BigUint64Array(out.buffer);
+					for (let i = 0; i < v.length; i++) v[i] = v[i] ? 1n : 0n;
+				}
+				c.stats.bytesRead += out.length;
+				return { json: { available }, bin: out };
+			}),
+		};
+	},
+
+	vkCreateBufferView(c, msg) {
+		c.log("kwvk: vkCreateBufferView: texel buffers are unsupported");
+		c.put(msg.id, { t: "bufferView" });
+		return undefined;
+	},
+
+	vkQueueSubmit(c, msg) {
+		c.stats.submits++;
+		const done = runSubmit(c, msg.cmds || []);
+		return { defer: done.then(() => undefined) };
+	},
+
+	present(c, msg) {
+		const img = c.get(msg.image, "image");
+		const w = img.width;
+		const h = img.height;
+		c.stats.presents++;
+		const info: VkPresentInfo = { connection: c, image: msg.image, texture: img.tex, width: w, height: h, format: img.format };
+		c.lastPresented = info;
+		try {
+			c.r.onPresent?.(info);
+		} catch (e) {
+			c.log(`kwvk: onPresent: ${(e as Error).message}`);
+		}
+		if (msg.readback === 0) return { json: { width: w, height: h, stride: w * img.info.bpb } };
+		const json = { width: w, height: h, stride: w * img.info.bpb };
+		return {
+			defer: readTexture(c, img, 0, 0, w, h).then((bin) => {
+				c.stats.bytesRead += bin.length;
+				return { json, bin };
+			}),
+		};
+	},
+};
+
+/** Read level `mip`, layer `layer` of an image as tightly packed rows. */
+export async function readTexture(c: Conn, img: any, mip: number, layer: number, w: number, h: number): Promise<Uint8Array> {
+	const bpb = img.info.bpb;
+	const tight = w * bpb;
+	const stride = (tight + 255) & ~255;
+	const stage = c.dev.createBuffer({ size: stride * h, usage: BU.MAP_READ | BU.COPY_DST });
+	const e = c.dev.createCommandEncoder();
+	e.copyTextureToBuffer({ texture: img.tex, mipLevel: mip, origin: [0, 0, layer] }, { buffer: stage, bytesPerRow: stride, rowsPerImage: h }, [w, h, 1]);
+	c.dev.queue.submit([e.finish()]);
+	await stage.mapAsync(MAP_READ);
+	const src = new Uint8Array(stage.getMappedRange());
+	const out = new Uint8Array(tight * h);
+	for (let y = 0; y < h; y++) out.set(src.subarray(y * stride, y * stride + tight), y * tight);
+	stage.unmap();
+	stage.destroy();
+	return out;
+}
+
+// --- render pipeline variants ---------------------------------------------
+
+// fans (5) draw as lists through a generated index buffer (vk-exec.ts)
+const TOPOLOGY = ["point-list", "line-list", "line-strip", "triangle-list", "triangle-strip", "triangle-list"];
+const BLEND_FACTOR = [
+	"zero", "one", "src", "one-minus-src", "dst", "one-minus-dst", "src-alpha", "one-minus-src-alpha", "dst-alpha",
+	"one-minus-dst-alpha", "constant", "one-minus-constant", "constant", "one-minus-constant", "src-alpha-saturated",
+	"src1", "one-minus-src1", "src1-alpha", "one-minus-src1-alpha",
+];
+const BLEND_OP = ["add", "subtract", "reverse-subtract", "min", "max"];
+const STENCIL_OP = ["keep", "zero", "replace", "increment-clamp", "decrement-clamp", "invert", "increment-wrap", "decrement-wrap"];
+
+export interface VariantDyn {
+	bias?: [number, number, number];
+	readMask?: number;
+	writeMask?: number;
+	/** a negative viewport height is current: the vertex stage is translated without the y flip */
+	noFlip?: boolean;
+	/** extended dynamic state (VK_EXT_extended_dynamic_state(2), Vulkan 1.3) as set by the vkCmdSet* commands */
+	ext?: Record<string, any>;
+}
+
+// VkDynamicState -> the ext key its setter fills
+const EXT_DYN: Record<number, string> = {
+	1000267000: "cullMode", 1000267001: "frontFace", 1000267002: "topology", 1000267005: "strides",
+	1000267006: "depthTestEnable", 1000267007: "depthWriteEnable", 1000267008: "depthCompareOp",
+	1000267010: "stencilTestEnable", 1000267011: "stencilOp", 1000377002: "depthBiasEnable",
+};
+
+/** The extended dynamic state a pipeline takes from the command buffer (only what it declares dynamic). */
+export function effectiveExt(p: any, ext: Record<string, any> | undefined): Record<string, any> {
+	const eff: Record<string, any> = {};
+	if (!ext || !p.dynamic) return eff;
+	for (const d of p.dynamic) {
+		const k = EXT_DYN[d];
+		if (k && ext[k] !== undefined) eff[k] = ext[k];
+	}
+	return eff;
+}
+
+/** The GPURenderPipeline of a pipeline for a subpass's formats (and baked dynamic state). */
+export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, stripFormat: string | undefined, refined?: any): any {
+	const eff = effectiveExt(p, dyn.ext);
+	const topoN = eff.topology ?? p.topology;
+	const topo = TOPOLOGY[topoN] || "triangle-list";
+	const strip = topo.endsWith("strip") ? stripFormat : undefined;
+	const useBias = p.dynamic.has(3) ? dyn.bias : undefined;
+	const rm = p.dynamic.has(6) ? dyn.readMask : undefined;
+	const wm = p.dynamic.has(7) ? dyn.writeMask : undefined;
+	const key = `${sp.key}|${strip}|${useBias}|${rm}|${wm}|${refined?.refineKey || ""}|${dyn.noFlip ? 1 : 0}|${JSON.stringify(eff)}`;
+	let v = p.variants.get(key);
+	if (v) return v;
+	c.stats.pipelines++;
+	const m = p.msg;
+	let vs = p.stages.find((s: any) => s.kind === "vertex");
+	const fs = p.stages.find((s: any) => s.kind === "fragment");
+	if (!vs) throw new Error("graphics pipeline without a vertex stage");
+	if (dyn.noFlip) vs = { ...vs, ...c.translate(vs.moduleId, { ...vs.opts, flipY: false }) };
+	const rs0 = m.rasterizationState || {};
+	const rs = { ...rs0 };
+	if (eff.cullMode !== undefined) rs.cullMode = eff.cullMode;
+	if (eff.frontFace !== undefined) rs.frontFace = eff.frontFace;
+	if (eff.depthBiasEnable !== undefined) rs.depthBiasEnable = eff.depthBiasEnable;
+	const d0 = m.depthStencilState || {};
+	const dss = { ...d0 };
+	for (const k of ["depthTestEnable", "depthWriteEnable", "depthCompareOp", "stencilTestEnable"]) if (eff[k] !== undefined) dss[k] = eff[k];
+	if (eff.stencilOp) {
+		if (eff.stencilOp.front) dss.front = { ...(d0.front || {}), ...eff.stencilOp.front };
+		if (eff.stencilOp.back) dss.back = { ...(d0.back || {}), ...eff.stencilOp.back };
+	}
+	const buffers = p.buffers.map((b: any) => (eff.strides?.[b.binding] !== undefined ? { ...b.desc, arrayStride: eff.strides[b.binding] } : b.desc));
+	const tri = topo.startsWith("triangle");
+	const desc: any = {
+		label: `kwvk pipeline ${m.id}`,
+		layout: (refined || p.layout).layout,
+		vertex: { module: vs.module, entryPoint: vs.res.entryPoint, buffers },
+		primitive: {
+			topology: topo,
+			frontFace: (rs.frontFace || 0) === 0 ? "ccw" : "cw",
+			cullMode: rs.cullMode === 1 ? "front" : rs.cullMode === 2 ? "back" : "none",
+		},
+		multisample: { count: sp.samples },
+	};
+	if (strip) desc.primitive.stripIndexFormat = strip;
+	if (rs.depthClampEnable && c.dev.features.has("depth-clip-control")) desc.primitive.unclippedDepth = true;
+	const ms = m.multisampleState;
+	if (ms) {
+		if (ms.sampleMask?.length) desc.multisample.mask = ms.sampleMask[0];
+		if (ms.alphaToCoverageEnable) desc.multisample.alphaToCoverageEnabled = true;
+	}
+	if (fs && !rs.rasterizerDiscardEnable) {
+		const cb = m.colorBlendState || {};
+		desc.fragment = {
+			module: fs.module,
+			entryPoint: fs.res.entryPoint,
+			targets: sp.colorFormats.map((f: string | null, i: number) => {
+				if (!f) return null;
+				const a = cb.attachments?.[i] || cb.attachments?.[0] || { colorWriteMask: 15 };
+				const t: any = { format: f, writeMask: a.colorWriteMask ?? 15 };
+				const fi = texFormatInfo(f);
+				if (a.blendEnable && fi && fi.caps & 8) {
+					const comp = (src: number, dst: number, op: number) => {
+						const operation = BLEND_OP[op] || "add";
+						if (operation === "min" || operation === "max") return { operation, srcFactor: "one", dstFactor: "one" };
+						return { operation, srcFactor: BLEND_FACTOR[src] || "one", dstFactor: BLEND_FACTOR[dst] || "zero" };
+					};
+					t.blend = {
+						color: comp(a.srcColorBlendFactor, a.dstColorBlendFactor, a.colorBlendOp),
+						alpha: comp(a.srcAlphaBlendFactor, a.dstAlphaBlendFactor, a.alphaBlendOp),
+					};
+				}
+				return t;
+			}),
+		};
+		if (cb.logicOpEnable) c.log("kwvk: vkCreateGraphicsPipelines: logic ops are unsupported");
+	} else if (rs.rasterizerDiscardEnable) {
+		c.log("kwvk: vkCreateGraphicsPipelines: rasterizer discard is unsupported (fragments dropped)");
+	}
+	if (sp.depthFormat) {
+		const df = sp.depthFormat as string;
+		const d = dss;
+		const depth = hasDepth(df);
+		const stencil = hasStencil(df);
+		const face = (s: any) =>
+			d.stencilTestEnable && s
+				? { compare: COMPARE[s.compareOp] || "always", failOp: STENCIL_OP[s.failOp] || "keep", depthFailOp: STENCIL_OP[s.depthFailOp] || "keep", passOp: STENCIL_OP[s.passOp] || "keep" }
+				: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "keep" };
+		const ds: any = {
+			format: df,
+			depthWriteEnabled: depth && !!d.depthTestEnable && !!d.depthWriteEnable,
+			depthCompare: depth && d.depthTestEnable ? COMPARE[d.depthCompareOp] || "less" : "always",
+		};
+		if (stencil) {
+			ds.stencilFront = face(d.front);
+			ds.stencilBack = face(d.back);
+			ds.stencilReadMask = rm ?? d.front?.compareMask ?? 0xff;
+			ds.stencilWriteMask = d.stencilTestEnable ? (wm ?? d.front?.writeMask ?? 0xff) : 0;
+		}
+		if (tri && depth) {
+			const b = useBias || (rs.depthBiasEnable ? [rs.depthBiasConstantFactor || 0, rs.depthBiasClamp || 0, rs.depthBiasSlopeFactor || 0] : undefined);
+			if (b && rs.depthBiasEnable) {
+				ds.depthBias = Math.round(b[0]);
+				ds.depthBiasClamp = b[1];
+				ds.depthBiasSlopeScale = b[2];
+			}
+		}
+		desc.depthStencil = ds;
+	}
+	v = c.dev.createRenderPipeline(desc);
+	p.variants.set(key, v);
+	return v;
+}
+
+
+function formatFilterable(tex: string, features: { has(name: string): boolean }): boolean {
+	const info = texFormatInfo(tex);
+	return !!info && (formatCaps(info, features) & CAP_FILTER) !== 0;
+}
+
+/** The GPUComputePipeline of a compute pipeline for a refined layout (or its own). */
+export function computeVariant(c: Conn, p: any, refined?: any): any {
+	if (!refined) return p.gpu;
+	let v = p.variants.get(refined.refineKey);
+	if (!v) {
+		v = c.dev.createComputePipeline({ label: `kwvk pipeline (refined)`, layout: refined.layout, compute: { module: p.stage.module, entryPoint: p.stage.res.entryPoint } });
+		p.variants.set(refined.refineKey, v);
+	}
+	return v;
+}
+
+// Vulkan 1.2's render pass 2: the same members as far as the host reads them
+handlers.vkCreateRenderPass2 = handlers.vkCreateRenderPass!;

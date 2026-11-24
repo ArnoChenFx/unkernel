@@ -800,6 +800,76 @@ out, so the guest has the vtest link alone, for comparison.
   data disk, the built server's
   `/assets/virgl-*/` files in a browser.
 
+## Guest Vulkan
+
+The Guest Vulkan option (`?vk=`, the `#opt-vk` box in Settings' Display
+and sound, under Guest GL; on by default, saved only as `vk=0`) boots with
+the SDK's `createKernel({ vk: true })` (vk.md): the base's ICD
+(`/usr/lib/kw/libvulkan_kw.so`) talks over vsock port 1018 to a renderer on
+the page thread's WebGPU, in worker mode too. Nothing of it (the
+renderer's chunks and `kwvk-naga.wasm`) is fetched before the guest's
+first VkInstance. Vulkan windows on the Wayland desktop are ordinary
+wl_shm windows (frames read back).
+
+- Only on Debian (`VK_DISTROS`, config.ts) and where `vkBlocker()` passes:
+  the page's build has the translator (`vkShaderUrl`) and the page's
+  thread has `navigator.gpu`. Otherwise the box is unticked and disabled
+  with the reason, and System's Environment row says why (`cfg.vkWhy`; a
+  warning where the option was set). Sessions record nothing of it: the
+  command line is the same, and the renderer is not in snapshots (a resume
+  resets the guest's Vulkan links).
+- The translator is picked like the GL renderer (`withVk()` in
+  `web/scripts/kernel.ts`): `KW_VK=<dir>` (`KW_VK=0`: none), else with a
+  local kernel `vendor/build/vk/kwvk-naga.wasm` (`vk/naga/build.sh`), else
+  the release's `kwvk-naga.wasm` asset (the release workflow builds and
+  attaches it; `release.json`'s `vk`). The dev server answers
+  `/_vk/kwvk-naga.wasm` (`serveGl()`), a build emits
+  `/assets/kwvk-naga-<16 hex digits of its sha256>.wasm`;
+  `virtual:unkernel-kernel`'s `vkShaderUrl`, which `src/sdk.ts` passes to
+  `webPlatform()` with the renderer's modules. The build log's `Vulkan
+  translator:` line says which.
+- `showVk()` (boot.ts): "on, not loaded yet" (`vm.vk.status` idle),
+  "loading", then the WebGPU adapter (`status.adapter`), the load time and
+  from `vm.vk.stats` the instances now and in all and, from the current
+  renderer's counters (`stats.renderer`) over the last 2 s, frames
+  presented a second and draws a frame, its totals, and its errors where
+  there are any (a warning row), every 2 s while they change; a software
+  adapter (SwiftShader) is a warning row; a lost WebGPU device (status
+  "lost", `stats.losses`) a warning row "WebGPU device lost" (the running
+  programs must be restarted, the next one gets a new device); a failed
+  load a failed row and a toast.
+- The vkcube app (`apps/gl/vkcube.ts`, Graphics folder; `needs.vk`):
+  `libvulkan1 vulkan-tools`, then `vulkaninfo --summary` and `vkcube --wsi
+  wayland` on the Wayland desktop. The vkmark app (`apps/gl/vkmark.ts`):
+  `vkmark --winsys wayland`. GTK on Vulkan (`apps/gl/gtkvk.ts`):
+  `gtk-4-examples`, `GSK_RENDERER=vulkan gtk4-demo`.
+- The page needs a base bundle with the ICD (vk.md). `test/vk/page-check.mjs`:
+  the dev server on a free port with `KW_KERNEL=$KW_BUILD/vk/base/unkernel.wasm`
+  where it exists (`--kernel FILE`; `--built`: web/.output, whose kernel
+  the build took), the Playwright Chromium with the WebGPU flags (vk.md,
+  Testing), the prepared disk `$KW_BUILD/vk/debian-vk.img` imported (as the
+  `.kwsparse.gz` next to it, made once; `--fresh`: apt instead), the
+  default URL; checks the option on by default with the renderer idle and
+  nothing fetched, `vulkaninfo --summary` naming kwvk, the row naming the
+  adapter, the vkcube tile's window and its pixels and the row's frame
+  rate, then the vkmark and GTK on Vulkan tiles' windows where the disk
+  has them (`--disk $KW_BUILD/vk/debian-vk-apps.img`, debian-disk.mjs
+  --apps; `--no-vkmark`, `--no-gtk`) (`--no-tile`, `--inline`,
+  `--shots DIR`). A reload of the page during the checks (the
+  dev server reloads it when a source in the tree changes, which ends the
+  VM) makes the run "could not run" (exit 2), not a failure.
+- Checked 2026-11-24 with `test/vk/page-check.mjs`, one CPU, a base built
+  with the ICD (Vulkan 1.1; `KW_BASE_OUT` and `kernel/tools/bundle.mjs`,
+  with the SMP patch): worker mode and `--inline` with `--disk
+  debian-vk-apps.img` pass (vulkaninfo apiVersion 1.1.314; the translator
+  loaded in about 30 ms on "google swiftshader"; vkcube 500x500 at 34-45
+  frames a second by the row, 1 draw a frame; vkmark's window 800x600 and
+  gtk4-demo's 828x598 with GTK's Vulkan renderer drawing, non-blank); and
+  `--built` (that base as the local bundle, the default disk). Two earlier
+  `--inline` failures came from the dev server reloading the page for
+  another session's edit of `js/core/vk-host.ts`. The built server sends
+  the translator as `application/wasm`, br-compressed, immutable.
+
 ## Wayland desktop
 
 Wayland apps in the guest show as windows on the page, through
@@ -1025,8 +1095,9 @@ answered at the kernel's next yield.
   platform on the `virtio_gpu` DRI driver, window configs in B8G8R8A8 and
   B8G8R8X8 only (no R8G8B8A8 one), so ARGB8888 with alpha and XRGB8888
   without, always with the LINEAR modifier (0), never y_invert, plane
-  offset 0, stride width x 4. GTK 4.18 draws with GskGLRenderer (no Vulkan
-  driver installed), which needed renderer patch 14 (gl.md, Patches).
+  offset 0, stride width x 4. GTK 4.18 draws with GskGLRenderer (its default;
+  `GSK_RENDERER=vulkan` uses guest Vulkan, vk.md), which needed renderer
+  patch 14 (gl.md, Patches).
 - One wland release on both sides: the npm version in `web/package.json`
   and the relay's `WLANDR_VERSION` (guest/distro/debian/pins.sh) change
   together (the link protocol is theirs). The relay comes with the Debian

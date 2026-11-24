@@ -195,7 +195,11 @@ The kw layer's `/usr/lib/kw/bin/fx`, `claude`, `opencode`, `node`, `npm`,
 `npx`, `bun`, `bunx`, `uv` and `uvx` link to `/usr/lib/kw/shim`, which installs the real program on
 its first call and runs it (described at its top). Every distro has them, the page and
 the CLI alike; `test/distro.test.ts` checks them on each image (no
-network).
+network). On the page it takes the glibc arm64 files the page's mirror has
+(claude, node, uv and the version lookups of opencode and uv) from
+`http://mirror.unkernel.dev` first, where that name resolves to a routed
+address (198.51.100.0/24: the page's own `fetch()`, web.md), and from the
+upstream when the mirror fails; elsewhere from the upstreams only.
 
 - PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for every interactive
   shell, kwtty for programs it starts), and the install goes to `~/.local/bin`, which

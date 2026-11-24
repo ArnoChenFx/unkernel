@@ -190,6 +190,24 @@ host's CPU, with the guest under kwemu.
   `test-backend-ops` against the CPU backend (partial runs): GET_ROWS,
   SILU, SOFT_MAX, ROPE pass; CPY 209 of 211, ADD 90 of 97, MUL_MAT 209
   of 249, RMS_NORM 41 of 123.
+- Ollama 0.40.18: its runner is llama.cpp's llama-server (b12651). It runs
+  as its `bin/ollama` plus llama.cpp's own arm64 Vulkan build of that tag
+  (the page's Ollama app; web.md, Guest Vulkan). Its discovery
+  (`llama-server --list-devices` through the loader) finds "kwvk (WebGPU)"
+  as an integrated GPU. It puts layers there only with
+  `OLLAMA_IGPU_ENABLE=1` and `LLAMA_ARG_FIT_TARGET=64`, since
+  llama-server's default target of 1 GiB free exceeds kwvk's heap (half
+  the guest's RAM). stories260K, made an Ollama model with F32 kept:
+  - 6/6 layers on kwvk ("100% GPU") and right text.
+  - 2.7-6.0 tokens/s in the guest (one CPU, the page and `/sh` runs).
+  - 43 tokens/s on the guest's CPU, no layers offloaded.
+  - 10.3 tokens/s natively through the relay.
+
+  F16 weights run too. stories260K converted by llama-quantize gave the CPU
+  backend's text with llama.cpp natively, and ran 100% GPU at 6.2 tokens/s
+  with Ollama in the guest. SmolLM2 135M and Qwen2.5-Coder 0.5B (F16)
+  abort at rms_norm_mul_f32_512 on SwiftShader. Neither has been run on a
+  real GPU.
 - Presentation: below.
 
 ## Device memory (2026-11-24)

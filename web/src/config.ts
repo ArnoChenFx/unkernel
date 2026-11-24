@@ -180,6 +180,14 @@ export const DEFAULT_DISTRO = DISTROS_OFFERED.find((d) => d.name === "debian")?.
  */
 export const DEFAULT_ROUTES: Readonly<Record<string, string>> = Object.freeze({
 	"deb.debian.org": "https://mirror.unkernel.dev/deb",
+	// The mirror's other paths, under its own name: /github/OWNER/REPO/releases/download/TAG/ASSET
+	// (llama.cpp's and Ollama's) and /ollama/v2/library/NAME/{manifests/TAG,blobs/sha256:HEX}
+	// (Ollama's registry), which the llama.cpp and Ollama apps' scripts ask first (apps/agents), and
+	// /claude, /nodejs, /opencode, /astral and /github/astral-sh/uv, which the install shim asks
+	// first where the name resolves to a routed address (guest/base/rootfs/usr/lib/kw/shim).
+	"mirror.unkernel.dev": "https://mirror.unkernel.dev",
+	// Ladybird's apt repository (apps/browsers/ladybird.ts), as Debian's.
+	"apt.ladybird.org": "https://mirror.unkernel.dev/ladybird",
 });
 
 /** The project's source, linked from About and the boot notes. */

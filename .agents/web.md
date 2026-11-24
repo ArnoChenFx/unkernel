@@ -432,7 +432,14 @@ deploying the page needs no kernel toolchain.
   WebSockets are exempt.
 - The guest network is Wisp, plus `fetch()` for the plain-HTTP hosts of
   `DEFAULT_ROUTES` (config.ts: deb.debian.org through the page's CORS
-  mirror; `?routes=0` sends them through Wisp too). A page served from an origin outside the
+  mirror, apt.ladybird.org through its /ladybird, and mirror.unkernel.dev
+  itself, whose other paths are asked before the upstreams: /github and
+  /ollama (llama.cpp's and Ollama's release files, Ollama's registry) by
+  the llama.cpp and Ollama apps' scripts, and /claude, /nodejs, /opencode,
+  /astral and /github/astral-sh/uv by the install shim, only where the
+  name resolves to a routed address (it checks nothing against a
+  checksum); the Ubuntu app's tarball is the page's own fetch of /ubuntu; `?routes=0` sends them
+  through Wisp too). A page served from an origin outside the
   Wisp server's allow list needs its own Wisp server (js.md). A `ws://`
   server is blocked as mixed content on an `https://` page.
 - The distro (above): `?distro=<name>` (default `debian`, else the first
@@ -575,8 +582,8 @@ deploying the page needs no kernel toolchain.
   tile per other open window (`#dock-terminal-K`, `#dock-display`,
   `#dock-preview`, ...), and while wland's relay is connected
   `#dock-wayland` (Ctrl-A w). Pins (`pins.ts`): localStorage `kw.pins`, an
-  ordered list of app ids and `group:<id>` (by default Terminal, Chromium,
-  Thunar, the Desktop and Games groups, and Settings), changed from the
+  ordered list of app ids and `group:<id>` (by default Terminal, the Browsers,
+  AI, Desktop, Graphics and Games groups, and Settings), changed from the
   tiles' and the launcher's menus (Keep in Dock, Remove from Dock, Move
   Left, Move Right); an entry the registry no longer has is kept but not
   shown. A pinned app's tile stands for its window (`appwindows.ts`
@@ -917,6 +924,109 @@ external buffer), else as wl_shm windows (frames read back).
   wait for pipelines); a later launch's text after 8-10 s at 5.2-6.1
   tokens/s;
   `MODEL=stories15M` aborted with the hint (rms_norm_mul_f32_512).
+- The Ollama app (`apps/agents/ollama.ts`, in the AI folder after
+  llama.cpp, described at its top; a Terminal window of its own) runs
+  Ollama's server and `ollama run` on kwvk. Ollama 0.40 runs models in
+  llama.cpp's llama-server, so its GPU path is ggml-vulkan, as in the
+  llama.cpp app. The installer adds `zstd` to llama.cpp's packages and
+  fetches the same stories260K into `~/.apps/ollama/models/`. On its first
+  run `ollama.sh` checks kwvk as `llama.sh` does, then fetches over https,
+  pinned by tag and SHA-256:
+  - Ollama's `bin/ollama` (with its Go code's `GO_LICENSE`), from the first
+    12 MiB of Ollama's linux-arm64 archive by an HTTP range. The archive is
+    1.6 GiB, mostly CUDA, and has no Vulkan backend (Ollama builds that for
+    amd64 only).
+  - llama-server, libllama and ggml, from llama.cpp's Ubuntu arm64 Vulkan
+    build of the tag that Ollama pins (b12651).
+
+  Both go into `~/.local/share/ollama/<version>` (97 MiB; the Vulkan
+  backend in `lib/ollama/vulkan/`). The script then starts `ollama serve`
+  in its own session (log in `ollama.log`) with these settings:
+  - `OLLAMA_IGPU_ENABLE=1`: Ollama drops integrated GPUs, and kwvk is one.
+  - `LLAMA_ARG_FIT_TARGET=64`: llama-server's `-fit` keeps 1 GiB of device
+    memory free, more than kwvk's heap (half the guest's RAM), and would
+    otherwise put every layer on the CPU.
+  - `OLLAMA_NO_CLOUD=1` and `OLLAMA_KEEP_ALIVE=-1`.
+
+  It stops with a message unless three checks pass: Ollama's "inference
+  compute" line names kwvk, a Vulkan0 model buffer exists after `ollama
+  create` (F32 kept) and a load, and llama-server reports offloaded
+  layers. The default model is `MODEL=qwen-coder` (Qwen2.5-Coder 0.5B
+  Instruct, F16, 994 MiB; guest memory of 3 GiB or more; the fx (local
+  model) app's default too), which gets `ollama run`'s chat, as any model
+  with a chat template. Models:
+  - `MODEL=stories260K`, the story model, runs on software WebGPU too: the
+    script writes a story from "Once upon a time" and reads the user's
+    story starts, sending each as `ollama run --verbose stories260k
+    "TEXT"` (Ollama's generate path), not through `ollama run`'s own
+    prompt, which chats through llama-server's chat endpoint with a
+    template this model does not know.
+  - `MODEL=smollm2` (SmolLM2 135M Instruct, F16, 271 MiB) and the default
+    are small coding models for a real GPU. On SwiftShader both abort at
+    rms_norm_mul_f32_512 (512-wide workgroups) with the hint; on the
+    user's GPU SmolLM2 loaded and answered (2026-11-24). Of the two, only
+    Qwen2.5-Coder's template has tools (`ollama show`).
+  - `MODEL=[user/]name[:tag]` takes any model of Ollama's registry.
+  - `MODEL=PATH.gguf` takes another GGUF. Quantized models abort for now.
+
+  `ollama pull` cannot work in the guest. It refuses redirects to hosts
+  that resolve to non-public addresses, and the page's network answers DNS
+  with synthetic ones (198.18.0.0/15). So the script fetches registry
+  models with curl instead, into Ollama's store as a pull would:
+  - The manifest goes byte for byte to
+    `manifests/registry.ollama.ai/<namespace>/<name>/<tag>`, a path the
+    server reads on each request, so it needs no restart.
+  - Each blob goes to `blobs/sha256-<hex>`, checked against its digest and
+    resumable.
+
+  The script's exit status says why it stopped: 3 a download failed, 4
+  guest Vulkan refused a shader, 5 the WebGPU device was lost, 1 anything
+  else.
+
+  `SERVE=1` runs the server only, for other apps. Once the model is on
+  kwvk, the script writes its Ollama name to `ollama.ready` and waits;
+  Ctrl-C or a TERM stops the server and removes the file. The script never
+  sets `OLLAMA_CONTEXT_LENGTH`, so the server inherits it from the caller.
+  `ollama.ts` exports `OLLAMA_MODEL`, `OLLAMA_MODEL_CTX` and
+  `OLLAMA_MODEL_TOOLS` (stories260k, 2048, false).
+
+  When the script ends it stops the server. A refused shader or a lost
+  device gets a hint like llama.sh's. Nothing needs deploying: all
+  downloads come from their upstreams. Driven by a scratch harness on
+  2026-11-24 (the tile clicked on a dev server of its own, headless
+  Chromium on SwiftShader, one CPU, 1 GiB, the prepared disk):
+  - The installer took 2 s (the model); the two fetches and unpacking 24 s.
+  - The server answered 3 s later. The model was on kwvk ("offloaded 6/6
+    layers to GPU", `ollama ps` "100% GPU") 44 s after the click.
+  - The first story's eval ran at 2.7-4.8 tokens/s. A typed story start
+    ("The little dragon": 8 prompt tokens) ran at 5.1 tokens/s.
+  - Ctrl-D ended it with no ollama or llama-server left.
+- The fx (local model) app (`apps/agents/fx-local.ts`, in the AI folder
+  after fx, described at its top; a Terminal window of its own) runs fx
+  against the Ollama app's server as fx's custom connection `local`. It
+  repeats nothing of Ollama: it writes the Ollama app's files and
+  downloads into `~/.apps/ollama` (shared models, log and `ollama.pid`, so
+  one server at a time), installs its packages plus `jq`, and its
+  `fx-local.sh` runs `SERVE=1 ./ollama.sh` there in the background with
+  `OLLAMA_CONTEXT_LENGTH=CTX`, waits for `ollama.ready`, and stops it when
+  fx quits. The connection (protocol `openai-chat-completions`,
+  `http://127.0.0.1:11434/v1`, auth none, long `timeouts`, and
+  `model_metadata` with `context_window`, `max_output_tokens`,
+  `supports_tool_use` and `supports_vision`) is merged with jq into an
+  app-private `FX_HOME` (`~/.apps/fx-local/fx-home/settings.json`), so the
+  user's `~/.fx` is untouched; fx runs with `FX_PROVIDER=local`,
+  `FX_MODEL` and `FX_AUTO_UPGRADE=0` in `~/.apps/fx-local/work`. The
+  default model is `MODEL=qwen-coder` (the smallest one ollama.sh offers
+  that can call tools; CTX 16384; guest memory 3 GiB or more). fx sends
+  its tools with every request whatever `supports_tool_use` says, and
+  Ollama answers HTTP 400 for a model without them (SmolLM2, the story
+  model), so fx-local.sh stops before fx with such a model. The
+  `context_window` never exceeds the trained context that Ollama's
+  `/api/show` reports, and tool use follows its capabilities
+  (`OLLAMA_MODEL_TOOLS` for the story model; `TOOLS=0|1` overrides). On
+  a real GPU (the user's, 2026-11-24) SmolLM2 loaded and fx reached it
+  (and got that 400); Qwen2.5-Coder with fx is untried. The field names
+  follow fx's docs for 0.0.17.
 - The page needs a base bundle with the ICD (vk.md). `test/vk/page-check.mjs`:
   the dev server on a free port with `KW_KERNEL=$KW_BUILD/vk/base/unkernel.wasm`
   where it exists (`--kernel FILE`; `--built`: web/.output, whose kernel

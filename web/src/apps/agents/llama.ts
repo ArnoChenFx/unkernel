@@ -48,6 +48,7 @@ import type { TerminalApp } from "../types.ts";
 
 const VER = "b12674";
 const TARBALL = `https://github.com/ggml-org/llama.cpp/releases/download/${VER}/llama-${VER}-bin-ubuntu-vulkan-arm64.tar.gz`;
+const TARBALL_MIRROR = `github/ggml-org/llama.cpp/releases/download/${VER}/llama-${VER}-bin-ubuntu-vulkan-arm64.tar.gz`;
 const TARBALL_SHA256 = "b909ff920a08a751c79d3d09a335be2b939bc8f73d3bd2841d9fa21dc136b9f8";
 const MODELS = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas";
 const MODEL_SHA256 = "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d";
@@ -65,7 +66,17 @@ const LLAMA_SH = String.raw`#!/bin/bash
 set -e
 VER=${VER}
 URL=${TARBALL}
+MURL_GH=${TARBALL_MIRROR}
 SHA=${TARBALL_SHA256}
+# Downloads try the page's mirror first: plain HTTP to mirror.unkernel.dev is
+# answered by the page's fetch() (config.ts DEFAULT_ROUTES), not carried over
+# the network relay; then the upstream itself. dl UPSTREAM MIRROR_PATH CURL_ARGS...
+MIRROR=http://mirror.unkernel.dev
+dl() {
+	local up=$1 mp=$2
+	shift 2
+	curl "$@" "$MIRROR/$mp" || curl "$@" "$up"
+}
 DIR=$HOME/.local/share/llama.cpp/$VER
 LOG=$PWD/llama.log
 D='\033[90m' B='\033[1m' R='\033[31m' N='\033[0m'
@@ -94,7 +105,7 @@ if [ ! -x "$DIR/llama-completion" ]; then
 	[ "$free" -ge 120 ] || die "llama.cpp needs 120 MiB on the disk, $free MiB free."
 	printf "$B%s$N\n" "Fetching llama.cpp $VER (Vulkan, arm64: 29 MiB, 77 MiB unpacked) from GitHub"
 	rm -rf "$DIR.part" && mkdir -p "$DIR.part"
-	curl -fL# -o "$DIR.part/llama.tar.gz" "$URL"
+	dl "$URL" "$MURL_GH" -fL# -o "$DIR.part/llama.tar.gz"
 	echo "$SHA  $DIR.part/llama.tar.gz" | sha256sum -c --quiet || { rm -rf "$DIR.part"; die "llama.cpp: wrong SHA-256, deleted"; }
 	tar xzf "$DIR.part/llama.tar.gz" -C "$DIR.part" --strip-components=1
 	rm "$DIR.part/llama.tar.gz" && mv "$DIR.part" "$DIR"

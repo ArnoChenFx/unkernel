@@ -80,7 +80,8 @@ export interface ManifestInput {
 	app: { name: string; size: number; sha256: string; files: InstallFile[] };
 	kernel: { name: string; size: number; sha256: string; files: InstallFile[] };
 	updater: { name: string; size: number; sha256: string }[];
-	distros: { name: string; file: string; size: number; sha256: string; served: string }[];
+	/** `url`: where the image is, when it is not in the upstream release (this fork's Omarchy release). */
+	distros: { name: string; file: string; size: number; sha256: string; served: string; url?: string }[];
 }
 
 /** The manifest of one release: every install file with the asset it comes from, the assets, the upstream release it came with. */
@@ -92,14 +93,14 @@ export function buildManifest(input: ManifestInput): Manifest {
 		for (const f of archive.files) files.push({ ...f, asset: archive.name, url: url(archive.name) });
 	}
 	for (const d of input.distros) {
-		files.push({ path: `web/.output/public/distros/${d.served}`, size: d.size, sha256: d.sha256, asset: d.file, url: upstreamUrl(d.file) });
+		files.push({ path: `web/.output/public/distros/${d.served}`, size: d.size, sha256: d.sha256, asset: d.file, url: d.url ?? upstreamUrl(d.file) });
 	}
 	files.sort(byPath);
 	const assets: Asset[] = [
 		{ name: input.app.name, kind: "app", size: input.app.size, sha256: input.app.sha256, url: url(input.app.name) },
 		{ name: input.kernel.name, kind: "kernel", size: input.kernel.size, sha256: input.kernel.sha256, url: url(input.kernel.name) },
 		...input.updater.map((u): Asset => ({ name: u.name, kind: "updater", size: u.size, sha256: u.sha256, url: url(u.name) })),
-		...input.distros.map((d): Asset => ({ name: d.file, kind: "distro", size: d.size, sha256: d.sha256, url: upstreamUrl(d.file) })),
+		...input.distros.map((d): Asset => ({ name: d.file, kind: "distro", size: d.size, sha256: d.sha256, url: d.url ?? upstreamUrl(d.file) })),
 	];
 	return {
 		format: MANIFEST_FORMAT,

@@ -157,10 +157,18 @@ jobs:
 
       # The upstream release: the page takes its kernel and distro images from
       # the newest release of pithings/unkernel (KW_LOCAL=0: never a local build).
+      # This repository's newest Omarchy image release (omarchy-image.yml), if any: the page
+      # lists it beside the upstream images when it was made for the same base bundle.
+      - name: Fetch the extra distro images
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node remote/scripts/fetch-extra-distros.ts --repo "$GITHUB_REPOSITORY"
+
       - name: Build the web page
         env:
           GITHUB_TOKEN: ${{ github.token }}
           KW_LOCAL: "0"
+          KW_EXTRA_DISTROS: ${{ github.workspace }}/remote/extra-distros
         run: pnpm build:web
 
       - name: Pack the release (app and kernel archives, manifest.json, the updater)

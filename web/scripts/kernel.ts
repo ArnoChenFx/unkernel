@@ -491,6 +491,34 @@ function checkGlFile(name: string, bytes: Uint8Array, what: string): void {
 		throw new Error(`${what}: not the ES module build of the GL renderer (it does not locate virgl.wasm next to itself)`);
 }
 
+/**
+ * The images of KW_EXTRA_DISTROS=<dir> (this fork's remote release: remote/scripts/fetch-extra-distros.ts),
+ * a directory with distros.json and its images, added to the release's own. An index made for another
+ * kwemu ABI or base bundle than the release's, or an image that does not match its entry, is left out.
+ */
+async function extraDistros(meta: ReleaseMeta): Promise<PageImage[]> {
+	const dir = process.env.KW_EXTRA_DISTROS;
+	if (!dir) return [];
+	const index = await readIndex(dir);
+	if (!index) { log(`KW_EXTRA_DISTROS=${dir}: no distros.json there; no extra images`); return []; }
+	if (index.abi !== meta.abi || index.base !== meta.baseId) {
+		log(`KW_EXTRA_DISTROS=${dir}: made for ABI ${index.abi}, ${index.base}; release ${meta.tag} has ABI ${meta.abi}, ${meta.baseId}: left out`);
+		return [];
+	}
+	const out: PageImage[] = [];
+	for (const d of index.distros) {
+		const file = path.join(dir, d.file);
+		if (meta.distros.some((o) => o.name === d.name)) { log(`extra image ${d.name}: the release has one; left out`); continue; }
+		if (!(await isFile(file)) || (await stat(file)).size !== d.size || (await fileSha256(file)) !== d.sha256) {
+			log(`extra image ${d.name}: ${d.file} is missing or does not match distros.json; left out`);
+			continue;
+		}
+		log(`extra image ${d.name}: ${d.file} ${mib(d.size)} (${d.image ?? "no image id"})`);
+		out.push({ name: d.name, url: "", size: d.size, file, sha256: d.sha256, ...(d.image ? { imageId: d.image } : {}) });
+	}
+	return out;
+}
+
 /** The release in web/kernel/release/ as the page's source; `why`: why no local build. */
 async function releaseSource(dev: boolean, why: string): Promise<PageSource> {
 	const meta = await fetchRelease(dev, why);
@@ -498,7 +526,9 @@ async function releaseSource(dev: boolean, why: string): Promise<PageSource> {
 	const bytes = new Uint8Array(await readFile(base));
 	const distros = meta.distros.map((d) => ({
 		name: d.name, url: "", size: d.size, file: path.join(RELEASE_DIR, d.file), sha256: d.sha256, ...(d.image ? { imageId: d.image } : {}),
-	})).sort(byName);
+	}));
+	distros.push(...(await extraDistros(meta)));
+	distros.sort(byName);
 	const gl = meta.gl ? await glDir(RELEASE_DIR) : null;
 	return {
 		why: `release ${meta.tag} (${why})`, kernel: { tag: meta.tag, date: meta.date, sha256: meta.sha256 }, linux: banner(bytes), base, distros,

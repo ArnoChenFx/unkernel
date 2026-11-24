@@ -29,7 +29,7 @@ function backendPage(): boolean {
 /**
  * The configuration with remote mode on or off (?remote=1|0; by default on
  * where the backend serves the page). On: one CPU in a worker whose messages
- * travel on the link, no shared memory, no guest GL, no suspend or session
+ * travel on the link, no shared memory, no guest GL (a 2D virtio-gpu with the display, ?gpu=0: none), no suspend or session
  * resume, the data disk, /work and the network on the backend's computer.
  */
 export function remoteConfig(c: Config, search: string = location.search): Config {
@@ -52,7 +52,9 @@ export function remoteConfig(c: Config, search: string = location.search): Confi
 		shm: false,
 		glWhy: c.glParam ? REMOTE_GL_WHY : null,
 		gl: false,
-		gpu: false,
+		// No guest GL, but a 2D virtio-gpu (dumb buffers: /dev/dri/card0 for KMS clients such as
+		// niri on kms_swrast, software rendering): with the display, unless ?gpu=0.
+		gpu: c.display && url.get("gpu") !== "0",
 	};
 }
 

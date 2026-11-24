@@ -242,6 +242,8 @@ install_launchers() {
 		[ -f "$APP/$name" ] && continue
 		[ -f "$1/remote/$name" ] && cp "$1/remote/$name" "$APP/$name"
 	done
+	# The Omarchy launcher follows each release: replaced every update.
+	[ -f "$1/remote/start-omarchy.sh" ] && cp "$1/remote/start-omarchy.sh" "$APP/start-omarchy.sh"
 	return 0
 }
 

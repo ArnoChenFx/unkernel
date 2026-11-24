@@ -859,9 +859,9 @@ wl_shm windows (frames read back).
   dev server reloads it when a source in the tree changes, which ends the
   VM) makes the run "could not run" (exit 2), not a failure.
 - Checked 2026-11-24 with `test/vk/page-check.mjs`, one CPU, a base built
-  with the ICD (Vulkan 1.1; `KW_BASE_OUT` and `kernel/tools/bundle.mjs`,
+  with the ICD (Vulkan 1.2; `KW_BASE_OUT` and `kernel/tools/bundle.mjs`,
   with the SMP patch): worker mode and `--inline` with `--disk
-  debian-vk-apps.img` pass (vulkaninfo apiVersion 1.1.314; the translator
+  debian-vk-apps.img` pass (vulkaninfo apiVersion 1.2.314; the translator
   loaded in about 30 ms on "google swiftshader"; vkcube 500x500 at 34-45
   frames a second by the row, 1 draw a frame; vkmark's window 800x600 and
   gtk4-demo's 828x598 with GTK's Vulkan renderer drawing, non-blank); and

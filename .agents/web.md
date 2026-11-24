@@ -1033,7 +1033,7 @@ answered at the kernel's next yield.
   image, so it matches the page only where the image is the same
   release's (the page's own images are); nothing checks the link's
   version, and `wland` reads only the relay's features for its own flags. The page needs wland
-  0.1.0-261122-6617578 or later, its npm pin (createWland's embedder
+  0.1.0-261122-6617578 or later (createWland's embedder
   options and hooks, `setBounds`, `setTiled`, `setVisible`,
   `setWindowPosition`, besides the `gpu` source, `view`, `readv` and the
   clipboard bridge); older packages lack that API. The
@@ -1041,8 +1041,7 @@ answered at the kernel's next yield.
   build, its entry `wlandr`). The relay at boot needs `--link-on-demand`
   (and `--version`, `--no-fence-wait`), and Firefox's input the core that
   sends seat events to every pointer and keyboard of a client: both in
-  wland 0.1.0-261122-632f589, the relay's pin in pins.sh (the npm pin is
-  the later release; the two differ for now). With an older relay the boot
+  wland 0.1.0-261122-632f589. Both pins are 0.1.0-261124-100fbf2. With an older relay the boot
   starts none and shells get no session (plain apps fail as outside the
   page; `wland CMD` works as before). A new release: `WLANDR_VERSION` and
   `WLANDR_SHA256` in pins.sh and the npm version in `web/package.json`
@@ -1069,8 +1068,8 @@ answered at the kernel's next yield.
   GTK 3 app (l3afpad). The GL windows app (`apps/gl/wlgl.ts`, Debian:
   mesa-utils; `needs.wayland`) runs `es2gears_wayland` after `eglinfo -B
   -p wayland`; its README suggests glmark2-es2-wayland and
-  gtk4-widget-factory (GTK 4). Other Wayland apps are in the Desktop and
-  Games groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
+  gtk4-widget-factory (GTK 4). Other Wayland apps are in the Browsers,
+  Desktop and Games groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
   one rootful Xwayland window with twm (`apps/xwl.ts`). Started from the
   launcher, a Wayland app's terminal is its log (`launcher.ts`): its tab
   opens selected, as any app's, and shows until the app's window maps and
@@ -1205,7 +1204,7 @@ answered at the kernel's next yield.
   time in I/O wait) and the first page takes minutes; with 2 GiB (the
   page's default on desktops) its window maps in about 45 to 65 s (a new
   profile; 24 s for the next start in the same boot). Its input
-  needs wland 0.1.0-261122-632f589 (the pin); before it Firefox took none,
+  needs wland 0.1.0-261122-632f589 or later; before it Firefox took none,
   on the GPU path and in software alike: wland
   0.1.0-261122-f36330a kept one wl_pointer and one wl_keyboard per client (the
   last made; `pointer_id`, `keyboard_id` in its compositor.zig), while
@@ -1927,8 +1926,8 @@ asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
 (extracting the pushed tarball; 0.2 later, `apt-get update` 28 s in the
 chroot).
 The REPL and toolchain apps (Claude Code, fx, Bun, Node.js, Python, Go,
-Rust), Doom (Debian's dsda-doom, a Wayland window) and the Desktop and
-Games groups came after that run and have not been through it.
+Rust), Doom (Debian's dsda-doom, a Wayland window) and the Browsers,
+Desktop and Games groups came after that run and have not been through it.
 Docker (Debian only: `docker run --rm hello-world` through the image's
 docker shim, kernel/guest.md) came later too: with Docker installed, its
 command pulled and ran hello-world in 6 s (Node SDK, 1 GiB, data disk, the

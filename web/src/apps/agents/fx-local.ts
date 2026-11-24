@@ -22,7 +22,10 @@
 // app's sign-in and settings) is not touched. fx-local.sh merges the
 // connection into that settings.json with jq on every run (fx's own saved
 // preferences there stay), and selects it per run with FX_PROVIDER=local and
-// FX_MODEL, with FX_AUTO_UPGRADE=0. The server's OLLAMA_CONTEXT_LENGTH and
+// FX_MODEL, with FX_AUTO_UPGRADE=0 and FX_PERMISSION_MODE=full-access (fx
+// runs its tool calls without asking: a small model's turns are slow enough,
+// and the guest is the sandbox; an FX_PERMISSION_MODE of the caller's
+// stays). The server's OLLAMA_CONTEXT_LENGTH and
 // the connection's context_window agree: CTX, by default the model's
 // trained context (8192 for SmolLM2) but 16384 for Qwen2.5 and Qwen3 (of
 // 32768 and 40960: device memory; Qwen3's KV cache is 112 KiB a token, 1.75
@@ -34,7 +37,8 @@
 // On a terminal fx-local.sh asks which model; the first and default is
 // Qwen3 1.7B (Q4_K_M, 1296 MiB, Ollama's library tag qwen3:1.7b; ollama.sh's
 // MODEL=qwen3-1.7b; guest memory 3 GiB or more), a thinking model with tools
-// that runs here without thinking. The models are the registry's quantized
+// (it thinks before its answers here; THINK=0 turns that off). The models
+// are the registry's quantized
 // tags, which run on guest Vulkan since 2026-11-24 (ollama.ts). Qwen3 0.6B
 // (MODEL=qwen3, 498 MiB) is the quicker choice: fx 0.0.17 on it (Ollama
 // 0.40.18 and llama.cpp b12651 on the host's CPU, temperature 0, no
@@ -52,7 +56,7 @@
 // template of ollama.sh's with a tool section). On software WebGPU
 // (SwiftShader) the models run, at a token every few seconds: too slow for
 // fx's prompts. The model runs at temperature 0 (TEMP=), and a thinking
-// model without its reasoning (THINK=1 for it).
+// model reasons before its answers unless THINK=0 (reasoning_effort "none").
 import type { TerminalApp } from "../types.ts";
 import ollama, { OLLAMA_MODEL, OLLAMA_MODEL_CTX, OLLAMA_MODEL_TOOLS } from "./ollama.ts";
 
@@ -76,8 +80,9 @@ const FX_LOCAL_SH = String.raw`#!/bin/bash
 #   MODEL=PATH.gguf|NAME ./fx-local.sh  another model, as ollama.sh takes it
 #   CTX=N                               the context length (server and fx; default: the model's, at most 16384)
 #   TEMP=N                              the sampling temperature (default 0; TEMP=model for the model's own)
-#   THINK=1                             let a thinking model (Qwen3, Qwen3.5) reason before answers (default: off)
+#   THINK=0                             stop a thinking model (Qwen3, Qwen3.5) reasoning before answers: quicker turns (default: it thinks)
 #   TOOLS=0|1                           declare tool use off or on (default: what Ollama reports)
+#   FX_PERMISSION_MODE=auto|ask         fx's permission mode (default here: full-access, no questions before tool calls)
 # fx's settings for this: FX_HOME=$PWD/fx-home (your ~/.fx is not touched).
 set -e
 OLLAMA_DIR="${OLLAMA_DIR.replace(/^~(?=\/)/, "$HOME")}"
@@ -211,13 +216,14 @@ fi
 # first reply waits for fx's whole prompt to go through the GPU.
 S=$FXH/settings.json
 { [ -s "$S" ] && jq -e 'type == "object"' "$S" >/dev/null 2>&1; } || echo '{}' >"$S"
-# Thinking (Qwen3, Qwen3.5: Ollama's capability "thinking") is off unless
-# THINK=1: the reasoning before each answer is most of a turn's tokens. fx
-# sends the connection's per-model request fields with each request, and
-# Ollama takes reasoning_effort "none" for no thinking.
+# Thinking (Qwen3, Qwen3.5: Ollama's capability "thinking") stays on unless
+# THINK=0: the reasoning before each answer is most of a turn's tokens, and
+# counts in the reply's limit. fx sends the connection's per-model request
+# fields with each request, and Ollama takes reasoning_effort "none" for no
+# thinking.
 NOTHINK=false
 if printf '%s' "$info" | jq -e '(.capabilities // []) | index("thinking") != null' >/dev/null 2>&1; then
-	case $THINK in 1 | true | yes | on) say "$NAME thinks before it answers (THINK=1): slow turns." ;; *) NOTHINK=true; say "$NAME: thinking off (THINK=1 turns it on)." ;; esac
+	case $THINK in 0 | false | no | off) NOTHINK=true; say "$NAME: thinking off (THINK=0)." ;; *) say "$NAME thinks before it answers (THINK=0 turns that off: quicker turns)." ;; esac
 fi
 jq --arg m "$NAME" --arg url "http://$HOST/v1" --argjson win "$WIN" --argjson out "$OUT" --argjson tools "$T" --argjson nothink "$NOTHINK" '
 	.provider = "local"
@@ -237,11 +243,14 @@ printf "$B%s$N\n" "fx on $NAME: context $WIN tokens, replies up to $OUT, tool us
 # fx sends its tools with every request, and Ollama refuses them (HTTP 400)
 # for a model whose template takes none.
 [ "$T" = true ] || die "$NAME cannot call tools (Ollama's capabilities for it), and fx needs them: Ollama would answer its requests with HTTP 400. Run ./fx-local.sh for the default, Qwen3 1.7B, or MODEL= another model with tools; to talk with $NAME without fx: cd $OLLAMA_DIR && MODEL=$MODEL ./ollama.sh"
-say "fx works in $PWD/work. Slow: each turn sends fx's whole prompt and tool list through this tab's GPU, so a first reply can take minutes. Quitting fx stops the server."
+say "fx works in $PWD/work and runs its tool calls without asking (FX_PERMISSION_MODE=auto or ask to change). Slow: each turn sends fx's whole prompt and tool list through this tab's GPU, so a first reply can take minutes. Quitting fx stops the server."
+# fx asks nothing before a tool call (full-access) unless the caller set a mode.
+PERM=$FX_PERMISSION_MODE
+[ -n "$PERM" ] || PERM=full-access
 cd work
 trap : INT
 set +e
-FX_HOME=$FXH FX_PROVIDER=local FX_MODEL=$NAME FX_AUTO_UPGRADE=0 fx
+FX_HOME=$FXH FX_PROVIDER=local FX_MODEL=$NAME FX_AUTO_UPGRADE=0 FX_PERMISSION_MODE=$PERM fx
 exit $?
 `;
 
@@ -255,7 +264,10 @@ const README = "fx, the coding agent, talking to a model that runs in this brows
 	"fx-local.sh asks which model (MODEL=NAME skips the question). The first is\n" +
 	"Qwen3 1.7B (Q4_K_M, 1296 MiB, fetched once): small, and it can call tools,\n" +
 	"which fx needs, though models this small often answer without calling one.\n" +
-	"The model runs at temperature 0 (TEMP=N) and without thinking (THINK=1). It\n" +
+	"The model runs at temperature 0 (TEMP=N); Qwen3 thinks before it answers\n" +
+	"(THINK=0 ./fx-local.sh: no thinking, quicker turns). fx runs its tool calls\n" +
+	"(commands, file writes) without asking, in ./work (FX_PERMISSION_MODE=auto\n" +
+	"or ask ./fx-local.sh for fx's usual checks). It\n" +
 	"needs guest memory of 3 GiB or more (Settings) and a real GPU to be usable\n" +
 	"(software WebGPU, SwiftShader, runs it at a token every few seconds).\n" +
 	"Others:\n" +

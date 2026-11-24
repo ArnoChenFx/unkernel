@@ -33,6 +33,7 @@ their top):
   after the preflight passes), `sdk.ts`, `net.ts` (Wisp, and the
   plain-HTTP hosts answered with `fetch()`), `apk.ts` (apk index
   prefetch), `download.ts` (files the page fetches for the guest),
+  `drop.ts` and `upload.ts` (host files dropped on the page, into the guest),
   `sudo.ts` (root in the guest: `SUDO_SH`, `execAsRoot()`), `data.ts` (the
   data disk), `session.ts` (the suspended session), `autosuspend.ts`
   (suspending in the background and the question on leaving: when,
@@ -1246,7 +1247,23 @@ answered at the kernel's next yield.
   no permission: it reads the page clipboard only from a paste event (or
   on focus where clipboard-read was granted already) and writes only
   around a gesture, so no browser prompts; a relay without the bridge
-  (0.1.0) turns it off for its link.
+  (0.1.0) turns it off for its link. Pasted HTML, images and files are
+  `wayland/paste.ts` (described at its top), which takes those paste
+  events before wland and sets the Wayland selection itself; host to
+  guest only. A page cannot put files on the host clipboard, so files
+  copied in an app show a toast that saves them through the browser
+  (`wayland/copyout.ts`; a folder or several as a .tar.gz), and their
+  paths are kept off the host clipboard (the bridge clears it instead).
+- Drags from the host (`drop.ts`, described at its top): files dropped on
+  an app go into the guest's `~/Downloads` (`upload.ts`; a name taken
+  gets " (2)") and reach it as text/uri-list, dragged text, HTML and
+  links as they are. createWland's own bridge is off (`dnd: false`): it
+  asks its container what is inside, and the apps' elements are not in
+  `#wl-desktop`. On a terminal whose shell is at its prompt they go into
+  the shell's directory instead (`promptDir()`); where a program runs,
+  it gets their quoted paths. A drop elsewhere on the page only copies.
+  Every other drop is cancelled, since the browser would open it over
+  the machine. Folders are not copied.
 - Sessions: kwshm is a device of the snapshot, so a session records it
   (`SessionDevices.shm`; absent in older ones: off) and resumes with its
   own (`adoptSessionGl()`); a fresh boot has it unless `?shm=0` (this

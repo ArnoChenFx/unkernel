@@ -33,6 +33,12 @@
 //   only by it (autoFocus off), window elements shown and hidden by it
 //   (manageDisplay off), and server-side decorations for the apps that ask
 //   (the WM's frame: decorations 'server').
+// - Drags from the host are the page's (drop.ts): createWland's own bridge is
+//   off (dnd: false) and drop.ts waylandDnd() makes one that knows the apps'
+//   windows are not in wland's container. Plain text on the clipboard is
+//   wland's bridge (on by default); HTML, images and files pasted into an app
+//   are wayland/paste.ts; files copied in an app can be saved to the host
+//   (wayland/copyout.ts).
 // - The parts, in wayland/: buffers.ts (the guest's buffers: kwshm and GPU
 //   resources, and their stats), host.ts (the toplevels as WM windows:
 //   frames, sizes, tiles, states, focus, moves and resizes, where they are,
@@ -42,12 +48,15 @@
 // - The store's Wayland state (store.ts wayland): available (the page listens), attached (the
 //   relay is connected: the Dock's #dock-wayland) and windows (wland's list);
 //   waylandFocused(): a Wayland window has the WM's focus.
+import { waylandDnd } from "./drop.ts";
 import { KW } from "./kw.ts";
 import { ui$ } from "./store.ts";
 import type { KernelHandle, VsockConnection, VsockListener } from "./sdk.ts";
-import type { Wland } from "wland/client";
+import type { DndBridge, Wland } from "wland/client";
 import { getGpuLast, gpuSource, handleSource, stats, type Stats } from "./wayland/buffers.ts";
+import { createCopyOut, withholdPaths } from "./wayland/copyout.ts";
 import { createHost } from "./wayland/host.ts";
+import { attachPaste } from "./wayland/paste.ts";
 import { getContainer, getCurrent, getHost, setCurrent, setHost } from "./wayland/state.ts";
 
 export { focusWayland, isWaylandWindow, setWaylandContainer, useWaylandFocused, waylandFocused } from "./wayland/state.ts";
@@ -109,6 +118,8 @@ export function attachWayland(vm: KernelHandle, log: (line: string) => void): ((
 		const hosted = createHost(W.ROLE_POPUP);
 		setHost(hosted);
 		let started: Wland;
+		let dnd: DndBridge | null = null;
+		const copyOut = createCopyOut(vm, () => mine);
 		try {
 			started = await W.createWland({
 				container,
@@ -123,11 +134,14 @@ export function attachWayland(vm: KernelHandle, log: (line: string) => void): ((
 				mount: hosted.mount,
 				unmount: hosted.unmount,
 				interactive: hosted.interactive,
+				dnd: false, // drop.ts waylandDnd()
 				onWindowsChange: hosted.schedule,
 				onFocusChange: hosted.schedule,
 				onEvent(ev) {
 					hosted.event(ev);
+					dnd?.handle(ev);
 					if (stopped) return;
+					copyOut(ev);
 					if (ev.type === "log") wireLog[wireAt++ % LOG_LINES] = ev.line;
 					else if (ev.type === "commit") stats.commits++;
 					else if (ev.type === "surface") {
@@ -153,8 +167,11 @@ export function attachWayland(vm: KernelHandle, log: (line: string) => void): ((
 			throw e;
 		}
 		hosted.attach(started);
-		// Its dispose ends the host too.
-		const wl: Wland = { ...started, dispose() { started.dispose(); hosted.dispose(); if (getHost() === hosted) setHost(null); } };
+		withholdPaths(started.engine, W.TEXT_MIMES);
+		dnd = waylandDnd(W, started, log);
+		const unPaste = attachPaste(started, container, W.TEXT_MIMES, log);
+		// Its dispose ends the host and the drags too.
+		const wl: Wland = { ...started, dispose() { unPaste(); started.dispose(); dnd?.dispose(); hosted.dispose(); if (getHost() === hosted) setHost(null); } };
 		// Stopped while wland loaded: this kernel is gone, and a later one may have its own.
 		if (stopped) wl.dispose();
 		else setCurrent(mine = wl);

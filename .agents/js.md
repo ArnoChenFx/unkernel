@@ -448,9 +448,10 @@ parts that are easy to get wrong.
     and held keys are mirrored, so return values are synchronous (possibly
     a yield stale). Do not merge consecutive moves: glimmer-check expects
     every tablet position.
-  - Sound: the owner's queued-frames answer goes back stamped on a clock
-    both threads share (`performance.timeOrigin + now()`). kwsnd only
-    reports it as delay, so a few ms of error changes no timing.
+  - Sound: without the sound ring (below), the owner's queued-frames
+    answer goes back stamped on a clock both threads share
+    (`performance.timeOrigin + now()`). kwsnd only reports it as delay, so
+    a few ms of error changes no timing.
 - Shared transport (`js/core/worker-shared.ts`, described at its top).
   Where a SharedArrayBuffer can be posted (`sharedMemoryAvailable()`:
   Node always, browsers when `crossOriginIsolated`) and `shared` is not
@@ -469,7 +470,15 @@ parts that are easy to get wrong.
   import. vsock packets for the guest go through a fourth (`VS_HEAD`,
   length-prefixed records; what does not fit waits on the owner's side,
   never a message, to keep the stream's order), queued in the
-  VsockDevice at the clock read. Sound, the guest's vsock packets and the
+  VsockDevice at the clock read. Sound PCM goes through a shared SPSC ring
+  (`sound-ring.ts`: `SoundRingWriter` -> one `SoundRingReader`) with coalesced
+  "sound-wake" messages (or directly to `SoundSink.onRing` without wakes) and
+  atomic queued-frame feedback; only `shared: false` falls back to
+  "sound-chunk"/"sound-queued" messages. Each state change is a record in
+  the ring as well as a "sound-state" message, with one number: the owner
+  delivers `onState` where the record sits among the chunks, so a sink
+  sees states and PCM in the kernel's order. A full ring drops the newest
+  PCM and the owner logs it. The guest's vsock packets and the
   other shm calls stay messages.
   With more than one CPU, console output comes through a SharedArrayBuffer
   of its own, the console ring (CPU threads, below), sent in the boot spec

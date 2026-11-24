@@ -162,7 +162,14 @@ host's CPU, with the guest under kwemu.
   queries, sparse resources; subgroup clustered reductions, elect and
   ballot counts in shaders (naga lacks them).
 - Mesa's zink: it connects and gives up after the hello, with no message;
-  it wants many more features. Low priority (guest GL has virgl).
+  it wants many more features. Low priority (guest GL has virgl). Mesa
+  (25.0 in Debian 13) never picks zink while virgl works; after a virgl
+  failure, GLX on a DRI3 X server tries zink on the first Vulkan device
+  (kwvk) and falls back to software only because kwvk has no timeline
+  semaphores, and EGL on Wayland skips kwvk only because it has no
+  VK_EXT_physical_device_drm. Before offering either, export
+  `LIBGL_KOPPER_DISABLE=1` in the base profile (and keep zink off EGL), or
+  GL would draw through zink on kwvk.
 - llama.cpp: quantized models (q4_0) give wrong text and MUL_MAT partly
   fails: about 29 shader variants fail Tint's uniformity analysis
   (`workgroupBarrier` outside uniform control flow); the norm family

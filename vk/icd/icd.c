@@ -2693,6 +2693,12 @@ static API void CALL kw_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhys
 	}
 }
 
+/* VkPhysicalDeviceDriverProperties, also in VkPhysicalDeviceVulkan12Properties. */
+#define KW_DRIVER_ID VK_DRIVER_ID_MESA_VENUS /* no own id; a virtual GPU's */
+#define KW_DRIVER_NAME "kwvk"
+#define KW_DRIVER_INFO "unkernel Vulkan on WebGPU"
+#define KW_CONFORMANCE ((VkConformanceVersion){1, 1, 0, 0})
+
 static API void CALL kw_vkGetPhysicalDeviceProperties2(VkPhysicalDevice pdh, VkPhysicalDeviceProperties2 *p)
 {
 	struct kw_physical_device *pd = PD(pdh);
@@ -2709,10 +2715,27 @@ static API void CALL kw_vkGetPhysicalDeviceProperties2(VkPhysicalDevice pdh, VkP
 		case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES: {
 			VkPhysicalDeviceDriverProperties *x = (void *)s;
 			ZBODY(x, VkPhysicalDeviceDriverProperties);
-			x->driverID = VK_DRIVER_ID_MESA_VENUS; /* no own id; a virtual GPU's */
-			snprintf(x->driverName, sizeof x->driverName, "kwvk");
-			snprintf(x->driverInfo, sizeof x->driverInfo, "unkernel Vulkan on WebGPU");
-			x->conformanceVersion = (VkConformanceVersion){1, 1, 0, 0};
+			x->driverID = KW_DRIVER_ID;
+			snprintf(x->driverName, sizeof x->driverName, KW_DRIVER_NAME);
+			snprintf(x->driverInfo, sizeof x->driverInfo, KW_DRIVER_INFO);
+			x->conformanceVersion = KW_CONFORMANCE;
+			break;
+		}
+		case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES: {
+			/* What a 1.2 caller reads in place of the structures above
+			 * (vulkaninfo's driver rows). The rest stays zero: no descriptor
+			 * indexing, no timeline semaphores, no minmax filtering. */
+			VkPhysicalDeviceVulkan12Properties *x = (void *)s;
+			ZBODY(x, VkPhysicalDeviceVulkan12Properties);
+			x->driverID = KW_DRIVER_ID;
+			snprintf(x->driverName, sizeof x->driverName, KW_DRIVER_NAME);
+			snprintf(x->driverInfo, sizeof x->driverInfo, KW_DRIVER_INFO);
+			x->conformanceVersion = KW_CONFORMANCE;
+			x->denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+			x->roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
+			x->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+			x->supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+			x->framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
 			break;
 		}
 		case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {

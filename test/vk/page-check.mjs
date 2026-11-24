@@ -21,11 +21,31 @@
 //   3  unless --no-tile: the launcher's vkcube tile (Graphics folder) maps a
 //      Wayland window on the page whose pixels are not blank (a screenshot
 //      of its canvas: several colours, many pixels off the most common one),
-//      and the Guest Vulkan row then shows frames presented a second; then
-//      the vkmark and the GTK on Vulkan tiles likewise, where the disk has
-//      vkmark and gtk4-demo (--disk; --no-vkmark, --no-gtk)
+//      and the Guest Vulkan row then shows frames presented a second; with
+//      vkcube also how it reached the page: where the guest's relay has
+//      --external-buffers (its --version; --relay FILE pushes an aarch64
+//      wlandr over the image's /usr/lib/kw/wlandr and restarts the boot's
+//      relay) wland must offer them (KW.wayland.externalBuffers()), every
+//      present be an external commit resolved to a picture
+//      (KW.wayland.stats().extImages) with no byte read back
+//      (vm.vk.stats.renderer.bytesRead), and the row say zero-copy; else
+//      by readback (wl_shm), and the row says so. Then the vkmark and the
+//      GTK on Vulkan tiles likewise, where the disk has vkmark and
+//      gtk4-demo (--disk; --no-vkmark, --no-gtk); then the D3D12 gears
+//      and triangle tiles (vkd3d's demos on Xwayland) where the disk has
+//      vkd3d-demos, or with --vkd3d (their installer installs it, and
+//      Xwayland, over the page's network; --no-vkd3d skips them): the
+//      Xwayland window's pixels, the gears' changing between two
+//      screenshots, and the row's frame rate (printed, not checked)
+//   M  the resource monitor's Vulkan figures (stats.ts): at 1, System's
+//      Overview has a Vulkan panel that says "Not loaded" and the top bar's
+//      GPU meter says nothing of Vulkan; while vkcube runs (3), the meter's
+//      label has Vulkan's frame rate and the panel frames a second. With
+//      --shots DIR: topbar-*.png (the bar and its Resources popover),
+//      monitor-*.png (the page) and monitor-vulkan-*.png (the panel), idle
+//      and vkcube
 //
-//   node test/vk/page-check.mjs [--port N] [--kernel FILE] [--built] [--inline] [--fresh] [--no-tile] [--shots DIR] [--chrome BIN] [--timeout S] [--verbose]
+//   node test/vk/page-check.mjs [--port N] [--kernel FILE] [--built] [--inline] [--fresh] [--no-tile] [--relay FILE] [--shots DIR] [--chrome BIN] [--timeout S] [--verbose]
 //
 // --built: the built Node server (web/.output) instead of the dev server;
 // its kernel is the one the build took (build with KW_KERNEL=FILE
@@ -63,9 +83,16 @@ const verbose = args.includes("--verbose");
 const shots = opt("--shots", "");
 const kernel = opt("--kernel", existsSync(join(build, "vk/base/unkernel.wasm")) ? join(build, "vk/base/unkernel.wasm") : "");
 const disk = resolve(opt("--disk", join(build, "vk/debian-vk.img")));
+const relay = opt("--relay") ? resolve(opt("--relay")) : "";
+if (relay && !existsSync(relay)) {
+	console.error(`no ${relay} (--relay)`);
+	process.exit(2);
+}
 const diskGz = `${disk}.kwsparse.gz`;
 const WEBGPU_FLAGS = ["--headless", "--no-sandbox", "--disable-gpu-sandbox", "--enable-unsafe-webgpu",
-	"--enable-features=Vulkan,WebGPU", "--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--ignore-gpu-blocklist"];
+	"--enable-features=Vulkan,WebGPU", "--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--ignore-gpu-blocklist",
+	// a GL backend for WebGPU canvases (external present's pictures; without it Chrome destroys the device: vk.ts probeCanvas)
+	"--use-angle=swiftshader", "--enable-unsafe-swiftshader"];
 const t0 = performance.now();
 const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
 const say = (s) => console.log(`[${secs()}] ${s}`);
@@ -139,6 +166,11 @@ if (shots) mkdirSync(shots, { recursive: true });
 // The prepared disk for the page's import: any origin, with CORP (the page is cross-origin isolated).
 const files = createServer((req, res) => {
 	const h = { "access-control-allow-origin": "*", "cross-origin-resource-policy": "cross-origin" };
+	if (req.url === "/wlandr" && relay) {
+		res.writeHead(200, { ...h, "content-type": "application/octet-stream", "content-length": statSync(relay).size });
+		createReadStream(relay).pipe(res);
+		return;
+	}
 	if (req.url !== "/disk.kwsparse.gz" || fresh) { res.writeHead(404, h).end(); return; }
 	res.writeHead(200, { ...h, "content-type": "application/octet-stream", "content-length": statSync(diskGz).size });
 	createReadStream(diskGz).pipe(res);
@@ -232,6 +264,37 @@ try {
 		if (!await waitFor("typeof globalThis.KW?.ready === 'function'", 120000)) throw new Error("the page did not load");
 		await evaluate("KW.ready().then(() => 1)");
 	};
+	// M: the monitor's Vulkan figures: Resources from the top bar (under the GPU meter where it shows), then System's
+	// Overview; their text, and with --shots their pictures; System closed again (it would cover the Wayland windows).
+	const monitor = async (tag, wait) => {
+		const shot = async (name, clip) => {
+			if (!shots) return;
+			const s = await send("Page.captureScreenshot", { format: "png", ...(clip ? { clip: { ...clip, scale: 1 } } : {}) });
+			writeFileSync(join(shots, name), Buffer.from(s.result.data, "base64"));
+			say(`shot ${join(shots, name)}`);
+		};
+		const rect = async (sel) => JSON.parse(await evaluate(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return "null"; e.scrollIntoView({ block: "nearest" }); const r = e.getBoundingClientRect(); return JSON.stringify(r.width > 0 ? { x: r.x, y: r.y, width: r.width, height: r.height } : null); })()`));
+		const meter = await evaluate(`(() => { const m = document.getElementById("tb-gpu") ?? document.getElementById("tb-net"); m?.click(); return m?.id ?? ""; })()`);
+		await waitFor(`!!document.getElementById("tb-res")`, 5000);
+		await sleep(wait); // full samples (every 2 s while Resources shows)
+		const gpuLabel = await evaluate(`document.getElementById("tb-gpu")?.getAttribute("aria-label") ?? ""`);
+		const res = await rect("#tb-res");
+		const vw = await evaluate("innerWidth");
+		await shot(`topbar-${tag}.png`, { x: 0, y: 0, width: vw, height: Math.ceil(res ? res.y + res.height + 8 : 40) });
+		await evaluate(`document.getElementById("tb-res-system")?.click(), 1`);
+		await waitFor(`!!document.querySelector('#system [data-tab="status"]')`, 5000);
+		await evaluate(`document.querySelector('#system [data-tab="status"]')?.click(), 1`);
+		await waitFor(`!!document.querySelector('#system section[aria-label="Vulkan"]')`, 5000);
+		await sleep(4500);
+		const card = await evaluate(`document.querySelector('#system section[aria-label="Vulkan"]')?.innerText.replace(/\\s+/g, " ") ?? ""`);
+		await shot(`monitor-${tag}.png`);
+		const box = await rect('#system section[aria-label="Vulkan"]');
+		if (box) await shot(`monitor-vulkan-${tag}.png`, box);
+		await evaluate(`document.querySelector('button[aria-label="Close System"]')?.click(), 1`);
+		await waitFor(`!document.querySelector('#system section[aria-label="Vulkan"]') && 1`, 5000);
+		say(`monitor (${tag}): meter #${meter}, its label "${gpuLabel.replace(/\n/g, " | ")}"; Vulkan panel: ${card.slice(0, 400)}`);
+		return { gpuLabel, card };
+	};
 	const rowAt = (re, ms = 10000) => waitFor(`(() => { const l = KW.ui.diagText().split("\\n").find((x) => / Guest Vulkan: /.test(x)); return l && ${re}.test(l) ? l.trim() : ""; })()`, ms)
 		.then(async (v) => v || (await evaluate(`KW.ui.diagText().split("\\n").find((x) => / Guest Vulkan: /.test(x))?.trim() ?? "(no Guest Vulkan row)"`)));
 	await send("Inspector.enable");
@@ -261,8 +324,21 @@ try {
 	say(`row: ${row0}`);
 	report("vk on by default, renderer idle", cfg.vk === true && cfg.asked === false && st0?.state === "idle" && wasmRequests.length === 0 && / Guest Vulkan: on, not loaded yet/.test(row0),
 		`${JSON.stringify(cfg)}; status ${JSON.stringify(st0)}; ${wasmRequests.length} kwvk-naga.wasm requests; ${row0.slice(0, 160)}`);
+	const m0 = await monitor("idle", 2500);
+	report("the monitor: Vulkan not loaded", /^Vulkan .*Not loaded/.test(m0.card) && !/Vulkan:/.test(m0.gpuLabel) && wasmRequests.length === 0,
+		`panel "${m0.card.slice(0, 120)}"; GPU meter "${m0.gpuLabel}"; ${wasmRequests.length} kwvk-naga.wasm requests`);
 	const icd = await sh("ls -l /usr/lib/kw/libvulkan_kw.so /usr/share/vulkan/icd.d/; command -v vulkaninfo vkcube");
 	say(`guest: ${icd.out.replace(/\n/g, " | ")}`);
+	// --relay: the relay under test over the image's, and the boot's relay started again with it
+	if (relay) {
+		const put = await evaluate(`fetch(${JSON.stringify(diskUrl.replace(/\/disk\.kwsparse\.gz$/, "/wlandr"))}).then((r) => r.arrayBuffer()).then((b) => KW.vm.exec("sh", ["-c",
+			"cat >/usr/lib/kw/wlandr.new && chmod 755 /usr/lib/kw/wlandr.new && mv -f /usr/lib/kw/wlandr.new /usr/lib/kw/wlandr && { pkill -x wlandr; sleep 0.5; /usr/lib/kw/bin/wland --boot; sleep 1; ps -eo user,args | grep '[w]landr'; }"],
+			{ input: new Uint8Array(b), user: "root" })).then((r) => ({ code: r.exitCode, out: (r.stdout + r.stderr).trim() }))`);
+		say(`relay pushed (exit ${put.code}): ${put.out.replace(/\n/g, " | ")}`);
+	}
+	const relayFeatures = (await sh("/usr/lib/kw/wlandr --version 2>/dev/null | sed -n 's/^features: //p'")).out;
+	const relayExt = / external-buffers( |$)/.test(` ${relayFeatures}`);
+	say(`guest relay features: ${relayFeatures || "(none: an older relay)"}`);
 
 	// 2: vulkaninfo names kwvk; the renderer loaded on first use
 	const vulkaninfo = async () => {
@@ -280,7 +356,9 @@ try {
 	if (!fresh) await vulkaninfo();
 
 	// 3: the launcher's Vulkan tiles (vkcube, then vkmark), each window's pixels; with vkcube the row's frame rate
-	const tileCase = async (id, re, proc, rowCheck) => {
+	// opts: wait (ms for the window: an install over the network takes longer), animated (two screenshots
+	// must differ), rate (print the row's frame rate)
+	const tileCase = async (id, re, proc, rowCheck, opts = {}) => {
 		const clicked = await evaluate(`(async () => {
 			const until = async (f) => { for (let i = 0; i < 50 && !f(); i++) await new Promise((r) => setTimeout(r, 100)); return f(); };
 			await until(() => document.querySelector("#dock-launcher"));
@@ -296,7 +374,7 @@ try {
 		})()`);
 		say(`${id} tile: ${clicked}`);
 		const find = `KW.wayland.windows().find((w) => ${re}.test(w.title + ' ' + w.appId))`;
-		const win = await waitFor(`${find} && JSON.stringify(KW.wayland.windows())`, fresh ? 900000 : 180000, 500);
+		const win = await waitFor(`${find} && JSON.stringify(KW.wayland.windows())`, opts.wait ?? (fresh ? 900000 : 180000), 500);
 		if (!win) {
 			report(`${id} window`, false, `tile ${clicked}; windows ${await evaluate("JSON.stringify(KW.wayland?.windows() ?? null)")}`);
 			const term = await evaluate(`(() => { const w = KW.windows.list().find((x) => x.name === "${id}"); return w ? KW.windows.text(w.n).trim().split("\\n").slice(-15).join("\\n") : "(no ${id} terminal)"; })()`).catch((e) => e.message);
@@ -305,6 +383,9 @@ try {
 			console.log(`--- the guest's processes and the relay's log:\n${guest.out}`);
 			console.log(`--- vm.vk: ${await evaluate("JSON.stringify({ status: KW.vm.vk.status, stats: KW.vm.vk.stats, wl: KW.wayland.stats?.() })")}`);
 		} else {
+			const counters = `JSON.stringify({ ext: KW.wayland.externalBuffers(), wl: KW.wayland.stats(), r: KW.vm.vk.stats.renderer })`;
+			await sleep(1500); // past the first frames (a resize may make a new swapchain)
+			const c0 = rowCheck ? JSON.parse(await evaluate(counters)) : null;
 			await sleep(4500); // a few frames, and the row's next 2 s update
 			const rect = JSON.parse(await evaluate(`(() => { const w = ${find}; const el = w && KW.wayland.container().querySelector('[data-wland-window="' + w.key + '"]'); const c = el && [...el.querySelectorAll("canvas")].map((x) => x.getBoundingClientRect()).sort((a, b) => b.width * b.height - a.width * a.height)[0]; return JSON.stringify(c && c.width > 50 ? { x: c.x, y: c.y, width: c.width, height: c.height } : null); })()`));
 			if (!rect) report(`${id} window pixels`, false, `windows ${win}; no canvas`);
@@ -322,11 +403,34 @@ try {
 				const vst = JSON.parse(await evaluate("JSON.stringify({ status: KW.vm.vk.status.state, renderer: KW.vm.vk.stats.renderer, losses: KW.vm.vk.stats.losses })"));
 				report(`${id} window pixels`, colours.size >= 16 && other >= img.width * img.height / 50,
 					`windows ${win}; ${img.width}x${img.height}: ${colours.size} colours, ${other} pixels off the most common; ${JSON.stringify(vst)}`);
+				if (opts.animated) {
+					await sleep(1000);
+					const s2 = await send("Page.captureScreenshot", { format: "png", clip: { ...rect, scale: 1 } });
+					const img2 = decodePng(Buffer.from(s2.result.data, "base64"));
+					let changed = 0;
+					for (let i = 0; i < Math.min(img.rgba.length, img2.rgba.length); i += 4)
+						if (img.rgba[i] !== img2.rgba[i] || img.rgba[i + 1] !== img2.rgba[i + 1] || img.rgba[i + 2] !== img2.rgba[i + 2]) changed++;
+					report(`${id} animates`, changed >= img.width * img.height / 200, `${changed} pixels changed over 1 s`);
+				}
 			}
+			if (opts.rate) say(`${id}: ${(await rowAt("/ frames presented a second, /")).replace(/^.*Guest Vulkan: /, "")}`);
 			if (rowCheck) {
 				const row = await rowAt("/ frames presented a second, /");
 				const fps = /([\d.]+) frames presented a second, ([\d.]+) draws a frame/.exec(row);
 				report("the row's frame rate while vkcube runs", !!fps && Number(fps[1]) > 0, fps ? `${fps[1]} frames/s, ${fps[2]} draws a frame` : row.slice(0, 300));
+				// how the frames reached the page: external buffers (no readback) where the relay has them
+				const c1 = JSON.parse(await evaluate(counters));
+				const d = (k) => (c1.r?.[k] ?? 0) - (c0.r?.[k] ?? 0), dw = (k) => (c1.wl?.[k] ?? 0) - (c0.wl?.[k] ?? 0);
+				const what = `externalBuffers ${c1.ext}; over the window: ${d("presents")} presents, ${d("externalPresents")} external, ${dw("extCommits")} external commits, ${dw("extImages")} pictures, ${d("bytesRead")} bytes read back, ` +
+					`resolve ${(dw("extMs") / Math.max(1, dw("extCommits"))).toFixed(2)} ms (max ${c1.wl?.extMaxMs?.toFixed(2)}), draw ${(dw("extDrawMs") / Math.max(1, dw("extImages"))).toFixed(2)} ms`;
+				const zrow = await rowAt(relayExt ? "/zero-copy presentation/" : "/by readback into wl_shm/");
+				if (relayExt)
+					report("vkcube by external buffers (zero-copy)", c1.ext === true && d("presents") > 5 && d("externalPresents") === d("presents") && dw("extImages") > 5 && d("bytesRead") === 0 && /zero-copy presentation/.test(zrow), `${what}; row: ${zrow.slice(zrow.indexOf("Wayland windows"), zrow.indexOf("Wayland windows") + 160)}`);
+				else
+					report("vkcube by readback (the relay has no external buffers)", c1.ext === false && d("presents") > 5 && d("externalPresents") === 0 && d("bytesRead") > 0 && /by readback into wl_shm/.test(zrow), what);
+				const m1 = await monitor("vkcube", 6000);
+				report("the monitor: Vulkan's frames while vkcube runs", /Vulkan: [\d.]+ fps · 1 instance/.test(m1.gpuLabel) && /^Vulkan .*\d fps/.test(m1.card),
+					`GPU meter "${m1.gpuLabel.replace(/\n/g, " | ")}"; panel "${m1.card.slice(0, 200)}"`);
 			}
 		}
 		await sh(`pkill -x ${proc}; true`);
@@ -342,6 +446,11 @@ try {
 		}
 		// GTK 4's demo on its Vulkan renderer, where the disk has it (debian-vk-apps.img: gtk-4-examples).
 		if (!fresh && !args.includes("--no-gtk") && (await sh("command -v gtk4-demo")).code === 0) await tileCase("gtkvk", "/gtk|demo/i", "gtk4-demo", false);
+		// vkd3d's Direct3D 12 demos on Xwayland (one X screen, the window's app id org.freedesktop.Xwayland)
+		if (!args.includes("--no-vkd3d") && (args.includes("--vkd3d") || (!fresh && (await sh("command -v vkd3d-gears")).code === 0))) {
+			await tileCase("d3d12gears", "/xwayland/i", "vkd3d-gears", false, { wait: 900000, animated: true, rate: true });
+			await tileCase("d3d12triangle", "/xwayland/i", "vkd3d-triangle", false, { rate: true });
+		}
 	}
 	if (reloaded) {
 		console.log(`the page was reloaded ${reloaded} time(s) during the checks (the dev server saw a source change): the results above do not count`);

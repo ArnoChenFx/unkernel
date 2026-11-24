@@ -173,6 +173,7 @@ fn translate(spv: &[u8], o: &Opts) -> Result<String, String> {
 	}
 	let words: Vec<u32> = spv.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
 	spirv::check(&words)?;
+	let words = spirv::member_access_to_variables(words);
 	let words = spirv::bake_spec_constants(words, &o.spec);
 	let words = spirv::fold_spec_ops(words);
 	let words = spirv::misc_fixes(words);

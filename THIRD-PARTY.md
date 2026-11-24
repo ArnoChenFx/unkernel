@@ -116,7 +116,10 @@ where a crate offers a choice, it is used under MIT.
 
 The guest's Vulkan ICD (`libvulkan_kw.so`, in the kernel bundle's base) is
 unkernel's own ([vk/icd](vk/icd), GPL-2.0-or-later), built against the
-Khronos Vulkan headers (Apache-2.0 OR MIT).
+Khronos Vulkan headers (Apache-2.0 OR MIT). It speaks wland's
+`wland_external_buffer_manager_v1` from an interface description written
+out by hand after wland's `protocol/wland-external-buffer-v1.xml`
+(MPL-2.0; [wland](https://github.com/pithings/wland)).
 
 ## The distro images
 

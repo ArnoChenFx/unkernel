@@ -286,6 +286,30 @@ async function suite(device, adapter, translator, label, shaderBytes) {
 	const cr = new Uint32Array((await cl.req({ op: "readBuffer", buffer: sbo, offset: 0, size: 256 })).bin.buffer);
 	check(`${label} compute doubles`, cr.every((v, i) => v === (i + 1) * 2), `${cr.slice(0, 4).join(",")}`);
 
+	// (d1) consecutive binding updates: a write spilling from binding 0 into 1,
+	// then a copy from (0, element 1), which is binding 1's buffer, into the
+	// compute set's binding 0: the dispatch doubles that buffer, not the other
+	{
+		const sdsl = nid(), sset = nid(), dset = nid(), ba = nid(), bb = nid();
+		cl.post({ op: "vkCreateDescriptorSetLayout", id: sdsl, bindings: [{ binding: 0, descriptorType: 7, descriptorCount: 1, stageFlags: 0x20 }, { binding: 1, descriptorType: 7, descriptorCount: 1, stageFlags: 0x20 }] });
+		cl.post({ op: "vkCreateBuffer", id: ba, size: 256, usage: 0x20 });
+		cl.post({ op: "vkCreateBuffer", id: bb, size: 256, usage: 0x20 });
+		cl.post({ op: "writeBuffer", buffer: ba, offset: 0 }, u8(vals));
+		cl.post({ op: "writeBuffer", buffer: bb, offset: 0 }, u8(vals));
+		cl.post({ op: "vkAllocateDescriptorSets", sets: [{ id: sset, layout: sdsl }, { id: dset, layout: cdsl }] });
+		cl.post({ op: "vkUpdateDescriptorSets", descriptorWrites: [{ dstSet: sset, dstBinding: 0, descriptorType: 7, descriptorCount: 2, bufferInfo: [{ buffer: ba, offset: 0, range: -1 }, { buffer: bb, offset: 0, range: -1 }] }] });
+		cl.post({ op: "vkUpdateDescriptorSets", descriptorWrites: [], descriptorCopies: [{ srcSet: sset, srcBinding: 0, srcArrayElement: 1, dstSet: dset, dstBinding: 0, dstArrayElement: 0, descriptorCount: 1 }] });
+		cl.post({ op: "vkQueueSubmit", cmds: [
+			{ c: "vkCmdBindPipeline", pipelineBindPoint: 1, pipeline: cpipe },
+			{ c: "vkCmdBindDescriptorSets", pipelineBindPoint: 1, layout: cpl, firstSet: 0, descriptorSets: [dset], dynamicOffsets: [] },
+			{ c: "vkCmdDispatch", groupCountX: 1, groupCountY: 1, groupCountZ: 1 },
+		] });
+		await cl.req({ op: "sync" });
+		const ra = new Uint32Array((await cl.req({ op: "readBuffer", buffer: ba, offset: 0, size: 256 })).bin.buffer);
+		const rb = new Uint32Array((await cl.req({ op: "readBuffer", buffer: bb, offset: 0, size: 256 })).bin.buffer);
+		check(`${label} descriptor copy past a binding's end (consecutive binding updates)`, rb.every((v, i) => v === (i + 1) * 2) && ra.every((v, i) => v === i + 1), `${ra[1]} ${rb[1]}`);
+	}
+
 	// (d2) a 512-wide workgroup (ggml's) on a device allowing 256: shrunk by
 	// the translator, the dispatch scaled by the host; 1000 floats doubled
 	{
@@ -1114,6 +1138,93 @@ async function robustness(device, adapter) {
 	removeEventListener("unhandledrejection", onErr);
 }
 
+// External present (vk/PROTOCOL.md, Amendments, "External present"): the
+// hello's token, exportImages, present without pixels, and renderer.external()
+// resolving (token << 32 | export id) to the image's picture, with every way
+// a ref must come out null.
+async function externalPresent(device, adapter) {
+	const renderer = new VkRenderer({ device, adapter, shaders: fakeTranslator, log: (l) => logs.push(`[ext] ${l}`) });
+	const cl = new Client(renderer);
+	const h = (await cl.req({ op: "hello", version: 1 })).json;
+	const token = h.external?.token;
+	check("external: hello carries a token", Number.isInteger(token) && token > 0 && token <= 0xffffffff, JSON.stringify(h.external));
+	const other = new Client(renderer);
+	const t2 = (await other.req({ op: "hello", version: 1 })).json.external?.token;
+	check("external: tokens differ per connection", t2 && t2 !== token, `${token} ${t2}`);
+	const W = 8, H = 6, AR24 = 0x34325241, XR24 = 0x34325258, AB24 = 0x34324241;
+	const image = (id) => cl.post({ op: "vkCreateImage", id, imageType: 1, format: 44 /* B8G8R8A8_UNORM */, extent: { width: W, height: H, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, tiling: 0, usage: 0x10 | 0x1 | 0x2 });
+	image(1);
+	image(2);
+	image(3);
+	const ids = (await cl.req({ op: "exportImages", images: [1, 2] })).json.ids;
+	const again = (await cl.req({ op: "exportImages", images: [2] })).json.ids;
+	check("external: export ids", JSON.stringify(ids) === "[1,2]" && JSON.stringify(again) === "[2]", `${JSON.stringify(ids)} ${JSON.stringify(again)}`);
+	// premultiplied: R 0.5, G 0.25, B 0, A 0.5 (straight 255,128,0 at alpha 128)
+	cl.post({ op: "vkQueueSubmit", cmds: [{ c: "vkCmdClearColorImage", image: 1, color: { float32: [0.5, 0.25, 0, 0.5] }, ranges: [{ aspectMask: 1, levelCount: 1, layerCount: 1 }] }] });
+	const before = renderer.stats.bytesRead;
+	const pr = await cl.req({ op: "present", image: 1, readback: 0, external: 1 });
+	const id = (lo, tok = token) => (BigInt(tok) << 32n) | BigInt(lo);
+	const px = (bmp) => {
+		if (!bmp) return "null";
+		const cv = new OffscreenCanvas(W, H), g = cv.getContext("2d");
+		g.drawImage(bmp, 0, 0);
+		bmp.close();
+		return Array.from(g.getImageData(3, 3, 1, 1).data).join(",");
+	};
+	const near = (s, want) => s !== "null" && s.split(",").every((v, i) => Math.abs(Number(v) - want[i]) <= 3);
+	const a = px(renderer.external({ id: id(ids[0]), width: W, height: H, format: AR24, flags: 0 }));
+	const x = px(renderer.external({ id: id(ids[0]), width: W, height: H, format: XR24, flags: 0 }));
+	check("external: present replies without pixels", pr.json.width === W && pr.json.height === H && !pr.bin.length && renderer.stats.bytesRead === before && renderer.stats.externalPresents === 1, JSON.stringify(pr.json));
+	check("external: ARGB8888 resolves premultiplied", near(a, [255, 128, 0, 128]), a);
+	check("external: XRGB8888 resolves opaque", near(x, [128, 64, 0, 255]), x);
+	const nulls = {
+		"a wrong token": renderer.external({ id: id(ids[0], token ^ 1), width: W, height: H, format: AR24, flags: 0 }),
+		"the other connection's token": renderer.external({ id: id(ids[0], t2), width: W, height: H, format: AR24, flags: 0 }),
+		"an unknown export id": renderer.external({ id: id(99), width: W, height: H, format: AR24, flags: 0 }),
+		"a wrong size": renderer.external({ id: id(ids[0]), width: W + 1, height: H, format: AR24, flags: 0 }),
+		"a wrong byte order": renderer.external({ id: id(ids[0]), width: W, height: H, format: AB24, flags: 0 }),
+		"y_invert": renderer.external({ id: id(ids[0]), width: W, height: H, format: AR24, flags: 1 }),
+		"an image never presented": renderer.external({ id: id(ids[1]), width: W, height: H, format: AR24, flags: 0 }),
+		"a number id": renderer.external({ id: Number(id(ids[0])), width: W, height: H, format: AR24, flags: 0 }),
+	};
+	// pictures closed unused (what a compositor that skips a frame does), at a window's size
+	cl.post({ op: "vkCreateImage", id: 9, imageType: 1, format: 44, extent: { width: 500, height: 500, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, tiling: 0, usage: 0x10 | 0x1 | 0x2 });
+	const big = (await cl.req({ op: "exportImages", images: [9] })).json.ids[0];
+	for (let i = 0; i < 4; i++) {
+		cl.post({ op: "vkQueueSubmit", cmds: [{ c: "vkCmdClearColorImage", image: 9, color: { float32: [0, 0, 1, 1] }, ranges: [{ aspectMask: 1, levelCount: 1, layerCount: 1 }] }] });
+		await cl.req({ op: "present", image: 9, readback: 0, external: 1 });
+		renderer.external({ id: id(big), width: 500, height: 500, format: XR24, flags: 0 })?.close();
+	}
+	await cl.req({ op: "sync" });
+	await new Promise((r) => setTimeout(r, 300));
+	check("external: pictures closed unused keep the device", !renderer.isLost, `lost ${renderer.isLost}`);
+	const notNull = Object.entries(nulls).filter(([, v]) => v !== null).map(([k]) => k);
+	check("external: refs that are not the image's resolve to null", !notNull.length, notNull.join(", "));
+	let unexported = "";
+	await cl.req({ op: "present", image: 3, readback: 0, external: 1 }).catch((e) => (unexported = e.message));
+	check("external: present of an unexported image fails", /not exported/.test(unexported), unexported);
+	// destroyed: null; its export id is never given again
+	cl.post({ op: "destroy", ids: [1] });
+	cl.post({ op: "vkCreateImage", id: 1, imageType: 1, format: 44, extent: { width: W, height: H, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, tiling: 0, usage: 0x10 | 0x1 | 0x2 });
+	const ids2 = (await cl.req({ op: "exportImages", images: [1] })).json.ids;
+	await cl.req({ op: "present", image: 1, readback: 0, external: 1 });
+	const gone = renderer.external({ id: id(ids[0]), width: W, height: H, format: AR24, flags: 0 });
+	check("external: a destroyed image's id resolves to null, ids are not reused", gone === null && ids2[0] === big + 1, `${gone} new id ${ids2[0]}`);
+	cl.conn.close();
+	const closed = renderer.external({ id: id(ids2[0]), width: W, height: H, format: AR24, flags: 0 });
+	check("external: a closed connection's ids resolve to null", closed === null && renderer.stats.externalImages === 6, `${closed} images ${renderer.stats.externalImages}`);
+	other.conn.close();
+	// a renderer told not to offer it (the SDK's canvas probe failed): no token, exportImages refused
+	const off = new VkRenderer({ device, adapter, shaders: fakeTranslator, external: false, log: (l) => logs.push(`[ext-off] ${l}`) });
+	const co = new Client(off);
+	const ho = (await co.req({ op: "hello", version: 1 })).json;
+	co.post({ op: "vkCreateImage", id: 1, imageType: 1, format: 44, extent: { width: W, height: H, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, tiling: 0, usage: 0x10 | 0x1 | 0x2 });
+	let refused = "";
+	await co.req({ op: "exportImages", images: [1] }).catch((e) => (refused = e.message));
+	check("external: not offered: no token, exports refused", !ho.external && /not offered/.test(refused), `${JSON.stringify(ho.external)} ${refused}`);
+	co.conn.close();
+}
+
 async function deviceLoss() {
 	const adapter = await navigator.gpu.requestAdapter();
 	const device = await adapter.requestDevice(vkDeviceDescriptor(adapter));
@@ -1156,6 +1267,7 @@ async function main() {
 			await suite(device, adapter, tr, "spirv", (name) => spv[name]);
 		} else log("skip spirv suite (no translator or glslangValidator)");
 		await robustness(device, adapter);
+		await externalPresent(device, adapter);
 		await deviceLoss();
 	} catch (e) {
 		check("exception", false, `${e.message}\n${e.stack}`);

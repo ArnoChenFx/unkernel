@@ -345,7 +345,7 @@ export interface Config {
 	vkWhy: string | null;
 	/** kwshm, for the Wayland desktop (wayland.ts): unless ?shm=0 (this load's URL only). */
 	shm: boolean;
-	/** The Wayland desktop shows GPU apps' buffers by resource (wayland.ts): unless ?wlgpu=0 (this load's URL only). */
+	/** The Wayland desktop shows GPU apps' buffers by resource and Vulkan apps' external buffers (wayland.ts): unless ?wlgpu=0 (this load's URL only). */
 	wlGpu: boolean;
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
@@ -391,6 +391,26 @@ export function vkBlocker(): string | null {
 	if (!vkShaderUrl) return "this page's build has no Vulkan translator (kwvk-naga.wasm: vk/naga/build.sh, or a release that carries it)";
 	if (!(navigator as { gpu?: unknown }).gpu) return "this browser has no WebGPU on the page's thread (navigator.gpu)";
 	return null;
+}
+
+/**
+ * Why this browser's WebGPU cannot serve guest Vulkan although navigator.gpu
+ * is there, or null: requestAdapter() gives no adapter (Chrome on Linux
+ * without its WebGPU flags, a blocklisted GPU or driver, no GPU process).
+ * Asked once at boot (boot.ts), which then runs without guest Vulkan and
+ * says why (the Environment row, the option's note, the launcher's Vulkan
+ * apps); the request makes no device. No answer in 3 s counts as an adapter.
+ */
+export async function vkAdapterBlocker(): Promise<string | null> {
+	const gpu = (navigator as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+	if (!gpu) return null; // vkBlocker() said so
+	try {
+		const adapter = await Promise.race([gpu.requestAdapter(), new Promise((r) => setTimeout(() => r(true), 3000))]);
+		if (adapter) return null;
+	} catch {
+		// As no adapter.
+	}
+	return "this browser's WebGPU has no adapter (navigator.gpu.requestAdapter() gives none: see chrome://gpu; Chrome on Linux needs chrome://flags/#enable-unsafe-webgpu and #enable-vulkan)";
 }
 
 /** The kernel's limit (NR_CPUS in kw_smp.config). */

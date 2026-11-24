@@ -62,6 +62,19 @@ check("spec.frag: defaults baked", has(sd, /scale: f32 = 1f/) && has(sd, /invert
 const bc = run("buffer.comp", "buffer.comp.spv", { stage: "compute", entryPoint: "main" });
 check("buffer.comp: storage kinds", bc?.bindings.map((b) => `${b.wgslBinding}:${b.kind}`).join() === "0:read-only-storage,2:storage", JSON.stringify(bc?.bindings));
 check("buffer.comp: runtime array", has(bc, /array<f32>/) && has(bc, /arrayLength/));
+// Older glslang (llama.cpp's release builds) marks `readonly buffer` only on the block's members:
+// the same module without the variables' NonWritable must still be read-only.
+{
+	const w = new Uint32Array(Uint8Array.from(readFileSync(new URL("buffer.comp.spv", here))).buffer);
+	const kept: number[] = [...w.subarray(0, 5)];
+	for (let i = 5; i < w.length; i += w[i] >>> 16) {
+		const n = w[i] >>> 16;
+		if (!((w[i] & 0xffff) === 71 && n === 3 && w[i + 2] === 24)) kept.push(...w.subarray(i, i + n)); // OpDecorate %var NonWritable
+	}
+	let mo: VkShaderResult | undefined;
+	try { mo = t.translate(new Uint8Array(new Uint32Array(kept).buffer), { stage: "compute", entryPoint: "main" }); } catch (e) { check("buffer.comp, member-only NonWritable: translates", false, (e as Error).message); }
+	check("buffer.comp, member-only NonWritable: still read-only", kept.length < w.length && mo?.bindings.map((b) => `${b.wgslBinding}:${b.kind}`).join() === "0:read-only-storage,2:storage", `${w.length - kept.length} words dropped; ${JSON.stringify(mo?.bindings)}`);
+}
 
 const ic = run("image.comp", "image.comp.spv", { stage: "compute", entryPoint: "main" });
 const ib = ic?.bindings[0];

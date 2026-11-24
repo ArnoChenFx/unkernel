@@ -83,7 +83,8 @@ with one floor: an image from before kwbox does not boot on a base with it
   closes the waiting apps at once), and where `/dev/dri/renderD128` exists
   `--dmabuf virtgpu:/dev/dri/renderD128` (GL apps by GPU resource; a
   running relay without it gets a note on how to restart it) with
-  `--no-fence-wait`. `wland --boot` (the layer's rc, as root, with
+  `--no-fence-wait`, and `--external-buffers` (Vulkan apps' swapchain
+  images by id; vk.md, Presentation). `wland --boot` (the layer's rc, as root, with
   `kw.wayland=1` on the command line: the page's boot) starts it for the
   image's user (`kw.user=`, else `user`, else root, as `kwtty login`
   picks), through busybox `su`, after making `/run/user/UID` (0700, the

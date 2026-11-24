@@ -99,7 +99,9 @@ export function attachWayland(vm: KernelHandle, log: (line: string) => void): ((
 		loading = true;
 		pending = first;
 		const gpu = KW.config.wlGpu ? vm.gl?.gpu : undefined;
-		log(`[host] wayland: the relay connected (vsock port ${WAYLAND_PORT}); loading wland${gpu ? " (GPU buffers by resource: guest GL's renderer)" : ""}`);
+		const vk = KW.config.wlGpu ? vm.vk : undefined;
+		const what = [gpu && "GPU buffers by resource: guest GL's renderer", vk && "external buffers: guest Vulkan's renderer"].filter(Boolean).join("; ");
+		log(`[host] wayland: the relay connected (vsock port ${WAYLAND_PORT}); loading wland${what ? ` (${what})` : ""}`);
 		const [W, { default: wasm }] = await Promise.all([import("wland/client"), import("wland/wland.wasm?url")]);
 		if (stopped) return;
 		const container = getContainer();
@@ -113,7 +115,7 @@ export function attachWayland(vm: KernelHandle, log: (line: string) => void): ((
 				wasm,
 				link: W.createStreamLink(link),
 				buffers: handleSource(vm),
-				...(gpu ? { gpu: gpuSource(gpu, log) } : {}),
+				...(gpu || vk ? { gpu: gpuSource(gpu, vk, log) } : {}),
 				// The page's WM owns the windows (see the top; wayland/host.ts).
 				decorations: "server",
 				autoFocus: false,
@@ -224,4 +226,6 @@ export const waylandApi = {
 	gpuLast: () => { const gpuLast = getGpuLast(); return gpuLast ? { ...gpuLast, modifier: `0x${gpuLast.modifier.toString(16)}` } : null; },
 	/** What the compositor read of the guest's buffers and what GPU commits cost (see `stats` in wayland/buffers.ts). */
 	stats: (): Stats => ({ ...stats }),
+	/** wland's engine.externalBuffers() on the current link: true (Vulkan apps present by external buffers), false (not offered), null (no link settled). */
+	externalBuffers: (): boolean | null => getCurrent()?.engine.externalBuffers() ?? null,
 };

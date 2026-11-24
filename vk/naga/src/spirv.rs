@@ -839,6 +839,78 @@ pub fn fold_spec_ops(words: Vec<u32>) -> Vec<u32> {
 	out
 }
 
+// `readonly buffer` / `writeonly buffer` as older glslang emits them (the
+// Ubuntu glslc of llama.cpp's release builds): NonWritable or NonReadable
+// on every member of the block, none on the variable. naga reads only the
+// variable's decorations, so such a buffer became read_write in WGSL, and
+// WebGPU then refused a dispatch that binds it over the same range as a
+// written buffer ("writable storage buffer binding aliasing"), which
+// Vulkan allows. Each variable (or array of them) of a block whose members
+// all carry the decoration gets it too.
+pub fn member_access_to_variables(words: Vec<u32>) -> Vec<u32> {
+	const OP_TYPE_ARRAY: u32 = 28;
+	const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
+	const OP_DECORATE_ID: u32 = 332;
+	const OP_DECORATE_STRING: u32 = 5632;
+	const DEC_NON_WRITABLE: u32 = 24;
+	const DEC_NON_READABLE: u32 = 25;
+	let (mut members, mut marked) = (HashMap::<u32, usize>::new(), HashMap::<(u32, u32), usize>::new());
+	let (mut elem, mut pointee, mut vars) = (HashMap::<u32, u32>::new(), HashMap::<u32, u32>::new(), Vec::new());
+	let mut has = std::collections::HashSet::<(u32, u32)>::new();
+	let mut last_annotation = 0;
+	let mut i = 5;
+	while i < words.len() {
+		let n = (words[i] >> 16) as usize;
+		let a = &words[i + 1..i + n];
+		match words[i] & 0xffff {
+			OP_DECORATE if a.len() >= 2 => {
+				has.insert((a[0], a[1]));
+				last_annotation = i + n;
+			}
+			OP_MEMBER_DECORATE if a.len() >= 3 => {
+				if a[2] == DEC_NON_WRITABLE || a[2] == DEC_NON_READABLE {
+					*marked.entry((a[0], a[2])).or_default() += 1;
+				}
+				last_annotation = i + n;
+			}
+			OP_DECORATE_ID | OP_DECORATE_STRING => last_annotation = i + n,
+			OP_TYPE_STRUCT if !a.is_empty() => {
+				members.insert(a[0], a.len() - 1);
+			}
+			OP_TYPE_ARRAY | OP_TYPE_RUNTIME_ARRAY if a.len() >= 2 => {
+				elem.insert(a[0], a[1]);
+			}
+			OP_TYPE_POINTER if a.len() >= 3 => {
+				pointee.insert(a[0], a[2]);
+			}
+			OP_VARIABLE if a.len() >= 3 => vars.push((a[1], a[0])),
+			_ => {}
+		}
+		i += n;
+	}
+	let mut add = Vec::new();
+	for (var, ptr) in vars {
+		let Some(mut t) = pointee.get(&ptr).copied() else { continue };
+		while let Some(&e) = elem.get(&t) {
+			t = e;
+		}
+		let Some(&count) = members.get(&t) else { continue };
+		for dec in [DEC_NON_WRITABLE, DEC_NON_READABLE] {
+			if count > 0 && marked.get(&(t, dec)).copied().unwrap_or(0) >= count && !has.contains(&(var, dec)) {
+				add.extend(inst(OP_DECORATE, &[var, dec]));
+			}
+		}
+	}
+	if add.is_empty() || last_annotation == 0 {
+		return words;
+	}
+	let mut out = Vec::with_capacity(words.len() + add.len());
+	out.extend_from_slice(&words[..last_annotation]);
+	out.extend(add);
+	out.extend_from_slice(&words[last_annotation..]);
+	out
+}
+
 // Constructs naga's spv-in rejects that have a WGSL-compatible meaning:
 // - NonSemantic.* extended instructions (DebugPrintf, ...): dropped.
 // - gl_PointCoord (no WGSL builtin; points are 1 px): a private vec2(0.5).

@@ -12,10 +12,12 @@ import wlgl from "./wlgl.ts";
 import vkcube from "./vkcube.ts";
 import vkmark from "./vkmark.ts";
 import gtkvk from "./gtkvk.ts";
+import d3d12gears from "./d3d12gears.ts";
+import d3d12triangle from "./d3d12triangle.ts";
 
 export default defineGroup({
 	id: "gl", title: "Graphics", desc: "OpenGL and Vulkan on the GPU, and Wayland windows",
 	// A cube.
 	icon: { svg: '<g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4Z"/><path d="M4 7.4 12 12l8-4.6M12 12v9.2"/></g>' },
 	colors: ["#8b5cf6", "#2e1065"],
-}, [kmscube, glmark2, xglamor, wlgl, vkcube, vkmark, gtkvk, foot]);
+}, [kmscube, glmark2, xglamor, wlgl, vkcube, vkmark, gtkvk, d3d12gears, d3d12triangle, foot]);

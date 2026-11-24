@@ -94,6 +94,7 @@ struct kw_physical_device {
 	int f16;
 	uint64_t max_alloc;
 	uint64_t max_buffer; /* WebGPU's maxBufferSize */
+	uint32_t ext_token; /* the hello's external.token: the host resolves external buffers (0: it does not) */
 };
 struct kw_instance {
 	VK_LOADER_DATA loader;
@@ -122,13 +123,21 @@ struct kw_memory {
 	int mapped, touched;
 	struct kw_memory *next, *prev;
 };
+/* byte ranges [lo, hi) of a buffer, sorted, disjoint and not adjacent; past
+ * KW_MAX_RANGES the two closest are joined (what lies between is covered too) */
+#define KW_MAX_RANGES 8
+struct kw_ranges {
+	int n;
+	VkDeviceSize lo[KW_MAX_RANGES + 1], hi[KW_MAX_RANGES + 1];
+};
+void kw_ranges_add(struct kw_ranges *r, VkDeviceSize lo, VkDeviceSize hi);
 struct kw_buffer {
 	uint32_t id;
 	VkDeviceSize size;
 	VkBufferUsageFlags usage;
 	struct kw_memory *mem;
 	VkDeviceSize offset;
-	int gpu_dirty;
+	struct kw_ranges dirty; /* what submitted work may have written: read back at the next wait (or map) */
 	int fresh; /* bound while its memory had no last-sent copy */
 	struct kw_buffer *next, *prev;
 };
@@ -141,13 +150,29 @@ struct kw_image {
 struct kw_obj { /* every other host object */
 	uint32_t id;
 };
+/* a descriptor set layout: its bindings sorted by number, for Vulkan's
+ * consecutive binding updates and the order of dynamic offsets. Shared by
+ * the sets allocated from it (a set may outlive its layout's handle). */
+struct kw_dsl_binding {
+	uint32_t binding, type, count;
+	uint32_t dyn; /* dynamic offsets of the bindings before it (dynamic types only) */
+};
+struct kw_dsl {
+	uint32_t id;
+	int refs;
+	uint32_t n;
+	struct kw_dsl_binding b[];
+};
 struct kw_dslot {
 	uint32_t binding, elem;
 	struct kw_buffer *buf;
+	VkDeviceSize offset, range;
+	int dyn; /* index of its dynamic offset in the set, -1: not dynamic */
 };
 struct kw_dset {
 	uint32_t id;
 	struct kw_dpool *pool;
+	struct kw_dsl *layout;
 	struct kw_dset *next, *prev;
 	struct kw_dslot *slots; /* storage buffers written into this set */
 	size_t nslots;
@@ -173,16 +198,23 @@ struct kw_pipe {
 	uint32_t w[];
 };
 #define KW_MAX_SETS 8
+#define KW_MAX_DYN 32 /* dynamic offsets kept per bound set (past them: whole buffers) */
+struct kw_written {
+	struct kw_buffer *buf;
+	struct kw_ranges r;
+};
 struct kw_cmdbuf {
 	VK_LOADER_DATA loader;
 	struct kw_device *dev;
 	struct kw_cmdpool *pool;
 	struct kw_cmdbuf *next, *prev;
 	struct jb cmds; /* comma-separated command objects */
-	struct kw_buffer **written;
+	struct kw_written *written; /* buffers and ranges the GPU may write */
 	size_t nwritten, capwritten;
 	struct kw_pipe *pipe[2]; /* bound graphics, compute pipeline */
 	struct kw_dset *sets[2][KW_MAX_SETS];
+	uint32_t dyn[2][KW_MAX_SETS][KW_MAX_DYN]; /* their dynamic offsets */
+	uint32_t ndyn[2][KW_MAX_SETS];
 	/* recorded something the host cannot run (an unusable pipeline, a
 	 * non-zero dispatch base, ...): submitting it loses the device */
 	char bad[384];
@@ -204,6 +236,7 @@ struct kw_stats {
 	int64_t submit_ns, submit_json, submits;
 	int64_t present_ns, present_bytes, presents;
 	int64_t wait_ns;
+	int64_t acquire_ns; /* external buffers: waiting for the compositor's release */
 };
 extern struct kw_stats kw_stats;
 extern int kw_stats_on;

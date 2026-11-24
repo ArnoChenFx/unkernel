@@ -64,7 +64,8 @@ processes requests strictly in order.
  "adapter":{"vendor":"","architecture":"","device":"","description":""},
  "limits":{ every GPUSupportedLimits member of the device },
  "features":[ GPUFeatureName of the device ],
- "formats":{ "<VkFormat number>": caps, ... }}
+ "formats":{ "<VkFormat number>": caps, ... },
+ "external":{"token":T}}   (only where the host offers external present: Amendments, "External present")
 ```
 caps bits: 1 sampled, 2 linear filter, 4 colour attachment, 8 blend, 16
 depth/stencil attachment, 32 storage image, 64 vertex attribute format.
@@ -75,10 +76,11 @@ compute, transfer), one queue.
 
 ## Memory and buffers
 
-VkDeviceMemory is guest-only: a malloc'd shadow, every memory type
-HOST_VISIBLE | HOST_COHERENT (and one DEVICE_LOCAL-only type, also a
-shadow). No message. Images have no CPU-visible data (linear-tiling images
-are unsupported); only buffers carry data.
+VkDeviceMemory is guest-only. No message. Two memory types: 0
+DEVICE_LOCAL (no shadow: nothing is diffed or read back), 1 HOST_VISIBLE |
+HOST_COHERENT (a malloc'd shadow); no DEVICE_LOCAL | HOST_VISIBLE type
+(Amendments, "Device memory tracking"). Images have no CPU-visible data
+(linear-tiling images are unsupported); only buffers carry data.
 
 - `vkCreateBuffer {id,size,usage}`: the host makes a GPUBuffer (size
   rounded up to 4, COPY_SRC | COPY_DST always added).
@@ -88,11 +90,12 @@ are unsupported); only buffers carry data.
   diffs; unmapped and never-written memory sends nothing), before each
   vkQueueSubmit, and at vkUnmapMemory and vkFlushMappedMemoryRanges.
 - `{"op":"readBuffer","r":N,"buffer":id,"offset":o,"size":s}` -> reply
-  with the bytes as binary. The ICD tracks buffers the GPU may have
-  written (copy destinations, storage buffers in descriptor sets bound at
-  a draw or dispatch) and reads them back into the shadow (and the
-  last-sent copy) when a fence wait, vkQueueWaitIdle or vkDeviceWaitIdle
-  completes, at vkMapMemory and at vkInvalidateMappedMemoryRanges.
+  with the bytes as binary. The ICD tracks the byte ranges of buffers the
+  GPU may have written (copy destinations, storage buffers in descriptor
+  sets bound at a draw or dispatch) and reads them back into the shadow
+  (and the last-sent copy) when a fence wait, vkQueueWaitIdle or
+  vkDeviceWaitIdle completes, at vkMapMemory and at
+  vkInvalidateMappedMemoryRanges (Amendments, "Device memory tracking").
 
 ## Objects (host-side)
 
@@ -215,8 +218,9 @@ own); acquire is guest-side round robin (FIFO and IMMEDIATE alike).
 rows in the image's own byte order (B8G8R8A8 stays BGRA), top row first.
 The ICD copies them into a wl_shm buffer (or XPutImage) and commits. With
 `"readback":0` (headless surface) the reply has no binary. The host also
-keeps the last presented texture per connection for a later zero-copy
-path.
+keeps the last presented texture per connection (`lastPresented`).
+Wayland surfaces on the page's wland present without pixels where both
+sides can (Amendments, "External present").
 
 ## Amendments
 
@@ -272,11 +276,11 @@ path.
   when the adapter has them, and the adapter's limits); the hello reply
   reflects whatever device the renderer got. `onPresent?(info)` is called
   at each present and `connection.lastPresented` holds the last one.
-- ICD (2026-11-24): readBuffer is sent with `offset` 0 and `size` the
-  buffer's size rounded up to 4. At a fence wait or wait-idle the ICD reads
-  back only GPU-written buffers whose memory is mapped at that moment; the
-  others stay marked and are read at vkMapMemory or
-  vkInvalidateMappedMemoryRanges.
+- ICD (2026-11-24): readBuffer is sent per GPU-written range (`offset`
+  and `size` multiples of 4; "Device memory tracking" below). At a fence
+  wait or wait-idle the ICD reads back only GPU-written buffers whose
+  memory is mapped at that moment; the others stay marked and are read at
+  vkMapMemory or vkInvalidateMappedMemoryRanges.
 - ICD: the ICD also offers VK_KHR_xcb_surface and VK_KHR_xlib_surface
   (xcb_put_image through a dlopen'ed libxcb; Xlib through
   XGetXCBConnection), presenting with `"readback":1` like Wayland. It
@@ -373,9 +377,9 @@ path.
   `vkCmdBindVertexBuffers2` with `sizes` (-1 = VK_WHOLE_SIZE) and `strides`
   only when given. Debugging: `KWVK_TRACE=FILE` writes every message's
   JSON, one per line.
-- ICD (round 2): a third memory type, DEVICE_LOCAL | HOST_VISIBLE |
-  HOST_COHERENT (the same malloc'd shadow as type 1), for apps that look
-  for "BAR" memory (SDL3's GPU API puts its uniform buffers there).
+- ICD: two memory types, DEVICE_LOCAL and HOST_VISIBLE | HOST_COHERENT;
+  no DEVICE_LOCAL | HOST_VISIBLE ("BAR") type ("Device memory tracking"
+  below).
 - Host (2026-11-24, round 3):
   - Queries. `vkCreateQueryPool {id, queryType, queryCount}` (1..4096):
     OCCLUSION (0) on a WebGPU occlusion query set, TIMESTAMP (2) on a
@@ -406,7 +410,8 @@ path.
     allows binding numbers < 1000). vkUpdateDescriptorSets honours
     dstArrayElement, descriptorCount and Vulkan's consecutive-binding
     overflow; descriptorCopies honour srcArrayElement/dstArrayElement/
-    descriptorCount; dynamic offsets count per element.
+    descriptorCount and the same overflow on both sides; dynamic offsets
+    count per element.
   - Input attachments (descriptor type 10) are bound as sampled textures
     (the translator's `textureLoad` at the fragment position): reading an
     attachment written in an earlier subpass works; one also written in the
@@ -646,3 +651,100 @@ path.
     (dispatchScale) fails the submit; cullMode FRONT_AND_BACK draws nothing
     to the attachments (it drew unculled). VkStats adds `lost` (connections
     the host ended as a lost device).
+
+- External present (2026-11-24): Wayland swapchains on the page's wland
+  present without pixels, through wland's `wland_external_buffer_manager_v1`
+  (wland's protocol/wland-external-buffer-v1.xml: a wl_buffer named by an
+  opaque 64-bit id that the page resolves to a picture at each commit).
+  - Hello: the reply carries `"external":{"token":T}` (T a random non-zero
+    u32, different for every connection the page's renderers ever made)
+    where the host can make such pictures (a WebGPU OffscreenCanvas on its
+    device that the SDK's probe found working); without it the ICD never
+    uses external present.
+  - `{"op":"exportImages","r":N,"images":[ids]}` -> `{"r":N,"ids":[E...]}`:
+    an export id per swapchain image (2D, single-sampled, B8G8R8A8 or
+    R8G8B8A8, sRGB or not). Export ids count up per connection from 1 and
+    are never given to another image (an image exported again keeps its
+    id). `err` (not offered, not an image, a format it cannot show) is a
+    refusal, NOT a lost device: the ICD presents that swapchain by readback.
+  - The ICD uses it when the hello has the token, the compositor advertises
+    the global (wland does only with a relay started with
+    `--external-buffers` and a page that resolves them), the swapchain is
+    B8G8R8A8, and neither `KWVK_EXTERNAL=0` nor `KWVK_DUMP` is set (else
+    readback into wl_shm as before; X11 and headless never use it). It
+    binds the global (version 1) and makes one wl_buffer per image with
+    `create_buffer(id_hi = T, id_lo = E, width, height, format, 0)`:
+    format ARGB8888 for compositeAlpha PRE_MULTIPLIED, XRGB8888 otherwise
+    (as the wl_shm formats), flags 0 (row 0 at the top).
+  - `{"op":"present","r":N,"image":id,"readback":0,"external":1}` ->
+    `{"r":N,"width":w,"height":h}`, no binary, sent once the validation of
+    every earlier submit is known (a failed frame loses the device instead
+    of reaching the compositor); from then on the image's id resolves. The
+    ICD commits to Wayland only after this reply: the frame's commands
+    travel on this link, the commit on wland's, so present -> reply ->
+    wl_surface.attach of the image's buffer, damage of the whole buffer, a
+    frame callback (FIFO pacing as with wl_shm), commit. A present of an
+    image not exported fails (err: a lost device).
+  - Lifetime: the image is the buffer. The ICD acquires an image again
+    only once its wl_buffer was released (wland releases at the commit's
+    ACK; after 100 ms it renders into it anyway rather than hang). At
+    vkDestroySwapchainKHR it waits up to 250 ms for its busy buffers to be
+    released, then sends `destroy` for the images and destroys the
+    wl_buffers (no release follows the destruction of a busy one): the
+    `destroy` is the lifetime message; the host keeps an exported texture
+    until then (a closed connection or a lost device drops them all).
+  - Host API: `renderer.external(ref)` (wland's ExternalRef: `{id: bigint,
+    width, height, format, flags}`) gives the picture of the image as an
+    ImageBitmap (a copy into a WebGPU OffscreenCanvas on the renderer's
+    device, alphaMode premultiplied, or opaque for XRGB8888/XBGR8888, then
+    transferToImageBitmap; synchronous, no readback), or null: an unknown
+    token or export id, a destroyed or never presented image, a closed
+    connection, a lost device, a claimed size, format (byte order) or
+    flags that are not the image's. The SDK's `vm.vk.externalImage(ref)`
+    calls it on the current renderer. VkStats adds `externalPresents` and
+    `externalImages`; `bytesRead` does not grow for external presents.
+
+- Device memory tracking (2026-11-24, ICD; host: descriptor copies):
+  - Consecutive binding updates: the ICD records each storage buffer of a
+    VkWriteDescriptorSet, VkCopyDescriptorSet (both sides) and descriptor
+    update template entry where Vulkan puts it: past a binding's last
+    element at element 0 of the next binding by number that has
+    descriptors (zero-count bindings skipped), from the set layout's
+    bindings (the ICD keeps them for the sets allocated from it). The host
+    numbers writes and copies the same way (a binding the layout lacks
+    counts as one descriptor). ggml-vulkan writes all of a set's buffers in
+    one write at binding 0.
+  - Ranges: what a submit may write is kept per buffer as byte ranges
+    (sorted, overlapping and adjacent ones joined, at most 8: past that the
+    two closest are joined), and readBuffer is sent per range. A range is
+    narrower than the buffer only where the command says exactly what it
+    writes: vkCmdCopyBuffer regions, vkCmdUpdateBuffer, vkCmdFillBuffer,
+    vkCmdCopyQueryPoolResults (`dstOffset + (queryCount - 1) * stride` plus
+    one result), a storage buffer descriptor as bound (`offset` plus its
+    dynamic offset, `range`; VK_WHOLE_SIZE is the size minus `offset`, as
+    the host binds it: WebGPU keeps a shader's writes inside the binding);
+    vkCmdCopyImageToBuffer from each region's `bufferOffset` to the end of
+    the buffer; everything else (sets bound for another bind point, more
+    dynamic offsets than the ICD keeps) the whole buffer. Ranges are
+    widened to 4 bytes; the host's readBuffer takes any 4-aligned
+    `offset`/`size` inside the buffer.
+  - Read back into a mapped shadow, a 4-byte word the CPU changed since
+    the last flush (shadow differs from the last-sent copy) keeps the
+    CPU's value (the GPU cannot have written it too in a valid program)
+    and is sent at the next flush; before, a whole-buffer readback
+    replaced bytes the CPU wrote while the GPU worked elsewhere in the
+    buffer.
+  - Memory types: 0 DEVICE_LOCAL, 1 HOST_VISIBLE | HOST_COHERENT, and no
+    DEVICE_LOCAL | HOST_VISIBLE type, so that memory the GPU writes is not
+    mapped by apps that prefer that type on an integrated GPU: ggml-vulkan
+    (deviceType INTEGRATED_GPU: uma) asks for DEVICE_LOCAL | HOST_VISIBLE |
+    HOST_COHERENT first for every device buffer and maps it for good (its
+    compute buffer, KV cache and weights would be read back, within the
+    ranges they were bound with, at every fence wait); it now gets type 0
+    and moves data through staging copies, as on a discrete GPU. SDL3's GPU
+    API puts its uniform buffers in type 1 (its warning "Out of BAR
+    memory, allocating uniform buffers on host-local memory" is below SDL's
+    default log priority). Allocators
+    that take the first type with the flags they need (GTK's GSK, VMA for
+    GPU-only allocations) get type 0 for GPU-only resources as before.
+    memoryTypeBits is 3 for buffers and images.

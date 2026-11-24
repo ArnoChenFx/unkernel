@@ -53,7 +53,7 @@ main/Contents-all.gz   0c2e2d099588073221d6eebb0a84e950f1728818faf527de9034d0116
 # Bump together: WLANDR_VERSION, WLANDR_SHA256 and wland's version in
 # web/package.json. build.sh takes a local relay from KW_WLANDR instead
 # (development).
-WLANDR_VERSION=v0.1.0-261124-100fbf2
+WLANDR_VERSION=v0.1.0-261124-3c987e5
 WLANDR_TARBALL="wlandr-link-$WLANDR_VERSION-linux-arm64.tar.gz"
 WLANDR_URL="https://github.com/pithings/wland/releases/download/$WLANDR_VERSION/wlandr-link-linux-arm64.tar.gz"
-WLANDR_SHA256=41cb5c03e32c899b18d3d1ee2ec403903ed2d7800c32c76a3809532eda241443
+WLANDR_SHA256=627b5b235a7dd1718c14a166e2609599ff66278ef004de711c2c199d2f8a0e57

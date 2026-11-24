@@ -39,10 +39,10 @@ void kw_stats_tick(void)
 	double sec = (now - last) / 1e9, fr = s->presents ? (double)s->presents : s->submits ? (double)s->submits : 1;
 	fprintf(stderr,
 		"kwvk stats: %.0f presents/s, %.0f submits/s; per %s: flush %.2f ms (scanned %.0f KiB, wrote %.0f KiB in %.1f writes), "
-		"submit %.2f ms (%.1f, %.0f KiB JSON), fence waits %.2f ms, readback %.2f ms (%.0f KiB), present %.2f ms (%.0f KiB)\n",
+		"submit %.2f ms (%.1f, %.0f KiB JSON), fence waits %.2f ms, readback %.2f ms (%.0f KiB), present %.2f ms (%.0f KiB), acquire %.2f ms\n",
 		s->presents / sec, s->submits / sec, s->presents ? "frame" : "submit", s->flush_ns / fr / 1e6, s->scan_bytes / fr / 1024, s->write_bytes / fr / 1024, s->writes / fr,
 		s->submit_ns / fr / 1e6, s->submits / fr, s->submit_json / fr / 1024, s->wait_ns / fr / 1e6, s->readback_ns / fr / 1e6,
-		s->read_bytes / fr / 1024, s->present_ns / fr / 1e6, s->present_bytes / fr / 1024);
+		s->read_bytes / fr / 1024, s->present_ns / fr / 1e6, s->present_bytes / fr / 1024, s->acquire_ns / fr / 1e6);
 	memset(s, 0, sizeof *s);
 	last = now;
 }
@@ -250,6 +250,8 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 	snprintf(p->deviceName, sizeof p->deviceName, "kwvk (WebGPU%s%s)", *desc || *dev ? ": " : "", *desc ? desc : dev);
 	memcpy(p->pipelineCacheUUID, "kwvk-webgpu-0001", 16);
 
+	/* the host turns swapchain images into a page compositor's pictures (wsi.c, external buffers) */
+	pd->ext_token = (uint32_t)js_num(js_get(js_get(rep->json, "external"), "token"), 0);
 	uint32_t t2 = lim(L, "maxTextureDimension2D", 8192);
 	pd->max2d = t2;
 	l->maxImageDimension1D = lim(L, "maxTextureDimension1D", 8192);
@@ -402,12 +404,14 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 	if (pd->max_alloc > pd->max_buffer)
 		pd->max_alloc = pd->max_buffer;
 	m->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
-	m->memoryTypeCount = 3;
+	/* No DEVICE_LOCAL | HOST_VISIBLE type: GPU-written memory the app keeps
+	 * mapped is read back at every wait, so apps that prefer it on an
+	 * integrated GPU (ggml puts every device buffer there, SDL3's GPU API
+	 * its uniform buffers) are steered to device-only memory or the plain
+	 * host-visible type (vk/PROTOCOL.md, Amendments). */
+	m->memoryTypeCount = 2;
 	m->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 	m->memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	/* the same shadow, for apps that look for "BAR" memory */
-	m->memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-					  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 }
 
 static API VkResult CALL kw_vkCreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out)
@@ -597,7 +601,7 @@ static API VkResult CALL kw_vkAllocateMemory(VkDevice dh, const VkMemoryAllocate
 {
 	(void)a;
 	struct kw_device *d = DEV(dh);
-	if (ai->memoryTypeIndex > 2)
+	if (ai->memoryTypeIndex >= d->pd->mem.memoryTypeCount)
 		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 	struct kw_memory *m = calloc(1, sizeof *m);
 	m->type = ai->memoryTypeIndex;
@@ -772,43 +776,126 @@ void kw_flush_writes(struct kw_device *d, struct kw_memory *only)
 	kw_stats.flush_ns += kw_now() - t0;
 }
 
+void kw_ranges_add(struct kw_ranges *r, VkDeviceSize lo, VkDeviceSize hi)
+{
+	if (lo >= hi)
+		return;
+	int n = r->n, i = n;
+	while (i > 0 && r->lo[i - 1] > lo) { /* keep them sorted by lo */
+		r->lo[i] = r->lo[i - 1];
+		r->hi[i] = r->hi[i - 1];
+		i--;
+	}
+	r->lo[i] = lo;
+	r->hi[i] = hi;
+	n++;
+	int k = 0; /* join overlapping or adjacent neighbours */
+	for (int j = 1; j < n; j++) {
+		if (r->lo[j] <= r->hi[k]) {
+			if (r->hi[j] > r->hi[k])
+				r->hi[k] = r->hi[j];
+		} else {
+			k++;
+			r->lo[k] = r->lo[j];
+			r->hi[k] = r->hi[j];
+		}
+	}
+	n = k + 1;
+	if (n > KW_MAX_RANGES) { /* too many: join the two closest (never less than the writes) */
+		int best = 0;
+		for (int j = 1; j + 1 < n; j++)
+			if (r->lo[j + 1] - r->hi[j] < r->lo[best + 1] - r->hi[best])
+				best = j;
+		r->hi[best] = r->hi[best + 1];
+		for (int j = best + 1; j + 1 < n; j++) {
+			r->lo[j] = r->lo[j + 1];
+			r->hi[j] = r->hi[j + 1];
+		}
+		n--;
+	}
+	r->n = n;
+}
+
+/*
+ * Bytes read back into a mapped shadow: a word the CPU changed since the
+ * last flush (the shadow differs from the last-sent copy) keeps the CPU's
+ * value, as the GPU cannot have written it too (that would be a data race
+ * the app may not have); the next flush sends it. Unmapped memory (no
+ * last-sent copy) has no CPU writes.
+ */
+static void merge_read(uint8_t *shadow, uint8_t *sent, const uint8_t *bin, size_t n)
+{
+	if (!sent) {
+		memcpy(shadow, bin, n);
+		return;
+	}
+	size_t i = 0;
+	for (; i + 4 <= n; i += 4) {
+		if (!memcmp(shadow + i, sent + i, 4))
+			memcpy(shadow + i, bin + i, 4);
+		memcpy(sent + i, bin + i, 4);
+	}
+	for (; i < n; i++) {
+		if (shadow[i] == sent[i])
+			shadow[i] = bin[i];
+		sent[i] = bin[i];
+	}
+}
+
 void kw_readback(struct kw_device *d, struct kw_memory *only)
 {
 	enum { MAXR = 64 };
 	struct kw_buffer *bs[MAXR];
 	uint32_t rs[MAXR];
+	uint64_t offs[MAXR];
 	int64_t t0 = kw_now();
 	/* one readback at a time: a thread that finds nothing marked must not
 	 * read its shadow while another thread's readback of it is in flight */
 	pthread_mutex_lock(&d->rb_mu);
 	for (;;) {
-		int n = 0;
+		int n = 0, more = 0;
 		pthread_mutex_lock(&d->mu);
-		for (struct kw_buffer *b = d->buffers; b && n < MAXR; b = b->next) {
+		for (struct kw_buffer *b = d->buffers; b; b = b->next) {
 			/* without `only` (a wait), read back only what is mapped now:
 			 * the rest stays dirty until vkMapMemory reads it */
-			if (!b->gpu_dirty || !b->mem || !b->mem->shadow || (only ? b->mem != only : !b->mem->mapped))
+			if (!b->dirty.n || !b->mem || !b->mem->shadow || (only ? b->mem != only : !b->mem->mapped))
 				continue;
-			b->gpu_dirty = 0;
+			if (n + b->dirty.n > MAXR) {
+				more = 1;
+				break;
+			}
+			struct kw_ranges r = b->dirty;
+			b->dirty.n = 0;
 			if (b->offset >= b->mem->size)
 				continue;
-			uint64_t size = round4(b->size), room = round4(b->mem->size) - b->offset;
+			/* only the ranges submitted work may have written (vk/PROTOCOL.md) */
+			uint64_t size = (b->size + 3) & ~3ull, room = round4(b->mem->size) - b->offset;
 			if (size > room)
 				size = room;
-			struct jb j = {0};
-			jb_printf(&j, "{\"op\":\"readBuffer\",\"buffer\":%u,\"offset\":0,\"size\":%llu}", b->id, (unsigned long long)size);
-			bs[n] = b;
-			rs[n++] = link_send(d->link, &j, NULL, 0, 1);
-			jb_free(&j);
+			for (int k = 0; k < r.n; k++) {
+				uint64_t lo = r.lo[k] & ~3ull, hi = r.hi[k] < size ? (r.hi[k] + 3) & ~3ull : size;
+				if (hi > size)
+					hi = size;
+				if (lo >= hi)
+					continue;
+				struct jb j = {0};
+				jb_printf(&j, "{\"op\":\"readBuffer\",\"buffer\":%u,\"offset\":%llu,\"size\":%llu}", b->id, (unsigned long long)lo,
+					  (unsigned long long)(hi - lo));
+				bs[n] = b;
+				offs[n] = lo;
+				rs[n++] = link_send(d->link, &j, NULL, 0, 1);
+				jb_free(&j);
+			}
 		}
 		pthread_mutex_unlock(&d->mu);
-		if (!n)
+		if (!n && !more)
 			break;
 		for (int i = 0; i < n; i++) {
 			struct kw_reply *rep = link_wait(d->link, rs[i]);
 			/* the shadow would keep stale bytes: the device is lost instead */
 			if (kw_reply_lost(d->link, rep, "reading back a buffer the GPU wrote")) {
 				reply_free(rep);
+				more = 0;
 				break;
 			}
 			kw_stats.read_bytes += rep->binlen;
@@ -818,17 +905,15 @@ void kw_readback(struct kw_device *d, struct kw_memory *only)
 			struct kw_buffer *x = d->buffers;
 			while (x && x != b)
 				x = x->next;
-			if (x && b->mem && rep->bin) {
-				uint64_t room = round4(b->mem->size) - b->offset;
+			if (x && b->mem && rep->bin && b->offset + offs[i] < round4(b->mem->size)) {
+				uint64_t at = b->offset + offs[i], room = round4(b->mem->size) - at;
 				size_t n2 = rep->binlen < room ? rep->binlen : room;
-				memcpy(b->mem->shadow + b->offset, rep->bin, n2);
-				if (b->mem->sent)
-					memcpy(b->mem->sent + b->offset, rep->bin, n2);
+				merge_read(b->mem->shadow + at, b->mem->sent ? b->mem->sent + at : NULL, rep->bin, n2);
 			}
 			pthread_mutex_unlock(&d->mu);
 			reply_free(rep);
 		}
-		if (n < MAXR)
+		if (!more || d->link->dead)
 			break;
 	}
 	pthread_mutex_unlock(&d->rb_mu);
@@ -888,7 +973,7 @@ static API void CALL kw_vkGetBufferMemoryRequirements(VkDevice d, VkBuffer bh, V
 	struct kw_buffer *b = HANDLE(struct kw_buffer, bh);
 	r->alignment = 256;
 	r->size = (round4(b->size) + 255) & ~255ull;
-	r->memoryTypeBits = 7;
+	r->memoryTypeBits = 3;
 }
 
 static API VkResult CALL kw_vkBindBufferMemory(VkDevice dh, VkBuffer bh, VkDeviceMemory mh, VkDeviceSize off)
@@ -995,7 +1080,7 @@ static API void CALL kw_vkGetImageMemoryRequirements(VkDevice d, VkImage i, VkMe
 	(void)d, (void)i;
 	r->size = 256;
 	r->alignment = 256;
-	r->memoryTypeBits = 7;
+	r->memoryTypeBits = 3;
 }
 
 static API VkResult CALL kw_vkBindImageMemory(VkDevice d, VkImage i, VkDeviceMemory m, VkDeviceSize o)
@@ -1258,11 +1343,37 @@ static struct kw_pipe *new_pipe(struct kw_device *d, const VkPipelineShaderStage
 
 DESTROY_FN(ShaderModule, VkShaderModule)
 
+static int dsl_cmp(const void *a, const void *b)
+{
+	uint32_t x = ((const struct kw_dsl_binding *)a)->binding, y = ((const struct kw_dsl_binding *)b)->binding;
+	return x < y ? -1 : x > y;
+}
+
+static void dsl_unref(struct kw_dsl *l)
+{
+	if (l && __atomic_sub_fetch(&l->refs, 1, __ATOMIC_ACQ_REL) == 0)
+		free(l);
+}
+
 static API VkResult CALL kw_vkCreateDescriptorSetLayout(VkDevice dh, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out)
 {
 	(void)a;
 	struct kw_device *d = DEV(dh);
-	struct kw_obj *o = new_obj(d);
+	struct kw_dsl *o = calloc(1, sizeof *o + ci->bindingCount * sizeof o->b[0]);
+	if (!o)
+		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	o->id = link_id(d->link);
+	o->refs = 1;
+	o->n = ci->bindingCount;
+	for (uint32_t i = 0; i < ci->bindingCount; i++)
+		o->b[i] = (struct kw_dsl_binding){ci->pBindings[i].binding, ci->pBindings[i].descriptorType, ci->pBindings[i].descriptorCount, 0};
+	qsort(o->b, o->n, sizeof o->b[0], dsl_cmp);
+	/* dynamic offsets come in binding order, one per array element (as the host counts them) */
+	for (uint32_t i = 0, ndyn = 0; i < o->n; i++) {
+		o->b[i].dyn = ndyn;
+		if (o->b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || o->b[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+			ndyn += o->b[i].count;
+	}
 	struct jb j = {0};
 	jb_printf(&j, "{\"op\":\"vkCreateDescriptorSetLayout\",\"id\":%u,\"flags\":%u,\"bindings\":[", o->id, ci->flags);
 	for (uint32_t i = 0; i < ci->bindingCount; i++) {
@@ -1283,7 +1394,15 @@ static API VkResult CALL kw_vkCreateDescriptorSetLayout(VkDevice dh, const VkDes
 	*out = (VkDescriptorSetLayout)(uintptr_t)o;
 	return VK_SUCCESS;
 }
-DESTROY_FN(DescriptorSetLayout, VkDescriptorSetLayout)
+static API void CALL kw_vkDestroyDescriptorSetLayout(VkDevice d, VkDescriptorSetLayout h, const VkAllocationCallbacks *a)
+{
+	(void)a;
+	struct kw_dsl *l = HANDLE(struct kw_dsl, h);
+	if (!l)
+		return;
+	destroy_id(DEV(d), l->id);
+	dsl_unref(l); /* its sets keep the binding table */
+}
 
 static API VkResult CALL kw_vkCreatePipelineLayout(VkDevice dh, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineLayout *out)
 {
@@ -1711,6 +1830,7 @@ static void free_sets(struct kw_device *d, struct kw_dpool *p, struct kw_dset *o
 			destroy_ids(d->link, ids, n);
 			n = 0;
 		}
+		dsl_unref(s->layout);
 		free(s->slots);
 		free(s);
 		s = next;
@@ -1745,6 +1865,9 @@ static API VkResult CALL kw_vkAllocateDescriptorSets(VkDevice dh, const VkDescri
 		struct kw_dset *s = calloc(1, sizeof *s);
 		s->id = link_id(d->link);
 		s->pool = p;
+		s->layout = HANDLE(struct kw_dsl, ai->pSetLayouts[i]);
+		if (s->layout)
+			__atomic_add_fetch(&s->layout->refs, 1, __ATOMIC_ACQ_REL);
 		s->next = p->sets;
 		if (p->sets)
 			p->sets->prev = s;
@@ -1766,15 +1889,65 @@ static API VkResult CALL kw_vkFreeDescriptorSets(VkDevice dh, VkDescriptorPool p
 	return VK_SUCCESS;
 }
 
-static void set_slot(struct kw_dset *s, uint32_t binding, uint32_t elem, struct kw_buffer *b)
+/*
+ * A position in a set for Vulkan's consecutive binding updates: a write or
+ * copy of N descriptors from (binding, element) goes on, past a binding's
+ * last element, at element 0 of the next binding by number that has
+ * descriptors (zero-count bindings are skipped). The host numbers them the
+ * same way (vk-host.ts, vkUpdateDescriptorSets), a binding the layout lacks
+ * counting as one descriptor.
+ */
+struct dpos {
+	uint32_t binding, elem;
+	int i; /* index in the layout's bindings, -1: not in it */
+};
+static void dpos_init(const struct kw_dsl *l, struct dpos *p, uint32_t binding, uint32_t elem)
+{
+	p->binding = binding;
+	p->elem = elem;
+	p->i = -1;
+	for (uint32_t k = 0; l && k < l->n; k++)
+		if (l->b[k].binding == binding)
+			p->i = (int)k;
+}
+/* settles p on a descriptor; 0 past the last binding */
+static int dpos_settle(const struct kw_dsl *l, struct dpos *p)
+{
+	if (!l)
+		return 1;
+	while (p->elem >= (p->i >= 0 ? l->b[p->i].count : 1)) {
+		int next = -1;
+		for (uint32_t k = 0; k < l->n && next < 0; k++)
+			if (l->b[k].binding > p->binding)
+				next = (int)k;
+		if (next < 0)
+			return 0;
+		p->i = next;
+		p->binding = l->b[next].binding;
+		p->elem = 0;
+	}
+	return 1;
+}
+/* the index of p's dynamic offset among the set's, -1 when not dynamic */
+static int dpos_dyn(const struct kw_dsl *l, const struct dpos *p)
+{
+	if (!l || p->i < 0)
+		return -1;
+	const struct kw_dsl_binding *b = &l->b[p->i];
+	if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && b->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+		return -1;
+	return (int)(b->dyn + p->elem);
+}
+
+static void set_slot(struct kw_dset *s, const struct kw_dslot *v)
 {
 	for (size_t i = 0; i < s->nslots; i++)
-		if (s->slots[i].binding == binding && s->slots[i].elem == elem) {
-			s->slots[i].buf = b;
+		if (s->slots[i].binding == v->binding && s->slots[i].elem == v->elem) {
+			s->slots[i] = *v;
 			return;
 		}
 	s->slots = realloc(s->slots, (s->nslots + 1) * sizeof *s->slots);
-	s->slots[s->nslots++] = (struct kw_dslot){binding, elem, b};
+	s->slots[s->nslots++] = *v;
 }
 
 static API void CALL kw_vkUpdateDescriptorSets(VkDevice dh, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c)
@@ -1808,8 +1981,13 @@ static API void CALL kw_vkUpdateDescriptorSets(VkDevice dh, uint32_t nw, const V
 		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
 		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
 		case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+		case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
 			JS(&j, ",\"bufferInfo\":[");
+			/* storage buffers are tracked where they really land (consecutive binding updates) */
+			int storage = x->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+				      x->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+			struct dpos at;
+			dpos_init(s->layout, &at, x->dstBinding, x->dstArrayElement);
 			for (uint32_t k = 0; k < x->descriptorCount; k++) {
 				const VkDescriptorBufferInfo *bi = &x->pBufferInfo[k];
 				struct kw_buffer *b = HANDLE(struct kw_buffer, bi->buffer);
@@ -1817,12 +1995,14 @@ static API void CALL kw_vkUpdateDescriptorSets(VkDevice dh, uint32_t nw, const V
 					  (unsigned long long)bi->offset);
 				j_size(&j, bi->range);
 				JS(&j, "}");
-				if (x->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-				    x->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
-					set_slot(s, x->dstBinding, x->dstArrayElement + k, b);
+				if (storage && dpos_settle(s->layout, &at)) {
+					set_slot(s, &(struct kw_dslot){at.binding, at.elem, b, bi->offset, bi->range, dpos_dyn(s->layout, &at)});
+					at.elem++;
+				}
 			}
 			JS(&j, "]");
 			break;
+		}
 		default:
 			kw_log("descriptor type %u is unsupported", x->descriptorType);
 			JS(&j, ",\"texelBufferView\":[");
@@ -1840,10 +2020,25 @@ static API void CALL kw_vkUpdateDescriptorSets(VkDevice dh, uint32_t nw, const V
 			      "\"dstArrayElement\":%u,\"descriptorCount\":%u}",
 			  i ? "," : "", src->id, x->srcBinding, x->srcArrayElement, dst->id, x->dstBinding, x->dstArrayElement,
 			  x->descriptorCount);
-		for (uint32_t k = 0; k < x->descriptorCount; k++)
+		/* both sides follow the consecutive binding updates */
+		struct dpos sp, dp;
+		dpos_init(src->layout, &sp, x->srcBinding, x->srcArrayElement);
+		dpos_init(dst->layout, &dp, x->dstBinding, x->dstArrayElement);
+		for (uint32_t k = 0; k < x->descriptorCount; k++) {
+			if (!dpos_settle(src->layout, &sp) || !dpos_settle(dst->layout, &dp))
+				break;
 			for (size_t q = 0; q < src->nslots; q++)
-				if (src->slots[q].binding == x->srcBinding && src->slots[q].elem == x->srcArrayElement + k)
-					set_slot(dst, x->dstBinding, x->dstArrayElement + k, src->slots[q].buf);
+				if (src->slots[q].binding == sp.binding && src->slots[q].elem == sp.elem) {
+					struct kw_dslot v = src->slots[q];
+					v.binding = dp.binding;
+					v.elem = dp.elem;
+					v.dyn = dpos_dyn(dst->layout, &dp);
+					set_slot(dst, &v);
+					break;
+				}
+			sp.elem++;
+			dp.elem++;
+		}
 	}
 	JS(&j, "]}");
 	send_msg(d, &j, NULL, 0);
@@ -2196,6 +2391,7 @@ static void cb_reset(struct kw_cmdbuf *cb)
 	cb->nwritten = 0;
 	memset(cb->pipe, 0, sizeof cb->pipe);
 	memset(cb->sets, 0, sizeof cb->sets);
+	memset(cb->ndyn, 0, sizeof cb->ndyn);
 	cb->bad[0] = 0;
 }
 
@@ -2292,18 +2488,55 @@ static API VkResult CALL kw_vkResetCommandBuffer(VkCommandBuffer c, VkCommandBuf
 	return VK_SUCCESS;
 }
 
-static void cb_written(struct kw_cmdbuf *cb, struct kw_buffer *b)
+/*
+ * The GPU may write [lo, hi) of b (hi past the end: to its end). A range may
+ * only be narrower than the buffer where the command says exactly what it
+ * writes; when unsure, the whole buffer (vk/PROTOCOL.md, readBuffer).
+ */
+#define KW_WHOLE UINT64_MAX
+static void cb_written_range(struct kw_cmdbuf *cb, struct kw_buffer *b, uint64_t lo, uint64_t hi)
 {
 	if (!b)
 		return;
+	uint64_t end = (b->size + 3) & ~3ull; /* host buffers are rounded up to 4 */
+	if (hi > end)
+		hi = end;
+	lo &= ~3ull;
+	if (lo >= hi)
+		return;
 	for (size_t i = 0; i < cb->nwritten; i++)
-		if (cb->written[i] == b)
+		if (cb->written[i].buf == b) {
+			kw_ranges_add(&cb->written[i].r, lo, hi);
 			return;
+		}
 	if (cb->nwritten == cb->capwritten) {
 		cb->capwritten = cb->capwritten ? cb->capwritten * 2 : 16;
 		cb->written = realloc(cb->written, cb->capwritten * sizeof *cb->written);
 	}
-	cb->written[cb->nwritten++] = b;
+	struct kw_written *w = &cb->written[cb->nwritten++];
+	w->buf = b;
+	w->r.n = 0;
+	kw_ranges_add(&w->r, lo, hi);
+}
+static void cb_written(struct kw_cmdbuf *cb, struct kw_buffer *b) { cb_written_range(cb, b, 0, KW_WHOLE); }
+
+/* a storage buffer descriptor as bound: [offset + dynamic offset, + range) */
+static void cb_written_slot(struct kw_cmdbuf *cb, const struct kw_dslot *v, const uint32_t *dyn, uint32_t ndyn)
+{
+	struct kw_buffer *b = v->buf;
+	if (!b)
+		return;
+	uint64_t off = v->offset;
+	if (v->dyn >= 0) {
+		if ((uint32_t)v->dyn >= ndyn) { /* offsets not kept: all of it */
+			cb_written(cb, b);
+			return;
+		}
+		off += dyn[v->dyn];
+	}
+	/* VK_WHOLE_SIZE: the size minus the descriptor's offset, from the dynamic offset on */
+	uint64_t range = v->range == VK_WHOLE_SIZE ? (b->size > v->offset ? b->size - v->offset : 0) : v->range;
+	cb_written_range(cb, b, off, range > KW_WHOLE - off ? KW_WHOLE : off + range);
 }
 
 /* starts a command object: {"c":"name" */
@@ -2362,7 +2595,7 @@ static void mark_written(VkCommandBuffer c, int bp)
 			for (int i = 0; !w && i < p->nw; i++)
 				w = p->w[i] == ((uint32_t)s << 16 | (ds->slots[k].binding & 0xffff));
 			if (w)
-				cb_written(cb, ds->slots[k].buf);
+				cb_written_slot(cb, &ds->slots[k], cb->dyn[bp][s], cb->ndyn[bp][s]);
 		}
 	}
 }
@@ -2372,14 +2605,31 @@ static API void CALL kw_vkCmdBindDescriptorSets(VkCommandBuffer c, VkPipelineBin
 {
 	struct jb *b = cmd(c, "vkCmdBindDescriptorSets");
 	jb_printf(b, ",\"pipelineBindPoint\":%u,\"layout\":%u,\"firstSet\":%u,\"descriptorSets\":[", bp, OID(layout), first);
+	uint32_t di = 0; /* the sets' dynamic offsets follow one another, in set order */
 	for (uint32_t i = 0; i < n; i++) {
 		struct kw_dset *s = HANDLE(struct kw_dset, sets[i]);
 		jb_printf(b, i ? ",%u" : "%u", s ? s->id : 0);
-		if (bp <= 1 && first + i < KW_MAX_SETS)
+		uint32_t nd = 0;
+		if (s && s->layout && s->layout->n) {
+			const struct kw_dsl_binding *lb = &s->layout->b[s->layout->n - 1];
+			nd = lb->dyn + (lb->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+						lb->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+					? lb->count
+					: 0);
+		}
+		uint32_t have = di < ndyn ? ndyn - di : 0;
+		if (have > nd)
+			have = nd;
+		if (bp <= 1 && first + i < KW_MAX_SETS) {
 			CB(c)->sets[bp][first + i] = s;
-		else if (s) /* another bind point: mark them all now */
+			uint32_t keep = have < KW_MAX_DYN ? have : KW_MAX_DYN; /* past KW_MAX_DYN: whole buffers */
+			if (keep)
+				memcpy(CB(c)->dyn[bp][first + i], dyn + di, keep * sizeof *dyn);
+			CB(c)->ndyn[bp][first + i] = keep;
+		} else if (s) /* another bind point: mark them all now */
 			for (size_t k = 0; k < s->nslots; k++)
 				cb_written(CB(c), s->slots[k].buf);
+		di += nd;
 	}
 	JS(b, "],\"dynamicOffsets\":");
 	j_u32s(b, dyn, ndyn);
@@ -2524,11 +2774,13 @@ static API void CALL kw_vkCmdCopyBuffer(VkCommandBuffer c, VkBuffer src, VkBuffe
 {
 	struct jb *b = cmd(c, "vkCmdCopyBuffer");
 	jb_printf(b, ",\"srcBuffer\":%u,\"dstBuffer\":%u,\"regions\":[", BUFID(src), BUFID(dst));
-	for (uint32_t i = 0; i < n; i++)
+	for (uint32_t i = 0; i < n; i++) {
 		jb_printf(b, "%s{\"srcOffset\":%llu,\"dstOffset\":%llu,\"size\":%llu}", i ? "," : "", (unsigned long long)r[i].srcOffset,
 			  (unsigned long long)r[i].dstOffset, (unsigned long long)r[i].size);
+		/* the host writes exactly [dstOffset, dstOffset + size) */
+		cb_written_range(CB(c), HANDLE(struct kw_buffer, dst), r[i].dstOffset, r[i].dstOffset + r[i].size);
+	}
 	JS(b, "]}");
-	cb_written(CB(c), HANDLE(struct kw_buffer, dst));
 }
 
 static API void CALL kw_vkCmdCopyImage(VkCommandBuffer c, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t n, const VkImageCopy *r)
@@ -2602,7 +2854,10 @@ static API void CALL kw_vkCmdCopyImageToBuffer(VkCommandBuffer c, VkImage src, V
 	struct jb *b = cmd(c, "vkCmdCopyImageToBuffer");
 	jb_printf(b, ",\"srcImage\":%u,\"srcImageLayout\":%u,\"dstBuffer\":%u", OID(src), sl, BUFID(dst));
 	j_bic(b, r, n);
-	cb_written(CB(c), HANDLE(struct kw_buffer, dst));
+	/* from each region's bufferOffset to the end (the footprint needs the
+	 * format's block size, which the ICD does not keep) */
+	for (uint32_t i = 0; i < n; i++)
+		cb_written_range(CB(c), HANDLE(struct kw_buffer, dst), r[i].bufferOffset, KW_WHOLE);
 }
 
 static API void CALL kw_vkCmdUpdateBuffer(VkCommandBuffer c, VkBuffer dst, VkDeviceSize off, VkDeviceSize size, const void *data)
@@ -2611,7 +2866,7 @@ static API void CALL kw_vkCmdUpdateBuffer(VkCommandBuffer c, VkBuffer dst, VkDev
 	jb_printf(b, ",\"dstBuffer\":%u,\"dstOffset\":%llu,\"data\":", BUFID(dst), (unsigned long long)off);
 	j_bytes(b, data, size);
 	JS(b, "}");
-	cb_written(CB(c), HANDLE(struct kw_buffer, dst));
+	cb_written_range(CB(c), HANDLE(struct kw_buffer, dst), off, off + size);
 }
 
 static API void CALL kw_vkCmdFillBuffer(VkCommandBuffer c, VkBuffer dst, VkDeviceSize off, VkDeviceSize size, uint32_t data)
@@ -2620,7 +2875,7 @@ static API void CALL kw_vkCmdFillBuffer(VkCommandBuffer c, VkBuffer dst, VkDevic
 	jb_printf(b, ",\"dstBuffer\":%u,\"dstOffset\":%llu,\"size\":", BUFID(dst), (unsigned long long)off);
 	j_size(b, size);
 	jb_printf(b, ",\"data\":%u}", data);
-	cb_written(CB(c), HANDLE(struct kw_buffer, dst));
+	cb_written_range(CB(c), HANDLE(struct kw_buffer, dst), off, size == VK_WHOLE_SIZE || size > KW_WHOLE - off ? KW_WHOLE : off + size);
 }
 
 static void j_ranges(struct jb *b, const VkImageSubresourceRange *r, uint32_t n)
@@ -2707,7 +2962,8 @@ static API void CALL kw_vkCmdExecuteCommands(VkCommandBuffer c, uint32_t n, cons
 			JS(&p->cmds, ",");
 		jb_put(&p->cmds, s->cmds.p, s->cmds.n);
 		for (size_t k = 0; k < s->nwritten; k++)
-			cb_written(p, s->written[k]);
+			for (int q = 0; q < s->written[k].r.n; q++)
+				cb_written_range(p, s->written[k].buf, s->written[k].r.lo[q], s->written[k].r.hi[q]);
 		if (s->bad[0] && !p->bad[0])
 			snprintf(p->bad, sizeof p->bad, "%s", s->bad);
 	}
@@ -2748,7 +3004,10 @@ static API void CALL kw_vkCmdCopyQueryPoolResults(VkCommandBuffer c, VkQueryPool
 {
 	jb_printf(cmd(c, "vkCmdCopyQueryPoolResults"), ",\"queryPool\":%u,\"firstQuery\":%u,\"queryCount\":%u,\"dstBuffer\":%u,\"dstOffset\":%llu,"
 		  "\"stride\":%llu,\"flags\":%u}", QID(q), f, n, BUFID(b), (unsigned long long)o, (unsigned long long)s, fl);
-	cb_written(CB(c), HANDLE(struct kw_buffer, b));
+	/* query i at o + i * stride: a value (8 bytes with 64-bit results, else 4), plus availability */
+	uint64_t one = (fl & VK_QUERY_RESULT_64_BIT ? 8 : 4) * (fl & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT ? 2 : 1);
+	if (n)
+		cb_written_range(CB(c), HANDLE(struct kw_buffer, b), o, o + (uint64_t)(n - 1) * (s ? s : one) + one);
 }
 
 /* ---- queue ---- */
@@ -2793,7 +3052,8 @@ static API VkResult CALL kw_vkQueueSubmit(VkQueue qh, uint32_t n, const VkSubmit
 				any = 1;
 			}
 			for (size_t w = 0; w < cb->nwritten; w++)
-				cb->written[w]->gpu_dirty = 1;
+				for (int q = 0; q < cb->written[w].r.n; q++)
+					kw_ranges_add(&cb->written[w].buf->dirty, cb->written[w].r.lo[q], cb->written[w].r.hi[q]);
 		}
 	JS(&j, "]}");
 	if (f) {

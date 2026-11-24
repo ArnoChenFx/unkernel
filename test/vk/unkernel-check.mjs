@@ -28,9 +28,21 @@
 //      then weston-screenshooter takes the screen with a running vkcube
 //      (vkcube.png in --out): the window must have many colours and the
 //      LunarG texture's teal, not olive (red and blue swapped)
+//   w  vkcube on Wayland through wland: wland/headless on the page (from
+//      web/node_modules/wland) serves vsock port 1023 with
+//      gpu.resolveExternal = vm.vk.externalImage, the relay runs in the
+//      guest (--relay FILE: an aarch64 wlandr pushed to /tmp/kwvk-wlandr,
+//      else the image's). With a relay that has --external-buffers: vkcube
+//      (IMMEDIATE) at each --wsizes size (default 500x500,1280x720) for
+//      --wsecs seconds (default 6) by external buffers (frames right, no
+//      byte read back per present, every present an external commit), then
+//      with KWVK_EXTERNAL=0 (readback into wl_shm) for comparison; frames/s
+//      and bytes read back per frame are printed. Always: a relay without
+//      the flag (no global): vkcube --c 150 must exit 0 over wl_shm with its
+//      window right (the fallback)
 //
-//   node test/vk/unkernel-check.mjs [--worker] [--skip h,a,b,c] [--tests DIR] [--no-push] [--kernel FILE] [--apps] [--snapshot] [--lose] [--cpus N] [--capture-shaders] [--disk FILE]
-//        [--device-re REGEX] [--cmd SHELL] [--out DIR] [--browser BIN] [--timeout S] [--no-build | --source]
+//   node test/vk/unkernel-check.mjs [--worker] [--skip h,a,b,c,w] [--tests DIR] [--no-push] [--kernel FILE] [--apps] [--snapshot] [--lose] [--cpus N] [--capture-shaders] [--disk FILE]
+//        [--relay FILE] [--wsizes WxH,...] [--wsecs S] [--device-re REGEX] [--cmd SHELL] [--out DIR] [--browser BIN] [--timeout S] [--no-build | --source]
 //
 // --lose adds step l: the renderer's WebGPU device destroyed (vm.vk.device)
 // while vkcube runs: vkcube must end, vm.vk.status must say lost, and
@@ -80,7 +92,9 @@ const timeout = Number(opt("--timeout", "1800")) * 1000;
 const browser = opt("--browser", process.env.CHROME || join(homedir(), ".cache/ms-playwright/chromium-1234/chrome-linux64/chrome"));
 process.removeAllListeners("warning"); // stripTypeScriptTypes is experimental
 const WEBGPU_FLAGS = ["--headless", "--no-sandbox", "--disable-gpu-sandbox", "--enable-unsafe-webgpu",
-	"--enable-features=Vulkan,WebGPU", "--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--ignore-gpu-blocklist", "--disable-dev-shm-usage"];
+	"--enable-features=Vulkan,WebGPU", "--use-vulkan=swiftshader", "--use-webgpu-adapter=swiftshader", "--ignore-gpu-blocklist", "--disable-dev-shm-usage",
+	// a GL backend for WebGPU canvases (external present's pictures; without it Chrome destroys the device: vk.ts probeCanvas)
+	"--use-angle=swiftshader", "--enable-unsafe-swiftshader"];
 const out = resolve(opt("--out", "") || mkdtempSync("/tmp/kwvk."));
 mkdirSync(out, { recursive: true });
 const apps = has("--apps");
@@ -91,6 +105,11 @@ const builtManifest = join(build, "vk/kw_icd.json"), manifest = existsSync(built
 const testDir = resolve(opt("--tests", join(build, "vk")));
 const skip = new Set((opt("--skip", "") || "").split(",").filter(Boolean));
 let push = !has("--no-push");
+const relay = opt("--relay") ? resolve(opt("--relay")) : "";
+if (relay && !existsSync(relay)) {
+	console.error(`no ${relay} (--relay)`);
+	process.exit(2);
+}
 
 const step = (what, cmd, cmdArgs) => {
 	console.log(`== ${what}`);
@@ -191,6 +210,7 @@ const server = createServer(async (req, res) => {
 	if (p === "/img/debian-vk.img") return sendFile(req, res, disk, "application/octet-stream");
 	if (p === "/files/libvulkan_kw.so" && push) return sendFile(req, res, icd, "application/octet-stream");
 	if (p === "/files/kw_icd.json") return sendFile(req, res, manifest, "application/json");
+	if (p === "/files/wlandr" && relay) return sendFile(req, res, relay, "application/octet-stream");
 	if (p.startsWith("/files/test/") && tests.includes(p.slice(12))) return sendFile(req, res, join(testDir, p.slice(12)), "application/octet-stream");
 	if (source && p === "/js/kwvk-naga.wasm") return sendFile(req, res, join(build, "vk/kwvk-naga.wasm"), "application/wasm");
 	if (source && p.startsWith("/js/") && p.endsWith(".ts")) {
@@ -215,7 +235,7 @@ const server = createServer(async (req, res) => {
 		}
 		console.log(`the page asked for ${rel}, which does not exist`);
 	}
-	for (const [prefix, dir] of [["/dist/", join(root, "dist")], ["/js/", join(root, "js")], ["/test/", here]]) {
+	for (const [prefix, dir] of [["/dist/", join(root, "dist")], ["/js/", join(root, "js")], ["/test/", here], ["/wland/", join(root, "web/node_modules/wland/dist")]]) {
 		if (prefix === "/js/" && !source) continue;
 		if (!p.startsWith(prefix)) continue;
 		const rel = normalize(p.slice(prefix.length));
@@ -237,6 +257,9 @@ if (opt("--kernel")) query.set("kernel", "/img/unkernel.wasm");
 if (has("--snapshot")) query.set("snap", "1");
 if (has("--lose")) query.set("lose", "1");
 if (opt("--cpus")) query.set("cpus", opt("--cpus"));
+if (relay) query.set("relay", "1");
+if (opt("--wsizes")) query.set("wsizes", opt("--wsizes"));
+if (opt("--wsecs")) query.set("wsecs", opt("--wsecs"));
 const pageUrl = `http://127.0.0.1:${server.address().port}/test/unkernel.html?${query}`;
 console.log(`== ${pageUrl}\n   output in ${out}`);
 const t0 = Date.now();
@@ -316,6 +339,30 @@ if (res.steps["vkcube-shot"]) {
 		detail = `${img.width}x${img.height}, ${colours.size} colours, ${teal} teal and ${olive} olive pixels (${file})`;
 	}
 	report("vkcube frame", ok, detail);
+}
+if (res.wland) {
+	const wl = res.wland, good = (f) => !!f && f.colours > 500 && f.teal > 200 && f.teal > 4 * f.olive;
+	const fr = (f) => (f ? `${f.width}x${f.height} ${f.colours} colours, ${f.teal} teal, ${f.olive} olive` : "no frame");
+	console.log(`wland: relay ${wl.relay?.path} (${(wl.relay?.version ?? "").replace(/\n/g, "; ")})${wl.error ? `; error ${wl.error}` : ""}${wl.errors?.length ? `; engine errors ${JSON.stringify(wl.errors)}` : ""}`);
+	if (wl.noExternal) report("wland external buffers", null, wl.noExternal);
+	for (const [name, p] of Object.entries(wl.phases ?? {})) {
+		if (name === "warmup") continue;
+		const ext = name.startsWith("ext");
+		const line = `${p.fps?.toFixed(1)} frames/s (${p.msPerFrame?.toFixed(1)} ms/frame), ${p.bytesReadPerFrame?.toFixed(0)} bytes read back/frame, ${p.presents} presents, ` +
+			`${p.externalPresents} external, ${p.externalCommits} external and ${p.shmCommits} shm commits, ${p.nullResolves} null resolves, resolve ${p.resolveMs?.toFixed(2)} ms; ` +
+			`externalBuffers ${p.externalBuffers}; ref ${JSON.stringify(p.lastRef)}; frame ${fr(p.frame)}; ICD: ${p.icd?.replace(/\n/g, " | ")}`;
+		const ok = ext
+			? p.presents > 10 && p.externalPresents === p.presents && p.bytesReadPerFrame === 0 && p.externalCommits > 0 && p.nullResolves === 0 && p.externalBuffers === true &&
+				p.lastRef?.width === p.width && p.lastRef?.height === p.height && good(p.frame)
+			// (bytes are counted at the reply, presents at the request: the window's edges differ by a frame)
+			: p.presents > 10 && p.externalPresents === 0 && p.bytesReadPerFrame >= 0.9 * p.width * p.height * 4 && p.shmCommits > 0 && good(p.frame);
+		report(`wland ${name}`, ok, line);
+	}
+	const f = wl.fallback;
+	if (f) report("wland fallback (no global: wl_shm)", f.exit === 0 && f.externalBuffers === false && f.shmCommits > 0 && f.externalCommits === 0 && f.bytesRead > 0 && good(f.frame),
+		`exit ${f.exit}; externalBuffers ${f.externalBuffers}; ${f.presents} presents, ${f.shmCommits} shm and ${f.externalCommits} external commits, ${f.bytesRead} bytes read back; frame ${fr(f.frame)}; ${f.out}`);
+	else if (!wl.error) report("wland fallback", false, "did not run");
+	if (wl.error) report("wland", false, wl.error);
 }
 if (res.snapshot) {
 	const sn = res.snapshot, v = res.steps["snap-vkcube"], cmp = res.steps["snap-compute"], vi = res.steps["snap-vulkaninfo"];

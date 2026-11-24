@@ -96,6 +96,23 @@ interface VkRendererLike {
 	/** `close`: the renderer ended the stream itself (device loss, a bad frame) */
 	connect(send: (bytes: Uint8Array) => void, close?: () => void): VkConnectionLike;
 	readonly stats?: object;
+	/** vk-host.ts VkRenderer.external(): an external buffer's picture, or null */
+	external?(ref: VkExternalRef): ImageBitmap | null;
+}
+
+/**
+ * An external buffer the guest's ICD made for a swapchain image (wland's
+ * ExternalRef: wland_external_buffer_manager_v1.create_buffer's arguments,
+ * the id as (id_hi << 32) | id_lo). vk/PROTOCOL.md, Amendments, "External present".
+ */
+export interface VkExternalRef {
+	id: bigint;
+	width: number;
+	height: number;
+	/** DRM fourcc: ARGB8888 / XRGB8888 (the ICD's B8G8R8A8 swapchains), ABGR8888 / XBGR8888 */
+	format: number;
+	/** 1 y_invert (the ICD never sets it) */
+	flags: number;
 }
 
 /** The renderer's modules (vk-host.ts, vk-shader.ts), as the entry that bundles them loads them. */
@@ -139,6 +156,48 @@ export function prepareVk(opt: VkOption | undefined, vsock: boolean, platform: V
 		return undefined;
 	}
 	return { opts, shaderWasm: opts.shaderWasm ?? platform.shaderWasm, load: () => platform.load() };
+}
+
+/**
+ * @internal Whether a WebGPU OffscreenCanvas can turn a texture into an
+ * ImageBitmap here (external present, VkRenderer.external()), tried on a
+ * device of its own: where that path is broken (headless Chrome without a GL
+ * backend for canvases: no --use-angle) Chrome destroys the device, which on
+ * the renderer's would cut off every Vulkan program. null when it works (or
+ * there is no OffscreenCanvas, where the renderer offers none), else why
+ * not; at most 2 s, in parallel with the renderer's own device request.
+ */
+export async function probeCanvas(gpu: { requestAdapter(o?: object): Promise<VkGpuAdapter | null> }): Promise<string | null> {
+	const OC = (globalThis as { OffscreenCanvas?: new (w: number, h: number) => any }).OffscreenCanvas;
+	if (!OC) return null; // the renderer offers no external present without one anyway
+	let dev: any;
+	try {
+		const adapter = await gpu.requestAdapter();
+		if (!adapter) return "no adapter for the probe";
+		dev = await adapter.requestDevice();
+		let lost: string | null = null;
+		dev.lost.then((i: { reason?: string; message?: string }) => (lost = `${i?.reason ?? "?"}: ${i?.message ?? ""}`));
+		const tex = dev.createTexture({ size: [4, 4], format: "bgra8unorm", usage: 1 | 4 }); // COPY_SRC | TEXTURE_BINDING
+		const cv = new OC(4, 4);
+		const ctx = cv.getContext("webgpu");
+		if (!ctx) return "no WebGPU context for an OffscreenCanvas";
+		ctx.configure({ device: dev, format: "bgra8unorm", usage: 2 | 16, alphaMode: "premultiplied" }); // COPY_DST | RENDER_ATTACHMENT
+		const e = dev.createCommandEncoder();
+		e.copyTextureToTexture({ texture: tex }, { texture: ctx.getCurrentTexture() }, [4, 4, 1]);
+		dev.queue.submit([e.finish()]);
+		cv.transferToImageBitmap().close();
+		const timeout = new Promise((r) => setTimeout(() => r("timeout"), 2000));
+		const done = await Promise.race([dev.queue.onSubmittedWorkDone().then(() => "done"), timeout]).catch((err: unknown) => `failed (${(err as Error)?.message ?? err})`);
+		await new Promise((r) => setTimeout(r, 20));
+		if (lost) return `the WebGPU canvas path destroyed its device (${lost})`;
+		return done === "done" ? null : `the WebGPU canvas path ${done}`;
+	} catch (err) {
+		return `the WebGPU canvas path threw (${(err as Error)?.message ?? err})`;
+	} finally {
+		try {
+			dev?.destroy();
+		} catch {}
+	}
 }
 
 /** @internal createKernel's `vk` once the kernel runs: a VkHost, or undefined. */
@@ -194,6 +253,31 @@ export class VkHost {
 		return this.#current ? this.#device : undefined;
 	}
 
+	/**
+	 * A page compositor's resolver for the ICD's external buffers (wland's
+	 * `gpu.resolveExternal`: give it the ref as wland does): the swapchain
+	 * image's current picture as an ImageBitmap of the caller's (close() it),
+	 * copied GPU to GPU on the renderer's device (no readback), row 0 at the
+	 * top, premultiplied alpha or opaque as the format says. Synchronous, on
+	 * this thread (the renderer's, in both modes). null keeps the surface's
+	 * last content: no renderer (not loaded, or lost), an id no live program
+	 * made (a wrong token, a destroyed image, an image not yet presented) or
+	 * a size, format or flags that are not the image's. It never starts the
+	 * load. The ICD uses external buffers only where wland offers its
+	 * wland_external_buffer_manager_v1, i.e. where the page passes this as
+	 * resolveExternal.
+	 */
+	externalImage(ref: VkExternalRef): ImageBitmap | null {
+		const r = this.#current;
+		if (!r?.external) return null;
+		try {
+			return r.external(ref);
+		} catch (e) {
+			this.#log(`[host] vk: externalImage: ${(e as Error)?.message ?? e}`);
+			return null;
+		}
+	}
+
 	/** Load the renderer now, as the guest's first Vulkan instance would; resolves as `loaded`. */
 	load(): Promise<string> {
 		this.#load().catch(() => {});
@@ -214,9 +298,12 @@ export class VkHost {
 		try {
 			const { opts } = this.#prep;
 			let adapter = opts.adapter, device = opts.device;
+			// external present (pictures through a WebGPU OffscreenCanvas) only where that path works (probeCanvas)
+			let canvas: Promise<string | null> = Promise.resolve(null);
 			if (!device) {
 				const gpu = (globalThis.navigator as unknown as { gpu?: { requestAdapter(o?: object): Promise<VkGpuAdapter | null> } }).gpu;
 				if (!gpu) throw new Error("no navigator.gpu");
+				canvas = probeCanvas(gpu);
 				adapter = (await gpu.requestAdapter(opts.powerPreference ? { powerPreference: opts.powerPreference } : undefined)) ?? undefined;
 				if (!adapter) throw new Error("navigator.gpu.requestAdapter() gave no adapter");
 				// Every feature the adapter has and its maximum limits: the ICD derives Vulkan's from them.
@@ -243,8 +330,10 @@ export class VkHost {
 				this.#status = { ...this.#status, state: fixed ? "failed" : "lost", error: `device lost (${why})` };
 				this.#log(`[host] vk: the WebGPU device was lost (${why}); its programs were cut off${fixed ? "; vk.device cannot be replaced" : ", the next one gets a new device"}`);
 			};
+			const broken = await canvas;
+			if (broken) this.#log(`[host] vk: no external present (Wayland windows by readback): ${broken}`);
 			renderer = new (VkRenderer as unknown as new (o: object) => VkRendererLike)({
-				device, adapter, shaders, onLost,
+				device, adapter, shaders, onLost, ...(broken ? { external: false } : {}),
 				log: (line: string) => verbose && this.#log(`[vk] ${line}`),
 			});
 			this.#current = renderer;

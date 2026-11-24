@@ -28,7 +28,7 @@ import { prefetchApkIndexes } from "./apk.ts";
 import { createAudioOut } from "./audio.ts";
 import { autoHide } from "./autohide.ts";
 import { AUTO_SUSPEND_HOLD_MS, AutoSuspend, AutoSuspendSkip, LEAVE_OFFER_MS, LEAVE_STAYED_MS, Pause, SuspendSaveError, allowLeave, autoSuspendLabel, pageLeaving, quietStart, resumeAskedFor, resumeChoice, resumedNote, sessionRoom, wantLeavePrompt, type SuspendFacts } from "./autosuspend.ts";
-import { CPUS_ONCE_KEY, GL_DISTROS, INLINE_ONCE_KEY, REPO, UP_ONCE_KEY, dataSizeCap } from "./config.ts";
+import { CPUS_ONCE_KEY, GL_DISTROS, INLINE_ONCE_KEY, REPO, UP_ONCE_KEY, dataSizeCap, vkAdapterBlocker } from "./config.ts";
 import { attachDataDisk, detachDataDisk, downloadKwsparse, exportDataDisk, importDataDisk, resetDataDisk, storageState, acquireDiskLock, type DataAttach } from "./data.ts";
 import { createDisplayUi } from "./display.ts";
 import { isPageChrome, ownsKeys } from "./focus.ts";
@@ -1296,7 +1296,11 @@ export function start(): void {
 			const total = r ? `; this renderer: ${r.presents ?? 0} presents, ${r.draws ?? 0} draws, ${r.submits ?? 0} submits, ${r.translations ?? 0} shaders translated, ${fmtMiB(r.bytesRead ?? 0)} read back, ${r.liveObjects ?? 0} live objects` : "";
 			const errors = r?.errors ? `; ${plural(r.errors, "renderer error")} (WebGPU validation or failed operations; the browser console has them)` : "";
 			const losses = st.losses ? `; the WebGPU device was lost ${st.losses === 1 ? "once" : `${st.losses} times`}` : "";
-			const now = `${plural(st.connections, "Vulkan instance")} now, ${st.opened} so far${frames ? `; ${frames}` : ""}${total}${errors}${losses}`;
+			// Wayland windows: zero-copy where wland offers external buffers on the relay's link (wayland/buffers.ts)
+			const ext = waylandApi.externalBuffers(), ws = waylandApi.stats();
+			const wl = ext === true ? `; Wayland windows: zero-copy presentation (external buffers: ${ws.extCommits} commits, ${ws.extImages} pictures${r ? `, ${r.externalPresents ?? 0} presents without readback` : ""})`
+				: ext === false ? `; Wayland windows: by readback into wl_shm (${cfg.wlGpu ? "the guest's relay has no external buffers" : "?wlgpu=0"})` : "";
+			const now = `${plural(st.connections, "Vulkan instance")} now, ${st.opened} so far${frames ? `; ${frames}` : ""}${total}${errors}${losses}${wl}`;
 			const key = `${s.state} ${s.adapter} ${now}`;
 			if (key === shown) return;
 			shown = key;
@@ -1648,6 +1652,11 @@ export function start(): void {
 		// first GL use (?glload=eager: before the boot); with it virtio-gpu, the guest's /dev/dri, 3D on
 		// that renderer (?gpu=0: none).
 		// And kwshm, for the Wayland desktop (wayland.ts; a resumed session keeps its own too).
+		// WebGPU without an adapter: this boot runs without guest Vulkan (config.ts vkAdapterBlocker()).
+		if (cfg.vk) {
+			const why = await vkAdapterBlocker();
+			if (why) Object.assign(cfg, { vk: false, vkBlocked: why, vkWhy: why });
+		}
 		const glDevices = () => ({
 			gl: cfg.gl && (cfg.glStrictWaits || cfg.glEager ? { ...(cfg.glStrictWaits ? { strictWaits: true } : {}), ...(cfg.glEager ? { eager: true } : {}) } : true),
 			gpu: cfg.gpu,

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
 // kwvk: surfaces (VkIcdSurface* layout), swapchains and
-// present. Wayland presents by reading the image back from the host into
-// a wl_shm buffer on a private event queue of the app's wl_display, X11
-// (xcb or Xlib surfaces) by xcb_put_image; libwayland-client and libxcb
-// are dlopen'ed, so the ICD has no link-time dependency.
-// Headless presents without readback.
+// present. Wayland presents without pixels where the compositor is the
+// page's wland and the host resolves its ids (external buffers: one
+// wl_buffer per swapchain image, named by the host's token and the image's
+// export id), else by reading the image back from the host into a wl_shm
+// buffer; both on a private event queue of the app's wl_display. X11 (xcb
+// or Xlib surfaces) presents by xcb_put_image; libwayland-client and
+// libxcb are dlopen'ed, so the ICD has no link-time dependency. Headless
+// presents without readback.
 #include "kwvk.h"
 
 #include <dlfcn.h>
@@ -91,6 +94,31 @@ static int wl_load(void)
 
 /* the interface's name is its first member */
 static const char *if_name(const struct wl_interface *i) { return *(const char *const *)i; }
+
+/* wland_external_buffer_manager_v1, version 1, written out by hand as
+ * wayland-scanner would from wland's protocol/wland-external-buffer-v1.xml
+ * (https://github.com/pithings/wland, MPL-2.0; only the interface's names
+ * and signatures are used here): wl_buffers named by an opaque 64-bit id
+ * that the page's embedder resolves, no fd and no pixels. Requests:
+ * destroy (0), create_buffer (1: new_id wl_buffer, id_hi, id_lo, width,
+ * height, format as a DRM fourcc, flags); no events. */
+struct kw_wl_message {
+	const char *name, *signature;
+	const struct wl_interface **types;
+};
+struct kw_wl_interface {
+	const char *name;
+	int version, method_count;
+	const struct kw_wl_message *methods;
+	int event_count;
+	const struct kw_wl_message *events;
+};
+static const struct wl_interface *ext_types[7]; /* [0] = wl_buffer_interface, at wl_setup */
+static const struct kw_wl_message ext_methods[] = {{"destroy", "", ext_types}, {"create_buffer", "nuuiiuu", ext_types}};
+static const struct kw_wl_interface ext_iface = {"wland_external_buffer_manager_v1", 1, 2, ext_methods, 0, NULL};
+#define EXT_IF ((const struct wl_interface *)&ext_iface)
+#define DRM_ARGB8888 0x34325241u /* 'AR24': B, G, R, A in memory (B8G8R8A8), premultiplied */
+#define DRM_XRGB8888 0x34325258u /* 'XR24': opaque */
 
 /* ---- libxcb (and libX11-xcb for Xlib surfaces), by hand ---- */
 
@@ -421,6 +449,11 @@ struct kw_swapchain {
 	uint32_t nbufs;
 	struct wl_proxy *frame;
 	int wl_ok;
+	/* external buffers (wland): one wl_buffer per image, busy from its commit to its release */
+	struct wl_proxy *ext; /* the manager, where the compositor offers it */
+	int external;
+	struct wl_proxy *ebuf[MAXIMG];
+	int ebusy[MAXIMG];
 	/* x11 */
 	void *xconn;
 	uint32_t xwin, xgc;
@@ -433,7 +466,9 @@ static void reg_global(void *data, struct wl_proxy *reg, uint32_t name, const ch
 	struct kw_swapchain *sc = data;
 	if (!strcmp(iface, "wl_shm") && !sc->shm)
 		sc->shm = wl.marshal_flags(reg, 0, wl.shm_if, 1, 0, name, if_name(wl.shm_if), 1u, NULL);
-	(void)ver;
+	/* advertised only where wland's embedder resolves external ids (its presence is the signal) */
+	if (sc->external && !strcmp(iface, ext_iface.name) && !sc->ext && ver >= 1)
+		sc->ext = wl.marshal_flags(reg, 0, EXT_IF, 1, 0, name, ext_iface.name, 1u, NULL);
 }
 static void reg_remove(void *data, struct wl_proxy *reg, uint32_t name) { (void)data, (void)reg, (void)name; }
 static void (*reg_listener[])(void) = {(void (*)(void))reg_global, (void (*)(void))reg_remove};
@@ -447,6 +482,13 @@ static void buf_release(void *data, struct wl_proxy *b)
 	((struct shmbuf *)data)->busy = 0;
 }
 static void (*buf_listener[])(void) = {(void (*)(void))buf_release};
+
+static void ebuf_release(void *data, struct wl_proxy *b)
+{
+	(void)b;
+	*(int *)data = 0;
+}
+static void (*ebuf_listener[])(void) = {(void (*)(void))ebuf_release};
 
 static void frame_done(void *data, struct wl_proxy *cb, uint32_t t)
 {
@@ -478,6 +520,7 @@ static int wl_setup(struct kw_swapchain *sc)
 	VkIcdSurfaceWayland *ws = (VkIcdSurfaceWayland *)sc->surf;
 	if (!wl_load())
 		return 0;
+	ext_types[0] = wl.buffer_if;
 	sc->dpy = ws->display;
 	sc->surface = (struct wl_proxy *)ws->surface;
 	sc->queue = wl.create_queue(sc->dpy);
@@ -535,10 +578,79 @@ static struct shmbuf *wl_buffer_get(struct kw_swapchain *sc, uint32_t w, uint32_
 	return b;
 }
 
+/* external buffers: one wl_buffer per swapchain image, named by the host's
+ * token and the export id it gave the image (vk/PROTOCOL.md, Amendments,
+ * "External present"); 0 when the host refuses (wl_shm then) */
+static int ext_setup(struct kw_swapchain *sc)
+{
+	struct kw_device *d = sc->dev;
+	struct jb j = {0};
+	JS(&j, "{\"op\":\"exportImages\",\"images\":[");
+	for (uint32_t i = 0; i < sc->n; i++)
+		jb_printf(&j, i ? ",%u" : "%u", sc->imgs[i].id);
+	JS(&j, "]}");
+	struct kw_reply *rep = link_call(d->link, &j, NULL, 0);
+	jb_free(&j);
+	const char *ids = rep ? js_get(rep->json, "ids") : NULL;
+	if (!ids || *ids != '[') {
+		/* a refusal is not a lost device: present by readback */
+		char why[256] = "no reply";
+		if (rep)
+			js_strcpy(js_get(rep->json, "err"), why, sizeof why);
+		kw_log("exportImages refused (%s): presenting by readback", why);
+		reply_free(rep);
+		return 0;
+	}
+	uint32_t lo[MAXIMG], n = 0;
+	for (const char *p = ids + 1; n < sc->n && *p && *p != ']';) {
+		while (*p == ' ' || *p == ',')
+			p++;
+		if (*p == ']' || !*p)
+			break;
+		lo[n++] = (uint32_t)js_num(p, 0);
+		p = js_skip(p);
+	}
+	reply_free(rep);
+	if (n != sc->n) {
+		kw_log("exportImages: %u ids for %u images: presenting by readback", n, sc->n);
+		return 0;
+	}
+	uint32_t fourcc = sc->alpha == VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR ? DRM_ARGB8888 : DRM_XRGB8888;
+	for (uint32_t i = 0; i < sc->n; i++) {
+		sc->ebuf[i] = wl.marshal_flags(sc->ext, 1, wl.buffer_if, wl.get_version(sc->ext), 0, NULL, d->pd->ext_token, lo[i],
+					       (int32_t)sc->extent.width, (int32_t)sc->extent.height, fourcc, 0u /* flags: row 0 at the top */);
+		wl.add_listener(sc->ebuf[i], ebuf_listener, &sc->ebusy[i]);
+	}
+	kw_log("presenting by external buffers (%ux%u, %u images, no readback)", sc->extent.width, sc->extent.height, sc->n);
+	return 1;
+}
+
+/* before the images go: give the compositor up to 250 ms to release the
+ * buffers it holds (no release follows the destruction of a busy one, and
+ * the host's image must outlive the commits naming it) */
+static void ext_drain(struct kw_swapchain *sc)
+{
+	if (!sc->external)
+		return;
+	for (int t = 0; t < 25 && !sc->dev->link->dead; t++) {
+		int busy = 0;
+		for (uint32_t i = 0; i < sc->n; i++)
+			busy |= sc->ebusy[i];
+		if (!busy)
+			break;
+		wl_pump(sc, 10);
+	}
+}
+
 static void wl_teardown(struct kw_swapchain *sc)
 {
 	if (!sc->queue)
 		return;
+	for (uint32_t i = 0; i < sc->n; i++)
+		if (sc->ebuf[i])
+			wl.marshal_flags(sc->ebuf[i], 0, NULL, wl.get_version(sc->ebuf[i]), 1);
+	if (sc->ext)
+		wl.marshal_flags(sc->ext, 0, NULL, wl.get_version(sc->ext), 1);
 	for (uint32_t i = 0; i < sc->nbufs; i++) {
 		wl.marshal_flags(sc->bufs[i].buffer, 0, NULL, wl.get_version(sc->bufs[i].buffer), 1);
 		munmap(sc->bufs[i].map, sc->bufs[i].size);
@@ -574,6 +686,12 @@ static API VkResult CALL kw_vkCreateSwapchainKHR(VkDevice dh, const VkSwapchainC
 		xcb.create_gc(sc->xconn, sc->xgc, sc->xwin, 0, NULL);
 	}
 	if (sc->surf->platform == VK_ICD_WSI_PLATFORM_WAYLAND) {
+		/* external buffers where the host resolves them (its hello token) and the
+		 * compositor offers them (wl_setup binds the manager); KWVK_EXTERNAL=0 and
+		 * KWVK_DUMP (which needs the pixels) keep readback */
+		const char *ev = getenv("KWVK_EXTERNAL"), *dump = getenv("KWVK_DUMP");
+		sc->external = d->pd->ext_token && !(ev && !strcmp(ev, "0")) && !(dump && *dump) &&
+			       (sc->format == VK_FORMAT_B8G8R8A8_UNORM || sc->format == VK_FORMAT_B8G8R8A8_SRGB);
 		sc->wl_ok = wl_setup(sc);
 		if (!sc->wl_ok) {
 			wl_teardown(sc);
@@ -599,6 +717,8 @@ static API VkResult CALL kw_vkCreateSwapchainKHR(VkDevice dh, const VkSwapchainC
 		sc->imgs[i].extent = ic.extent;
 		sc->imgs[i].swapchain = 1;
 	}
+	if (sc->external)
+		sc->external = sc->ext && ext_setup(sc);
 	*out = (VkSwapchainKHR)(uintptr_t)sc;
 	return VK_SUCCESS;
 }
@@ -610,6 +730,7 @@ static API void CALL kw_vkDestroySwapchainKHR(VkDevice dh, VkSwapchainKHR sh, co
 	if (!sc)
 		return;
 	struct kw_device *d = (struct kw_device *)dh;
+	ext_drain(sc);
 	struct jb j = {0};
 	JS(&j, "{\"op\":\"destroy\",\"ids\":[");
 	for (uint32_t i = 0; i < sc->n; i++)
@@ -646,6 +767,15 @@ static API VkResult CALL kw_vkAcquireNextImageKHR(VkDevice d, VkSwapchainKHR sh,
 	struct kw_swapchain *sc = HANDLE(struct kw_swapchain, sh);
 	if (sc->dev->link->dead)
 		return VK_ERROR_DEVICE_LOST;
+	/* external buffers: the image is the buffer, so it is acquired again only once
+	 * the compositor released it (it takes the content at commit and releases after
+	 * its ACK); after 100 ms render into it anyway rather than hang (a stalled link) */
+	if (sc->external && sc->ebusy[sc->next]) {
+		int64_t t0 = kw_now();
+		for (int t = 0; sc->ebusy[sc->next] && t < 20; t++)
+			wl_pump(sc, 5);
+		kw_stats.acquire_ns += kw_now() - t0;
+	}
 	*idx = sc->next;
 	sc->next = (sc->next + 1) % sc->n;
 	struct kw_fence *f = HANDLE(struct kw_fence, fh);
@@ -674,9 +804,60 @@ static void dump_frame(struct kw_swapchain *sc, const char *path, const uint8_t 
 	rename(tmp, path);
 }
 
+/* wl_surface.attach, damage of the whole buffer, a frame callback where none
+ * is pending, commit: after FIFO's wait for the last frame callback */
+static void wl_commit(struct kw_swapchain *sc, struct wl_proxy *buffer)
+{
+	struct wl_proxy *s = sc->surface;
+	uint32_t ver = wl.get_version(s);
+	wl.marshal_flags(s, 1, NULL, ver, 0, buffer, 0, 0);
+	if (ver >= 4)
+		wl.marshal_flags(s, 9, NULL, ver, 0, 0, 0, (int32_t)sc->extent.width, (int32_t)sc->extent.height);
+	else
+		wl.marshal_flags(s, 2, NULL, ver, 0, 0, 0, (int32_t)sc->extent.width, (int32_t)sc->extent.height);
+	if (!sc->frame) {
+		sc->frame = wl.marshal_flags(sc->surface_wrap, 3, wl.callback_if, ver, 0, NULL);
+		wl.add_listener(sc->frame, frame_listener, sc);
+	}
+	wl.marshal_flags(s, 6, NULL, ver, 0);
+	wl.flush(sc->dpy);
+}
+
+static void wl_pace(struct kw_swapchain *sc)
+{
+	if (sc->mode == VK_PRESENT_MODE_FIFO_KHR)
+		for (int i = 0; i < 4 && sc->frame; i++)
+			wl_pump(sc, 8);
+	else
+		wl_pump(sc, 0);
+}
+
+/* external buffers: the host replies once the frame is queued on its device
+ * (and its submits validated), then the commit names the image's wl_buffer;
+ * the page's compositor takes the image's content at that commit */
+static VkResult present_external(struct kw_swapchain *sc, uint32_t idx)
+{
+	struct kw_device *d = sc->dev;
+	struct jb j = {0};
+	jb_printf(&j, "{\"op\":\"present\",\"image\":%u,\"readback\":0,\"external\":1}", sc->imgs[idx].id);
+	struct kw_reply *rep = link_call(d->link, &j, NULL, 0);
+	jb_free(&j);
+	if (kw_reply_lost(d->link, rep, "vkQueuePresentKHR")) {
+		reply_free(rep);
+		return VK_ERROR_DEVICE_LOST;
+	}
+	reply_free(rep);
+	wl_pace(sc);
+	sc->ebusy[idx] = 1;
+	wl_commit(sc, sc->ebuf[idx]);
+	return VK_SUCCESS;
+}
+
 static VkResult present_one(struct kw_swapchain *sc, uint32_t idx)
 {
 	struct kw_device *d = sc->dev;
+	if (sc->external)
+		return present_external(sc, idx);
 	int wayland = sc->surf->platform == VK_ICD_WSI_PLATFORM_WAYLAND, x11 = is_x11(sc->surf);
 	const char *dump = getenv("KWVK_DUMP");
 	if (dump && !*dump)
@@ -733,30 +914,14 @@ static VkResult present_one(struct kw_swapchain *sc, uint32_t idx)
 		reply_free(rep);
 		return VK_SUCCESS;
 	}
-	if (sc->mode == VK_PRESENT_MODE_FIFO_KHR)
-		for (int i = 0; i < 4 && sc->frame; i++)
-			wl_pump(sc, 8);
-	else
-		wl_pump(sc, 0);
+	wl_pace(sc);
 	struct shmbuf *b = wl_buffer_get(sc, sc->extent.width, sc->extent.height);
 	if (b) {
 		size_t dst_stride = (size_t)sc->extent.width * 4;
 		for (uint32_t y = 0; y < h && (size_t)(y + 1) * stride <= rep->binlen; y++)
 			memcpy((uint8_t *)b->map + y * dst_stride, rep->bin + (size_t)y * stride, (size_t)w * 4);
 		b->busy = 1;
-		struct wl_proxy *s = sc->surface;
-		uint32_t ver = wl.get_version(s);
-		wl.marshal_flags(s, 1, NULL, ver, 0, b->buffer, 0, 0);
-		if (ver >= 4)
-			wl.marshal_flags(s, 9, NULL, ver, 0, 0, 0, (int32_t)sc->extent.width, (int32_t)sc->extent.height);
-		else
-			wl.marshal_flags(s, 2, NULL, ver, 0, 0, 0, (int32_t)sc->extent.width, (int32_t)sc->extent.height);
-		if (!sc->frame) {
-			sc->frame = wl.marshal_flags(sc->surface_wrap, 3, wl.callback_if, ver, 0, NULL);
-			wl.add_listener(sc->frame, frame_listener, sc);
-		}
-		wl.marshal_flags(s, 6, NULL, ver, 0);
-		wl.flush(sc->dpy);
+		wl_commit(sc, b->buffer);
 	}
 	reply_free(rep);
 	return VK_SUCCESS;

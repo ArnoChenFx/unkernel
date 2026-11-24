@@ -17,15 +17,18 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
 ## Parts
 
 - **ICD** (`vk/icd/`, GPL-2.0-or-later, C): thin. Instance, physical
-  device, device, queue, memory (malloc'd shadows; every memory type
-  host-visible and coherent), fences, semaphores, command recording and
+  device, device, queue, memory (a device-local type without a shadow and a
+  host-visible coherent one with a malloc'd shadow; Device memory below),
+  fences, semaphores, command recording and
   presentation are guest-side; every other object is made on the host by a
   message. Command buffers go as JSON at submit; host-visible memory is
-  diffed and sent before each submit; buffers the bound pipeline's SPIR-V
-  may write are read back at fence waits. Its physical device is an
+  diffed and sent before each submit; the ranges of mapped buffers that
+  submitted work may write (copy regions, storage buffers the bound
+  pipeline's SPIR-V may write, as bound) are read back at fence waits. Its physical device is an
   integrated GPU whose limits, features and formats come from the host's
-  hello reply (WebGPU's). WSI: VK_KHR_wayland_surface (wl_shm buffers,
-  pre-multiplied alpha), VK_KHR_xcb_surface and VK_KHR_xlib_surface
+  hello reply (WebGPU's). WSI: VK_KHR_wayland_surface (external buffers
+  on the page's wland, else wl_shm buffers; pre-multiplied alpha;
+  Presentation below), VK_KHR_xcb_surface and VK_KHR_xlib_surface
   (XPutImage), VK_EXT_headless_surface; Wayland, xcb and Xlib are
   `dlopen`ed. `KWVK_LINK` picks the link (`vsock:2:1018` default, `tcp:`,
   `unix:`); `KWVK_DEBUG`, `KWVK_TRACE`, `KWVK_STATS` and
@@ -45,8 +48,8 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
 - **Host** (`js/core/vk-host.ts`, `vk-exec.ts`, `vk-formats.ts`, MIT):
   implements the objects and the command stream on one GPUDevice.
   Swapchain images are read back at present (the `present` reply carries
-  the pixels; the last presented texture is kept for the page,
-  `renderer.image()`). A lost device fails and closes every stream, then
+  the pixels) unless they are external buffers (`renderer.external()`,
+  Presentation below). A lost device fails and closes every stream, then
   calls `onLost`; a failure of one stream's work that no reply can report
   loses the device for that stream only (Errors below).
 - **SDK** (`js/core/vk.ts`; js.md, Guest Vulkan): the web entry only.
@@ -55,7 +58,8 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   their own) and the translator. `vm.vk`: `status` (idle, loading, ready,
   lost, failed), `stats` (streams, bytes, `losses`, `renderer`: the host's
   counters, e.g. `presents`, `errors`, `lost`), `device`, `loaded`,
-  `load()`. After a lost
+  `load()`, `externalImage(ref)` (wland's resolveExternal; Presentation).
+  After a lost
   device the next program gets a new device and renderer. Snapshots hold
   no renderer state: a restore drops the connections. Ignored with a log
   line on Node.
@@ -65,7 +69,11 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   WGSL enables). Specialization constants are baked, vertex output gets
   the Y flip, descriptor arrays are flattened, input attachments become
   textures, 8/16-bit and float16 storage is lowered to u32 words (float16
-  computed in f32 without `shader-f16`). `vk/naga/build.sh` ->
+  computed in f32 without `shader-f16`), and a block whose members are all
+  NonWritable (or NonReadable), as older glslang marks `readonly buffer`,
+  is read-only (write-only) as a whole: naga reads only the variable's
+  decorations, and WebGPU refuses a read_write buffer bound over the range
+  of another binding. `vk/naga/build.sh` ->
   `$KW_BUILD/vk/kwvk-naga.wasm` (about 0.9 MB) -> `dist/kwvk-naga.wasm`.
 
 ## Build
@@ -88,8 +96,11 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   the translator on `test/vk/guest/double.comp` (skipped without
   `kwvk-naga.wasm`).
 - `node test/vk/host/check.mjs`: the host renderer alone in headless Chrome
-  with a fake client (95 cases, the failures that must reach the guest
-  included: refused and unusable pipelines, lost devices). `vk/naga/test/run.ts`: the translator on the shaders
+  with a fake client (109 cases, the failures that must reach the guest
+  included: refused and unusable pipelines, lost devices; descriptor copies
+  past a binding's end; external present:
+  tokens, export ids, pictures premultiplied and opaque, every ref that
+  must resolve to null). `vk/naga/test/run.ts`: the translator on the shaders
   in `vk/naga/test/shaders/`, validated in a real WebGPU; `corpus.sh`: a
   real-world corpus (Sascha Willems' examples, vkmark, GTK 4, SDL 3).
 - `node test/vk/relay.mjs -- CMD` runs CMD (e.g. `vulkaninfo --summary`,
@@ -106,11 +117,21 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   vsock`), a (`vulkaninfo --summary` names kwvk), b (every
   `$KW_BUILD/vk/vk-*` test program exits 0: compute, triangle, headless,
   dynamic state, threads, depth, flat varyings, loud failures: refused
-  pipelines and lost devices), c (`vkcube --wsi wayland`
+  pipelines and lost devices, descriptor sets: consecutive binding updates
+  by a write, a copy and a template, dynamic offsets, mapped results read
+  directly), c (`vkcube --wsi wayland`
   under `weston --backend=headless --renderer=pixman --debug`, started by
   the page's `/usr/local/bin/kwvk-wl CMD`; then a running vkcube's frame
   taken by `weston-screenshooter` and judged: many colours, the LunarG
-  teal, not olive). `--lose` (the device destroyed while vkcube runs; new
+  teal, not olive), w (vkcube through wland: wland/headless on the page,
+  from `web/node_modules/wland`, serves vsock port 1023 with
+  `resolveExternal` = `vm.vk.externalImage`; the relay in the guest is the
+  image's or `--relay FILE`, an aarch64 wlandr pushed to
+  `/tmp/kwvk-wlandr`; with a relay that has `--external-buffers`, vkcube
+  (IMMEDIATE) at each `--wsizes` size, default 500x500 and 1280x720, for
+  `--wsecs` seconds by external buffers, then with `KWVK_EXTERNAL=0` by
+  readback, frames/s and bytes read back per frame printed; always a relay
+  without the flag, where vkcube must run over wl_shm). `--lose` (the device destroyed while vkcube runs; new
   programs work), `--snapshot` (a snapshot with a running vkcube,
   restored), `--cpus N` (SMP; the page cross-origin isolated). `--apps`
   boots the second-stage disk (`debian-disk.mjs --apps`: vkmark,
@@ -124,7 +145,11 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   --enable-features=Vulkan,WebGPU --use-vulkan=swiftshader
   --use-webgpu-adapter=swiftshader --disable-dev-shm-usage` (adapter
   "google swiftshader", no `shader-f16`, 256 invocations per workgroup);
-  dnf's `chromium-headless` has no adapter. Without
+  dnf's `chromium-headless` has no adapter. External present also needs
+  `--use-angle=swiftshader --enable-unsafe-swiftshader` (the scripts pass
+  them): without a GL backend for canvases a WebGPU OffscreenCanvas's
+  transferToImageBitmap makes Chrome destroy the GPUDevice, which the SDK's
+  probe catches (no external present, a `[host] vk:` line). Without
   `--disable-dev-shm-usage` other browsers filled `/dev/shm` (64 MiB) and
   Chrome crashed before the page ran.
 
@@ -144,23 +169,128 @@ host's CPU, with the guest under kwemu.
   `GSK_RENDERER=vulkan` (gtk4-demo: as with the cairo renderer, shadow
   included; GTK's default renderer stays GL); vkd3d-gears (Direct3D 12 on
   vkd3d) under Xvfb.
-- llama.cpp (ggml-vulkan, cross-built for aarch64 by
-  `test/vk/guest/build-llama.sh`, not packaged in trixie): ggml selects
-  kwvk and generates. stories260K (F32, `-ngl 99`, temperature 0) gives the
-  CPU backend's text: 1.8 tokens/s in the guest on a loaded host against
-  0.25 on the emulated CPU, 9.5 natively through the relay. stories15M
-  q4_0 no longer gives wrong text: it aborts at its first pipeline the host
-  cannot make ("ggml_vulkan: compute pipeline creation failed for
-  rms_norm_mul_f32_512: ... ErrorInvalidShaderNV", after the ICD's reason;
-  below). Compute shaders wider than the device's
+- llama.cpp (ggml-vulkan; not packaged in trixie: forky's wants glibc
+  2.43): ggml selects kwvk and generates, cross-built for aarch64 by
+  `test/vk/guest/build-llama.sh` and as llama.cpp's own release build
+  (`llama-b12674-bin-ubuntu-vulkan-arm64.tar.gz`, which the page's
+  llama.cpp app runs; web.md, Guest Vulkan; its older glslang's shaders
+  need the translator's member-decoration rule above, without which WebGPU
+  refused its first submit for binding aliasing). stories260K (F32, `-ngl
+  99`, temperature 0) gives the CPU backend's text: 1.8 tokens/s in the
+  guest on a loaded host against 0.25 on the emulated CPU, 9.5 natively
+  through the relay; the release build's llama-completion 5.1-6.9 tokens/s
+  in the page (one CPU). stories15M, q4_0 and F32 alike, aborts at its
+  first pipeline the host cannot make ("ggml_vulkan: compute pipeline
+  creation failed for rms_norm_mul_f32_512: ... ErrorInvalidShaderNV",
+  after the ICD's reason; below); stories260K's 64-wide rows take another
+  variant. Compute shaders wider than the device's
   workgroup limit (ggml's are 512, SwiftShader allows 256) are split by
   the translator where they have no barriers or shared memory. 139 of
   ggml's 156 shader variants translate and compile. Its
   `test-backend-ops` against the CPU backend (partial runs): GET_ROWS,
   SILU, SOFT_MAX, ROPE pass; CPY 209 of 211, ADD 90 of 97, MUL_MAT 209
   of 249, RMS_NORM 41 of 123.
-- Presentation is by readback: a frame's pixels cross vsock and are copied
-  into a wl_shm buffer or by XPutImage, 9-13 ms a frame on Wayland.
+- Presentation: below.
+
+## Device memory (2026-11-24)
+
+vk/PROTOCOL.md, Amendments, "Device memory tracking", is the contract.
+
+- Memory type 0 is DEVICE_LOCAL without a shadow, type 1 HOST_VISIBLE |
+  HOST_COHERENT with one; there is no DEVICE_LOCAL | HOST_VISIBLE type.
+  CPU writes to mapped memory are found by diffing the shadow against a
+  last-sent copy at each submit; GPU writes are known only from the
+  commands, so the ICD tracks per buffer the byte ranges submitted work
+  may write and reads them back when the app can look (a fence wait or
+  wait-idle for mapped memory, else at vkMapMemory). Storage buffers
+  count where Vulkan's consecutive binding updates put them (a write,
+  copy or template entry spilling past a binding), at the range they were
+  bound with plus the dynamic offset. A rule that must hold: a range only
+  shrinks to what the command says exactly; when unsure, the whole buffer.
+  Words the CPU changed meanwhile keep the CPU's value.
+- Why no DEVICE_LOCAL | HOST_VISIBLE type: kwvk is an integrated GPU, and
+  ggml-vulkan then asks for that type first for every device buffer and
+  keeps it mapped (`ggml-vulkan-buffers.cpp`, `ggml_vk_create_buffer_device`;
+  on a discrete GPU it does the same when such a type shares the first
+  device-local heap, "rebar"), so its compute buffer and KV cache would be
+  read back at every token: for stories260K F32 192 KB a token even with
+  ranges (ggml binds whole tensors), for real models their full size.
+  Without it ggml gets device-only memory and moves data by staging
+  copies, as on a discrete GPU without ReBAR. SDL3's GPU API then puts its
+  uniform buffers in type 1 (testgpu_spinning_cube and testgpu_simple_clear
+  30 FPS as before; its "Out of BAR memory" warning is below SDL's default
+  log priority). vkcube, vkmark, GTK 4's Vulkan renderer and vkd3d-gears
+  run as before. Reporting a
+  discrete GPU instead would not have helped ggml by itself (rebar) and
+  would change how Mesa, GTK and Ladybird pick devices.
+- Measured (llama-simple, stories260K F32, `-ngl 99`, 32 tokens, temperature
+  0; SwiftShader; text the same in every case: "Once upon a time, there was
+  a little girl named Lily..."). Read back at load / per decode:
+
+  | ICD | load | per decode | native (relay) | guest (inline, one CPU) |
+  | --- | --- | --- | --- | --- |
+  | before (spill-over untracked) | 45.8 MB in 44 readbacks | 2080 B | 8.8 tokens/s | 5.1-7.6 (4 runs, three of them 6.2-7.6) |
+  | spill-over tracked, whole buffers, DL+HV type | 45.8 MB | 235 KB | 8.8 | not run |
+  | spill-over tracked, ranges, DL+HV type | 1.0 MB | 192 KB in 7 readbacks | 9.0 | 6.8 (1 run) |
+  | now | 0 | 2048 B (the logits, one copy) | 8.8 | 4.8-5.8 (4 runs) |
+
+  The load readback was each weight upload chunk (a vkCmdCopyBuffer from
+  ggml's pinned staging) re-reading the whole 1 MB weight buffer. Now
+  ggml uploads each per-token input tensor (tokens, positions, mask, ...)
+  with its own copy and fence wait: 405 submits (260 with a fence) for
+  the run against 180 (67), which costs nothing natively and about 6 ms a
+  wait in the guest's inline mode, hence the slower guest eval on this
+  tiny model; per-token readback no longer grows with the model. The diff
+  scan at submit fell from 1405 KiB (0.7-0.9 ms) to 141 KiB (0.07 ms) a
+  submit, the weights no longer being host-visible.
+- Open: a fence whose submit (and everything before it) writes nothing
+  mapped could signal without the round trip, bounded to a few submits in
+  flight so a program pacing itself by fences cannot queue unbounded work;
+  not done (it changes when a failed submit is reported). Two VkBuffers
+  bound to overlapping ranges of one memory are two GPU buffers on the
+  host: a GPU write through one is not seen through the other.
+
+## Presentation (2026-11-24)
+
+- Wayland on the page's wland: external buffers (vk/PROTOCOL.md,
+  Amendments, "External present"). Where the hello has a token (the SDK's
+  canvas probe passed), the compositor advertises
+  `wland_external_buffer_manager_v1` (a relay with `--external-buffers`,
+  which the base's `wland` launcher passes where `wlandr --version` lists
+  `external-buffers`, and a page with `resolveExternal`: web.md, Wayland
+  desktop) and the swapchain is B8G8R8A8, the ICD makes one wl_buffer per
+  swapchain image named (token << 32) | export id, and a present is a
+  request without pixels whose reply (after the validation of earlier
+  submits) comes before the commit. The page resolves each commit with
+  `vm.vk.externalImage()`: a copy of the GPUTexture into a WebGPU
+  OffscreenCanvas on the renderer's device, `transferToImageBitmap()`
+  (synchronous: the renderer is on the page's thread in both modes, so
+  no worker crossing). The image is acquired again only after its
+  wl_buffer's release; a swapchain's destroy waits up to 250 ms for
+  releases before the images go. `KWVK_EXTERNAL=0` forces readback.
+- Else readback: the frame's pixels cross vsock and are copied into a
+  wl_shm buffer (other compositors, e.g. weston in the guest; an older
+  relay; `?wlgpu=0`; the probe failed) or by XPutImage (X11 always).
+- Measured (test/vk/unkernel-check.mjs step w, one CPU, vkcube IMMEDIATE
+  through wland/headless after a warm-up, each case twice in alternating
+  order, frames/s over 6 s; SwiftShader on this host's CPU):
+
+  | | external | readback |
+  | --- | --- | --- |
+  | 500x500 inline | 100.0, 98.9 (10.0 ms a frame) | 77.4, 78.6 (12.8 ms; 1 MB a frame) |
+  | 1280x720 inline | 36.8, 31.7 (27-32 ms) | 33.6, 33.0 (30 ms; 3.6 MB a frame) |
+  | 500x500 worker | 103.2, 102.4 (9.7 ms) | 94.1, 99.1 (10.4 ms) |
+  | 1280x720 worker | 36.1, 36.0 (27.7 ms) | 40.4, 39.6 (25 ms) |
+
+  No byte read back and no wait for releases (ICD `acquire` 0 ms) on the
+  external path; the resolver takes 0.1 ms (page-check: 0.12 ms worker,
+  0.61 ms inline; wland's draw 0.26-1.25 ms). On SwiftShader the GPU work
+  is CPU work too: the readback's copy and transfer are traded for a
+  page-side copy into the canvas and a new canvas texture per frame, a
+  gain at 500x500 and none (worker mode: a loss of 10%) at 1280x720.
+  Nothing measured on a real GPU, where the readback's map stalls the
+  pipeline and the copy is cheap. The probe makes the renderer's load
+  about 60 ms longer (90-120 ms against 30).
 
 ## Unsupported and open (2026-11-24)
 
@@ -185,8 +315,10 @@ host's CPU, with the guest under kwemu.
   Tint's uniformity analysis (`workgroupBarrier` outside uniform control
   flow); the norm family (norm, rms_norm, group_norm, l2_norm, the fused
   rms_norm_mul) reduces across a 512-wide workgroup through shared memory
-  and cannot be split on a 256-limit device. Eval is bound by GPU time on SwiftShader and, for q4_0, by
-  several small readbacks a token (not batched). Never run on a real GPU.
+  and cannot be split on a 256-limit device, which stops F32 models wider
+  than stories260K there too. Eval is bound by GPU time on SwiftShader
+  natively, and in the guest also by ggml's waited copies (Device memory
+  below). Never run on a real GPU.
 - Chrome-specific reliances: WGSL's `uniform_buffer_standard_layout`
   (push constant blocks stay std430 in a uniform buffer) and the
   `texture-component-swizzle` feature (image view swizzles; identity
@@ -223,7 +355,12 @@ Amendments, "Loud failures", is the contract.
   whose creation failed loses the device for that connection only
   (`stats.renderer.lost`): the next wait, submit or present returns
   VK_ERROR_DEVICE_LOST, and the program can make a new device. Replies that
-  carry data wait for the validation of earlier submits.
+  carry data wait for the validation of earlier submits, as does an
+  external present's (so a failed frame never reaches the compositor). A
+  refused exportImages is not an error: that swapchain presents by
+  readback. The page's resolver gives null (the window keeps its last
+  content) for any id no live connection made, a destroyed or never
+  presented image, and after a device loss.
 - Measured 2026-11-24 natively through the relay (SwiftShader): llama.cpp
   stories260K F32 gives the same text at the same speed (eval 9.7-9.8
   tokens/s, prompt 4.9-5.1 s; 9.4 and 5.0 before).

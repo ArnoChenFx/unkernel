@@ -103,12 +103,49 @@ export interface VkStats {
 	liveObjects: number;
 	/** gauge: GPU buffers and textures held for guests, deferred destroys included (renderer-wide) */
 	liveGpu: number;
+	/** presents of external swapchains (no readback: a page compositor resolves them, `renderer.external()`) */
+	externalPresents: number;
+	/** pictures made for a page compositor by `renderer.external()` (resolved external buffers) */
+	externalImages: number;
 }
 
 const GAUGES = new Set(["liveObjects", "liveGpu"]);
 
 export function newStats(): VkStats {
-	return { messages: 0, submits: 0, draws: 0, dispatches: 0, presents: 0, bytesWritten: 0, bytesRead: 0, translations: 0, translateMs: 0, pipelines: 0, errors: 0, lost: 0, encodeMs: 0, parseMs: 0, liveObjects: 0, liveGpu: 0 };
+	return { messages: 0, submits: 0, draws: 0, dispatches: 0, presents: 0, bytesWritten: 0, bytesRead: 0, translations: 0, translateMs: 0, pipelines: 0, errors: 0, lost: 0, encodeMs: 0, parseMs: 0, liveObjects: 0, liveGpu: 0, externalPresents: 0, externalImages: 0 };
+}
+
+/** wland's ExternalRef (protocol/wland-external-buffer-v1.xml): the id, as the ICD made it, is (token << 32) | export id. */
+export interface VkExternalRef {
+	id: bigint;
+	width: number;
+	height: number;
+	/** DRM fourcc: ARGB8888 / XRGB8888 (B8G8R8A8 images), ABGR8888 / XBGR8888 (R8G8B8A8) */
+	format: number;
+	flags: number;
+}
+/** DRM fourccs of external buffers: alpha (premultiplied) or opaque, by the image's byte order. */
+export const DRM_FORMATS: Record<number, { base: string; opaque: boolean }> = {
+	0x34325241: { base: "bgra8unorm", opaque: false }, // AR24
+	0x34325258: { base: "bgra8unorm", opaque: true }, // XR24
+	0x34324241: { base: "rgba8unorm", opaque: false }, // AB24
+	0x34324258: { base: "rgba8unorm", opaque: true }, // XB24
+};
+/**
+ * Per-connection tokens handed out (the high 32 bits of every external id),
+ * never given twice in this realm, renderers after a device loss included:
+ * an id an old connection made can never name a newer connection's image.
+ */
+const usedTokens = new Set<number>();
+function newToken(): number {
+	const a = new Uint32Array(1);
+	for (;;) {
+		globalThis.crypto.getRandomValues(a);
+		if (a[0] && !usedTokens.has(a[0])) {
+			usedTokens.add(a[0]);
+			return a[0];
+		}
+	}
 }
 
 export interface VkRendererOptions {
@@ -120,6 +157,12 @@ export interface VkRendererOptions {
 	onPresent?: (info: VkPresentInfo) => void;
 	/** called once when the GPUDevice is lost, after every connection was failed and closed */
 	onLost?: (info: { reason?: string; message?: string }) => void;
+	/**
+	 * Offer external present (the hello's `external` token; renderer.external()).
+	 * Default: where this thread has OffscreenCanvas. The SDK passes false where
+	 * its probe (vk.ts probeCanvas) found the WebGPU canvas path broken.
+	 */
+	external?: boolean;
 }
 
 /** Limits on what one guest stream may make the host hold (the guest is untrusted). */
@@ -244,6 +287,10 @@ export class VkRenderer {
 	/** shared helper pipelines (blit, clears), keyed */
 	helpers = new Map<string, any>();
 	conns = new Map<number, Conn>();
+	/** live connections by their external token (hello reply) */
+	tokens = new Map<number, Conn>();
+	/** external present is offered (VkRendererOptions.external) */
+	externalOk = false;
 	nextConn = 1;
 	retired: VkStats = newStats();
 	canvases = new Map<string, any>();
@@ -266,6 +313,7 @@ export class VkRenderer {
 		this.shaders = opts.shaders;
 		if (opts.onPresent) this.onPresent = opts.onPresent;
 		if (opts.onLost) this.onLost = opts.onLost;
+		this.externalOk = opts.external ?? typeof (globalThis as any).OffscreenCanvas === "function";
 		this.logFn = opts.log || ((line) => console.warn(line));
 		this.emptyBGL = this.device.createBindGroupLayout({ entries: [] });
 		this.emptyBG = this.device.createBindGroup({ layout: this.emptyBGL, entries: [] });
@@ -349,17 +397,49 @@ export class VkRenderer {
 		const c = typeof connection === "number" ? this.conns.get(connection) : (connection as Conn);
 		const img = c?.objs.get(imageId);
 		if (!c || !img || img.t !== "image" || img.samples > 1) return undefined;
+		return this.picture(img, false);
+	}
+
+	/**
+	 * wland's resolveExternal for the ICD's external buffers (vk/PROTOCOL.md,
+	 * Amendments, "External present"): the picture of the swapchain image the
+	 * ref's id names, as it is now (the frame its last present queued: the ICD
+	 * renders into it again only after the compositor released the buffer),
+	 * GPU to GPU, no readback. Synchronous. null (the surface keeps its last
+	 * content) for an id no live connection made (a wrong token, an image
+	 * destroyed or never presented, a closed connection, a lost device) and
+	 * for a claimed size, format or flags that are not the image's.
+	 */
+	external(ref: VkExternalRef): ImageBitmap | null {
+		if (this.isLost || typeof ref?.id !== "bigint") return null;
+		const c = this.tokens.get(Number(ref.id >> 32n));
+		const e = c?.exported.get(Number(ref.id & 0xffffffffn));
+		if (!c || c.closed || !e || c.objs.get(e.id) !== e.img || !e.img.presented) return null;
+		const img = e.img, f = DRM_FORMATS[ref.format];
+		if (!f || ref.flags !== 0 || ref.width !== img.width || ref.height !== img.height || img.format.replace(/-srgb$/, "") !== f.base) return null;
+		let bmp: ImageBitmap | null = null;
+		try {
+			bmp = this.picture(img, f.opaque) ?? null;
+		} catch (err) {
+			this.log(`kwvk: external image: ${(err as Error).message}`);
+		}
+		if (bmp) c.stats.externalImages++;
+		return bmp;
+	}
+
+	/** Level 0, layer 0 of an image into an ImageBitmap: a copy into a WebGPU OffscreenCanvas on the device (premultiplied alpha, or opaque: alpha read as 1), then transferToImageBitmap. */
+	picture(img: any, opaque: boolean): ImageBitmap | undefined {
 		const base = img.format.replace(/-srgb$/, "");
 		if (base !== "bgra8unorm" && base !== "rgba8unorm" && base !== "rgba16float") return undefined;
 		const OC = (globalThis as any).OffscreenCanvas;
 		if (!OC) return undefined;
-		const key = `${img.width}x${img.height}:${img.format}`;
+		const key = `${img.width}x${img.height}:${base}:${opaque ? "opaque" : "premultiplied"}`;
 		let cv = this.canvases.get(key);
 		if (!cv) {
 			const canvas = new OC(img.width, img.height);
 			const ctx = canvas.getContext("webgpu");
 			if (!ctx) return undefined;
-			ctx.configure({ device: this.device, format: base, usage: TU.COPY_DST | TU.RENDER_ATTACHMENT, alphaMode: "premultiplied" });
+			ctx.configure({ device: this.device, format: base, usage: TU.COPY_DST | TU.RENDER_ATTACHMENT, alphaMode: opaque ? "opaque" : "premultiplied" });
 			cv = { canvas, ctx };
 			if (this.canvases.size > 8) this.canvases.clear();
 			this.canvases.set(key, cv);
@@ -409,6 +489,11 @@ export class Conn implements VkConnection {
 	closed = false;
 	objs = new Map<number, any>();
 	lastPresented?: VkPresentInfo;
+	/** the high 32 bits of this connection's external ids (hello reply), 0 before the hello */
+	token = 0;
+	/** export id (the low 32 bits) -> the image it names; ids are never given twice */
+	exported = new Map<number, { id: number; img: any }>();
+	nextExport = 1;
 	closeFn?: () => void;
 	/** "r" of deferred replies not sent yet (answered with err at device loss) */
 	pending = new Set<number>();
@@ -551,6 +636,8 @@ export class Conn implements VkConnection {
 		if (this.closed) return;
 		this.closed = true;
 		this.r.conns.delete(this.id);
+		if (this.token && this.r.tokens.get(this.token) === this) this.r.tokens.delete(this.token);
+		this.exported.clear();
 		for (const k in this.stats) if (!GAUGES.has(k)) (this.r.retired as any)[k] += (this.stats as any)[k];
 		this.buf = new Uint8Array(0);
 		this.big = undefined;
@@ -685,6 +772,8 @@ export class Conn implements VkConnection {
 		this.stats.liveObjects = this.objs.size;
 		const gpu = o.t === "buffer" ? o.buf : o.t === "image" ? o.tex : undefined;
 		if (gpu) this.r.gpuDestroy(gpu);
+		// its external id now resolves to null, and is never given to another image
+		if (o.t === "image" && o.exportId) this.exported.delete(o.exportId);
 		if (o.t === "queryPool") {
 			if (o.set) this.r.gpuDestroy(o.set);
 			this.r.gpuDestroy(o.results);
@@ -1397,6 +1486,12 @@ const handlers: Record<string, Handler> = {
 		}
 		const features = [...dev.features];
 		const ai = dev.adapterInfo || c.r.adapter?.info || {};
+		// external present: swapchain images become a page compositor's pictures without
+		// readback (renderer.external()), where this thread can make them (a WebGPU OffscreenCanvas)
+		if (!c.token && c.r.externalOk && typeof (globalThis as any).OffscreenCanvas === "function" && typeof (globalThis as any).crypto?.getRandomValues === "function") {
+			c.token = newToken();
+			c.r.tokens.set(c.token, c);
+		}
 		return {
 			json: {
 				version: 1,
@@ -1404,8 +1499,30 @@ const handlers: Record<string, Handler> = {
 				limits,
 				features,
 				formats: formatTable(dev.features),
+				...(c.token ? { external: { token: c.token } } : {}),
 			},
 		};
+	},
+
+	/** External present: an export id for each swapchain image (the low 32 bits of its wland external id). */
+	exportImages(c, msg) {
+		if (!c.token) throw new Error("external present is not offered on this connection (no token)");
+		const imgs = (Array.isArray(msg.images) ? msg.images : []).map((id: number) => {
+			const img = c.get(id, "image");
+			const base = img.format.replace(/-srgb$/, "");
+			if (img.samples > 1 || img.is3D || (base !== "bgra8unorm" && base !== "rgba8unorm"))
+				throw new Error(`image ${id} (${img.format}) cannot be presented externally`);
+			return img;
+		});
+		const ids = imgs.map((img: any, i: number) => {
+			if (!img.exportId) {
+				if (c.nextExport > 0xffffffff) throw new Error("export ids exhausted");
+				img.exportId = c.nextExport++;
+				c.exported.set(img.exportId, { id: msg.images[i], img });
+			}
+			return img.exportId;
+		});
+		return { json: { ids } };
 	},
 
 	sync(c) {
@@ -1612,6 +1729,17 @@ const handlers: Record<string, Handler> = {
 	},
 
 	vkUpdateDescriptorSets(c, msg) {
+		// past a binding's last element a write or copy goes on at element 0 of the next binding
+		// that has descriptors (Vulkan's consecutive binding updates; the ICD numbers them the same)
+		const settle = (layout: any, b: number, el: number, what: string): [number, number] => {
+			while (el >= (layout.bindings.get(b)?.count ?? 1)) {
+				const nb = layout.order.find((x: number) => x > b);
+				if (nb === undefined) throw new Error(`descriptor ${what} past the last binding`);
+				b = nb;
+				el = 0;
+			}
+			return [b, el];
+		};
 		for (const w of msg.descriptorWrites || []) {
 			const set = c.get(w.dstSet, "set");
 			set.cache.clear();
@@ -1620,13 +1748,7 @@ const handlers: Record<string, Handler> = {
 			let b = w.dstBinding | 0;
 			let el = w.dstArrayElement | 0;
 			for (let i = 0; i < n; i++) {
-				// past a binding's last element the write goes on in the next binding (Vulkan's consecutive binding updates)
-				while (el >= (set.layout.bindings.get(b)?.count ?? 1)) {
-					const nb = set.layout.order.find((x: number) => x > b);
-					if (nb === undefined) throw new Error("descriptor write past the last binding");
-					b = nb;
-					el = 0;
-				}
+				[b, el] = settle(set.layout, b, el, "write");
 				const info = infos[i];
 				const d: any = { type: w.descriptorType };
 				if (w.imageInfo?.length) Object.assign(d, { sampler: info.sampler, imageView: info.imageView });
@@ -1642,9 +1764,17 @@ const handlers: Record<string, Handler> = {
 			const src = c.get(cp.srcSet, "set");
 			const dst = c.get(cp.dstSet, "set");
 			const n = Math.min(cp.descriptorCount ?? 1, 4096);
+			let sb = cp.srcBinding | 0;
+			let se = cp.srcArrayElement | 0;
+			let db = cp.dstBinding | 0;
+			let de = cp.dstArrayElement | 0;
 			for (let i = 0; i < n; i++) {
-				const d = src.desc.get(dkey(cp.srcBinding, (cp.srcArrayElement | 0) + i));
-				if (d) dst.desc.set(dkey(cp.dstBinding, (cp.dstArrayElement | 0) + i), { ...d });
+				[sb, se] = settle(src.layout, sb, se, "copy source");
+				[db, de] = settle(dst.layout, db, de, "copy");
+				const d = src.desc.get(dkey(sb, se));
+				if (d) dst.desc.set(dkey(db, de), { ...d });
+				se++;
+				de++;
 			}
 			dst.cache.clear();
 		}
@@ -1801,6 +1931,19 @@ const handlers: Record<string, Handler> = {
 			c.r.onPresent?.(info);
 		} catch (e) {
 			c.log(`kwvk: onPresent: ${(e as Error).message}`);
+		}
+		if (msg.external) {
+			// external present: no pixels; the reply (which the ICD's wl_surface.commit waits for)
+			// goes once the validation of every earlier submit is known, so a failed frame loses
+			// the device instead of reaching the compositor; the image's id resolves from then on
+			if (!img.exportId) throw new Error(`image ${msg.image} was not exported (exportImages)`);
+			c.stats.externalPresents++;
+			return {
+				defer: c.checked.then(() => {
+					img.presented = true;
+					return { json: { width: w, height: h } };
+				}),
+			};
 		}
 		if (msg.readback === 0) return { json: { width: w, height: h, stride: w * img.info.bpb } };
 		const json = { width: w, height: h, stride: w * img.info.bpb };

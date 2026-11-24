@@ -940,6 +940,23 @@ parts that are easy to get wrong.
   renderer; the next program's connection makes a new device and renderer
   (with `vk.device`, which cannot be replaced, the state stays failed).
   Renderer state is not in snapshots: a restore drops the connections.
+- `vm.vk.externalImage(ref)`: a page compositor's resolver for the ICD's
+  external buffers (wland's `gpu.resolveExternal`, the ref as wland gives
+  it: `{ id: bigint, width, height, format, flags }`; `VkExternalRef`):
+  the swapchain image's picture as an ImageBitmap of the caller's
+  (close() it), copied GPU to GPU on the renderer's device (a WebGPU
+  OffscreenCanvas, `transferToImageBitmap()`; premultiplied, or opaque for
+  XRGB8888/XBGR8888), synchronous, on the owner's thread in both modes (the
+  renderer is there, so nothing crosses to the worker). Null for no
+  renderer (it never starts the load), a lost device, or an id no live
+  program made (vk/PROTOCOL.md, Amendments, "External present"; vk.md,
+  Presentation). The ICD uses external buffers only where wland offers
+  the global, so a page routes wland's resolveExternal here. Before the
+  renderer is made, `probeCanvas()` tries that canvas path on a device of
+  its own (where it is broken, as in headless Chrome without
+  `--use-angle`, Chrome destroys the device): if it fails the renderer
+  offers no external present (`external: false`) and says why in a
+  `[host] vk:` line.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 

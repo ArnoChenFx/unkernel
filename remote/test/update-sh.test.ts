@@ -26,6 +26,7 @@ import { writeZip, type ZipEntry } from "../scripts/zip.ts";
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const updateSh = readFileSync(path.join(repo, "remote", "update.sh"));
 const startSh = readFileSync(path.join(repo, "remote", "start.sh"));
+const startOmarchySh = readFileSync(path.join(repo, "remote", "start-omarchy.sh"));
 const UP_TAG = "v0.2.0-test";
 const FORK = "owner/fork";
 const DISTROS = [
@@ -75,6 +76,7 @@ function appFiles(version: string): Record<string, Buffer> {
 		"LICENSE": Buffer.from("license\n"),
 		"remote/README.md": Buffer.from(`readme ${version}\n`),
 		"remote/start.sh": startSh,
+		"remote/start-omarchy.sh": startOmarchySh,
 		"remote/unkernel-remote.js": Buffer.from(`bundle ${version}\n`),
 		"remote/update.sh": updateSh,
 		"remote/worker-entry.js": Buffer.from("worker\n"),
@@ -196,8 +198,15 @@ run("the first run installs the release and downloads each asset once", async ()
 		assert.deepEqual(readFileSync(path.join(app, "versions", "remote-v1", "web", ".output", "public", "distros", d.served)), d.bytes);
 	}
 	assert.ok(existsSync(path.join(app, "update.sh")) && existsSync(path.join(app, "start.sh")), "the launchers are in the install directory");
+	assert.deepEqual(readFileSync(path.join(app, "start-omarchy.sh")), startOmarchySh, "the Omarchy launcher is installed too");
 	assert.equal(existsSync(path.join(app, "downloads")), false);
 	assert.equal(existsSync(path.join(app, "update.lock")), false);
+});
+
+run("start-omarchy.sh says so when the installed version has no Omarchy image", async () => {
+	const r = await sh([path.join(app, "start-omarchy.sh"), "--no-open"]);
+	assert.equal(r.status, 2);
+	assert.match(r.out, /no Omarchy image/);
 });
 
 run("a re-run with nothing changed downloads nothing", async () => {

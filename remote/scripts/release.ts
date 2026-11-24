@@ -31,8 +31,8 @@ const KERNEL_FILE = /^web\/\.output\/public\/assets\/unkernel(?:-smp)?-[A-Za-z0-
 const GL_FILE = /^web\/\.output\/public\/assets\/virgl-[0-9a-f]+\//;
 const DISTRO_FILE = /^web\/\.output\/public\/distros\//;
 const ROOT_FILES = ["LICENSE", "LICENSE-MIT"];
-const REMOTE_FILES = ["start-windows.ps1", "start-windows.cmd", "unkernel-remote.example.json", "README.md", "update.ps1", "update.cmd", "update.sh", "start.sh", "start-omarchy.ps1", "start-omarchy.cmd", "start-omarchy.sh"];
-const BUNDLE_FILES = ["unkernel-remote.js", "worker-entry.js"];
+const REMOTE_FILES = ["start-windows.ps1", "start-windows.cmd", "unkernel-remote.example.json", "README.md", "update.ps1", "update.cmd", "update.sh", "start.sh", "start-omarchy.ps1", "start-omarchy.cmd", "start-omarchy.sh", "omarchy-desktop.cmd", "omarchy-desktop.sh"];
+const BUNDLE_FILES = ["unkernel-remote.js", "worker-entry.js", "kiosk.js"];
 const UPDATER_FILES = ["update.ps1", "update.cmd", "update.sh", "start.sh"];
 
 interface UpstreamRelease {

@@ -192,14 +192,21 @@ trap 'exit 143' TERM HUP
 
 # --- the install ---------------------------------------------------------------
 
-# The newest release named remote-v* that is neither a draft nor a prerelease.
+# The newest release named remote-v* that is neither a draft nor a prerelease, by publication time:
+# the API's order is not the publication order (a release made from an older commit can be listed first).
 latest_tag() {
 	list=$APP/downloads/releases.json
 	fetch "$API_BASE/repos/$REPO/releases?per_page=30" "$list" || die "cannot read the releases of $REPO"
-	picked=$(tr -d '\r\n' < "$list" | tr '{' '\n' | awk '
-		/"tag_name" *: *"remote-v[^"]*"/ && !/"draft" *: *true/ && !/"prerelease" *: *true/ {
-			s = $0; sub(/.*"tag_name" *: *"/, "", s); sub(/".*/, "", s); print s; exit
-		}')
+	picked=$(tr -d '\r\n' < "$list" | sed 's/"tag_name"/\n"tag_name"/g' | awk '
+		function sv(k,   s) {
+			if (match($0, "\"" k "\" *: *\"[^\"]*\"")) { s = substr($0, RSTART, RLENGTH); sub(/^[^:]*: *"/, "", s); sub(/"$/, "", s); return s }
+			return ""
+		}
+		/^"tag_name" *: *"remote-v[^"]*"/ && !/"draft" *: *true/ && !/"prerelease" *: *true/ {
+			ts = sv("published_at"); if (ts == "") ts = sv("created_at")
+			if (best == "" || ts > bts) { best = sv("tag_name"); bts = ts }
+		}
+		END { print best }')
 	rm -f "$list"
 	[ -n "$picked" ] || die "no remote-v* release in $REPO"
 	printf '%s' "$picked"
@@ -243,7 +250,9 @@ install_launchers() {
 		[ -f "$1/remote/$name" ] && cp "$1/remote/$name" "$APP/$name"
 	done
 	# The Omarchy launcher follows each release: replaced every update.
-	[ -f "$1/remote/start-omarchy.sh" ] && cp "$1/remote/start-omarchy.sh" "$APP/start-omarchy.sh"
+	for name in start-omarchy.sh omarchy-desktop.sh; do
+		[ -f "$1/remote/$name" ] && cp "$1/remote/$name" "$APP/$name"
+	done
 	return 0
 }
 

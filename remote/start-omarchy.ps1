@@ -10,10 +10,14 @@
 # Ctrl+C in this window stops the backend after it has saved the disk. In the guest,
 # run `omarchy desktop` (remote mode has no virgl: niri renders in software, slowly).
 #
-#   start-omarchy.cmd [-Port 8791] [-NoOpen]
+# -Desktop opens /kiosk instead: a page that is just the desktop (the display fills the
+# window, `omarchy desktop` starts by itself; no windows, dock or terminal around it).
+# Double-click omarchy-desktop.cmd for that.
+#
+#   start-omarchy.cmd [-Port 8791] [-NoOpen] [-Desktop]
 
 [CmdletBinding()]
-param([string]$Port = '8791', [switch]$NoOpen)
+param([string]$Port = '8791', [switch]$NoOpen, [switch]$Desktop)
 
 $ErrorActionPreference = "Stop"
 # PowerShell 7 hands Windows PowerShell 5.1 a PSModulePath that hides its own modules (Get-FileHash...).
@@ -40,7 +44,7 @@ $data = Join-Path $root 'data\img\omarchy.img'
 $work = Join-Path $root 'data\work-omarchy'
 New-Item -ItemType Directory -Force (Split-Path -Parent $data), $work | Out-Null
 
-$url = "http://127.0.0.1:$Port/?remote=1&distro=omarchy"
+$url = if ($Desktop) { "http://127.0.0.1:$Port/kiosk" } else { "http://127.0.0.1:$Port/?remote=1&distro=omarchy" }
 if (-not $NoOpen) {
 	Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "for(`$i=0;`$i -lt 90;`$i++){ try { Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:$Port/' -TimeoutSec 2 | Out-Null; Start-Process '$url'; break } catch { Start-Sleep 1 } }"
 }

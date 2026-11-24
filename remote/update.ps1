@@ -125,7 +125,9 @@ function Test-Flag($release, [string]$name) {
 
 function Get-LatestTag {
 	$list = Invoke-RestMethod -Uri "$ApiBase/repos/$Repo/releases?per_page=30" -UserAgent $UserAgent -Headers @{ Accept = 'application/vnd.github+json' }
-	$pick = @($list | Where-Object { ([string]$_.tag_name) -like 'remote-v*' -and -not (Test-Flag $_ 'draft') -and -not (Test-Flag $_ 'prerelease') })
+	# The API's order is not the publication order (a release made from an older commit can be listed first): the newest is by publication time.
+	$pick = @($list | Where-Object { ([string]$_.tag_name) -like 'remote-v*' -and -not (Test-Flag $_ 'draft') -and -not (Test-Flag $_ 'prerelease') } |
+		Sort-Object -Descending -Property @{ Expression = { $t = if ($_.PSObject.Properties['published_at'] -and $_.published_at) { $_.published_at } else { $_.created_at }; [DateTimeOffset]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture).UtcTicks } })
 	if ($pick.Count -eq 0) { throw "no remote-v* release in $Repo" }
 	return [string]$pick[0].tag_name
 }
@@ -181,7 +183,7 @@ function Update-Launchers([string]$versionDir) {
 		if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $target -Force }
 	}
 	# The Omarchy launchers follow each release: replaced every update (they find the version's image themselves).
-	foreach ($name in 'start-omarchy.ps1', 'start-omarchy.cmd') {
+	foreach ($name in 'start-omarchy.ps1', 'start-omarchy.cmd', 'omarchy-desktop.cmd') {
 		$source = Join-Path (Join-Path $versionDir 'remote') $name
 		if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $app $name) -Force }
 	}

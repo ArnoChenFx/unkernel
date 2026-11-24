@@ -7,17 +7,20 @@
 # directory (the one holding versions/): data/img/omarchy.img and data/work-omarchy.
 # In the guest, run `omarchy desktop` (remote mode has no virgl: niri renders in software).
 #
-#   sh start-omarchy.sh [--port 8791] [--no-open]
+# --desktop opens /kiosk: a page that is just the desktop (omarchy-desktop.sh).
+#
+#   sh start-omarchy.sh [--port 8791] [--no-open] [--desktop]
 
 set -eu
 fail() { printf 'unkernel remote: %s\n' "$*" >&2; exit 2; }
 
-PORT=8791 OPEN=1
+PORT=8791 OPEN=1 DESKTOP=0
 while [ $# -gt 0 ]; do
 	case $1 in
 		--port) [ $# -ge 2 ] || fail "--port needs a value"; PORT=$2; shift ;;
 		--no-open) OPEN=0 ;;
-		-h|--help) echo "usage: start-omarchy.sh [--port N] [--no-open]"; exit 0 ;;
+		--desktop) DESKTOP=1 ;;
+		-h|--help) echo "usage: start-omarchy.sh [--port N] [--no-open] [--desktop]"; exit 0 ;;
 		*) fail "unknown option: $1" ;;
 	esac
 	shift
@@ -39,7 +42,7 @@ for f in "$version"/web/.output/public/distros/omarchy-*.erofs; do [ -f "$f" ] &
 [ -n "$image" ] || fail "this version has no Omarchy image: run update.sh for a release that has it"
 
 mkdir -p "$root/data/img" "$root/data/work-omarchy"
-url="http://127.0.0.1:$PORT/?remote=1&distro=omarchy"
+if [ "$DESKTOP" = 1 ]; then url="http://127.0.0.1:$PORT/kiosk"; else url="http://127.0.0.1:$PORT/?remote=1&distro=omarchy"; fi
 echo "Omarchy ($(basename "$image")): $url"
 if [ "$OPEN" = 1 ]; then
 	(

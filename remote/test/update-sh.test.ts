@@ -27,6 +27,7 @@ const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 const updateSh = readFileSync(path.join(repo, "remote", "update.sh"));
 const startSh = readFileSync(path.join(repo, "remote", "start.sh"));
 const startOmarchySh = readFileSync(path.join(repo, "remote", "start-omarchy.sh"));
+const omarchyDesktopSh = readFileSync(path.join(repo, "remote", "omarchy-desktop.sh"));
 const UP_TAG = "v0.2.0-test";
 const FORK = "owner/fork";
 const DISTROS = [
@@ -52,7 +53,9 @@ function serve(req: IncomingMessage, res: ServerResponse): void {
 	if (url.pathname === `/repos/${FORK}/releases`) {
 		const listed = [
 			{ tag_name: "remote-v9-draft", draft: true, prerelease: false },
-			...releases.map((tag) => ({ tag_name: tag, draft: false })),
+			// Oldest first, with times: the newest is by published_at, whatever the order (the API's is not the publication order).
+			...releases.map((tag, i) => ({ tag_name: tag, draft: false, prerelease: false, published_at: new Date(Date.UTC(2026, 10, 24) - i * 3_600_000).toISOString() })).reverse(),
+			{ tag_name: "remote-v99-pre", draft: false, prerelease: true, published_at: "2027-01-01T00:00:00Z" },
 			{ tag_name: UP_TAG, draft: false, prerelease: false },
 		];
 		res.writeHead(200, { "content-type": "application/json" });
@@ -77,6 +80,7 @@ function appFiles(version: string): Record<string, Buffer> {
 		"remote/README.md": Buffer.from(`readme ${version}\n`),
 		"remote/start.sh": startSh,
 		"remote/start-omarchy.sh": startOmarchySh,
+		"remote/omarchy-desktop.sh": omarchyDesktopSh,
 		"remote/unkernel-remote.js": Buffer.from(`bundle ${version}\n`),
 		"remote/update.sh": updateSh,
 		"remote/worker-entry.js": Buffer.from("worker\n"),
@@ -199,6 +203,7 @@ run("the first run installs the release and downloads each asset once", async ()
 	}
 	assert.ok(existsSync(path.join(app, "update.sh")) && existsSync(path.join(app, "start.sh")), "the launchers are in the install directory");
 	assert.deepEqual(readFileSync(path.join(app, "start-omarchy.sh")), startOmarchySh, "the Omarchy launcher is installed too");
+	assert.deepEqual(readFileSync(path.join(app, "omarchy-desktop.sh")), omarchyDesktopSh, "and the desktop one");
 	assert.equal(existsSync(path.join(app, "downloads")), false);
 	assert.equal(existsSync(path.join(app, "update.lock")), false);
 });

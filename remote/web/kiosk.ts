@@ -5,13 +5,14 @@
 // or terminal). It boots the Omarchy image on the remote backend through the same link
 // as the app, types `omarchy desktop` on the guest's console once the shell is up (so
 // the image needs no change), shows the boot status until the first frame of the
-// desktop, and sends the keyboard and mouse to the guest. The guest's display size
-// follows the window.
+// desktop, and sends the keyboard and mouse to the guest. The desktop's Super key is the
+// mod key, Pause by default (keys.ts). The guest's display size follows the window.
 
 import { createKernelOn, type CreateKernelOptions, type Platform, type WorkerOption } from "../../js/core/instance.ts";
 import type { DisplayMode } from "../../js/core/display.ts";
-import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux, domCodeToLinux } from "../../js/core/input.ts";
+import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux } from "../../js/core/input.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
+import { DEFAULT_MOD, MOD_KEYS, parseMod, routeKey } from "./keys.ts";
 import { RemoteLink } from "./link.ts";
 import { Picture } from "./picture.ts";
 
@@ -127,19 +128,14 @@ async function main(): Promise<void> {
 		timer = window.setTimeout(() => vm.updateDisplaySize(size()), 300);
 	});
 
-	// Keyboard: everything goes to the guest (F11 and F12 stay the browser's).
+	// Keyboard: everything goes to the guest (F11 and F12 stay the browser's). The mod key
+	// stands for the desktop's Super key (keys.ts).
+	const modParam = parseMod(params.get("mod"));
+	if (modParam === undefined) console.warn(`kiosk: ?mod= takes ${MOD_KEYS.join(", ")} or none; using ${DEFAULT_MOD}`);
+	const mod = modParam === undefined ? DEFAULT_MOD : modParam;
 	const onKey = (e: KeyboardEvent): void => {
 		const ev = evdev();
-		if (!ev) return;
-		const code = domCodeToLinux(e.code);
-		const down = e.type === "keydown";
-		if (!down && code !== undefined && ev.key(code, false)) {
-			e.preventDefault();
-			return;
-		}
-		if (e.code === "F11" || e.code === "F12" || !ev.keyboardOpen) return;
-		e.preventDefault();
-		if (down && code !== undefined) ev.key(code, true);
+		if (ev && routeKey(ev, mod, e.type === "keydown", e.code)) e.preventDefault();
 	};
 	addEventListener("keydown", onKey, true);
 	addEventListener("keyup", onKey, true);

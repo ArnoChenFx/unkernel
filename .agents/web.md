@@ -589,10 +589,21 @@ deploying the page needs no kernel toolchain.
   shown. A pinned app's tile stands for its window (`appwindows.ts`
   `windowApp()`: a page app's own window, a terminal app's Terminal or
   Wayland window, its installer), which then has no tile of its own; a
-  pinned group's tile opens its apps in a popover above it (DockStack.tsx,
-  `#dock-stack`). Tiles magnify under a mouse and show a label above them
-  at once (`#dock-label`: the name, the state, the key; no native
-  tooltip), a running dot (busy faint, error red) and an install's bar. A
+  pinned group's tile opens its apps in a stack above it (DockStack.tsx,
+  `#dock-stack`: a macOS Grid stack, the group's title over its apps on
+  a panel of the Dock's glass with a notch pointing at the tile, growing
+  out of it). A mouse resting on a group's tile (within 5 px) for 500 ms
+  opens its stack without moving the focus, and with one open, resting on
+  another group's tile for 130 ms switches to it (500 ms on the way from a
+  tile to its stack); it closes 300 ms after the pointer has left the tile
+  and the stack (`OPEN_DELAY`, `SWITCH_DELAY`, `GRACE` in Dock.tsx). A click opens
+  it pinned (or pins a hovered one) until a click on the tile, a press
+  elsewhere or Esc; a tap (touch, a pen) and Enter or Space toggle it as a
+  click does, the keyboard's putting the focus in it. A tile's menu or the
+  launcher closes it (Dock.tsx's header has the rules). Tiles magnify under
+  a mouse and show a label above them at once (`#dock-label`: the name,
+  the state, the key; no native tooltip; a group's tile shows its stack
+  instead), a running dot (busy faint, error red) and an install's bar. A
   click shows a window, or minimizes the focused one (not in compact
   mode); a right click, a long press or Shift-F10 opens the tile's menu
   (`winmenu.tsx` `windowItems()`, the same items as the top bar's app

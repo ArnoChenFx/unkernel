@@ -17,9 +17,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 if (!process.argv[2]) throw new Error("usage: bun remote/scripts/bundle.ts <out-dir>");
 const outDir = path.resolve(process.argv[2]);
 
-const ENTRIES = [
-	{ entry: "remote/cli.ts", out: "unkernel-remote.js" },
-	{ entry: "js/node/worker-entry.ts", out: "worker-entry.js" },
+const ENTRIES: { entry: string; out: string; target: "bun" | "browser" }[] = [
+	{ entry: "remote/cli.ts", out: "unkernel-remote.js", target: "bun" },
+	{ entry: "js/node/worker-entry.ts", out: "worker-entry.js", target: "bun" },
+	// The kiosk page's script (remote/web/kiosk.ts), served by the backend as /kiosk.js.
+	{ entry: "remote/web/kiosk.ts", out: "kiosk.js", target: "browser" },
 ];
 
 const WORKER_URL_TEST = /new URL\("\.\/[a-z-]+-entry\.ts", import\.meta\.url\)/;
@@ -37,10 +39,10 @@ const workerUrls: Bun.BunPlugin = {
 };
 
 mkdirSync(outDir, { recursive: true });
-for (const { entry, out } of ENTRIES) {
+for (const { entry, out, target } of ENTRIES) {
 	const result = await Bun.build({
 		entrypoints: [path.join(root, entry)],
-		target: "bun",
+		target,
 		format: "esm",
 		minify: true,
 		plugins: [workerUrls],

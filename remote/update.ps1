@@ -183,7 +183,7 @@ function Update-Launchers([string]$versionDir) {
 		if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $target -Force }
 	}
 	# The Omarchy launchers follow each release: replaced every update (they find the version's image themselves).
-	foreach ($name in 'start-omarchy.ps1', 'start-omarchy.cmd') {
+	foreach ($name in 'start-omarchy.ps1', 'start-omarchy.cmd', 'omarchy-desktop.cmd') {
 		$source = Join-Path (Join-Path $versionDir 'remote') $name
 		if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $app $name) -Force }
 	}

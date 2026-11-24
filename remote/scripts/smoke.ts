@@ -108,6 +108,12 @@ async function main(): Promise<void> {
 		const html = await page.text();
 		if (page.status !== 200 || !/name="unkernel-remote"/.test(html)) fail(`the page is not the remote page (status ${page.status})`);
 
+		const kiosk = await fetch(`${origin}/kiosk?distro=alpine`);
+		const kioskHtml = await kiosk.text();
+		if (kiosk.status !== 200 || !/window\.__KIOSK__=\{"kernel":"\/assets\/unkernel-[^"]+\.wasm","distro":"\/distros\/alpine-[0-9a-f]+\.erofs"/.test(kioskHtml)) fail(`the kiosk page is wrong (status ${kiosk.status})`);
+		const kioskJs = await fetch(`${origin}/kiosk.js`);
+		if (kioskJs.status !== 200 || (await kioskJs.text()).length < 10_000) fail("the kiosk script is not served");
+
 		const alpine = readdirSync(path.join(web, "distros")).find((f) => /^alpine-[0-9a-f]+\.erofs$/.test(f));
 		if (!alpine) fail("the web build has no Alpine distro image (distros/alpine-*.erofs)");
 		const range = await fetch(`${origin}/distros/${alpine}`, { headers: { range: "bytes=0-15" } });

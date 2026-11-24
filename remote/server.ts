@@ -8,9 +8,9 @@
 // only under the web build, the distro images are copied to the cache, and
 // the data disk is created from the kernel's template when missing.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledBoot } from "../js/core/kernel.ts";
 import { REMOTE_INFO_PATH, REMOTE_WIRE, REMOTE_WS_PATH } from "./wire.ts";
 import { createImageFromKwsparse } from "../js/node/disk.ts";
@@ -34,6 +34,52 @@ const SECURITY_HEADERS = {
 	"x-content-type-options": "nosniff",
 	"referrer-policy": "no-referrer",
 };
+
+/** The kiosk page's script (remote/web/kiosk.ts): kiosk.js beside the bundle, or built from the source in a checkout. */
+const here = path.dirname(fileURLToPath(import.meta.url));
+let kioskCode: Promise<string> | undefined;
+function kioskScript(): Promise<string> {
+	kioskCode ??= (async () => {
+		const beside = path.join(here, "kiosk.js");
+		if (existsSync(beside)) return readFileSync(beside, "utf8");
+		const built = await Bun.build({ entrypoints: [path.join(here, "web", "kiosk.ts")], target: "browser", format: "esm", minify: true });
+		if (!built.success) throw new Error(`the kiosk page does not build: ${built.logs.join("; ")}`);
+		return built.outputs[0]!.text();
+	})();
+	return kioskCode;
+}
+
+/** The kiosk page (/kiosk[?distro=NAME]): the kernel and the distro image are the web build's own. */
+function kioskHtml(web: string, distro: string): string | undefined {
+	const list = (dir: string) => {
+		try {
+			return readdirSync(path.join(web, dir));
+		} catch {
+			return [];
+		}
+	};
+	const kernel = list("assets").find((f) => /^unkernel-(?!smp-)[A-Za-z0-9_-]+\.wasm$/.test(f));
+	const image = list("distros").find((f) => f.startsWith(`${distro}-`) && DISTRO_FILE.test(`/distros/${f}`));
+	if (!kernel || !image) return undefined;
+	const config = JSON.stringify({ kernel: `/assets/${kernel}`, distro: `/distros/${image}`, command: distro === "omarchy" ? "omarchy desktop" : "" });
+	return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Omarchy</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="unkernel-remote" content="1">
+<style>
+html,body{margin:0;height:100%;background:#0b0c10;color:#c0caf5;font:15px system-ui,sans-serif;overflow:hidden}
+#fb{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;cursor:none;opacity:0;touch-action:none}
+body.live #fb{opacity:1}
+#msg{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;pointer-events:none}
+body.live #msg{display:none}
+#status{font-size:22px}#detail{opacity:.6}
+</style></head><body>
+<canvas id="fb" width="640" height="480" tabindex="0"></canvas>
+<div id="msg"><div id="status"></div><div id="detail"></div></div>
+<script>window.__KIOSK__=${config};</script>
+<script type="module" src="/kiosk.js"></script>
+</body></html>
+`;
+}
 
 function isFile(p: string): boolean {
 	try {
@@ -158,6 +204,14 @@ export async function startRemoteServer(config: RemoteConfig, log: (line: string
 				return Response.json(info(), { headers: { ...SECURITY_HEADERS, "cache-control": "no-store" } });
 			}
 			if (req.method !== "GET" && req.method !== "HEAD") return new Response("method not allowed", { status: 405 });
+			if (url.pathname === "/kiosk" || url.pathname === "/kiosk/") {
+				const html = kioskHtml(web, url.searchParams.get("distro") ?? "omarchy");
+				if (!html) return new Response("the web build has no such distro image", { status: 404 });
+				return new Response(html, { headers: { ...SECURITY_HEADERS, "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" } });
+			}
+			if (url.pathname === "/kiosk.js") {
+				return new Response(await kioskScript(), { headers: { ...SECURITY_HEADERS, "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" } });
+			}
 			return staticFile(url.pathname);
 		},
 		websocket: {

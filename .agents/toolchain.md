@@ -81,6 +81,10 @@ minirootfs, Debian, busybox-static, erofs-utils, lz4, zstd) in
 `guest/**/pins.sh` (erofs-utils is patched: `guest/tools/erofs-utils-patches/`,
 data in tar order and the metadata zone in front, for the distro images'
 layout; guest/README.md) (`ALPINE_TARBALL=file` overrides the download);
-the Vulkan headers guest Vulkan's ICD builds against in `vk/pins.sh`. wterm (`@wterm/dom`
+the Vulkan headers guest Vulkan's ICD builds against in `vk/pins.sh`, and
+so are shaderc 2026.4 and its glslang, SPIRV-Tools and SPIRV-Headers
+commits, from which `vk/glslc.sh` builds a host glslc (and installs the
+SPIR-V headers) into `vendor/toolchain/glslc` for
+`test/vk/guest/build-llama.sh` (`GLSLC=` names another). wterm (`@wterm/dom`
 0.5.10, Apache-2.0) is an npm dependency of `web/`, pinned exactly and
 locked in `pnpm-lock.yaml` (see web.md).

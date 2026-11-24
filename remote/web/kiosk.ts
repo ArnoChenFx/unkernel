@@ -31,7 +31,25 @@ const say = (title: string, more = ""): void => {
 	detail.textContent = more;
 	document.body.classList.remove("live");
 };
-const size = () => ({ width: Math.max(320, Math.floor(innerWidth)), height: Math.max(240, Math.floor(innerHeight)), dpi: 96 });
+// The guest renders in software (no virgl over the link), so its display is capped at about
+// 1280x800 worth of pixels whatever the window (a 5120x1440 window would ask for 6.6 MP,
+// slow in the guest and heavy frames for the page); the canvas is scaled up to the window.
+// ?size=WxH asks for that size exactly; ?max=WxH moves the cap.
+const params = new URLSearchParams(location.search);
+const wxh = (v: string | null): [number, number] | undefined => {
+	const m = v ? /^(\d{3,4})x(\d{3,4})$/.exec(v) : null;
+	return m ? [Number(m[1]), Number(m[2])] : undefined;
+};
+const fixed = wxh(params.get("size"));
+const cap = wxh(params.get("max")) ?? [1280, 800];
+const size = () => {
+	if (fixed) return { width: fixed[0], height: fixed[1], dpi: 96 };
+	let w = Math.max(320, innerWidth), h = Math.max(240, innerHeight);
+	const scale = Math.min(1, Math.sqrt((cap[0] * cap[1]) / (w * h)));
+	w = Math.floor((w * scale) / 8) * 8;
+	h = Math.floor((h * scale) / 2) * 2;
+	return { width: Math.max(320, w), height: Math.max(240, h), dpi: Math.round(96 * scale) || 96 };
+};
 
 async function main(): Promise<void> {
 	say("Connecting…");
@@ -45,6 +63,7 @@ async function main(): Promise<void> {
 	say("Starting Linux…", "first start downloads the Omarchy image, which takes a while");
 	let mode: { width: number; height: number } | null = null;
 	let shownOnce = false;
+	let gone = 0;
 	const opts: CreateKernelOptions & WorkerOption & { worker: true } = {
 		worker: true,
 		shared: false,
@@ -60,10 +79,15 @@ async function main(): Promise<void> {
 		onInput: () => {},
 		onDisplay: (m) => {
 			mode = m ? { width: m.width, height: m.height } : null;
+			clearTimeout(gone);
 			if (m) {
 				canvas.width = m.width;
 				canvas.height = m.height;
-			} else if (shownOnce) say("The desktop closed", "reload this page to start it again");
+				if (shownOnce) document.body.classList.add("live");
+			} else if (shownOnce) {
+				// A mode change (the window resized) lets go of the display for a moment: closed only if it stays so.
+				gone = window.setTimeout(() => { if (!mode) say("The desktop closed", "reload this page to start it again"); }, 8000);
+			}
 		},
 	} as never;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);

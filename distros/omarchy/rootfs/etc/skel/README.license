@@ -1,0 +1,5 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+
+etc/skel/README: the README in the user's home of the Omarchy image. Plain
+text, so its header is in this file.

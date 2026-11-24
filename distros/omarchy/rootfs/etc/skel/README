@@ -1,0 +1,52 @@
+Omarchy: a keyboard-driven desktop and terminal on Debian 13 (arm64),
+running on unkernel. The packages are Debian's own, except niri, the
+compositor, which is its release built for this image.
+
+Desktop
+
+    omarchy desktop         start niri on the display (the page's GPU option,
+                            or the CLI's --gpu). Super+Shift+E leaves it.
+    Super+Alt+Space         the menu: install, update, lock, power.
+    Super+Space             the launcher (fuzzel).
+    Super+Return            a terminal (foot).
+    omarchy keys            every keybinding.
+
+    The top bar (waybar) shows the workspaces, the focused window, the clock,
+    and the CPU and memory use. The wallpaper is Tokyo Night.
+
+Terminal
+
+    bash with starship (prompt), zoxide (z DIR), fzf (Ctrl-R history,
+    Ctrl-T files, Alt-C directories), ripgrep (rg), fd (fdfind), bat (cat),
+    eza (ls, ll, la), btop (top), lazygit (lg), neovim (v), tmux (prefix
+    Ctrl-a), git, jq, curl.
+
+Packages
+
+    omarchy install PKG...  or sudo apt-get install PKG...
+    omarchy update          apt update and upgrade.
+
+    The root file system is read-only. Packages and changes go to the
+    overlay: they stay across reboots when the page keeps a data disk, and
+    are lost otherwise.
+
+Lock screen
+
+    The lock needs a password. Set one first:
+
+        sudo passwd user
+
+    Then Super+Escape locks the screen. Without a password, omarchy lock
+    refuses, so the screen cannot lock itself shut.
+
+Configuration
+
+    ~/.config: niri, waybar, foot, fuzzel, mako, starship.toml, nvim, btop,
+    tmux, lazygit, bat. Everything is in Tokyo Night.
+
+Limits
+
+    No sound, no Nerd Font, no network tools beyond curl and git. No X11
+    programs (there is no Xwayland). niri has no scratchpad and no split
+    direction: the keys for them are gone. The desktop is for one user, on
+    the display the page or the CLI draws.

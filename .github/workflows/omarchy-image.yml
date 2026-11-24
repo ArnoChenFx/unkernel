@@ -1,0 +1,419 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+#
+# The Omarchy image (distros/omarchy): a Debian 13 arm64 root with a desktop,
+# built from source on the base bundle of this commit, indexed as distros.json
+# and published as a GitHub release under its own tag, omarchy-<YYMMDD>-<commit>
+# (never the latest release, which the package's v* releases are). Its assets:
+#
+#   omarchy.erofs          the image
+#   omarchy.erofs.sha256   its sha256sum line (sha256sum -c)
+#   distros.json           its index, in the entry format of upstream's
+#                          distros.json: name, file, size, sha256, image id, and
+#                          the abi and base id of the base bundle it was built on
+#
+# Runs:
+#   - by hand (Actions > Omarchy image > Run workflow): a release of the branch's
+#     head. Unchecking "release" builds the files and keeps them as the workflow
+#     artifact omarchy-image only.
+#   - from another workflow of this repository, as a reusable workflow
+#     (uses: ./.github/workflows/omarchy-image.yml): remote-release.yml does, for
+#     the commit it releases (sha). The calling job grants permissions:
+#     contents: write, or the release job cannot publish. The outputs are the
+#     tag, the asset's URL and its sha256.
+#
+# The tag must not start with v: the v* tags are the package's releases, which
+# the page and the SDK fetch by their version. A tag the workflow creates (with
+# GITHUB_TOKEN) does not start another run.
+#
+# Caches (all restored and saved explicitly): the toolchain, the kernel tree and
+# the kernel builds, under release.yml's keys (their contents are the same, so
+# one run's cache serves the other's); downloads under omarchy-downloads-, which
+# also keeps the Debian packages of the image.
+name: Omarchy image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a GitHub release with the image (unchecked: build the files and keep them as a workflow artifact)"
+        type: boolean
+        default: true
+      tag:
+        description: "The release tag (empty: omarchy-<YYMMDD>-<commit>; never a v* tag)"
+        type: string
+        default: ""
+      sha:
+        description: "The commit to build (empty: the commit the run is on)"
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      release:
+        description: "Publish a GitHub release with the image (false: build the files only)"
+        type: boolean
+        default: true
+      tag:
+        description: "The release tag (empty: omarchy-<YYMMDD>-<commit>; never a v* tag)"
+        type: string
+        default: ""
+      sha:
+        description: "The commit to build (empty: the calling run's commit)"
+        type: string
+        default: ""
+    outputs:
+      tag:
+        description: "The release tag of the image"
+        value: ${{ jobs.guard.outputs.tag }}
+      url:
+        description: "The URL of omarchy.erofs in the release (empty without a release)"
+        value: ${{ jobs.release.outputs.url }}
+      sha256:
+        description: "The sha256 of omarchy.erofs"
+        value: ${{ jobs.build.outputs.sha256 }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omarchy-image-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    name: Pick the release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      sha: ${{ steps.pick.outputs.sha }}
+      release: ${{ steps.pick.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Pick the tag and check it
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.sha || github.sha }}
+          TAG_INPUT: ${{ inputs.tag }}
+          RELEASE_INPUT: ${{ inputs.release }}
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::$COMMIT is not a full commit sha"; exit 1; }
+          date="$(date -u -d "$(git log -1 --format=%cI "$COMMIT")" +%y%m%d)"
+          tag="${TAG_INPUT:-omarchy-$date-${COMMIT::7}}"
+          case "$tag" in
+          v*) echo "::error::the tag $tag starts with v: those are the package's releases"; exit 1 ;;
+          esac
+          [[ "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] ||
+            { echo "::error::$tag is not a usable tag name"; exit 1; }
+          {
+            echo "tag=$tag"
+            echo "sha=$COMMIT"
+            echo "release=${RELEASE_INPUT:-true}"
+          } >> "$GITHUB_OUTPUT"
+          echo "ok: $tag at $COMMIT ($([ "${RELEASE_INPUT:-true}" = true ] && echo release || echo build only))"
+
+  build:
+    name: Build the image
+    needs: guard
+    # The repository variable RELEASE_RUNNER names a larger runner (more cores for
+    # the wasm-ld and kernel builds), if one is set up.
+    runs-on: ${{ vars.RELEASE_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    outputs:
+      sha256: ${{ steps.image.outputs.sha256 }}
+    env:
+      # The base bundle then writes base.cpio without the kwtest programs, and
+      # the image build refuses the development relay (KW_WLANDR).
+      KW_RELEASE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+
+      - name: Install clang 22 and host tools
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/keyrings/apt.llvm.org.asc >/dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-22.list >/dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang-22 lld-22 llvm-22 cmake ninja-build flex bison bc m4 e2fsprogs patch meson pkg-config
+          echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          cache: true
+
+      - name: Check prerequisites
+        run: ./setup.sh --check
+
+      - name: Cache keys
+        id: keys
+        run: |
+          {
+            echo "linux=$(sed -n 's/^LINUX_BASE=//p' kernel/build.sh)"
+            echo "llvm=$(sed -n 's/^LLVM_COMMIT=//p' kernel/build.sh)"
+            echo "clang=$(clang --version | head -1 | sha256sum | cut -c1-16)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Patched wasm-ld, as release.yml builds it (the same key and cache).
+      - name: Restore toolchain
+        id: toolchain
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/lld22/bin/lld
+            vendor/toolchain/bin
+          key: toolchain-${{ runner.os }}-${{ steps.keys.outputs.llvm }}-${{ hashFiles('kernel/patches/llvm/**') }}
+          restore-keys: toolchain-${{ runner.os }}-${{ steps.keys.outputs.llvm }}-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/llvm/**') }}
+      - name: Build the patched wasm-ld
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          if [ -x vendor/toolchain/bin/wasm-ld ]; then
+            echo "restored from ${{ steps.toolchain.outputs.cache-matched-key }}"
+          else
+            kernel/build.sh toolchain
+          fi
+      - name: Save toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/lld22/bin/lld
+            vendor/toolchain/bin
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+
+      - name: Restore downloads
+        id: downloads
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/downloads
+          key: omarchy-downloads-${{ hashFiles('kernel/tools/env.sh', 'kernel/build.sh', 'guest/**/pins.sh', 'distros/omarchy/pins.sh') }}
+          restore-keys: |
+            omarchy-downloads-
+            downloads-
+
+      # Exact key only: build.sh never re-applies the series on an existing
+      # kw-arm64-user branch, so a tree with other patches must not be restored.
+      - name: Restore the kernel tree
+        id: linux-src
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/src/linux-wasm-kernel
+          key: linux-src-${{ steps.keys.outputs.linux }}-${{ hashFiles('kernel/patches/linux/**') }}
+
+      # Only from a build of the same tree (exact linux-src key above), so file
+      # times order correctly and make rebuilds what changed.
+      - name: Restore the kernel build
+        id: kernel-out
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/kernel
+            vendor/build/kernel-smp
+          key: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-${{ hashFiles('src/**', 'include/**', 'build.zig', 'build.zig.zon', 'kernel/build.sh') }}
+          restore-keys: kernel-out-${{ steps.keys.outputs.clang }}-${{ hashFiles('kernel/patches/linux/**', 'kernel/tools/fake-llvm/**') }}-
+
+      - name: Drop a kernel build that does not match the tree
+        if: steps.linux-src.outputs.cache-hit != 'true'
+        run: rm -rf vendor/build/kernel vendor/build/kernel-smp
+
+      # As release.yml: build.sh would run zig build for the runner's CPU, so
+      # build for a baseline CPU and hand build.sh the library.
+      - name: Build kwemu
+        run: |
+          zig build -Dkwemu-jit=true -Dcpu=baseline
+          zig build -Dkwemu-jit=true -Dkwemu-atomics=true -Dcpu=baseline --prefix vendor/build/kwemu-smp
+
+      - name: Build the kernels
+        env:
+          KWEMU: ${{ github.workspace }}/zig-out/lib/libkwemu.a
+          KWEMU_SMP: ${{ github.workspace }}/vendor/build/kwemu-smp/lib/libkwemu.a
+        run: |
+          kernel/build.sh kernel
+          kernel/build.sh smp
+
+      - name: Save the kernel tree
+        if: steps.linux-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/src/linux-wasm-kernel
+          key: ${{ steps.linux-src.outputs.cache-primary-key }}
+      - name: Save the kernel build
+        if: steps.kernel-out.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            vendor/build/kernel
+            vendor/build/kernel-smp
+          key: ${{ steps.kernel-out.outputs.cache-primary-key }}
+
+      # The image's build runs the SDK from source (it boots the base bundle at
+      # build time: guest/tools/vm-run.ts).
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the data disk template and the base bundle
+        env:
+          KW_SMP: "1"
+        run: |
+          kernel/build.sh datadisk
+          kernel/build.sh base
+          ls -l vendor/build/bundle/unkernel.wasm vendor/build/initramfs/base.cpio
+          sha256sum vendor/build/bundle/unkernel.wasm
+
+      # niri (distros/omarchy/build-niri.sh): cross-compiled for arm64 on this
+      # runner, its binary cached by the pins it is built from (the niri commit is
+      # in build-niri.sh, the libraries' lists in guest/distro/debian/pins.sh).
+      - name: Restore niri
+        id: niri
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/niri-arm64/niri
+          key: niri-${{ runner.os }}-${{ hashFiles('distros/omarchy/build-niri.sh', 'distros/omarchy/resolve-debs.py', 'guest/distro/debian/pins.sh') }}
+      - name: Build niri
+        if: steps.niri.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross libclang-22-dev
+          distros/omarchy/build-niri.sh
+      - name: Save niri
+        if: steps.niri.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/build/niri-arm64/niri
+          key: ${{ steps.niri.outputs.cache-primary-key }}
+
+      # The image itself (distros/omarchy/build.sh), in its own output directory,
+      # then its distros.json: guest/build.sh index, which reads the base bundle's
+      # abi and base id from the same bundle the image boots on.
+      - name: Build the Omarchy image
+        env:
+          KW_DISTRO_OUT: ${{ github.workspace }}/vendor/build/omarchy
+        run: |
+          set -o pipefail
+          distros/omarchy/build.sh 2>&1 | tee omarchy.log
+          if grep -q "no apt cache in the image" omarchy.log; then
+            echo "::error::the image was built without apt's source cache"
+            exit 1
+          fi
+
+      - name: Index the image
+        env:
+          KW_DISTRO_OUT: ${{ github.workspace }}/vendor/build/omarchy
+        run: |
+          guest/build.sh index
+          cat vendor/build/omarchy/distros.json
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          node -e '
+            const fs = require("node:fs"), crypto = require("node:crypto");
+            const j = JSON.parse(fs.readFileSync("vendor/build/omarchy/distros.json", "utf8"));
+            const want = Number(/^#define KW_ABI_VERSION (\d+)$/m.exec(fs.readFileSync("include/kw_emu.h", "utf8"))[1]);
+            const fail = (m) => { console.log(`::error::distros.json: ${m}`); process.exit(1); };
+            if (j.abi !== want) fail(`abi ${j.abi}, include/kw_emu.h has ${want}`);
+            if (!j.base) fail("no base id");
+            const names = j.distros.map((d) => d.name).join(",");
+            if (names !== "omarchy") fail(`distros ${names}, expected omarchy`);
+            for (const d of j.distros) {
+              if (d.file !== "omarchy.erofs") fail(`${d.name}: ${d.file} is not omarchy.erofs`);
+              const b = fs.readFileSync(`vendor/build/omarchy/${d.file}`);
+              const sum = crypto.createHash("sha256").update(b).digest("hex");
+              if (b.length !== d.size || sum !== d.sha256) fail(`${d.file}: ${b.length} bytes, ${sum}`);
+              if (!d.image) fail(`${d.name}: no image id`);
+            }
+            console.log(`ok: abi ${j.abi}, ${j.base}, ${j.distros.map((d) => `${d.file} ${d.image}`).join(", ")}`);
+          '
+
+      - name: Save downloads
+        if: steps.downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/downloads
+          key: ${{ steps.downloads.outputs.cache-primary-key }}
+
+      - name: Stage the release assets
+        id: image
+        run: |
+          mkdir -p release
+          cp vendor/build/omarchy/omarchy.erofs vendor/build/omarchy/distros.json release/
+          (cd release && sha256sum omarchy.erofs > omarchy.erofs.sha256 && sha256sum -c omarchy.erofs.sha256)
+          echo "sha256=$(cut -d' ' -f1 release/omarchy.erofs.sha256)" >> "$GITHUB_OUTPUT"
+          ls -l release
+          (cd release && sha256sum -- *)
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: omarchy-image
+          path: release/
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [guard, build]
+    if: needs.guard.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # the tag and the GitHub release
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: omarchy-image
+          path: out
+
+      # gh creates a release with its assets (a draft until the last one is up),
+      # so a run cut off in between leaves a draft: the next run uploads what is
+      # missing and publishes it. A release that exists keeps its notes; its
+      # omarchy.erofs must be this build's bytes (the image is reproducible: the
+      # same commit gives the same file), or the run fails.
+      - name: Publish the GitHub release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.guard.outputs.tag }}
+          COMMIT: ${{ needs.guard.outputs.sha }}
+          SHA: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/omarchy.erofs"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern omarchy.erofs --dir existing --clobber 2>/dev/null; then
+              got="$(sha256sum existing/omarchy.erofs | cut -d' ' -f1)"
+              [ "$got" = "$SHA" ] || { echo "::error::release $TAG has another omarchy.erofs ($got) than this build ($SHA)"; exit 1; }
+            fi
+            have="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            for f in out/*; do
+              grep -qxF "$(basename "$f")" <<<"$have" || gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+            done
+            if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+            fi
+            echo "release $TAG exists: its assets are checked"
+          else
+            gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --latest=false \
+              --title "$TAG" --notes "The Omarchy image (distros/omarchy) of commit $COMMIT: a Debian 13 arm64 root with a keyboard-driven desktop. Assets: omarchy.erofs, its sha256 (omarchy.erofs.sha256) and distros.json (the index: the abi and base id of the base bundle it was built on)."
+            echo "created $TAG at $COMMIT"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "$url"

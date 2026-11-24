@@ -1,0 +1,6 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+
+etc/skel/.config/waybar/style.css: the bar's stylesheet of the Omarchy image. CSS
+comments are not the header syntax install_tree strips, so the header is in
+this file.

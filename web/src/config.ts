@@ -340,7 +340,7 @@ export interface Config {
 }
 
 /** The distros whose Mesa has the virgl driver (Alpine's has none). */
-export const GL_DISTROS: readonly string[] = ["debian"];
+export const GL_DISTROS: readonly string[] = ["debian", "omarchy"];
 
 /** The GL option's default: on where the display is (?display=0: off). */
 export function glDefault(display: boolean): boolean {

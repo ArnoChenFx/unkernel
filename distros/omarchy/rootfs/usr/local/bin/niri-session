@@ -1,0 +1,30 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+# niri on the display's DRM device, started by `omarchy desktop`: the user's
+# runtime directory, the seat through seatd, dbus for niri's clients.
+# niri renders with GLES on the render node. With virgl (the page's GL option) the
+# virtio_gpu driver renders on the host's GL; without it the device has no 3D
+# context and niri gets llvmpipe through kms_swrast on the dumb buffers that
+# --gpu gives. MESA_LOADER_DRIVER_OVERRIDE, when set, is used as it is.
+
+set -u
+
+run=/run/user/$(id -u)
+[ -e /dev/dri/card0 ] || { echo "niri-session: no /dev/dri/card0 (the CLI's --gpu)" >&2; exit 1; }
+[ -d "$run" ] && [ -O "$run" ] || { echo "niri-session: $run is missing (sudo /etc/init.d/omarchy start)" >&2; exit 1; }
+unset DISPLAY WAYLAND_DISPLAY
+
+# VIRTIO_GPU_F_VIRGL is feature bit 0, the first character of the device's features.
+virgl=0
+for dev in /sys/bus/virtio/devices/*; do
+	[ "$(cat "$dev/device" 2>/dev/null)" = 0x0010 ] || continue
+	[ "$(cut -c1 "$dev/features" 2>/dev/null)" = 1 ] && virgl=1
+done
+if [ "$virgl" = 0 ]; then
+	export MESA_LOADER_DRIVER_OVERRIDE=${MESA_LOADER_DRIVER_OVERRIDE:-kms_swrast}
+fi
+
+export XDG_RUNTIME_DIR="$run" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=niri XDG_SESSION_DESKTOP=niri
+export LIBSEAT_BACKEND=seatd XCURSOR_THEME=DMZ-White XCURSOR_SIZE=24 LANG="${LANG:-C.UTF-8}"
+exec dbus-run-session -- niri "$@"

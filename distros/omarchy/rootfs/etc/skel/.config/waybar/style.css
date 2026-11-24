@@ -1,0 +1,62 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * Copyright (C) 2026 ARNO <arnochen101@gmail.com>
+ * ~/.config/waybar/style.css of the Omarchy image: the bar in Tokyo Night. */
+
+* {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    min-height: 0;
+    border: none;
+    border-radius: 0;
+}
+
+window#waybar {
+    background: #1a1b26;
+    color: #a9b1d6;
+    border-bottom: 2px solid #292e42;
+}
+
+#workspaces {
+    margin-left: 6px;
+}
+
+#workspaces button {
+    padding: 0 9px;
+    color: #565f89;
+    background: transparent;
+}
+
+#workspaces button:hover {
+    color: #c0caf5;
+    background: #292e42;
+}
+
+#workspaces button.active {
+    color: #1a1b26;
+    background: #7aa2f7;
+}
+
+#workspaces button.urgent {
+    color: #1a1b26;
+    background: #f7768e;
+}
+
+#window {
+    color: #c0caf5;
+    padding: 0 12px;
+}
+
+#clock {
+    color: #7dcfff;
+    font-weight: bold;
+}
+
+#cpu {
+    color: #9ece6a;
+    padding: 0 10px;
+}
+
+#memory {
+    color: #bb9af7;
+    padding: 0 10px 0 0;
+}

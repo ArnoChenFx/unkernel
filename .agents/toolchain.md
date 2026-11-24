@@ -47,9 +47,10 @@ The API differs from 0.13-0.15. Examples of all of these are in
   allocator to each call.
 - build.zig uses `root_module = b.createModule(...)`,
   `b.addLibrary(.{ .linkage })` and `b.addTranslateC`.
-- kwemu is built for wasm64 with cpu `mvp`, so the object needs only
-  memory64: no atomics, bulk memory or sign-ext (`-Dkwemu-atomics` adds
-  atomics and bulk memory for an SMP kernel).
+- kwemu is built for wasm64 with cpu `mvp` plus bulk memory, sign-ext,
+  nontrapping-fptoint and mutable globals, which the kernel's C objects
+  (clang's `generic` cpu) need anyway; no atomics (`-Dkwemu-atomics` adds
+  them for an SMP kernel).
 - The guest programs (kwtest, kwbench, glimmer, kwtty, kw9p, kwvsock,
   kwshm) are built with `zig cc` (`aarch64-linux-musl`, `-mcpu=generic`,
   static); abitest freestanding (`aarch64-linux-none`, `-nostdlib`).

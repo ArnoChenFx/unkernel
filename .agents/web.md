@@ -313,8 +313,8 @@ deploying the page needs no kernel toolchain.
   `open` while their window shows), the options' `#opt-*`, `#confirm`,
   `#keys`, `#fb-layer`, `#wl-desktop`. Keep them working.
 - Safe areas are the CSS variables `--st`, `--sr`, `--sb`, `--sl` (style.css). On iOS,
-  `--sb` is three quarters of the bottom inset: the Dock sits that far above the bottom
-  edge, over the wallpaper that goes on under the home indicator, and moves its ends in
+  `--sb` is three quarters of the bottom inset: the Dock's tiles sit that far above the
+  bottom edge, its bar going on under the home indicator, and its ends move in
   by `--sc` (half the bottom inset) for the round corners. While the on-screen keyboard
   is up (`App.tsx` sets `kb` on the root when the visual viewport is well below the
   layout viewport) both are 0 and the top bar and the Dock are hidden (the key bar
@@ -549,8 +549,12 @@ deploying the page needs no kernel toolchain.
   bar and the Dock, inside the safe areas. Compact mode (phones,
   `KW.config.mobile`, and viewports below 640 px, `COMPACT_PX` in
   Workspace.tsx): every window is drawn maximized with a slim strip for
-  its title, only the top one shows, and the Dock is the switcher; the
-  geometry is kept for when the viewport widens.
+  its title, only the top one shows, and the Dock is the switcher, a lower
+  bar across the page; the geometry is kept for when the viewport widens.
+  Outside it, while a maximized window is shown (`dockHides()` in wm.ts) the
+  Dock hides itself and the workspace goes on to the page's bottom; the
+  pointer at the bottom edge (`#dock-edge`, `useReveal` in Dock.tsx) brings
+  it back over the windows.
 - Snapping (`wmsnap.ts`): a window dragged by its title bar to the
   workspace's sides or corners tiles to a half or a quarter (to the top
   edge: maximized), with a preview under it (SnapPreview.tsx); Ctrl-A and
@@ -609,8 +613,9 @@ deploying the page needs no kernel toolchain.
   mode); a right click, a long press or Shift-F10 opens the tile's menu
   (`winmenu.tsx` `windowItems()`, the same items as the top bar's app
   menu). The tiles scroll sideways when they do not fit.
-- Top bar (`TopBar.tsx`, `#topbar`): no background over the wallpaper, a
-  blurred tint over a window. The current app, one control (its icon, as
+- Top bar (`TopBar.tsx`, `#topbar`): no background over the wallpaper,
+  nearly black while a maximized window is shown (`data-dark`) and in
+  compact mode. The current app, one control (its icon, as
   on its Dock tile, the focused window's `meta` title, then its own title
   in a quieter tone; unkernel's mark and "Desktop" with none), a menu of
   the window's items (`#tb-app`), and in its place until user space prints the
@@ -622,9 +627,7 @@ deploying the page needs no kernel toolchain.
   bar the share of the page's time the two renderers took together, its
   tooltip each one's figures), which open
   Resources, and the Control Center's item (`#tb-status`,
-  `#tb-status-label`). The bar always shows:
-  its auto-hide over a maximized window is off (`auto` in TopBar.tsx; the
-  code for it stays).
+  `#tb-status-label`). The bar always shows.
 - Control Center (`ControlCenter.tsx`, `#tb-cc`), opened by hovering or
   clicking `#tb-status`:
   the state and the uptime, quick buttons for what applies at once (full

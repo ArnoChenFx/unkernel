@@ -475,9 +475,12 @@ parts that are easy to get wrong.
   allocation falls back to credits. shm reads go through a third ring
   (`SHM_HEAD`), answered by a "shm-read" message posted from the clock
   import. vsock packets for the guest go through a fourth (`VS_HEAD`,
-  length-prefixed records; what does not fit waits on the owner's side,
-  never a message, to keep the stream's order), queued in the
-  VsockDevice at the clock read. Sound PCM goes through a shared SPSC ring
+  length-prefixed records; what does not fit waits on the owner's side),
+  queued in the VsockDevice at the clock read. While the kernel waits idle
+  a burst goes as one "vsock" message instead (transferred: the ring
+  copies every byte twice), only with the ring empty, and until the worker
+  has counted that message in `VS_ACK` the next bursts are messages too,
+  which keeps the stream's order. Sound PCM goes through a shared SPSC ring
   (`sound-ring.ts`: `SoundRingWriter` -> one `SoundRingReader`) with coalesced
   "sound-wake" messages (or directly to `SoundSink.onRing` without wakes) and
   atomic queued-frame feedback; only `shared: false` falls back to
@@ -509,6 +512,8 @@ parts that are easy to get wrong.
   through the shared transport's ring (at its next clock read; as
   messages they waited for its yield, up to 20 ms under load: 2026-11-22,
   12 ms on average of each frame of a Wayland app under load, web.md),
+  or as a message while the kernel waits idle (a cold 26 MB read from a
+  host mount: 125 ms through the ring alone, 103 ms so, 2026-11-24),
   else as messages; the worker posts the guest's per microtask (the
   kernel's next task switch or yield), or at once from inside the import
   past 64 KiB or 64 packets.

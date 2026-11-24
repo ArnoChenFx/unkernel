@@ -1033,7 +1033,7 @@ answered at the kernel's next yield.
   image, so it matches the page only where the image is the same
   release's (the page's own images are); nothing checks the link's
   version, and `wland` reads only the relay's features for its own flags. The page needs wland
-  0.1.0-261122-6617578 or later, its npm pin (createWland's embedder
+  0.1.0-261122-6617578 or later (createWland's embedder
   options and hooks, `setBounds`, `setTiled`, `setVisible`,
   `setWindowPosition`, besides the `gpu` source, `view`, `readv` and the
   clipboard bridge); older packages lack that API. The
@@ -1041,8 +1041,7 @@ answered at the kernel's next yield.
   build, its entry `wlandr`). The relay at boot needs `--link-on-demand`
   (and `--version`, `--no-fence-wait`), and Firefox's input the core that
   sends seat events to every pointer and keyboard of a client: both in
-  wland 0.1.0-261122-632f589, the relay's pin in pins.sh (the npm pin is
-  the later release; the two differ for now). With an older relay the boot
+  wland 0.1.0-261122-632f589. Both pins are 0.1.0-261124-100fbf2. With an older relay the boot
   starts none and shells get no session (plain apps fail as outside the
   page; `wland CMD` works as before). A new release: `WLANDR_VERSION` and
   `WLANDR_SHA256` in pins.sh and the npm version in `web/package.json`
@@ -1205,7 +1204,7 @@ answered at the kernel's next yield.
   time in I/O wait) and the first page takes minutes; with 2 GiB (the
   page's default on desktops) its window maps in about 45 to 65 s (a new
   profile; 24 s for the next start in the same boot). Its input
-  needs wland 0.1.0-261122-632f589 (the pin); before it Firefox took none,
+  needs wland 0.1.0-261122-632f589 or later; before it Firefox took none,
   on the GPU path and in software alike: wland
   0.1.0-261122-f36330a kept one wl_pointer and one wl_keyboard per client (the
   last made; `pointer_id`, `keyboard_id` in its compositor.zig), while

@@ -108,7 +108,9 @@ async function main(): Promise<void> {
 		const html = await page.text();
 		if (page.status !== 200 || !/name="unkernel-remote"/.test(html)) fail(`the page is not the remote page (status ${page.status})`);
 
-		const range = await fetch(`${origin}/distros/alpine-72a89c2638ec4cb6.erofs`, { headers: { range: "bytes=0-15" } });
+		const alpine = readdirSync(path.join(web, "distros")).find((f) => /^alpine-[0-9a-f]+\.erofs$/.test(f));
+		if (!alpine) fail("the web build has no Alpine distro image (distros/alpine-*.erofs)");
+		const range = await fetch(`${origin}/distros/${alpine}`, { headers: { range: "bytes=0-15" } });
 		const rangeBody = new Uint8Array(await range.arrayBuffer());
 		if (range.status !== 206 || rangeBody.length !== 16) fail(`the distro image's Range read answered ${range.status} with ${rangeBody.length} bytes`);
 

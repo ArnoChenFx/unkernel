@@ -47,7 +47,7 @@ if (-not $NoOpen) {
 Write-Host "Omarchy ($($image.Name)): $url"
 Write-Host "data disk $data (created on first start), /work $work"
 
-$launch = @('-Data', $data, '-Work', $work, '-Port', $Port, '-NoOpen')
-if (Test-Path -LiteralPath (Join-Path $root 'cache')) { $launch += @('-Cache', (Join-Path $root 'cache')) }
-& (Join-Path $versionDir 'remote\start-windows.ps1') @args
+$launch = @{ Data = $data; Work = $work; Port = $Port; NoOpen = $true }
+if (Test-Path -LiteralPath (Join-Path $root 'cache')) { $launch.Cache = Join-Path $root 'cache' }
+& (Join-Path $versionDir 'remote\start-windows.ps1') @launch
 exit $LASTEXITCODE

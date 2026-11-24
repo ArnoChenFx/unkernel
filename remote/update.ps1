@@ -125,7 +125,9 @@ function Test-Flag($release, [string]$name) {
 
 function Get-LatestTag {
 	$list = Invoke-RestMethod -Uri "$ApiBase/repos/$Repo/releases?per_page=30" -UserAgent $UserAgent -Headers @{ Accept = 'application/vnd.github+json' }
-	$pick = @($list | Where-Object { ([string]$_.tag_name) -like 'remote-v*' -and -not (Test-Flag $_ 'draft') -and -not (Test-Flag $_ 'prerelease') })
+	# The API's order is not the publication order (a release made from an older commit can be listed first): the newest is by publication time.
+	$pick = @($list | Where-Object { ([string]$_.tag_name) -like 'remote-v*' -and -not (Test-Flag $_ 'draft') -and -not (Test-Flag $_ 'prerelease') } |
+		Sort-Object -Descending -Property @{ Expression = { $t = if ($_.PSObject.Properties['published_at'] -and $_.published_at) { $_.published_at } else { $_.created_at }; [DateTimeOffset]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture).UtcTicks } })
 	if ($pick.Count -eq 0) { throw "no remote-v* release in $Repo" }
 	return [string]$pick[0].tag_name
 }

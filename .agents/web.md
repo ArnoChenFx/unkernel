@@ -1069,8 +1069,8 @@ answered at the kernel's next yield.
   GTK 3 app (l3afpad). The GL windows app (`apps/gl/wlgl.ts`, Debian:
   mesa-utils; `needs.wayland`) runs `es2gears_wayland` after `eglinfo -B
   -p wayland`; its README suggests glmark2-es2-wayland and
-  gtk4-widget-factory (GTK 4). Other Wayland apps are in the Desktop and
-  Games groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
+  gtk4-widget-factory (GTK 4). Other Wayland apps are in the Browsers,
+  Desktop and Games groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
   one rootful Xwayland window with twm (`apps/xwl.ts`). Started from the
   launcher, a Wayland app's terminal is its log (`launcher.ts`): its tab
   opens selected, as any app's, and shows until the app's window maps and
@@ -1927,8 +1927,8 @@ asciiquarium 6.7/6.8 (community), glimmer 0.1 (no packages), Ubuntu 28
 (extracting the pushed tarball; 0.2 later, `apt-get update` 28 s in the
 chroot).
 The REPL and toolchain apps (Claude Code, fx, Bun, Node.js, Python, Go,
-Rust), Doom (Debian's dsda-doom, a Wayland window) and the Desktop and
-Games groups came after that run and have not been through it.
+Rust), Doom (Debian's dsda-doom, a Wayland window) and the Browsers,
+Desktop and Games groups came after that run and have not been through it.
 Docker (Debian only: `docker run --rm hello-world` through the image's
 docker shim, kernel/guest.md) came later too: with Docker installed, its
 command pulled and ran hello-world in 6 s (Node SDK, 1 GiB, data disk, the

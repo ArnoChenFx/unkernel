@@ -9,9 +9,11 @@
 // follows the window.
 
 import { createKernelOn, type CreateKernelOptions, type Platform, type WorkerOption } from "../../js/core/instance.ts";
+import type { DisplayMode } from "../../js/core/display.ts";
 import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux, domCodeToLinux } from "../../js/core/input.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
 import { RemoteLink } from "./link.ts";
+import { Picture } from "./picture.ts";
 
 interface KioskConfig {
 	kernel: string;
@@ -31,6 +33,13 @@ const say = (title: string, more = ""): void => {
 	detail.textContent = more;
 	document.body.classList.remove("live");
 };
+let kept: HTMLCanvasElement | undefined;
+const picture = new Picture({
+	canvas,
+	spare: () => (kept ??= document.createElement("canvas")),
+	say,
+	show: () => document.body.classList.add("live"),
+});
 // The guest renders in software (no virgl over the link), so its display is capped at about
 // 1280x800 worth of pixels whatever the window (a 5120x1440 window would ask for 6.6 MP,
 // slow in the guest and heavy frames for the page); the canvas is scaled up to the window.
@@ -61,9 +70,6 @@ async function main(): Promise<void> {
 		distroSpec: (src) => ({ kind: "http", url: new URL(String(src), location.href).href, readOnly: true }),
 	};
 	say("Starting Linux…", "first start downloads the Omarchy image, which takes a while");
-	let mode: { width: number; height: number } | null = null;
-	let shownOnce = false;
-	let gone = 0;
 	const opts: CreateKernelOptions & WorkerOption & { worker: true } = {
 		worker: true,
 		shared: false,
@@ -77,18 +83,7 @@ async function main(): Promise<void> {
 		disks: [{ kind: "data", template: "bundled", optional: true }],
 		vsock: true,
 		onInput: () => {},
-		onDisplay: (m) => {
-			mode = m ? { width: m.width, height: m.height } : null;
-			clearTimeout(gone);
-			if (m) {
-				canvas.width = m.width;
-				canvas.height = m.height;
-				if (shownOnce) document.body.classList.add("live");
-			} else if (shownOnce) {
-				// A mode change (the window resized) lets go of the display for a moment: closed only if it stays so.
-				gone = window.setTimeout(() => { if (!mode) say("The desktop closed", "reload this page to start it again"); }, 8000);
-			}
-		},
+		onDisplay: (m: DisplayMode | null) => picture.display(m),
 	} as never;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);
 
@@ -106,7 +101,7 @@ async function main(): Promise<void> {
 		if (!typed && out.includes("⇒")) setTimeout(type, 300);
 	});
 	setTimeout(type, 90_000);
-	void vm.exited.then((r) => say("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
+	void vm.exited.then((r) => picture.stopped("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
 
 	// Frames.
 	const evdev = () => vm.evdev;
@@ -114,20 +109,14 @@ async function main(): Promise<void> {
 	let seq = -1;
 	const paint = (): void => {
 		requestAnimationFrame(paint);
+		const mode = picture.mode;
 		if (!mode) return;
 		if (vm.frameSeq === seq) {
 			vm.requestFrame();
 			return;
 		}
-		if (!image || image.width !== mode.width || image.height !== mode.height) image = new ImageData(mode.width, mode.height);
-		const f = vm.frame(image.data);
-		if (!f || f.width !== mode.width || f.height !== mode.height) return;
-		ctx.putImageData(image, 0, 0);
-		seq = vm.frameSeq;
-		if (!shownOnce) {
-			shownOnce = true;
-			document.body.classList.add("live");
-		}
+		const img = image && image.width === mode.width && image.height === mode.height ? image : (image = new ImageData(mode.width, mode.height));
+		if (picture.paint(vm.frame(img.data), () => ctx.putImageData(img, 0, 0))) seq = vm.frameSeq;
 	};
 	requestAnimationFrame(paint);
 

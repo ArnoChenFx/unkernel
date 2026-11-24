@@ -315,6 +315,13 @@ parts that are easy to get wrong.
   `onChunk` returns the frames the sink has queued, which the guest sees
   as delay. The CLI's `--display`, `--sound`, `--sound-wav` and the
   `--input` tokens are the test hooks (`--help`).
+- `createAudioOut()` (`js/web/audio.ts`, described at its top; exported by
+  `js/web.ts`, used by the page) is the Web Audio sink. It creates no
+  AudioContext before the page may start sound, and holds what plays until
+  then. The worklet is a string (`AUDIO_WORKLET`, a Blob URL module), so it
+  needs nothing from a bundler and must not refer to the module around it.
+  `test/audio.test.ts` (`pnpm test:audio`) runs the worklet and the sink on
+  stand-ins for Web Audio.
 - `KernelHandle` (instance.ts) is the surface shared by `KernelInstance`
   and `WorkerKernel`; a new device member goes there.
 - `Kernel.boot()` retries with the other memory type if instantiation

@@ -38,12 +38,11 @@ their top):
   data disk), `session.ts` (the suspended session), `autosuspend.ts`
   (suspending in the background and the question on leaving: when,
   decided without a DOM), `display.ts` (the guest display's window, the
-  mode offered, keyboard routing), `audio.ts` (Web Audio output),
-  `stats.ts` (the resource sampler), `preview.ts` and `preview-ws.ts` (the
-  guest preview's page side), `open.ts` (the guest's `open` and
-  `xdg-open`, host commands: a URL on the guest's own address in the
-  preview, any other http(s) URL in a new tab, each only after the user
-  confirms), `wayland.ts` and `wayland/` (the guest's Wayland apps: wland
+  mode offered, keyboard routing), `stats.ts` (the resource sampler),
+  `preview.ts` and `preview-ws.ts` (the guest preview's page side),
+  `open.ts` (the guest's `open` and `xdg-open`, host commands: a URL on the
+  guest's own address in the preview, any other http(s) URL in a new tab,
+  each only after the user confirms), `wayland.ts` and `wayland/` (the guest's Wayland apps: wland
   on vsock and kwshm), `sw.ts` (the service worker's registration and the
   update check), `profile.ts` (`/profile.html`).
 - The desktop: `wm.ts` (the window manager), `wmsnap.ts` (the tiles'
@@ -423,9 +422,10 @@ deploying the page needs no kernel toolchain.
   no report within 20 s) reloads once on the page's thread
   (`bootUpOnce(..., inline)`, sessionStorage `kw-inline-once`); every
   other way an asked worker can fail ends in `ui.fail`.
-- Sound is an AudioWorklet fed by postMessage, because the kernel calls
-  the import from a busy main thread; scheduled buffers are the fallback
-  where there is no secure context. Checked by hand only.
+- Sound is the SDK's `createAudioOut()` (js.md): an AudioWorklet fed by
+  postMessage, because the kernel calls the import from a busy main thread
+  (inline); scheduled buffers are the fallback where there is no secure
+  context. On the page itself it is checked by hand only.
 - Every response carries COOP/COEP. A secure context is therefore
   cross-origin isolated, which worker mode's shared transport needs (the
   kernel's own memory is not shared). Anything cross-origin that the page

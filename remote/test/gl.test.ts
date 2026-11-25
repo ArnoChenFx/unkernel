@@ -42,7 +42,7 @@ test("the note says why there is no renderer", () => {
 test("the note walks through the renderer's states", () => {
 	assert.equal(glNote(true, { state: "idle", webgl: null, error: null }, null), "guest GL: the renderer loads on the guest's first GL use");
 	assert.equal(glNote(true, { state: "loading", webgl: null, error: null }, null), "guest GL: loading the renderer");
-	assert.equal(glNote(true, { state: "lost", webgl: NVIDIA, error: "a GPU reset" }, null), "guest GL: the WebGL2 context was lost; the next GL use makes a new one (a GPU reset)");
+	assert.equal(glNote(true, { state: "lost", webgl: NVIDIA, error: "a GPU reset" }, null), "guest GL: the WebGL2 context was lost, and the guest's GL programs stop; reload this page (a GPU reset)");
 });
 
 test("a ready renderer on SwiftShader says it is software, not a GPU", () => {

@@ -43,7 +43,7 @@ export function glNote(asked: boolean, view: GlStateView | null, why: string | n
 		case "loading":
 			return "guest GL: loading the renderer";
 		case "lost":
-			return `guest GL: the WebGL2 context was lost; the next GL use makes a new one${view.error ? ` (${view.error})` : ""}`;
+			return `guest GL: the WebGL2 context was lost, and the guest's GL programs stop; reload this page${view.error ? ` (${view.error})` : ""}`;
 		case "ready": {
 			const sw = softwareName(view.webgl);
 			const webgl = view.webgl ? `, ${view.webgl}` : "";

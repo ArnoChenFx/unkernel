@@ -119,23 +119,22 @@ function describe(bytes: number): string {
 }
 
 /**
- * The images of remote/extra-distros/ (fetch-extra-distros.ts) that the web build took into the page
- * (kernel.ts leaves out one made for another base bundle): each with its URL in this repository's release.
+ * The images of remote/extra-distros/ (fetch-extra-distros.ts), each with its URL in this repository's
+ * release. Each must be in the web build: kernel.ts leaves out an index made for another base bundle,
+ * and then the release fails rather than going out without the image.
  */
 function extraDistros() {
 	const dir = path.join(root, "remote/extra-distros");
 	if (!existsSync(path.join(dir, "distros.json")) || !existsSync(path.join(dir, "source.json"))) return [];
-	const index = JSON.parse(readFileSync(path.join(dir, "distros.json"), "utf8")) as { distros: UpstreamRelease["distros"] };
+	const index = JSON.parse(readFileSync(path.join(dir, "distros.json"), "utf8")) as { base?: string; distros: UpstreamRelease["distros"] };
 	const source = JSON.parse(readFileSync(path.join(dir, "source.json"), "utf8")) as { repo: string; tag: string };
 	const out = [];
 	for (const d of index.distros) {
 		const served = servedDistroName(d.name, d.sha256, d.file);
 		const src = path.join(root, PUBLIC, "distros", served);
-		if (!existsSync(src)) {
-			console.log(`extra distro ${d.name}: not in the web build; left out of the manifest`);
-			continue;
-		}
+		if (!existsSync(src)) throw new Error(`extra distro ${d.name} (${source.tag}, base ${index.base ?? "unknown"}) is not in the web build: kernel.ts left it out (see KW_EXTRA_DISTROS in the build log)`);
 		if (statSync(src).size !== d.size || sha256File(src) !== d.sha256) throw new Error(`${served} does not match ${source.tag}'s distros.json (${d.file})`);
+		console.log(`extra distro ${d.name}: ${d.file} from ${source.tag}, base ${index.base ?? "unknown"}`);
 		out.push({ ...d, served, url: releaseUrl(source.repo, source.tag, d.file) });
 	}
 	return out;

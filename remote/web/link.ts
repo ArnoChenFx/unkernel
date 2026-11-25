@@ -9,16 +9,27 @@
 
 import { BootError } from "../../js/core/load.ts";
 import { FsError, type Fs } from "../../js/core/fs.ts";
-import { REMOTE_WIRE, REMOTE_WS_PATH, decodeRemote, encodeRemote, remoteFs, type RemoteFsCaps, type RemoteFsOp, type RemoteReply, type RemoteRequest } from "../wire.ts";
+import { REMOTE_TAKEN_OVER, REMOTE_WIRE, REMOTE_WS_PATH, decodeRemote, encodeRemote, remoteFs, type RemoteFsCaps, type RemoteFsOp, type RemoteReply, type RemoteRequest, type RemoteSession } from "../wire.ts";
 import type { FromWorker, ToWorker, WorkerEndpoint } from "../../js/core/worker-protocol.ts";
 
-/** What the backend said first: its wire version, its file calls for /work (null: none), and the paths it shows. */
+/**
+ * What the backend said first: its wire version, its file calls for /work (null:
+ * none), the paths it shows, and what its kernel is doing (session).
+ */
 export interface RemoteHello {
 	wire: number;
 	fs: RemoteFsCaps | null;
 	net: boolean;
 	data: string | null;
 	work: string | null;
+	session: RemoteSession;
+}
+
+/** Options of RemoteLink.connect(). */
+export interface RemoteConnectOptions {
+	/** The kernel this page boots outlives the page: a page that connects later resumes it (remote/README.md, Lifecycle). */
+	keep?: boolean;
+	timeoutMs?: number;
 }
 
 interface Listeners {
@@ -35,6 +46,7 @@ export class RemoteLink {
 	#listeners?: Listeners;
 	#pending: FromWorker[] = [];
 	#closed = false;
+	#takenOver = false;
 	#used = false;
 	#fsSeq = 0;
 	#fsCalls = new Map<number, { resolve(v: unknown): void; reject(e: unknown): void }>();
@@ -49,10 +61,17 @@ export class RemoteLink {
 		ws.onclose = (ev) => this.#onClose(ev);
 	}
 
+	/** Another page took the kernel over: this connection was closed for it (reload this page to take it back). */
+	get takenOver(): boolean {
+		return this.#takenOver;
+	}
+
 	/** Connect to the backend at `base` (its origin; /remote/ws is added). */
-	static connect(base: string | URL, timeoutMs = 10000): Promise<RemoteLink> {
+	static connect(base: string | URL, options: RemoteConnectOptions = {}): Promise<RemoteLink> {
 		const url = new URL(REMOTE_WS_PATH, base);
 		url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+		if (options.keep) url.searchParams.set("keep", "1");
+		const timeoutMs = options.timeoutMs ?? 10000;
 		return new Promise((resolve, reject) => {
 			const ws = new WebSocket(url.href);
 			ws.binaryType = "arraybuffer";
@@ -110,11 +129,16 @@ export class RemoteLink {
 		return remoteFs((op, a) => this.#call(op, a), caps);
 	}
 
-	/** Close the socket (the backend stops the kernel). */
+	/** Close the socket: the backend stops the kernel this page booted, unless it was kept for the next page. */
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
-		try { this.#ws.close(1000, "the page ended the kernel"); } catch {}
+		try { this.#ws.close(1000, "the page closed its connection"); } catch {}
+	}
+
+	/** The console command was typed: a page that binds to this kernel later does not type it again. */
+	reportTyped(): void {
+		this.#send({ k: "session", op: "typed" });
 	}
 
 	#send(req: RemoteRequest): void {
@@ -148,9 +172,10 @@ export class RemoteLink {
 	#onClose(ev: CloseEvent): void {
 		const wasClosed = this.#closed;
 		this.#closed = true;
+		if (ev.code === REMOTE_TAKEN_OVER) this.#takenOver = true;
 		for (const c of this.#fsCalls.values()) c.reject(new FsError("ECONNABORTED", "the backend closed the connection"));
 		this.#fsCalls.clear();
-		if (!wasClosed && ev.code !== 1000) this.#fail = new Error(`the remote kernel's connection closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ""})`);
+		if (!wasClosed && ev.code !== 1000 && ev.code !== REMOTE_TAKEN_OVER) this.#fail = new Error(`the remote kernel's connection closed (${ev.code}${ev.reason ? `: ${ev.reason}` : ""})`);
 		if (this.#listeners) {
 			if (this.#fail) this.#listeners.error(this.#fail);
 			this.#listeners.exit();

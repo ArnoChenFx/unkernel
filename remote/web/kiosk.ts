@@ -7,7 +7,9 @@
 // the image needs no change), shows the boot status until the first frame of the
 // desktop, and sends the keyboard and mouse to the guest. The desktop's Super key is the
 // mod key, Pause by default (keys.ts). The guest's display size follows the window.
-// With ?gl=1 the guest's GL runs on this browser's WebGL2 (remote/README.md, Guest GL).
+// The kernel outlives this page: a page that connects again resumes the same desktop
+// without typing the command twice (remote/README.md, Lifecycle). With ?gl=1 the
+// guest's GL runs on this browser's WebGL2 and stops with its page (Guest GL).
 
 import { createKernelOn, type CreateKernelOptions, type Platform, type WorkerOption } from "../../js/core/instance.ts";
 import type { DisplayMode } from "../../js/core/display.ts";
@@ -68,9 +70,13 @@ const size = () => {
 
 async function main(): Promise<void> {
 	say("Connecting…");
-	const link = await RemoteLink.connect(location.origin);
+	const link = await RemoteLink.connect(location.origin, { keep: true });
 	const asked = glAsked(location.search);
 	const glModuleUrl = cfg.gl;
+	const kernelUrl = new URL(cfg.kernel, location.href).href;
+	const distroUrl = new URL(cfg.distro, location.href).href;
+	const running = link.hello.session.machine;
+	const sameMachine = !!running && running.gl === asked && running.kernel === kernelUrl && running.distro === distroUrl;
 	const platform: Platform = {
 		defaultKernel: () => new URL(cfg.kernel, location.href),
 		spawnWorker: () => link.endpoint(),
@@ -78,7 +84,16 @@ async function main(): Promise<void> {
 		distroSpec: (src) => ({ kind: "http", url: new URL(String(src), location.href).href, readOnly: true }),
 		glModule: glModuleUrl ? () => new URL(glModuleUrl, location.href) : undefined,
 	};
-	say("Starting Linux…", "first start downloads the Omarchy image, which takes a while");
+	const previous = link.hello.session.ended ? `the previous desktop stopped: ${link.hello.session.ended}` : "";
+	if (running && !sameMachine) {
+		say("Restarting the desktop", `the running one ${running.gl ? "has" : "has no"} guest GL, this page ${asked ? "asks for" : "does not ask for"} it: it stops, saving its disk, before this one starts`);
+	} else if (running?.state === "ending") {
+		say("The previous desktop is stopping", "its disk is saved first, then this one starts");
+	} else if (running) {
+		say("Reconnecting to the desktop…", running.state === "booting" ? "it is still starting" : "");
+	} else {
+		say("Starting Linux…", previous || "first start downloads the Omarchy image, which takes a while");
+	}
 	let glForce = true;
 	const opts: CreateKernelOptions & WorkerOption & { worker: true } = {
 		worker: true,
@@ -97,17 +112,25 @@ async function main(): Promise<void> {
 		onDisplay: (m: DisplayMode | null) => {
 			glForce = true;
 			picture.display(m);
+			if (fit && m) {
+				fit = false;
+				const want = size();
+				if (m.width !== want.width || m.height !== want.height) setTimeout(() => vm.updateDisplaySize(size()), 0);
+			}
 		},
 	} as never;
+	let fit = sameMachine;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);
 
 	// The console: type the command once the shell's prompt shows (Omarchy's prompt ends in ⇒), or after 90 s anyway.
+	// A desktop that is already running has typed it (the backend says so).
 	let out = "";
-	let typed = false;
+	let typed = sameMachine && !!running?.typed;
 	const type = (): void => {
 		if (typed) return;
 		typed = true;
 		say("Starting the desktop…");
+		link.reportTyped();
 		vm.write(`${cfg.command}\n`);
 	};
 	vm.onOutput((b) => {
@@ -115,7 +138,9 @@ async function main(): Promise<void> {
 		if (!typed && out.includes("⇒")) setTimeout(type, 300);
 	});
 	setTimeout(type, 90_000);
-	void vm.exited.then((r) => picture.stopped("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
+	void vm.exited.then((r) => link.takenOver
+		? picture.stopped("Another page took the desktop over", "reload this page to take it back")
+		: picture.stopped("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
 
 	// Frames. A guest GL scanout is drawn from the renderer's bitmap, with no readback
 	// of the frame; otherwise the CPU frame.

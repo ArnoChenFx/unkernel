@@ -151,10 +151,11 @@ disk first and releases the data disk's lock (`<data>.lock`).
 
 `?gl=1` runs the guest's 3D on the browser's WebGL2. On `/kiosk?gl=1` and on
 `/?remote=1&gl=1`, the kernel and the disk stay on the backend. The config
-allows the images with virgl (Omarchy and Debian); Omarchy is the one tested. Its virtio-gpu 3D commands cross the
-link to the page, where the virgl renderer (`virgl.mjs` and `virgl.wasm` of the
-bundle, `js/core/gl-gpu.ts`) runs them. The kiosk draws the guest's scanout from
-the renderer's bitmap, so the frame is not read back through the backend.
+allows the images with virgl (Omarchy and Debian); Omarchy is the one tested.
+Its virtio-gpu 3D commands cross the link to the page, where the virgl renderer
+(`virgl.mjs` and `virgl.wasm` of the bundle, `js/core/gl-gpu.ts`) runs them. The
+kiosk draws the guest's scanout from the renderer's bitmap, so the frame is not
+read back through the backend.
 
 - Without the query the CPU path is the default, and the page says that guest GL
   is off and why. The 2D virtio-gpu (dumb buffers) stays on either way.
@@ -168,9 +169,10 @@ the renderer's bitmap, so the frame is not read back through the backend.
   the picture stays as it was. Reload the page to start them again.
 - Vulkan is still off (`?vk`).
 
-The guest's texture uploads cross the link to the page: about 1.1 MB per drawn
-frame in a terminal that scrolls (measured 2026-11-25: 1.1 to 1.3 MB). The CPU path sends each
-RGBA frame to the page and gets its buffer back, about 3.7 MB each way per frame.
+The guest's texture uploads cross the link to the page: about 1.1 to 1.3 MB per
+drawn frame in a terminal that scrolls (measured 2026-11-25). The CPU path sends
+each RGBA frame to the page and gets its buffer back, about 3.7 MB each way per
+frame.
 
 Tested on 2026-11-25 with the Omarchy image in headless Chrome 157 on Linux,
 where WebGL2 is SwiftShader. Windows Chrome is not tested.

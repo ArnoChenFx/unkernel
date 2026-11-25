@@ -20,9 +20,10 @@
 # The tag is created at that commit when it does not exist. A release of the tag
 # that is not a draft is left as it is.
 #
-# The Omarchy image of the same commit is published by omarchy-image.yml, through
-# workflow_call, as its own release (omarchy-<YYMMDD>-<sha7>, never the latest).
-# It runs beside the package and does not gate it: the package carries no image.
+# The Omarchy image of the same commit is built first, by omarchy-image.yml through
+# workflow_call, and published as its own release (omarchy-<YYMMDD>-<sha7>, never the
+# latest). The build waits for it and fetches that exact release: a package made
+# without its image is not released.
 #
 # Only the release jobs can write (contents: write, to create the tags and the
 # releases). The build reads the repository and the upstream release with
@@ -108,7 +109,7 @@ jobs:
 
   build:
     name: Build and smoke-test the release
-    needs: prepare
+    needs: [prepare, omarchy]
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -157,12 +158,14 @@ jobs:
 
       # The upstream release: the page takes its kernel and distro images from
       # the newest release of pithings/unkernel (KW_LOCAL=0: never a local build).
-      # This repository's newest Omarchy image release (omarchy-image.yml), if any: the page
+      # This commit's Omarchy image (the omarchy job, which this job needs): the page
       # lists it beside the upstream images when it was made for the same base bundle.
-      - name: Fetch the extra distro images
+      # release.ts fails the release if the page does not list it.
+      - name: Fetch the Omarchy image of this commit
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: node remote/scripts/fetch-extra-distros.ts --repo "$GITHUB_REPOSITORY"
+          OMARCHY_TAG: ${{ needs.omarchy.outputs.tag }}
+        run: node remote/scripts/fetch-extra-distros.ts --repo "$GITHUB_REPOSITORY" --tag "$OMARCHY_TAG"
 
       - name: Build the web page
         env:

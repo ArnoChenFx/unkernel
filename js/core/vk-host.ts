@@ -845,8 +845,10 @@ export class Conn implements VkConnection {
 
 	// --- shaders and layouts -----------------------------------------------
 
-	translate(moduleId: number, opts: VkShaderOpts): { module: any; res: VkShaderResult; check: Promise<string | undefined> } {
-		const m = this.get(moduleId, "shader");
+	/** `mod`: a shader module's id, or the module itself (a pipeline's stage keeps it: the app may destroy the module once the pipeline is made, and a variant made at draw time translates it again). */
+	translate(mod: number | any, opts: VkShaderOpts): { module: any; res: VkShaderResult; check: Promise<string | undefined> } {
+		const m = typeof mod === "number" ? this.get(mod, "shader") : mod;
+		const moduleId = m.id;
 		const key = JSON.stringify(opts);
 		let t = m.cache.get(key);
 		if (!t) {
@@ -1148,7 +1150,7 @@ export class Conn implements VkConnection {
 		if (v) return v;
 		const stages = root.stages.map((st: any) => {
 			const opts = { ...st.opts, storageFormats: formats };
-			return { ...st, opts, ...this.translate(st.moduleId, opts) };
+			return { ...st, opts, ...this.translate(st.mod, opts) };
 		});
 		const layout = this.pipelineLayout(root.layoutId ?? root.msg.layout, stages);
 		v = { ...root, root, stages, layout, storageFormats: formats, variants: new Map(), storageVariants: undefined };
@@ -1201,8 +1203,8 @@ export class Conn implements VkConnection {
 					if (Object.keys(fm.inputs).length) (opts as any).relink = fm.inputs;
 				}
 			}
-			const { module, res, check } = this.translate(st.module, opts);
-			out.push({ stage: kind === "vertex" ? SS.VERTEX : kind === "fragment" ? SS.FRAGMENT : SS.COMPUTE, kind, module, res, moduleId: st.module, opts, check });
+			const { module, res, check } = this.translate(sm, opts);
+			out.push({ stage: kind === "vertex" ? SS.VERTEX : kind === "fragment" ? SS.FRAGMENT : SS.COMPUTE, kind, module, res, moduleId: st.module, mod: sm, opts, check });
 		}
 		return out;
 	}
@@ -1736,7 +1738,7 @@ const handlers: Record<string, Handler> = {
 		let code = bin;
 		if (!code.length && Array.isArray(msg.code)) code = Uint8Array.from(msg.code);
 		code = code.slice();
-		c.put(msg.id, { t: "shader", code, cache: new Map(), baseBuiltins: usesBaseBuiltins(code) });
+		c.put(msg.id, { t: "shader", id: msg.id, code, cache: new Map(), baseBuiltins: usesBaseBuiltins(code) });
 		return undefined;
 	},
 
@@ -2100,7 +2102,7 @@ function graphicsPipeline(c: Conn, msg: any): any {
 		dynamic: new Set<number>(msg.dynamicState?.dynamicStates || []),
 		variants: new Map<string, any>(),
 		// BaseVertex / BaseInstance / DrawIndex: WGSL has none, the translator reads 0
-		usesBase: stages.some((st: any) => c.objs.get(st.moduleId)?.baseBuiltins),
+		usesBase: stages.some((st: any) => st.mod.baseBuiltins),
 	};
 	// build the variant of the render pass it was created for, so errors show here
 	const rp = msg.renderPass ? c.objs.get(msg.renderPass) : undefined;
@@ -2194,7 +2196,7 @@ export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, strip
 	let vs = p.stages.find((s: any) => s.kind === "vertex");
 	const fs = p.stages.find((s: any) => s.kind === "fragment");
 	if (!vs) throw new Error("graphics pipeline without a vertex stage");
-	if (dyn.noFlip) vs = { ...vs, ...c.translate(vs.moduleId, { ...vs.opts, flipY: false }) };
+	if (dyn.noFlip) vs = { ...vs, ...c.translate(vs.mod, { ...vs.opts, flipY: false }) };
 	const rs0 = m.rasterizationState || {};
 	const rs = { ...rs0 };
 	if (eff.cullMode !== undefined) rs.cullMode = eff.cullMode;

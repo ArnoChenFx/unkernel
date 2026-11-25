@@ -302,8 +302,9 @@ sides can (Amendments, "External present").
   `immutableSamplers` (ids) only for sampler types; texel buffer
   descriptors (unsupported) are written as `texelBufferView:[ids]`.
 - ICD: the physical device reports VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-  and apiVersion 1.1 (round 2); maxBoundDescriptorSets is the host's maxBindGroups - 1
-  (the push constant group), maxPushConstantsSize 128.
+  and apiVersion 1.1 (round 2); maxBoundDescriptorSets is the host's maxBindGroups
+  (a layout with that many sets and push constants fails in
+  vkCreatePipelineLayout: the push constant group), maxPushConstantsSize 128.
 - Host (2026-11-24, round 2): the host also takes these (the ICD may
   start sending them; field names as Vulkan's, pointer prefixes optional):
   - Dynamic rendering: `vkCmdBeginRendering {renderArea, layerCount,

@@ -227,13 +227,18 @@ It writes the assets to `remote/dist/`, and the install to `remote/dist/install/
 
 ## Upstream files
 
-The remote mode adds no code to upstream's own paths except three hooks in the
-page. They are the only files that can conflict with upstream changes:
+The remote mode adds no code to upstream's own paths except the hooks below.
+They are the only files that can conflict with upstream changes:
 
 - `web/src/boot.ts`: the remote branch of boot (a connection to the backend
   instead of a kernel in this page, the data disk as a file on the backend's
   computer, and the storage and suspend actions that the backend does not offer).
-- `web/src/config.ts`: the `remote` field of the page's configuration.
+- `web/src/config.ts`: the `remote` field of the page's configuration, and
+  `GL_DISTROS`, which includes Omarchy beside Debian.
 - `web/src/main.tsx`: the page's configuration is read through `remote/web/page.ts`.
+- `web/scripts/kernel.ts`: the extra distro images of `KW_EXTRA_DISTROS`
+  (`remote/scripts/fetch-extra-distros.ts`) join the release's images.
+- `.agents/web.md` and `.gitignore`: the Omarchy GL note, and `remote/extra-distros/`.
 
-Everything else lives in `remote/` and in `.github/workflows/remote-*.yml`.
+Everything else lives in `remote/`, `distros/omarchy/` and in
+`.github/workflows/remote-*.yml` and `omarchy-image.yml`.

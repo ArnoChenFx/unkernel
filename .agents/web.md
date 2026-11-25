@@ -1427,7 +1427,7 @@ answered at the kernel's next yield.
   mesa-utils; `needs.wayland`) runs `es2gears_wayland` after `eglinfo -B
   -p wayland`; its README suggests glmark2-es2-wayland and
   gtk4-widget-factory (GTK 4). Other Wayland apps are in the Browsers,
-  Desktop, Games and Media groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
+  Desktop, Games, Media and Tools groups: SDL games (what they share: `apps/sdlwl.ts`), X11 apps in
   one rootful Xwayland window with twm (`apps/xwl.ts`). Started from the
   launcher, a Wayland app's terminal is its log (`launcher.ts`): its tab
   opens selected, as any app's, and shows until the app's window maps and

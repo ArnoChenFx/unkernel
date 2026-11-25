@@ -9,7 +9,8 @@
 // such a context again in the renderer when a command first names it. And
 // the renderer side (GpuRenderer) against fake renderer cores: a lost
 // WebGL2 context, the stale ids it leaves, a new renderer for the next new
-// GL context, twice, and without `renew` a final loss.
+// GL context, twice, and without `renew` a final loss; video() (a
+// VideoFrame drawn into a resource's texture) and the state it restores.
 //
 //   node --test test/gl-gpu.test.ts
 import test from "node:test";
@@ -272,4 +273,58 @@ test("a new renderer that cannot be made: the new context fails too, and nothing
 	assert.equal(await send(r, cmd(GPU_CMD.SUBMIT_3D, 3, [0]), true), GPU_RESP.ERR_UNSPEC);
 	assert.equal(tries, 1);
 	assert.equal(r.stats.contextLost, true);
+});
+
+test("video(): a frame drawn into a resource's texture with the context's state restored; refusals and GL errors say why", async () => {
+	const G = { TEXTURE_2D: 0xde1, TEXTURE_BINDING_2D: 0x8069, PIXEL_UNPACK_BUFFER: 0x88ec, PIXEL_UNPACK_BUFFER_BINDING: 0x88ef, RGBA: 0x1908, UNSIGNED_BYTE: 0x1401, NONE: 0,
+		UNPACK_FLIP_Y_WEBGL: 0x9240, UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241, UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, UNPACK_ROW_LENGTH: 0xcf2, UNPACK_SKIP_PIXELS: 0xcf4, UNPACK_SKIP_ROWS: 0xcf3, UNPACK_ALIGNMENT: 0xcf5 };
+	// a guest's state left as vrend might leave it
+	const state = new Map<number, unknown>([[G.UNPACK_FLIP_Y_WEBGL, false], [G.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true], [G.UNPACK_COLORSPACE_CONVERSION_WEBGL, 0x9244], [G.UNPACK_ROW_LENGTH, 77], [G.UNPACK_SKIP_PIXELS, 3], [G.UNPACK_SKIP_ROWS, 2], [G.UNPACK_ALIGNMENT, 1], [G.TEXTURE_BINDING_2D, "guest-tex"], [G.PIXEL_UNPACK_BUFFER_BINDING, "guest-pbo"]]);
+	const before = new Map(state);
+	const calls: unknown[][] = [];
+	let error = 0, throws: Error | null = null;
+	const gl = {
+		...G, canvas: new EventTarget(), isContextLost: () => false,
+		getParameter: (k: number) => state.get(k),
+		pixelStorei: (k: number, v: unknown) => void state.set(k, v),
+		bindTexture: (_t: number, x: unknown) => void state.set(G.TEXTURE_BINDING_2D, x),
+		bindBuffer: (_t: number, x: unknown) => void state.set(G.PIXEL_UNPACK_BUFFER_BINDING, x),
+		texSubImage2D: (...a: unknown[]) => {
+			if (throws) throw throws;
+			calls.push([...a.slice(0, 8), state.get(G.TEXTURE_BINDING_2D), state.get(G.PIXEL_UNPACK_BUFFER_BINDING), state.get(G.UNPACK_FLIP_Y_WEBGL), state.get(G.UNPACK_PREMULTIPLY_ALPHA_WEBGL), state.get(G.UNPACK_COLORSPACE_CONVERSION_WEBGL), state.get(G.UNPACK_ROW_LENGTH)]);
+		},
+		getError: () => {
+			const e = error;
+			error = 0;
+			return e;
+		},
+	};
+	const infos: Record<number, { texture: unknown; width: number; height: number; format: number; yTop: boolean }> = {
+		5: { texture: "tex5", width: 64, height: 48, format: 2, yTop: false },
+		6: { texture: "tex6", width: 64, height: 48, format: 134, yTop: true },
+		7: { texture: "tex7", width: 64, height: 48, format: 64, yTop: false },
+	};
+	const core = { gpu: { ...fakeCore("v").core.gpu, info: (r: number) => infos[r] ?? null }, gl } as unknown as GpuRendererCore;
+	const r = new GpuRenderer(async () => core);
+	r.start();
+	await r.init;
+	const frame = { tag: "frame" };
+	// B8G8R8X8: top left, cropped to the texture (a 1088-row frame into 1080 rows, here 50 into 48)
+	assert.equal(r.video(5, frame, 64, 50), null);
+	assert.deepEqual(calls.pop(), [G.TEXTURE_2D, 0, 0, 0, 64, 48, G.RGBA, G.UNSIGNED_BYTE, "tex5", null, false, false, G.NONE, 0]);
+	assert.deepEqual(state, before, "the guest's state restored");
+	// R8G8B8X8, Y_0_TOP: flipped, at the bottom rows of the texture
+	assert.equal(r.video(6, frame, 60, 40), null);
+	assert.deepEqual(calls.pop()!.slice(0, 6), [G.TEXTURE_2D, 0, 0, 8, 60, 40]);
+	assert.equal(calls.length, 0);
+	// a format not held as RGBA8, an unknown resource
+	assert.match(r.video(7, frame, 64, 48)!, /format 64/);
+	assert.match(r.video(9, frame, 64, 48)!, /no such texture/);
+	// a GL error (cleared) and a throw: reported, the state still restored
+	error = 0x502;
+	assert.match(r.video(5, frame, 64, 48)!, /GL error 0x502/);
+	assert.equal(gl.getError(), 0);
+	throws = Object.assign(new TypeError("Overload resolution failed."), { name: "TypeError" });
+	assert.match(r.video(5, frame, 64, 48)!, /texSubImage2D: TypeError/);
+	assert.deepEqual(state, before);
 });

@@ -730,6 +730,14 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   clients that way: wland's relay (`--dmabuf virtgpu`) names each client
   buffer by its resource, and the page's `gpu.resolve()` is `image()`
   (web.md, Wayland desktop, which has what Mesa picks and the numbers).
+  Host code can also fill a guest resource: `vm.gl.gpu.write(id, box,
+  fill)` is a TRANSFER_TO_HOST_3D in no guest context (vrend's context 0)
+  with host bytes, after the commands before it; guest VA-API's exported
+  surfaces are filled that way (va.md, Zero-copy output). `vm.gl.gpu.video(id,
+  frame, w, h)` draws a VideoFrame into such a texture on the GPU instead
+  (texSubImage2D on the renderer's context, its state restored: a BGRX
+  resource is RGBA8 texels in RGBA order here, as transfers swizzle), for
+  guest VA-API's video processing.
 - **Window images** (`image()`): `kw_vgpu_blit` (inside the module, as
   present: vrend's state handled the same way) copies the resource's
   rectangle into the drawing buffer, sized to it, and

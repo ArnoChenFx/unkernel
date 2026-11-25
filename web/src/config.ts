@@ -92,6 +92,18 @@
 //   ?shm=0                             this load only: no kwshm device, so no Wayland desktop
 //                                      (wayland.ts; the launcher's Wayland apps are disabled).
 //                                      A resumed session keeps the device it was saved with.
+//   ?va=0                              this load only: no guest VA-API (default on, Debian only,
+//                                      where the page's thread has WebCodecs' VideoDecoder): the
+//                                      base's libva driver sends pictures over vsock port 1024 to
+//                                      a VideoDecoder here and reads them back (the SDK's
+//                                      createKernel({ va }), .agents/va.md). It finds libva's DRM
+//                                      display on the virtio-gpu device, so it needs guest GL's
+//                                      device (not with ?gpu=0). Nothing is asked of WebCodecs
+//                                      before the guest's first connection.
+//   ?va=cpu                            this load only: VA-API on, but video processing outputs
+//                                      (mpv's --vo=dmabuf-wayland) are converted on the CPU from a
+//                                      copy of each frame instead of drawn from the VideoFrame on
+//                                      the GPU (VaOptions.upload "cpu"; compare vm.va.stats).
 //   ?wlgpu=0                           this load only: the Wayland desktop takes no GPU buffers
 //                                      (no gpu source for wland: GL apps render in software,
 //                                      llvmpipe over wl_shm, instead of by resource on the
@@ -358,6 +370,8 @@ export interface Config {
 	shm: boolean;
 	/** The Wayland desktop shows GPU apps' buffers by resource and Vulkan apps' external buffers (wayland.ts): unless ?wlgpu=0 (this load's URL only). */
 	wlGpu: boolean;
+	/** Guest VA-API (the SDK's createKernel({ va })): on Debian where the page's thread has WebCodecs' VideoDecoder, unless ?va=0 (this load's URL only); ?va=cpu: video processing on the CPU. */
+	va: boolean | { upload: "cpu" };
 	/** Ask before the page is closed or left while a used machine runs (?askleave=0: never). */
 	askLeave: boolean;
 	/** A touch device or a mobile user agent. */
@@ -607,6 +621,7 @@ export function readConfig(search: string = location.search, saved: Record<strin
 		vkWhy,
 		shm: url.get("shm") !== "0",
 		wlGpu: url.get("wlgpu") !== "0",
+		va: url.get("va") !== "0" && distro?.name === "debian" && typeof (globalThis as { VideoDecoder?: unknown }).VideoDecoder === "function" ? (url.get("va") === "cpu" ? { upload: "cpu" } : true) : false,
 		mobile,
 		coarse,
 		mobileUA,

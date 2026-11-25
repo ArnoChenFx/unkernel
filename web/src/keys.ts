@@ -9,9 +9,13 @@
 // is terminals.ts's.
 // - the prefix: Ctrl-A as in GNU screen, then a key (COMMANDS). Ctrl-A
 //   twice sends one Ctrl-A on to the guest (readline's start of line, or a
-//   screen or tmux in the guest). On Apple devices ⌘A is the prefix too
-//   (in place of the browser's select all), and ⌘ may stay held for the
-//   command key: ⌘A ⌘K is ⌘A k. While it is armed, the Dock and the top
+//   screen or tmux in the guest); in a text field of the page's with text
+//   in it, it is select all. On Apple devices the prefix is ⌘J
+//   instead (twice only disarms it), so Ctrl-A always goes to the guest
+//   (readline, screen, the Wayland apps, the display) and to the page's
+//   fields, and ⌘A is select all; another ⌘ key or Ctrl-A while it is
+//   armed disarms it and does what it does otherwise. Below, Ctrl-A stands for either
+//   prefix. While it is armed, the Dock and the top
 //   bar show each item's key on it, and the HUD (KeysHud.tsx) draws the
 //   keyboard with what each key does (a click on a key runs it: runKey());
 //   the key bar on phones has a key that arms it (Keys.tsx, ui.ts pressKey);
@@ -47,6 +51,7 @@
 // evdev keyboard (X, games) too.
 import { openAbout } from "./components/About.tsx";
 import { toggleDisplay } from "./display.ts";
+import { hasText } from "./focus.ts";
 import { KW } from "./kw.ts";
 import { toggleLauncher } from "./launcher.ts";
 import { togglePreview } from "./preview.ts";
@@ -57,14 +62,15 @@ import { waylandFocused } from "./wayland.ts";
 import { toggleWayland } from "./winmenu.tsx";
 import { wm } from "./wm.ts";
 
-/** macOS, iOS, iPadOS: ⌘A is the prefix too. */
+/** macOS, iOS, iPadOS: ⌘ shortcuts (Command.meta). */
 export const APPLE = /mac|iphone|ipad|ipod|ios/i.test((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform || navigator.platform || navigator.userAgent);
-export const PREFIX = "Ctrl-A";
+export const PREFIX = APPLE ? "⌘J" : "Ctrl-A";
 /** The prefix as the armed indicator shows it. */
-export const PREFIX_SHORT = "^A";
+export const PREFIX_SHORT = APPLE ? "⌘J" : "^A";
 const isCtrlA = (e: KeyboardEvent) => e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "KeyA";
-const isCmdA = (e: KeyboardEvent) => APPLE && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && e.code === "KeyA";
-const isPrefix = (e: KeyboardEvent) => isCtrlA(e) || isCmdA(e);
+/** By the letter typed (Dvorak's ⌘H is on KeyJ), by the code on a layout without Latin letters. */
+const isCmdJ = (e: KeyboardEvent) => e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (/^[a-z]$/i.test(e.key) ? e.key.toLowerCase() === "j" : e.code === "KeyJ");
+const isPrefix = APPLE ? isCmdJ : isCtrlA;
 export const CHORD = "Ctrl-Shift";
 
 /** A command's stable name: the chrome finds its key by it (keyFor()). */
@@ -213,20 +219,26 @@ export function installShortcuts(): () => void {
 		if (s.ask) return; // the confirm dialog (a modal <dialog>) takes its keys itself
 		if (s.prefix) {
 			if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
+			if (APPLE && isPrefix(e)) { // ⌘J is never the guest's: it only disarms (a held one's repeats do nothing)
+				swallow(e);
+				if (!e.repeat) ui.setPrefix(false);
+				return;
+			}
 			ui.setPrefix(false);
-			if (isCtrlA(e)) return; // send-prefix: this one goes through
-			if (isCmdA(e)) { swallow(e); return; } // ⌘A never reaches the guest: it only disarms
-			swallow(e);
-			if (!runKey(ARROW_KEYS[e.key] ?? e.key) && e.key !== "Escape") ui.toast(`${PREFIX} ${e.key}: not a shortcut (${PREFIX} ${keyFor("keys")} lists them)`);
-			return;
+			if (isPrefix(e)) return; // send-prefix: this one goes through
+			if (!(APPLE && (e.metaKey || isCtrlA(e)))) { // there a ⌘ key (⌘A, ⌘C) or Ctrl-A is no command key: handled below, as without the prefix
+				swallow(e);
+				if (!runKey(ARROW_KEYS[e.key] ?? e.key) && e.key !== "Escape") ui.toast(`${PREFIX} ${e.key}: not a shortcut (${PREFIX} ${keyFor("keys")} lists them)`);
+				return;
+			}
 		}
 		if (APPLE && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
 			const cmd = COMMANDS.find((c) => c.meta === e.code);
 			if (cmd) { swallow(e); if (!e.repeat) cmd.run(); return; }
 		}
-		if (isPrefix(e) && !e.repeat) {
+		if (isPrefix(e) && (APPLE || (!e.repeat && !hasText(e.target)))) { // Ctrl-A in a field with text is select all
 			swallow(e);
-			ui.setPrefix(true);
+			if (!e.repeat) ui.setPrefix(true);
 			return;
 		}
 		if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {

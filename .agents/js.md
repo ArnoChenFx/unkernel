@@ -1476,6 +1476,20 @@ parts that are easy to get wrong.
   an unknown id, a buffer, an empty rectangle or no renderer; a promise
   while the renderer loads; it never starts the load. `stats.images`
   counts them.
+- `write(resourceId, box, fill)`: host pixels into a guest 2D texture
+  resource (rows from the top, tightly packed; `fill` writes them into the
+  module's heap: one copy), as a TRANSFER_TO_HOST_3D in no guest context,
+  after the commands before it; false for no renderer, an unknown resource
+  or a buffer. Guest VA-API's zero-copy output (va.ts, `VaGpu`; createKernel
+  passes the GpuRenderer to `startVa`) fills exported surfaces with it.
+- `video(resourceId, frame, width, height)`: a VideoFrame drawn into a
+  guest texture resource held as RGBA8 (B8G8R8X8/A8, R8G8B8X8/A8) with
+  texSubImage2D in the renderer's context (top left, cropped; no colour
+  management, no premultiply; a Y_0_TOP texture flipped), pixel store,
+  unpack buffer and 2D binding restored, its GL error cleared; null when
+  done, else why not. `read(resourceId, box)`: a texture's texels back in
+  the guest's layout. Guest VA-API's video processing uses both (va.md,
+  Zero-copy output).
 - Snapshots (`blocker()`): refused while any 3D resource exists or a
   context submitted commands; a context that only had buffers attached
   (a Wayland relay's) passes, and after a restore the device side makes a

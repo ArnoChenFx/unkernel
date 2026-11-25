@@ -222,6 +222,10 @@ static API VkResult CALL kw_vkEnumerateDeviceLayerProperties(VkPhysicalDevice pd
 	return VK_SUCCESS;
 }
 
+/* The host's maxBindGroups: push constants take the group after a layout's
+ * sets (vk/PROTOCOL.md). */
+static uint32_t kw_bind_groups = 4;
+
 static uint32_t lim(const char *limits, const char *name, uint32_t dflt)
 {
 	double v = js_num(js_get(limits, name), -1);
@@ -319,8 +323,9 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 	l->maxMemoryAllocationCount = 65536;
 	l->maxSamplerAllocationCount = 4000;
 	l->bufferImageGranularity = 1;
-	uint32_t groups = lim(L, "maxBindGroups", 4);
-	l->maxBoundDescriptorSets = groups > 1 ? groups - 1 : 1;
+	/* Every bind group is a set; a layout that also has push constants gets
+	 * one less (vkCreatePipelineLayout). */
+	l->maxBoundDescriptorSets = kw_bind_groups = lim(L, "maxBindGroups", 4);
 	l->maxPerStageDescriptorSamplers = lim(L, "maxSamplersPerShaderStage", 16);
 	l->maxPerStageDescriptorUniformBuffers = lim(L, "maxUniformBuffersPerShaderStage", 12);
 	l->maxPerStageDescriptorStorageBuffers = lim(L, "maxStorageBuffersPerShaderStage", 8);
@@ -345,7 +350,10 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 	l->maxFragmentInputComponents = inter * 4;
 	l->maxFragmentOutputAttachments = lim(L, "maxColorAttachments", 8);
 	l->maxFragmentDualSrcAttachments = 0;
-	l->maxFragmentCombinedOutputResources = 8;
+	/* The sum, so nothing derived from it is cut: wgpu fits storage buffers,
+	 * storage images and color attachments under this value together. */
+	l->maxFragmentCombinedOutputResources = l->maxFragmentOutputAttachments +
+		l->maxPerStageDescriptorStorageBuffers + l->maxPerStageDescriptorStorageImages;
 	l->maxComputeSharedMemorySize = lim(L, "maxComputeWorkgroupStorageSize", 16384);
 	uint32_t wg = lim(L, "maxComputeWorkgroupsPerDimension", 65535);
 	l->maxComputeWorkGroupCount[0] = l->maxComputeWorkGroupCount[1] = l->maxComputeWorkGroupCount[2] = wg;
@@ -483,7 +491,6 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 
 static API VkResult CALL kw_vkCreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out)
 {
-	(void)ci;
 	(void)a;
 	struct kw_link *l = link_open();
 	if (!l)
@@ -491,7 +498,16 @@ static API VkResult CALL kw_vkCreateInstance(const VkInstanceCreateInfo *ci, con
 	struct jb b = {0};
 	/* the subgroup size to report: KWVK_SUBGROUP_SIZE, else 0 (the host's
 	 * choice); the reply says what the host translates for (pd_init) */
-	jb_printf(&b, "{\"op\":\"hello\",\"version\":1,\"subgroupSize\":%u}", kw_subgroup_request());
+	jb_printf(&b, "{\"op\":\"hello\",\"version\":1,\"subgroupSize\":%u", kw_subgroup_request());
+	/* the engine's name: a hint for which way the app's viewports point,
+	 * so pipelines are made for that first (vk/PROTOCOL.md, Amendments,
+	 * "Y flip hint") */
+	const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
+	if (ai && ai->pEngineName) {
+		jb_printf(&b, ",\"engineName\":");
+		jb_str(&b, ai->pEngineName);
+	}
+	jb_printf(&b, "}");
 	struct kw_reply *rep = link_call(l, &b, NULL, 0);
 	jb_free(&b);
 	if (!rep || js_get(rep->json, "err")) {
@@ -1576,6 +1592,11 @@ static API void CALL kw_vkDestroyDescriptorSetLayout(VkDevice d, VkDescriptorSet
 static API VkResult CALL kw_vkCreatePipelineLayout(VkDevice dh, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineLayout *out)
 {
 	(void)a;
+	if (ci->pushConstantRangeCount && ci->setLayoutCount >= kw_bind_groups) {
+		kw_err("vkCreatePipelineLayout: %u sets with push constants need %u bind groups, the host has %u: VK_ERROR_FEATURE_NOT_PRESENT",
+		       ci->setLayoutCount, ci->setLayoutCount + 1, kw_bind_groups);
+		return VK_ERROR_FEATURE_NOT_PRESENT;
+	}
 	struct kw_device *d = DEV(dh);
 	struct kw_obj *o = new_obj(d);
 	struct jb j = {0};

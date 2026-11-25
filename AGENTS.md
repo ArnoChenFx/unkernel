@@ -28,6 +28,7 @@ programs).
 | [.agents/testing.md](.agents/testing.md) | quick checks per area, CLI exit codes, the full matrix, release CI |
 | [.agents/gl.md](.agents/gl.md) | guest GL through virgl on WebGL2 (branch `webgl`): plan, measurements, headless tests |
 | [.agents/vk.md](.agents/vk.md) | guest Vulkan on WebGPU (kwvk): the ICD, the host renderer, the SPIR-V translator, the relay and headless tests |
+| [.agents/va.md](.agents/va.md) | guest VA-API on WebCodecs (kwva): the libva driver, the host decoder and its codecs (VP9, H.264, AV1, HEVC), decoders other than the modelled one, zero-copy output (dmabuf export into virtio-gpu resources), the relay and headless tests |
 | [.agents/status.md](.agents/status.md) | roadmap and open issues; read only for planning, or when asked |
 
 ## Building and testing

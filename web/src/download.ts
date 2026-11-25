@@ -25,6 +25,9 @@
 // - pushFile() writes the bytes to a .part file next to the target, checks
 //   its size and renames it, so a reader never sees a partial file. The
 //   whole file is in page memory once, as vm.exec()'s input.
+// - getFiles() fetches many small files (an app's `bundle`), a few at once
+//   over one Wisp connection, each as getFile() does; pushFiles() writes a
+//   batch of them into a directory with one exec, as a tar.
 
 import { DEFAULT_WISP_SERVERS, fetchOver, wispBackend, type ByteDuplex, type GuestConnect, type KernelHandle, type NetBackend } from "./sdk.ts";
 
@@ -124,6 +127,8 @@ async function openCache(): Promise<Cache | null> {
  */
 export async function getFile(f: FileSpec, opts: {
 	servers?: readonly string[] | null;
+	/** Fetch over this backend, which stays open, instead of one of its own. */
+	backend?: NetBackend;
 	signal?: AbortSignal;
 	onProgress?: (got: number, total: number | null) => void;
 } = {}): Promise<{ bytes: Uint8Array; source: FileSource; checked: boolean }> {
@@ -137,7 +142,8 @@ export async function getFile(f: FileSpec, opts: {
 		await cache!.delete(key).catch(() => {});
 	}
 
-	const backend = f.cors ? null : wispBackend(opts.servers?.length ? opts.servers : [...DEFAULT_WISP_SERVERS]);
+	const own = f.cors || opts.backend ? null : wispBackend(opts.servers?.length ? opts.servers : [...DEFAULT_WISP_SERVERS]);
+	const backend = f.cors ? null : opts.backend ?? own;
 	try {
 		const res = backend ? await httpGet(backend, f.url, { signal: opts.signal }) : await fetch(f.url, { signal: opts.signal });
 		if (!res.ok || !res.body) {
@@ -168,7 +174,7 @@ export async function getFile(f: FileSpec, opts: {
 		}
 		return { bytes, source: "downloaded", checked: sum !== null };
 	} finally {
-		backend?.close();
+		own?.close();
 	}
 }
 
@@ -186,4 +192,94 @@ mv "$1.part" "$1"`;
 export async function pushFile(vm: KernelHandle, path: string, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
 	const r = await vm.exec("/bin/sh", ["-c", PUSH_SH, "sh", path.replace(/^~\//, ""), String(bytes.length)], { input: bytes, signal });
 	if (r.exitCode !== 0) throw new Error(`writing ${path} failed: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`);
+}
+
+/** At most this many of a bundle's files are fetched at once. */
+const PARALLEL = 6;
+/** Tries per file of a bundle. */
+const TRIES = 3;
+
+/**
+ * Fetch files, a few at once, each handed to onFile as it arrives (in any
+ * order; awaited, so what it does holds that fetch's place). Rejects with
+ * the first file that failed all its tries, or that onFile refused, once
+ * the other fetches stopped.
+ */
+export async function getFiles(files: readonly FileSpec[], opts: {
+	servers?: readonly string[] | null;
+	backend?: NetBackend;
+	signal?: AbortSignal;
+	onFile: (f: FileSpec, bytes: Uint8Array, source: FileSource) => Promise<void> | void;
+	/** Bytes fetched so far, of all the files. */
+	onProgress?: (got: number) => void;
+}): Promise<void> {
+	const own = opts.backend ? null : wispBackend(opts.servers?.length ? opts.servers : [...DEFAULT_WISP_SERVERS]);
+	const backend = opts.backend ?? own!;
+	const stop = new AbortController();
+	const signal = opts.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal;
+	const got = new Array<number>(files.length).fill(0);
+	let sum = 0, next = 0;
+	const progress = (i: number, n: number) => { sum += n - got[i]!; got[i] = n; opts.onProgress?.(sum); };
+	const worker = async () => {
+		while (next < files.length) {
+			const i = next++, f = files[i]!;
+			for (let t = 1; ; t++) {
+				signal.throwIfAborted();
+				let file;
+				try {
+					file = await getFile(f, { backend, signal: AbortSignal.any([signal, AbortSignal.timeout(5 * 60_000)]), onProgress: (n) => progress(i, n) });
+				} catch (e) {
+					progress(i, 0);
+					if (signal.aborted || t >= TRIES) throw signal.aborted ? signal.reason : new Error(`${f.url}: ${(e as Error)?.message ?? e}`);
+					continue;
+				}
+				progress(i, file.bytes.length);
+				await opts.onFile(f, file.bytes, file.source);
+				break;
+			}
+		}
+	};
+	try {
+		const workers = Array.from({ length: Math.min(PARALLEL, files.length) }, worker);
+		await Promise.all(workers).catch(async (e) => {
+			stop.abort(e);
+			await Promise.allSettled(workers);
+			throw e;
+		});
+	} finally {
+		own?.close();
+	}
+}
+
+/** A ustar archive of files (names of at most 100 bytes, ASCII). */
+export function tarOf(files: readonly { name: string; bytes: Uint8Array }[]): Uint8Array {
+	const pad = (n: number) => (n + 511) & ~511;
+	const out = new Uint8Array(files.reduce((n, f) => n + 512 + pad(f.bytes.length), 1024));
+	const enc = new TextEncoder();
+	let at = 0;
+	for (const { name, bytes } of files) {
+		const head = out.subarray(at, at + 512);
+		const put = (off: number, s: string) => head.set(enc.encode(s), off);
+		const oct = (n: number, len: number) => `${n.toString(8).padStart(len - 1, "0")}\0`;
+		if (name.length > 100) throw new Error(`${name}: the name is too long`);
+		put(0, name);
+		put(100, oct(0o644, 8));
+		put(108, oct(0, 8));
+		put(116, oct(0, 8));
+		put(124, oct(bytes.length, 12));
+		put(136, oct(0, 12));
+		put(148, "        ");
+		put(156, "0");
+		put(257, "ustar\x0000");
+		put(148, `${head.reduce((n, b) => n + b, 0).toString(8).padStart(6, "0")}\0 `);
+		out.set(bytes, at + 512);
+		at += 512 + pad(bytes.length);
+	}
+	return out;
+}
+
+/** Write files into the directory `dir` of the guest (relative to ~, or absolute) in one exec. A file may be cut short when it fails: the reader checks. */
+export async function pushFiles(vm: KernelHandle, dir: string, files: readonly { name: string; bytes: Uint8Array }[], signal?: AbortSignal): Promise<void> {
+	const r = await vm.exec("/bin/sh", ["-c", 'cd ~ && mkdir -p "$1" && cd "$1" && tar -xof -', "sh", dir.replace(/^~\//, "")], { input: tarOf(files), signal });
+	if (r.exitCode !== 0) throw new Error(`writing to ${dir} failed: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`);
 }

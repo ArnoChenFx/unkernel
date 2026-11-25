@@ -40,10 +40,10 @@ import { attachPreview, closePreview, openPreview, previewState, previewSupporte
 import { isRunning, isStopped, ui$ } from "./store.ts";
 import { currentTerminal } from "./termtabs.ts";
 import { ScreenTail, clearSession, loadSession, saveSession, sessionCpus, sessionInfo, sessionMismatch, type SessionDevices, type SessionMeta } from "./session.ts";
-import { APPLE, CHORD } from "./keys.ts";
+import { APPLE, CHORD, keyFor, PREFIX } from "./keys.ts";
 import { dropLegacyScope } from "./sw.ts";
 import { clearResumeRequest, setResumeRequest, takeResumeRequest } from "./ui.ts";
-import { createTerminals, pasteText, setTermFont, termText, TERM_OPTIONS } from "./wterms.ts";
+import { createTerminals, ctrlCInterrupts, pasteText, setTermFont, termText, TERM_OPTIONS } from "./wterms.ts";
 import { attachWayland, waylandApi } from "./wayland.ts";
 import {
 	BootError, ConsoleRouter, KernelInstance, SnapshotCommitError, WorkerKernel, bundledBoot, createAudioOut, createKernel, loadKernelModule, openDistroDisk, serveWasiPrograms, snapshotDiskMismatch,
@@ -376,6 +376,7 @@ export function start(): void {
 		onResize: (cols, rows) => vm?.resize(cols, rows), // SIGWINCH
 	});
 	g.term = term;
+	ctrlCInterrupts(termEl, term);
 	// init() instantiates wterm's parser (a small wasm module inside the package);
 	// output written before then waits here. boot() waits for it before the kernel starts.
 	let early: (string | Uint8Array)[] | null = [];
@@ -798,7 +799,7 @@ export function start(): void {
 			ui.hostLog(`[host] preview: port ${p.port} opened again after the resume`);
 		}, (e: Error) => {
 			ui.hostLog(`[host] preview: not opened again (${e.message})`);
-			ui.toast(`The preview's port ${p.port} did not answer after the resume: Ctrl-A p opens it again`);
+			ui.toast(`The preview's port ${p.port} did not answer after the resume: ${PREFIX} ${keyFor("preview")} opens it again`);
 		});
 	}
 	/**
@@ -1676,6 +1677,9 @@ export function start(): void {
 			// Guest Vulkan on this thread's WebGPU (Debian, on by default; showVk()): nothing loads
 			// before the guest's first Vulkan instance, and nothing of it is in a snapshot.
 			vk: cfg.vk,
+			// Guest VA-API on this thread's WebCodecs (Debian, on by default, ?va=0: off): nothing is
+			// asked of WebCodecs before the guest's first VA-API connection, nothing is in a snapshot.
+			va: cfg.va,
 		});
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);

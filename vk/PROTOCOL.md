@@ -58,7 +58,7 @@ processes requests strictly in order.
 
 ## Hello
 
-`{"op":"hello","r":1,"version":1,"subgroupSize":N}` ->
+`{"op":"hello","r":1,"version":1,"subgroupSize":N,"engineName":"..."}` ->
 ```
 {"r":1,"version":1,
  "adapter":{"vendor":"","architecture":"","device":"","description":""},
@@ -70,6 +70,8 @@ processes requests strictly in order.
 ```
 `subgroupSize`: the subgroup size the ICD reports, which the host
 translates compute shaders for (Amendments, "Subgroup size").
+`engineName`: the app's VkApplicationInfo.pEngineName, when it gave one
+(Amendments, "Y flip hint").
 caps bits: 1 sampled, 2 linear filter, 4 colour attachment, 8 blend, 16
 depth/stencil attachment, 32 storage image, 64 vertex attribute format.
 Only formats the host can map are listed; the ICD derives
@@ -154,7 +156,8 @@ sides rely on:
   pass through unchanged. `frontFace` passes through too (both APIs judge
   winding in framebuffer space, which the flip keeps). Negative viewport
   heights (VK_KHR_maintenance1) work: the host draws with the vertex stage
-  translated without the flip and the viewport normalized.
+  translated without the flip and the viewport normalized (which of the
+  two a pipeline is made with first: Amendments, "Y flip hint").
 - Bindings: WGSL `@group(set) @binding(2 * vkBinding)`; the sampler half
   of a COMBINED_IMAGE_SAMPLER is at `2 * vkBinding + 1`. Descriptor arrays
   are unsupported.
@@ -302,8 +305,9 @@ sides can (Amendments, "External present").
   `immutableSamplers` (ids) only for sampler types; texel buffer
   descriptors (unsupported) are written as `texelBufferView:[ids]`.
 - ICD: the physical device reports VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
-  and apiVersion 1.1 (round 2); maxBoundDescriptorSets is the host's maxBindGroups - 1
-  (the push constant group), maxPushConstantsSize 128.
+  and apiVersion 1.1 (round 2); maxBoundDescriptorSets is the host's maxBindGroups
+  (a layout with that many sets and push constants fails in
+  vkCreatePipelineLayout: the push constant group), maxPushConstantsSize 128.
 - Host (2026-11-24, round 2): the host also takes these (the ICD may
   start sending them; field names as Vulkan's, pointer prefixes optional):
   - Dynamic rendering: `vkCmdBeginRendering {renderArea, layerCount,
@@ -897,3 +901,18 @@ sides can (Amendments, "External present").
     original local index. Other modules keep WebGPU's subgroups (requires
     "subgroups", their width the adapter's), as before; graphics stages
     are not lowered.
+- Y flip hint (2026-11-25, ICD, host; amends "Loud failures", where the
+  variant made at creation was always the flipped one). Vulkan 1.1 makes
+  negative viewport heights core, so neither the enabled extensions nor
+  the API version tell the host which way an app's viewports point, and
+  wgpu (Zed) makes its pipelines with dynamic viewports before its first
+  draw, then draws every pass with a negative height.
+  - The ICD sends `"engineName"` in the hello: VkApplicationInfo's
+    pEngineName, when the app gave one (an older host ignores it).
+  - The host makes the graphics pipelines of a connection whose engine
+    it knows to draw with negative heights (`wgpu-hal`) with the vertex
+    stage translated without the flip, and builds that variant at
+    vkCreateGraphicsPipelines (its errors reported there); other
+    connections, an older ICD's included, get the flipped one as before.
+    The other orientation is a variant made at the first draw that uses
+    it (checked with its submit), so a wrong hint costs only time.

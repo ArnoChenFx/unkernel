@@ -63,7 +63,7 @@
 //   hidden or the system paused or suspended, nor while the last one still runs.
 import { WTerm } from "@wterm/dom";
 import { trackBottom, type Bottom } from "./bottom.ts";
-import { keyFor, PREFIX } from "./keys.ts";
+import { APPLE, keyFor, PREFIX } from "./keys.ts";
 import { KW, type TerminalInfo, type TerminalsApi } from "./kw.ts";
 import { PtyError, type KernelHandle, type Pty } from "./sdk.ts";
 import { isHeld, ui$ } from "./store.ts";
@@ -98,6 +98,21 @@ export function setTermFont(el: HTMLElement, px: number): void {
 
 /** The options every terminal on the page has (the console's in boot.ts too). */
 export const TERM_OPTIONS = { scrollbackLines: 5000, cursorBlink: true } as const;
+
+/**
+ * On Apple devices Ctrl-C is never copy (⌘C is), but wterm leaves it to the
+ * browser while text is selected, which does nothing with it there: drop
+ * the selection first, so it sends ^C. `el` is the terminal's element.
+ */
+export function ctrlCInterrupts(el: HTMLElement, term: WTerm): void {
+	if (!APPLE) return;
+	el.addEventListener("keydown", (e) => {
+		if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey || e.isComposing || e.key.toLowerCase() !== "c") return;
+		term.clearSelection();
+		const sel = getSelection();
+		if (sel?.toString()) sel.removeAllRanges(); // any selection on the page stops wterm, not just its own
+	}, true);
+}
 
 /** History and screen as text, a line per row (wterm's own readText() is async). */
 export function termText(term: WTerm): string {
@@ -430,6 +445,7 @@ export function createTerminals(opts: TerminalsOptions): Terminals {
 			onBinary: (d) => input(t, d),
 			onResize: (cols, rows) => { const px = pixels(t); t.session?.resize(cols, rows, px.x, px.y); },
 		});
+		ctrlCInterrupts(el, t.term);
 		t.term.setRenderingPaused(!isTabShown(n));
 		if (sel) select(n);
 		const failed = (msg: string): OpenError => Object.assign(new Error(msg), { term: n });

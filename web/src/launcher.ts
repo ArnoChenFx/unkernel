@@ -31,7 +31,8 @@
 //    - the downloads (download.ts: plain http over Wisp, checked against
 //      their SHA-256, kept in the browser's cache), each pushed into the
 //      guest; a failure is logged, not fatal: the app's script must check
-//      the file and fetch it itself when missing;
+//      the file and fetch it itself when missing; then the app's bundle
+//      (many files, several at once, pushed in batches), the same way;
 //    - install.sh, run on pipes (vm.spawn(), no terminal) in a login shell,
 //      its output the installer's log and progress (installer.ts
 //      packageParser(); KW_STATUS=1 adds apt's status lines): unless the
@@ -77,7 +78,7 @@
 import { createElement } from "react";
 import { isPageApp, type AppDef, type AppDownload, type AppFiles, type Distro, type TerminalApp } from "./apps/types.ts";
 import { Installer } from "./components/Installer.tsx";
-import { getFile, pushFile } from "./download.ts";
+import { getFile, getFiles, pushFile, pushFiles, type FileSpec } from "./download.ts";
 import { fmtMiB } from "./format.ts";
 import { cleanLine, InstallCancelled, packageParser, runInstall, showInstaller, type InstallCtl } from "./installer.ts";
 import { keyFor, PREFIX } from "./keys.ts";
@@ -297,8 +298,10 @@ interface Plan {
 	packages: boolean;
 	/** The downloads missing in the guest. */
 	downloads: AppDownload[];
+	/** Its bundle is missing in the guest. */
+	bundle: boolean;
 }
-const needsWork = (p: Plan) => p.packages || p.downloads.length > 0;
+const needsWork = (p: Plan) => p.packages || p.downloads.length > 0 || p.bundle;
 
 // need DIR PATH SIZE UNLESS: succeeds when PATH (relative to ~, or absolute)
 // is missing or not SIZE bytes long and the test UNLESS fails, run in DIR
@@ -313,12 +316,13 @@ const NEED_SH = `need() {
 async function planApp(vm: KernelHandle, d: TerminalApp, dir: string, signal?: AbortSignal): Promise<Plan> {
 	const test = installedTest(d);
 	const dls = d.downloads ?? [];
-	if (!test && !dls.length) return { packages: false, downloads: [] };
+	if (!test && !dls.length && !d.bundle) return { packages: false, downloads: [], bundle: false };
 	const home = dir.replace(/^~\/?/, "") || ".";
 	const script = [
 		test ? `${test} || echo packages` : "",
 		dls.length ? NEED_SH : "",
 		...dls.map((f, i) => `need ${q(home)} ${q(fromHome(appPath(dir, f.path)))} ${f.size ?? -1} ${q(f.unless ?? "")} && echo need ${i}`),
+		d.bundle ? `( cd ~ && cd ${q(home)} && eval ${q(d.bundle.unless)} ) >/dev/null 2>&1 || echo bundle` : "",
 		"true",
 	].filter(Boolean).join("\n");
 	const r = await vm.exec("/bin/sh", ["-c", script], { signal });
@@ -327,6 +331,7 @@ async function planApp(vm: KernelHandle, d: TerminalApp, dir: string, signal?: A
 	return {
 		packages: lines.includes("packages"),
 		downloads: dls.filter((_, i) => lines.includes(`need ${i}`)),
+		bundle: lines.includes("bundle"),
 	};
 }
 
@@ -338,7 +343,7 @@ async function appFiles(d: TerminalApp): Promise<AppFiles> {
 }
 
 /** A download's file name, for the log. */
-const fileName = (f: AppDownload) => f.url.replace(/[?#].*$/, "").split("/").pop() || f.url;
+const fileName = (f: FileSpec) => f.url.replace(/[?#].*$/, "").split("/").pop() || f.url;
 
 // Runs install.sh in DIR ($1, relative to ~, or absolute) for the installer, stderr with stdout.
 const INSTALL_SH = `cd && cd "$1" && exec ./install.sh 2>&1`;
@@ -364,6 +369,53 @@ async function eachLine(stream: ReadableStream<Uint8Array>, line: (s: string) =>
 	} catch { /* the session went: ended says how */ }
 }
 
+/** A bundle's files are pushed in batches of about this many bytes. */
+const BATCH = 16 << 20;
+
+/** An app's bundle: fetched and pushed into dir, a batch at a time; a failure is logged (the app's script fetches what is missing). */
+async function fetchBundle(vm: KernelHandle, d: TerminalApp, dir: string, files: readonly FileSpec[], size: number, ctl: InstallCtl): Promise<void> {
+	const ui = KW.ui!, signal = ctl.signal, t0 = performance.now();
+	let batch: { name: string; bytes: Uint8Array }[] = [], held = 0, cached = 0;
+	let pushing: Promise<void> = Promise.resolve();
+	const flush = () => {
+		const b = batch;
+		batch = [];
+		held = 0;
+		// One push at a time; the fetch that filled the next batch waits for it.
+		return (pushing = pushing.then(() => pushFiles(vm, dir, b, signal)));
+	};
+	ctl.stage("bundle", 0);
+	ctl.step("Downloading…");
+	ctl.log(`[installer] fetching ${files.length} files (${fmtMiB(size)}) to ${dir}`);
+	try {
+		await getFiles(files, {
+			servers: KW.config.wisp,
+			signal,
+			onProgress: (n) => {
+				ctl.stage("bundle", Math.min(1, n / size));
+				ctl.step(`Downloading ${fmtMiB(n).replace(/ MiB$/, "")} of ${fmtMiB(size)}…`);
+			},
+			onFile: async (f, bytes, source) => {
+				if (source === "cache") cached++;
+				batch.push({ name: fileName(f), bytes });
+				if ((held += bytes.length) >= BATCH) await flush();
+			},
+		});
+		ctl.step("Copying into the system…");
+		if (batch.length) await flush();
+		const msg = `pushed ${files.length} files (${fmtMiB(size)}, ${cached} from the browser cache) to ${dir} in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+		ctl.log(`[installer] ${msg}`);
+		ui.log(`[app] ${d.id}: ${msg}`, "h");
+	} catch (e) {
+		await pushing.catch(() => {});
+		if (signal.aborted) throw new InstallCancelled();
+		const msg = (e as Error)?.message ?? String(e);
+		ctl.log(`[installer] ${msg}; the app fetches the rest itself`);
+		ui.log(`[app] ${d.id}: ${msg}; the guest fetches the rest instead`, "e");
+	}
+	ctl.stage("bundle", 1);
+}
+
 /** The weights of the installer's stages (installer.ts: any scale). */
 const W_FILES = 2, W_SHARE = 98;
 /** Of a download's weight: fetching it (the rest: pushing it into the guest). */
@@ -382,12 +434,15 @@ async function prepare(vm: KernelHandle, d: TerminalApp, dir: string, ctl: Insta
 	const plan = first ?? await planApp(vm, d, dir, signal);
 	const dls = plan.downloads;
 	const sizes = dls.map((f) => f.size ?? 8 << 20);
-	const sum = sizes.reduce((a, b) => a + b, 0) || 1;
-	const dlShare = dls.length ? (plan.packages ? 0.4 : 1) * W_SHARE : 0;
+	const bundle = plan.bundle ? await d.bundle!.files() : [];
+	const bundleSize = bundle.reduce((n, f) => n + f.size, 0);
+	const sum = sizes.reduce((a, b) => a + b, 0) + bundleSize || 1;
+	const dlShare = dls.length || bundle.length ? (plan.packages ? 0.4 : 1) * W_SHARE : 0;
 	const pkgShare = plan.packages ? W_SHARE - dlShare : 0;
 	ctl.plan([
 		["files", W_FILES],
 		...dls.flatMap((_, i): [string, number][] => [[`get${i}`, dlShare * (sizes[i]! / sum) * FETCH_SHARE], [`push${i}`, dlShare * (sizes[i]! / sum) * (1 - FETCH_SHARE)]]),
+		["bundle", dlShare * (bundleSize / sum)],
 		["packages", pkgShare],
 	]);
 
@@ -427,6 +482,8 @@ async function prepare(vm: KernelHandle, d: TerminalApp, dir: string, ctl: Insta
 			ui.log(`[app] ${d.id}: ${name}: ${msg}; the guest fetches it instead`, "e");
 		}
 	}
+
+	if (bundle.length) await fetchBundle(vm, d, appPath(dir, d.bundle!.path), bundle, bundleSize, ctl);
 
 	if (!plan.packages) return;
 	ctl.stage("packages", null);

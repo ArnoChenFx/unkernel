@@ -54,7 +54,9 @@
 //   fields) keeps its keys. Fields outside the terminals (the soft keyboard's
 //   input among them) keep theirs too. A release goes to the guest whenever
 //   it saw the press, and losing the focus (or the page losing it) releases
-//   every held key and button and leaves pointer lock. The page's shortcuts
+//   every held key and button and leaves pointer lock. On Apple devices the
+//   browser sends no keyup for a key released while ⌘ is held: the keys
+//   pressed with it are released when ⌘ comes up. The page's shortcuts
 //   (keys.ts) listen first. On a desktop the focused window's DOM focus
 //   stays in (or goes to) the current terminal while no program reads the
 //   keyboard, so a program that reads the tty gets the typing as before;
@@ -67,6 +69,7 @@ import type { AppMeta } from "./apps/types.ts";
 import { DisplayIcon } from "./components/icons.tsx";
 import { KernelInstance, domCodeToLinux, type WorkerKernel, type DisplayMode, type InputState } from "./sdk.ts";
 import { inTerminal, ownsKeys } from "./focus.ts";
+import { APPLE } from "./keys.ts";
 import { useSyncExternalStore } from "react";
 import { ui$, type PadLayout, type TouchMode } from "./store.ts";
 import { store } from "./prefs.ts";
@@ -358,6 +361,8 @@ export function hideDisplay(): void {
 	if (wm.isVisible(DISPLAY_WIN)) wm.minimize(DISPLAY_WIN);
 }
 
+const MODIFIER = /^(Meta|Control|Shift|Alt)(Left|Right)$|^CapsLock$/;
+
 export function createDisplayUi(opts: DisplayUiOptions): DisplayUi {
 	current = opts;
 	const $ = ui$();
@@ -367,11 +372,21 @@ export function createDisplayUi(opts: DisplayUiOptions): DisplayUi {
 	// input), dialogs, the Resume card's buttons (Enter or Space on a focused Resume or Continue is theirs),
 	// the launcher (focused itself on touch devices, components/Launcher.tsx), the Dock, the top bar
 	// and the menus (TopBar.tsx, Menu.tsx).
+	const cmdKeys = new Set<number>(); // pressed while ⌘ was held, their keyup not seen
 	function onKey(e: KeyboardEvent) {
 		const ev = evdev();
 		if (!ev) return;
 		const code = domCodeToLinux(e.code);
 		const down = e.type === "keydown";
+		if (!down && e.key === "Meta" && !e.metaKey) {
+			for (const c of cmdKeys) ev.key(c, false);
+			cmdKeys.clear();
+		}
+		// Pressed again (not a repeat) without a keyup seen: the guest must see a release between.
+		if (code !== undefined && cmdKeys.has(code) && !(down && e.repeat)) {
+			cmdKeys.delete(code);
+			if (down) ev.key(code, false);
+		}
 		// A release goes to the guest if the guest saw the press, whatever the state or target now.
 		if (!down && code !== undefined && ev.key(code, false)) {
 			e.preventDefault();
@@ -383,11 +398,14 @@ export function createDisplayUi(opts: DisplayUiOptions): DisplayUi {
 		if (!ev.keyboardOpen || !displayFocused()) return;
 		e.preventDefault();
 		e.stopImmediatePropagation();
-		if (down && code !== undefined) ev.key(code, true);
+		if (down && code !== undefined) {
+			ev.key(code, true);
+			if (APPLE && e.metaKey && !MODIFIER.test(e.code)) cmdKeys.add(code);
+		}
 	}
 	window.addEventListener("keydown", onKey, true);
 	window.addEventListener("keyup", onKey, true);
-	window.addEventListener("blur", () => evdev()?.releaseAll());
+	window.addEventListener("blur", () => { cmdKeys.clear(); evdev()?.releaseAll(); });
 	// The page or the workspace resized: the box the window would open at (or a maximized one) changes.
 	window.addEventListener("resize", offerSize);
 	let area = wm$.get().area, compact = wm$.get().compact;

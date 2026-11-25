@@ -119,7 +119,7 @@ app -> Vulkan loader (Debian libvulkan1) -> /usr/lib/kw/libvulkan_kw.so (vk/icd)
   the translator on `test/vk/guest/double.comp` (skipped without
   `kwvk-naga.wasm`).
 - `node test/vk/host/check.mjs`: the host renderer alone in headless Chrome
-  with a fake client (119 cases, the failures that must reach the guest
+  with a fake client (131 cases, the failures that must reach the guest
   included: refused and unusable pipelines, lost devices; a pipeline made
   with its read-only buffers kept and dispatched with them in a buffer it
   also writes; a 512-wide shared-memory reduction on 256 invocations;

@@ -123,9 +123,9 @@ Open **[unkernel.dev](https://unkernel.dev/)**. A desktop appears after a
 download of about 10 MB, with a shell in its Terminal window. Your changes
 are saved in the browser. The Dock opens the apps (so do ⌘K on a Mac and
 Ctrl-Shift-O elsewhere); Settings has the options and export or reset for
-your disk, System the diagnostics. Ctrl-A n (or ⌘A n on a Mac) or `+` on
+your disk, System the diagnostics. Ctrl-A n (⌘J n on a Mac) or `+` on
 a Terminal window's tabs opens another terminal with its own shell, up to
-9; Ctrl-A and a digit switches, and Ctrl-A ? lists every shortcut. The
+9; Ctrl-A (⌘J) and a digit switches, and Ctrl-A ? lists every shortcut. The
 wallpaper is a random photo from [Lorem Picsum](https://picsum.photos/)
 by default, so the page fetches one from picsum.photos on every load;
 the built-in wallpaper or a preset (Settings > Desktop) stops that.
@@ -162,7 +162,7 @@ Wayland apps show as windows on the page: `wland foot` (or the
 launcher's foot tile) starts wland's relay in the guest and runs the app
 against it; [wland](https://github.com/pithings/wland)'s compositor runs in
 the page and reads the app's pixels straight from guest memory. Each app
-window is a window of the page's desktop; Ctrl-A w switches between them
+window is a window of the page's desktop; Ctrl-A w (⌘J w on a Mac) switches between them
 and the other windows.
 
 ```sh

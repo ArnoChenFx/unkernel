@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 	const kernelUrl = new URL(cfg.kernel, location.href).href;
 	const distroUrl = new URL(cfg.distro, location.href).href;
 	const running = link.hello.session.machine;
-	const sameMachine = !!running && running.gl === asked && running.kernel === kernelUrl && running.distro === distroUrl;
+	const resumes = !!running && running.state !== "ending" && running.gl === asked && running.kernel === kernelUrl && running.distro === distroUrl;
 	const platform: Platform = {
 		defaultKernel: () => new URL(cfg.kernel, location.href),
 		spawnWorker: () => link.endpoint(),
@@ -85,10 +85,10 @@ async function main(): Promise<void> {
 		glModule: glModuleUrl ? () => new URL(glModuleUrl, location.href) : undefined,
 	};
 	const previous = link.hello.session.ended ? `the previous desktop stopped: ${link.hello.session.ended}` : "";
-	if (running && !sameMachine) {
-		say("Restarting the desktop", `the running one ${running.gl ? "has" : "has no"} guest GL, this page ${asked ? "asks for" : "does not ask for"} it: it stops, saving its disk, before this one starts`);
-	} else if (running?.state === "ending") {
+	if (running?.state === "ending") {
 		say("The previous desktop is stopping", "its disk is saved first, then this one starts");
+	} else if (running && !resumes) {
+		say("Restarting the desktop", "the running desktop is not this one: it stops, saving its disk, before this one starts");
 	} else if (running) {
 		say("Reconnecting to the desktop…", running.state === "booting" ? "it is still starting" : "");
 	} else {
@@ -119,13 +119,13 @@ async function main(): Promise<void> {
 			}
 		},
 	} as never;
-	let fit = sameMachine;
+	let fit = resumes;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);
 
 	// The console: type the command once the shell's prompt shows (Omarchy's prompt ends in ⇒), or after 90 s anyway.
 	// A desktop that is already running has typed it (the backend says so).
 	let out = "";
-	let typed = sameMachine && !!running?.typed;
+	let typed = resumes && !!running?.typed;
 	const type = (): void => {
 		if (typed) return;
 		typed = true;

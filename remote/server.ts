@@ -61,7 +61,9 @@ function kioskHtml(web: string, distro: string): string | undefined {
 	const kernel = list("assets").find((f) => /^unkernel-(?!smp-)[A-Za-z0-9_-]+\.wasm$/.test(f));
 	const image = list("distros").find((f) => f.startsWith(`${distro}-`) && DISTRO_FILE.test(`/distros/${f}`));
 	if (!kernel || !image) return undefined;
-	const config = JSON.stringify({ kernel: `/assets/${kernel}`, distro: `/distros/${image}`, command: distro === "omarchy" ? "omarchy desktop" : "" });
+	const glDir = list("assets").find((f) => /^virgl-[0-9a-f]{16}$/.test(f));
+	const gl = glDir && list(`assets/${glDir}`).includes("virgl.mjs") ? `/assets/${glDir}/virgl.mjs` : null;
+	const config = JSON.stringify({ kernel: `/assets/${kernel}`, distro: `/distros/${image}`, command: distro === "omarchy" ? "omarchy desktop" : "", gl });
 	return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Omarchy</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="unkernel-remote" content="1">

@@ -7,11 +7,14 @@
 // the image needs no change), shows the boot status until the first frame of the
 // desktop, and sends the keyboard and mouse to the guest. The desktop's Super key is the
 // mod key, Pause by default (keys.ts). The guest's display size follows the window.
+// With ?gl=1 the guest's GL runs on this browser's WebGL2 (remote/README.md, Guest GL).
 
 import { createKernelOn, type CreateKernelOptions, type Platform, type WorkerOption } from "../../js/core/instance.ts";
 import type { DisplayMode } from "../../js/core/display.ts";
+import { probeWebGl2 } from "../../js/core/gl.ts";
 import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux } from "../../js/core/input.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
+import { glAsked, glNote } from "./gl.ts";
 import { DEFAULT_MOD, MOD_KEYS, parseMod, routeKey } from "./keys.ts";
 import { RemoteLink } from "./link.ts";
 import { Picture } from "./picture.ts";
@@ -21,6 +24,8 @@ interface KioskConfig {
 	distro: string;
 	/** What is typed on the console once the shell is up. */
 	command: string;
+	/** The guest GL renderer's module (virgl.mjs) beside this page, or null: ?gl=1 needs it. */
+	gl: string | null;
 }
 
 const cfg = (window as unknown as { __KIOSK__: KioskConfig }).__KIOSK__;
@@ -64,13 +69,17 @@ const size = () => {
 async function main(): Promise<void> {
 	say("Connecting…");
 	const link = await RemoteLink.connect(location.origin);
+	const asked = glAsked(location.search);
+	const glModuleUrl = cfg.gl;
 	const platform: Platform = {
 		defaultKernel: () => new URL(cfg.kernel, location.href),
 		spawnWorker: () => link.endpoint(),
 		absoluteUrl: (src) => new URL(src, location.href).href,
 		distroSpec: (src) => ({ kind: "http", url: new URL(String(src), location.href).href, readOnly: true }),
+		glModule: glModuleUrl ? () => new URL(glModuleUrl, location.href) : undefined,
 	};
 	say("Starting Linux…", "first start downloads the Omarchy image, which takes a while");
+	let glForce = true;
 	const opts: CreateKernelOptions & WorkerOption & { worker: true } = {
 		worker: true,
 		shared: false,
@@ -80,11 +89,15 @@ async function main(): Promise<void> {
 		memoryMiB: 1024,
 		display: size(),
 		gpu: true,
+		gl: asked ? true : undefined,
 		distro: new URL(cfg.distro, location.href).href,
 		disks: [{ kind: "data", template: "bundled", optional: true }],
 		vsock: true,
 		onInput: () => {},
-		onDisplay: (m: DisplayMode | null) => picture.display(m),
+		onDisplay: (m: DisplayMode | null) => {
+			glForce = true;
+			picture.display(m);
+		},
 	} as never;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);
 
@@ -104,7 +117,8 @@ async function main(): Promise<void> {
 	setTimeout(type, 90_000);
 	void vm.exited.then((r) => picture.stopped("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
 
-	// Frames.
+	// Frames. A guest GL scanout is drawn from the renderer's bitmap, with no readback
+	// of the frame; otherwise the CPU frame.
 	const evdev = () => vm.evdev;
 	let image: ImageData | null = null;
 	let seq = -1;
@@ -112,6 +126,16 @@ async function main(): Promise<void> {
 		requestAnimationFrame(paint);
 		const mode = picture.mode;
 		if (!mode) return;
+		const gpu = vm.gl?.gpu;
+		const scanout = gpu?.scanout;
+		if (gpu && scanout) {
+			picture.paint(scanout, () => {
+				const drawn = gpu.drawFrame(ctx, glForce) === true;
+				if (drawn) glForce = false;
+				return drawn;
+			});
+			return;
+		}
 		if (vm.frameSeq === seq) {
 			vm.requestFrame();
 			return;
@@ -120,6 +144,20 @@ async function main(): Promise<void> {
 		if (picture.paint(vm.frame(img.data), () => ctx.putImageData(img, 0, 0))) seq = vm.frameSeq;
 	};
 	requestAnimationFrame(paint);
+
+	// While guest GL is asked for: the renderer's state, and "software" where its WebGL2
+	// is a software rasterizer (gl.ts).
+	const note = document.createElement("div");
+	note.id = "gl-note";
+	note.style.cssText = "position:fixed;left:8px;bottom:8px;max-width:calc(100vw - 16px);padding:3px 8px;border-radius:4px;background:rgba(0,0,0,.6);color:#e6e6e6;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none;display:none";
+	document.body.append(note);
+	const why = asked ? probeWebGl2() || (glModuleUrl ? "the SDK started no renderer (see the console)" : "this build has no renderer module") : null;
+	setInterval(() => {
+		const st = vm.gl?.status;
+		const text = glNote(asked, st ? { state: st.state, webgl: st.webgl, error: st.error } : null, why);
+		note.textContent = text ?? "";
+		note.style.display = text ? "block" : "none";
+	}, 1000);
 
 	// The display follows the window.
 	let timer = 0;

@@ -86,6 +86,16 @@ test("the picture is shown from its first painted frame", () => {
 	assert.equal(state.visible, true);
 });
 
+test("a put that paints nothing is not a painted frame", () => {
+	const { picture, paint, state } = setup();
+	picture.display(WIDE);
+	assert.equal(picture.paint(WIDE, () => false), false);
+	assert.equal(state.visible, false);
+	assert.equal(picture.paint(WIDE, () => true), true);
+	assert.equal(state.visible, true);
+	assert.equal(paint(WIDE, "frame"), true);
+});
+
 test("nothing is painted while the display is closed", () => {
 	const { picture, paint } = setup();
 	assert.equal(paint(WIDE, "frame"), false);

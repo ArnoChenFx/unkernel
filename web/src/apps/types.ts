@@ -78,6 +78,21 @@ export interface AppDownload extends FileSpec {
 	unless?: string;
 }
 
+/**
+ * Many files the page fetches together and pushes into one directory of the
+ * guest before the app runs (download.ts getFiles()). As with a download, a
+ * failure is not fatal: the app's script checks them and fetches the missing
+ * ones itself.
+ */
+export interface AppBundle {
+	/** The directory they go to, by the names their URLs end in: relative to the app's dir, or absolute. */
+	path: string;
+	/** The files, with their sizes (loaded when they are needed). */
+	files: () => Promise<(FileSpec & { size: number })[]>;
+	/** A shell test run in dir: when it succeeds nothing is fetched. */
+	unless: string;
+}
+
 /** The distro images an app can name packages for. */
 export type Distro = "alpine" | "debian";
 
@@ -121,6 +136,8 @@ export interface TerminalApp extends AppBase {
 	files?: AppFiles | (() => Promise<AppFiles>);
 	/** Files fetched by the page and pushed into the guest before run.sh starts. */
 	downloads?: AppDownload[];
+	/** Many files fetched and pushed together, after the downloads. */
+	bundle?: AppBundle;
 	/**
 	 * Packages to install first (those not installed yet), per distro. With
 	 * it, the app runs only on the distros it names (an empty list: nothing

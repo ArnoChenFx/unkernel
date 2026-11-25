@@ -738,8 +738,8 @@ only) loads it before the boot (`gl: { eager: true }`). `?gpu=0` (this
 load's URL only, like `?glwait=`; also `?display=0`) leaves the device
 out, so the guest has the vtest link alone, for comparison.
 
-- Only on Debian and Omarchy (`GL_DISTROS`, config.ts: Alpine's Mesa has no
-  virgl driver) and only where `glBlocker()` passes: the page's build has the
+- Only on Debian (`GL_DISTROS`, config.ts: Alpine's Mesa has no virgl
+  driver) and only where `glBlocker()` passes: the page's build has the
   renderer (`glUrl`, above) and the page's thread has `OffscreenCanvas` and
   `WebGL2RenderingContext`. Otherwise the box is unticked and disabled with
   the reason in its note (it follows the Distro radios as chosen), its

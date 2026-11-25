@@ -186,3 +186,11 @@ The packages are in `pins.sh` (`OMARCHY_PACKAGES`, installed with no recommends)
 | `rootfs/etc/init.d/omarchy` | the desktop's runtime: udev, the user's runtime directory, the machine id |
 | `boot-files`, `warm-files` | what a boot and the first commands read, for the page's prefetch |
 | `screenshots/` | the screenshots above |
+
+## Differences from upstream
+
+The fork's page turns GL on for this image: `GL_DISTROS` in `web/src/config.ts`
+lists `omarchy` beside `debian`. Upstream's `.agents/web.md` says GL is on only
+on Debian; that file is kept as upstream wrote it, so this section records the
+difference. Vulkan stays Debian-only (`VK_DISTROS`), because kwvk does not
+accelerate niri's GLES. In remote mode guest GL is off (`remote/README.md`).

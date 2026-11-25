@@ -72,13 +72,15 @@ export class Picture {
 
 	/**
 	 * Paints a frame of the display's mode (`frame` is its size, null when there
-	 * is none) by calling `put`. A frame of another size is the previous mode's,
-	 * still in flight after a display report: it is not painted. True when painted.
+	 * is none) by calling `put`, which returns false when it painted nothing (a
+	 * guest GL frame that was drawn already). A frame of another size is the
+	 * previous mode's, still in flight after a display report: it is not painted.
+	 * True when painted.
 	 */
-	paint(frame: PictureMode | null, put: () => void): boolean {
+	paint(frame: PictureMode | null, put: () => boolean | void): boolean {
 		const m = this.mode;
 		if (!m || !frame || frame.width !== m.width || frame.height !== m.height) return false;
-		put();
+		if (put() === false) return false;
 		if (!this.#painted) {
 			this.#painted = true;
 			this.#host.show();

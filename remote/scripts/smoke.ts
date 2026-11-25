@@ -15,6 +15,7 @@ import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { RemoteLink } from "../web/link.ts";
+import { REMOTE_WIRE } from "../wire.ts";
 import type { FromWorker, ToWorker } from "../../js/core/worker-protocol.ts";
 
 const BOOT_TIMEOUT_MS = 180_000;
@@ -101,7 +102,7 @@ async function main(): Promise<void> {
 			const res = await fetch(`${origin}/remote/info`).catch(() => undefined);
 			return res?.ok ? ((await res.json()) as { app?: string; wire?: number; net?: boolean; data?: string }) : undefined;
 		});
-		if (info.app !== "unkernel-remote" || info.wire !== 1 || info.net !== false) fail(`unexpected /remote/info: ${JSON.stringify(info)}`);
+		if (info.app !== "unkernel-remote" || info.wire !== REMOTE_WIRE || info.net !== false) fail(`unexpected /remote/info: ${JSON.stringify(info)}`);
 		if (info.data !== data) fail(`the backend uses ${info.data}, not ${data}`);
 
 		const page = await fetch(`${origin}/`);
@@ -120,7 +121,7 @@ async function main(): Promise<void> {
 		const rangeBody = new Uint8Array(await range.arrayBuffer());
 		if (range.status !== 206 || rangeBody.length !== 16) fail(`the distro image's Range read answered ${range.status} with ${rangeBody.length} bytes`);
 
-		link = await RemoteLink.connect(origin, 15_000);
+		link = await RemoteLink.connect(origin, { timeoutMs: 15_000 });
 		const endpoint = link.endpoint();
 		const decoder = new TextDecoder();
 		let output = "";

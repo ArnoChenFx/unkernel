@@ -43,7 +43,7 @@ test("the wire carries plain data, the types the worker protocol uses, and binar
 	assert.deepEqual([...new Uint8Array(back.buf)], [7, 7, 7, 7]);
 	assert.deepEqual([...back.view], [258]);
 	assert.equal(back.err.message, "bad");
-	assert.equal(REMOTE_WIRE, 1);
+	assert.equal(REMOTE_WIRE, 2);
 });
 
 test("a /work call goes over the wire and sees the host directory", async () => {

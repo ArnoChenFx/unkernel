@@ -611,6 +611,8 @@ const CMD_NAMES = new Map<number, string>(Object.entries(GPU_CMD).map(([k, v]) =
 
 /** kw_vgpu_blit()'s flags (gl/wasm/kw_virgl.h). */
 const BLIT_OPAQUE = 1, BLIT_FLIP_Y = 2;
+/** virgl formats held as GL_RGBA8 with R, G, B, A in that order on a GLES host (B8G8R8A8, B8G8R8X8: swizzled on transfer; R8G8B8A8, R8G8B8X8): GpuRenderer.video(). */
+const RGBA8_TEXELS = new Set([1, 2, 67, 134]);
 
 /** What GpuRenderer.image() takes of a resource, and how. */
 export interface GpuImageOptions {
@@ -959,6 +961,117 @@ export class GpuRenderer {
 		if (this.#core) return this.#image(this.#core, resource, opts);
 		if (!this.#started || this.#failed) return null;
 		return this.init.then(() => this.#image(this.#core!, resource, opts), () => null);
+	}
+
+	/**
+	 * Host pixels into a guest 2D texture resource (level 0, the box x, y,
+	 * width x height; rows from the top as the guest lays them out), after
+	 * every command before it: a TRANSFER_TO_HOST_3D in no guest context,
+	 * which vrend runs as any upload. For host code that fills a resource a
+	 * guest program made and exported (guest VA-API's surfaces, va.ts): its
+	 * importers sample what the guest's commands after this one see. `fill`
+	 * writes the rows, tightly packed (width x the format's bytes per
+	 * texel), into the buffer it gets (the module's heap: one copy). False,
+	 * with nothing written, for no renderer (not loaded, failed, lost), an
+	 * unknown resource or a buffer, or a format the module cannot pack.
+	 */
+	write(resource: number, box: { x: number; y: number; width: number; height: number }, fill: (dst: Uint8Array) => void): boolean {
+		const c = this.#core;
+		if (!c || this.#lost || this.#queue) return false;
+		const i = c.gpu.info(resource);
+		const blk = i?.texture ? c.gpu.format(i.format) : 0;
+		// block width | height << 8 | bytes << 16: only 1x1 blocks (no compressed formats)
+		if (!i || (blk & 0xffff) !== 0x101 || box.x < 0 || box.y < 0 || !(box.width > 0 && box.height > 0) || box.x + box.width > i.width || box.y + box.height > i.height) return false;
+		const stride = box.width * (blk >>> 16), n = stride * box.height;
+		const cmd = new Uint8Array(HDR + 48), dv = new DataView(cmd.buffer);
+		dv.setUint32(0, GPU_CMD.TRANSFER_TO_HOST_3D, true);
+		dv.setUint32(HDR, box.x, true);
+		dv.setUint32(HDR + 4, box.y, true);
+		dv.setUint32(HDR + 12, box.width, true);
+		dv.setUint32(HDR + 16, box.height, true);
+		dv.setUint32(HDR + 20, 1, true);
+		dv.setUint32(HDR + 32, resource, true);
+		dv.setUint32(HDR + 40, stride, true);
+		dv.setUint32(HDR + 44, n, true);
+		const buf = c.gpu.buffer(n);
+		fill(buf);
+		// unfenced: answered at once (a failure is counted and logged as any command's)
+		const r = this.#run({ cmd, data: buf });
+		return !(r instanceof Promise) && r.code === 0;
+	}
+
+	/**
+	 * A VideoFrame (or another TexImageSource) drawn into a guest 2D texture
+	 * resource on the GPU: texSubImage2D of its visible picture, top left,
+	 * cropped to width x height, in the renderer's context (GPU to GPU for a
+	 * hardware frame in Chromium; the browser converts YUV to RGB by the
+	 * frame's colour space, with no colour management). For guest VA-API's
+	 * video processing (va.ts), as write() is: what the guest's commands
+	 * after it see. Only formats this build stores as RGBA8 texels in RGBA
+	 * order (B8G8R8X8/A8 are swizzled on transfer, R8G8B8X8/A8 as they are).
+	 * The pixel-store state, the unpack buffer and the active unit's 2D
+	 * binding are restored; a GL error is asked for (and so cleared) on the
+	 * first uploads and then one in 64. Null when done,
+	 * else why not.
+	 */
+	#videos = 0;
+
+	video(resource: number, frame: unknown, width: number, height: number): string | null {
+		const c = this.#core;
+		if (!c || this.#lost || this.#queue) return "no renderer";
+		const gl = c.gl;
+		if (gl.isContextLost()) {
+			this.#loseContext();
+			return "the WebGL2 context is lost";
+		}
+		const i = c.gpu.info(resource);
+		if (!i?.texture) return "no such texture";
+		if (!RGBA8_TEXELS.has(i.format)) return `format ${i.format}`;
+		const w = Math.min(width, i.width), h = Math.min(height, i.height);
+		if (!(w > 0 && h > 0)) return "empty";
+		const P = gl;
+		const saved = [P.UNPACK_FLIP_Y_WEBGL, P.UNPACK_PREMULTIPLY_ALPHA_WEBGL, P.UNPACK_COLORSPACE_CONVERSION_WEBGL, P.UNPACK_ROW_LENGTH, P.UNPACK_SKIP_PIXELS, P.UNPACK_SKIP_ROWS, P.UNPACK_ALIGNMENT].map((k) => [k, gl.getParameter(k)] as const);
+		const tex = gl.getParameter(gl.TEXTURE_BINDING_2D), pbo = gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING);
+		let err: string | null = null;
+		try {
+			if (pbo) gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+			gl.bindTexture(gl.TEXTURE_2D, i.texture);
+			// a Y_0_TOP texture holds the picture bottom up
+			gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, i.yTop);
+			gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+			gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+			gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+			gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+			gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+			gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+			gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, i.yTop ? i.height - h : 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, frame as TexImageSource);
+			// getError waits for the GPU process to run everything queued (7 ms
+			// a 1080p frame on an M4 Pro): asked for the first uploads and then
+			// one in 64, as a failure here follows the frame's kind and size
+			const n = this.#videos++;
+			if (n < 8 || n % 64 === 0) {
+				const e = gl.getError();
+				if (e) err = `GL error 0x${e.toString(16)}`;
+			}
+		} catch (e) {
+			err = `texSubImage2D: ${(e as Error)?.name ?? "Error"}: ${(e as Error)?.message ?? e}`;
+		} finally {
+			for (const [k, v] of saved) gl.pixelStorei(k, v);
+			gl.bindTexture(gl.TEXTURE_2D, tex);
+			if (pbo) gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, pbo);
+		}
+		return err;
+	}
+
+	/** A guest texture resource's texels read back (the box, rows from the top, the guest's layout), or null. */
+	read(resource: number, box: { x: number; y: number; width: number; height: number }): Uint8Array | null {
+		const c = this.#core;
+		if (!c || this.#lost || this.#queue) return null;
+		const i = c.gpu.info(resource);
+		const blk = i?.texture ? c.gpu.format(i.format) : 0;
+		if (!i || (blk & 0xffff) !== 0x101 || box.x < 0 || box.y < 0 || !(box.width > 0 && box.height > 0) || box.x + box.width > i.width || box.y + box.height > i.height) return null;
+		this.stats.reads++;
+		return c.gpu.read(resource, box.x, box.y, box.width, box.height, blk >>> 16);
 	}
 
 	#image(c: GpuRendererCore, resource: number, opts: GpuImageOptions): ImageBitmap | null {

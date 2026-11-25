@@ -32,6 +32,9 @@
 #                           the relay the Debian image carries;
 #                           libvulkan_kw.so: guest Vulkan's ICD, vk/icd,
 #                           with usr/share/vulkan/icd.d/kw_icd.json),
+#                           usr/lib/aarch64-linux-gnu/dri/kw_drv_video.so
+#                           (guest VA-API's driver, va/, linked as
+#                           virtio_gpu_drv_video.so),
 #                           etc/profile.d/{kw-path.sh,kw-term.sh,kw-gl.sh,kw-wayland.sh},
 #                           etc/chromium.d/kw-wayland,
 #                           usr/local/bin/Xwayland (the distro's, with a
@@ -139,6 +142,20 @@ if [ "${KW_VK:-1}" != 0 ]; then
 	install -m 755 "$build/vk/libvulkan_kw.so" "$layer/usr/lib/kw/libvulkan_kw.so"
 	mkdir -p "$layer/usr/share/vulkan/icd.d"
 	install -m 644 "$build/vk/kw_icd.json" "$layer/usr/share/vulkan/icd.d/kw_icd.json"
+fi
+# Guest VA-API's driver (va/build.sh, .agents/va.md): libva's driver for the
+# SDK's `va` option, in the layer for the same reason. libva names the
+# driver after the DRM device's kernel driver (virtio_gpu), so the layer
+# links that name to it: Debian's libva2 loads it with no environment
+# variables (LIBVA_DRIVER_NAME=kw names it directly). The link shadows
+# mesa-va-drivers' file of that name, which the image does not carry; an
+# installed mesa-va-drivers replaces it. KW_VA=0 leaves it out.
+if [ "${KW_VA:-1}" != 0 ]; then
+	"$root/va/build.sh" guest >/dev/null
+	dri="$layer/usr/lib/aarch64-linux-gnu/dri"
+	mkdir -p "$dri"
+	install -m 755 "$build/va/kw_drv_video.so" "$dri/kw_drv_video.so"
+	ln -s kw_drv_video.so "$dri/virtio_gpu_drv_video.so"
 fi
 ln -s /kw/layer/usr/sbin/kw-overlay "$stage/usr/sbin/kw-overlay"
 ln -s /kw/layer/usr/lib/kw "$stage/usr/lib/kw"

@@ -21,6 +21,7 @@ import { CMD_PORT } from "../js/core/commands.ts";
 import { GL_PORT } from "../js/core/gl.ts";
 import { TTY_PORT } from "../js/core/tty.ts";
 import { WASI_EXEC_PORT } from "../js/core/wasi-exec.ts";
+import { VA_PORT } from "../js/core/va.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const build = process.env.KW_BUILD ? resolve(process.env.KW_BUILD) : join(root, "vendor/build");
@@ -195,7 +196,7 @@ test("prepareVk: ignored with a log line without WebGPU or a renderer", () => {
 test("the host's vsock ports are distinct", () => {
 	// the page's Wayland relay (web/src/wayland.ts) is read from its source: it imports browser-only modules
 	const wayland = Number(/export const WAYLAND_PORT = (\d+)/.exec(readFileSync(join(root, "web/src/wayland.ts"), "utf8"))?.[1]);
-	const ports: Record<string, number> = { P9_PORT, GL_PORT, CMD_PORT, WASI_EXEC_PORT, TTY_PORT, VK_PORT, WAYLAND_PORT: wayland };
+	const ports: Record<string, number> = { P9_PORT, GL_PORT, CMD_PORT, WASI_EXEC_PORT, TTY_PORT, VK_PORT, VA_PORT, WAYLAND_PORT: wayland };
 	assert.ok(wayland > 0, "WAYLAND_PORT in web/src/wayland.ts");
 	const seen = new Map<number, string>();
 	for (const [name, port] of Object.entries(ports)) {

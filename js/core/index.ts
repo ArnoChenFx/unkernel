@@ -53,6 +53,8 @@ export { GL_FORWARDER, GL_PORT, GlHost } from "./gl.ts";
 export type { GlOption, GlOptions, GlRendererStatus, GlStats, VirglTotals } from "./gl.ts";
 export { VK_PORT, VkHost } from "./vk.ts";
 export type { VkExternalRef, VkGpuAdapter, VkGpuDevice, VkOption, VkOptions, VkRendererStatus, VkStats } from "./vk.ts";
+export { VA_PORT, VaHost } from "./va.ts";
+export type { VaContextStats, VaOption, VaOptions, VaStats, VaStatus } from "./va.ts";
 export { Deframer, MUX, StreamHost, frame } from "./gl-stream.ts";
 export type { StreamHostStats, VtestRenderer } from "./gl-stream.ts";
 export type { CommandErrorCode, CommandsOption, HostCommand, HostCommandContext, HostCommandResult } from "./commands.ts";

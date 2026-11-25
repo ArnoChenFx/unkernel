@@ -26,6 +26,7 @@ import { CommandTable, type HostCommand, type parseCommands } from "./commands.t
 import { MountTable, type FsSource, type Mount, type MountOptions, type parseMounts } from "./mounts.ts";
 import type { GlHost } from "./gl.ts";
 import type { VkHost } from "./vk.ts";
+import type { VaHost } from "./va.ts";
 import type { GpuRenderer } from "./gl-gpu.ts";
 import { FrameClient, RemoteEvdev, SoundBridge } from "./worker-devices.ts";
 import { SharedOwner, newSharedControl, sharedMemoryAvailable, type KernelTransport } from "./worker-shared.ts";
@@ -219,6 +220,7 @@ export class WorkerKernel implements KernelHandle {
 	#commands: CommandTable;
 	#gl: GlHost | undefined;
 	#vk: VkHost | undefined;
+	#va: VaHost | undefined;
 	#gpu: GpuRenderer | undefined;
 	#shm: ShmClient | undefined;
 	#shmCalls = new Map<number, { resolve: (v: ShmCallResult) => void; reject: (e: Error) => void }>();
@@ -546,6 +548,7 @@ export class WorkerKernel implements KernelHandle {
 		this.#shmLocal = undefined;
 		this.#gl?.shutdown();
 		this.#vk?.shutdown();
+		this.#va?.shutdown();
 		this.#commands.shutdown();
 		this.#mounts.shutdown();
 		this.#vsock?.shutdown();
@@ -804,6 +807,17 @@ export class WorkerKernel implements KernelHandle {
 	/** With the vk option: the Vulkan renderer's host side (vk.ts), on this thread as inline. */
 	get vk(): VkHost | undefined {
 		return this.#vk;
+	}
+
+	/** @internal createKernel's `va`, once the kernel runs: served on this thread, as vsock is. */
+	attachVa(va: VaHost | undefined): void {
+		this.#va = va;
+		if (va && this.#result) va.shutdown();
+	}
+
+	/** With the va option: the VA-API decoder's host side (va.ts), on this thread as inline. */
+	get va(): VaHost | undefined {
+		return this.#va;
 	}
 
 	/**

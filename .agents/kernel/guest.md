@@ -44,8 +44,9 @@ rdinit=/init`, the data disk template, the SMP patch) and copies that to
 ## The kw layer (`guest/base/rootfs/`)
 
 The top lower layer of every distro's root (`/kw/layer` in the base, so
-RAM-resident: keep it small). Everything in it is `kw-*` or under
-`/usr/lib/kw/`, so it never shadows a distro's file; its scripts run the
+RAM-resident: keep it small). Everything in it is `kw-*`, `kw_*` or under
+`/usr/lib/kw/`, so it never shadows a distro's file, except the VA driver's
+`virtio_gpu_drv_video.so` link (below); its scripts run the
 base's busybox (`#!/run/kw-lower/bin/busybox sh`) and only gain features,
 with one floor: an image from before kwbox does not boot on a base with it
 (Guest tools, below).
@@ -66,6 +67,17 @@ with one floor: an image from before kwbox does not boot on a base with it
   option); the manifest is in the loader's default search path, so
   Debian's `libvulkan1` finds it with no environment variables. Alpine's
   musl loader cannot load it. `KW_VK=0` builds the base without it.
+- `/usr/lib/aarch64-linux-gnu/dri/kw_drv_video.so` and the link
+  `virtio_gpu_drv_video.so` to it: guest VA-API's libva driver
+  (`va/build.sh`; va.md), in the layer for the same reason (its link
+  protocol belongs to the SDK's `va` option). libva names a DRM device's
+  driver after its kernel driver, `virtio_gpu`, so Debian's `libva2` loads
+  it with no environment variables (`LIBVA_DRIVER_NAME=kw` names it
+  directly). The link shadows mesa-va-drivers' file of that name, which the
+  image does not carry; installing mesa-va-drivers replaces it in the upper
+  layer, and removing it again leaves an overlay whiteout over the layer's
+  link (`LIBVA_DRIVER_NAME=kw`, or make the link again). `KW_VA=0` builds
+  the base without both.
 - `/usr/lib/kw/bin/wland`: Wayland apps as windows on the page (web.md,
   Wayland desktop) through wland's relay `/usr/lib/kw/wlandr`
   (https://github.com/pithings/wland, MPL-2.0 and MIT), which only the

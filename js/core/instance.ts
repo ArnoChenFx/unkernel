@@ -22,6 +22,7 @@ import { CommandTable, parseCommands, type CommandsOption, type HostCommand } fr
 import { MountTable, parseMounts, snapshotMountMismatch, type FsSource, type Mount, type MountOptions, type MountsOption } from "./mounts.ts";
 import { prepareGl, startGl, type GlHost, type GlOption } from "./gl.ts";
 import { prepareVk, startVk, type VkHost, type VkOption, type VkPlatform } from "./vk.ts";
+import { prepareVa, startVa, type VaHost, type VaOption } from "./va.ts";
 import { inlineGpuLink, VirglGpuBackend } from "./gl-gpu.ts";
 import { Kernel, bundledBoot, moduleIsMemory64, type ExitResult, type KernelStats, type MemoryStage, type NetDevice } from "./kernel.ts";
 import { BootError, loadBytes, loadKernelModule, type BytesSource, type DownloadProgress, type KernelSource } from "./load.ts";
@@ -255,6 +256,18 @@ export interface CreateKernelOptions {
 	 * gives a device. Default false.
 	 */
 	vk?: VkOption;
+	/**
+	 * Guest VA-API (va.ts, va/PROTOCOL.md): the guest's libva driver
+	 * (kw_drv_video.so, which libva loads for the virtio-gpu device as
+	 * virtio_gpu_drv_video.so) sends each picture over vsock port 1024 to a
+	 * WebCodecs VideoDecoder on this thread and reads it back as NV12
+	 * (VP9 profile 0, H.264, AV1 Main and HEVC Main where WebCodecs decodes
+	 * them; decode only). Nothing is asked of WebCodecs before the
+	 * guest's first connection. true, or options. Needs vsock and
+	 * VideoDecoder: where there is none (Node) it is ignored with a log
+	 * line. Default false.
+	 */
+	va?: VaOption;
 	/** Initial console size (cols x rows); resize() changes it later. */
 	consoleSize?: { cols: number; rows: number };
 	/** Console output, from the first byte. */
@@ -542,6 +555,8 @@ export interface KernelHandle {
 	readonly gl: GlHost | undefined;
 	/** With the vk option, where it could start: the Vulkan renderer's host side (status, stats); on this thread in both modes. */
 	readonly vk: VkHost | undefined;
+	/** With the va option, where it could start: the VA-API decoder's host side (status, stats); on this thread in both modes. */
+	readonly va: VaHost | undefined;
 }
 
 function isBackend(n: NetDevice | NetBackend): n is NetBackend {
@@ -574,6 +589,7 @@ export class KernelInstance implements KernelHandle {
 	#commands = new CommandTable(undefined, () => {});
 	#gl: GlHost | undefined;
 	#vk: VkHost | undefined;
+	#va: VaHost | undefined;
 
 	/** @internal Use createKernel(). */
 	constructor(kernel: Kernel, module: WebAssembly.Module, cmdline: string, net: NetDevice | undefined, compileMs: number) {
@@ -587,6 +603,7 @@ export class KernelInstance implements KernelHandle {
 		this.exited = kernel.exited.then((res) => {
 			this.#gl?.shutdown();
 			this.#vk?.shutdown();
+			this.#va?.shutdown();
 			this.#commands.shutdown();
 			this.#mounts.shutdown();
 			this.#vsock?.shutdown();
@@ -655,6 +672,17 @@ export class KernelInstance implements KernelHandle {
 	/** With the vk option: the Vulkan renderer's host side (vk.ts), or undefined. */
 	get vk(): VkHost | undefined {
 		return this.#vk;
+	}
+
+	/** @internal createKernel's `va`, once the kernel runs. */
+	attachVa(va: VaHost | undefined): void {
+		this.#va = va;
+		if (va && this.kernel.result) va.shutdown();
+	}
+
+	/** With the va option: the VA-API decoder's host side (va.ts), or undefined. */
+	get va(): VaHost | undefined {
+		return this.#va;
 	}
 
 	/** createKernel's `mounts` and `commands` first (see KernelHandle.spawn()). */
@@ -968,6 +996,8 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	const glPrep = prepareGl(opts.gl, !!opts.gpu, !!vopt && !raw, platform.glModule?.(), opts.log ?? ((m: string) => console.error(m)), !!opts.restore);
 	// vk: nothing loads before the guest's first Vulkan instance (vk.ts).
 	const vkPrep = prepareVk(opts.vk, !!vopt && !raw, platform.vk?.(), opts.log ?? ((m: string) => console.error(m)));
+	// va: nothing is asked of WebCodecs before the guest's first VA-API connection (va.ts).
+	const vaPrep = prepareVa(opts.va, !!vopt && !raw, opts.log ?? ((m: string) => console.error(m)));
 	if (opts.worker) {
 		checkWorkerOptions(platform, opts);
 		const vm = await createKernelInWorker(platform, opts, progress, glPrep?.gpu);
@@ -975,6 +1005,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 		vm.startCommands(commands);
 		vm.attachGl(startGl(glPrep, vm.vsock, opts.log ?? ((m: string) => console.error(m))));
 		vm.attachVk(startVk(vkPrep, vm.vsock, opts.log ?? ((m: string) => console.error(m))));
+		vm.attachVa(startVa(vaPrep, vm.vsock, opts.log ?? ((m: string) => console.error(m)), glPrep?.gpu));
 		return vm;
 	}
 	const loadOpts = { signal, readFile: platform.readFile, onProgress: progress };
@@ -1095,6 +1126,7 @@ export async function createKernelOn(platform: Platform, opts: CreateKernelOptio
 	instance.startCommands(commands);
 	instance.attachGl(startGl(glPrep, vsock, log));
 	instance.attachVk(startVk(vkPrep, vsock, log));
+	instance.attachVa(startVa(vaPrep, vsock, log, glPrep?.gpu));
 	if (signal) {
 		const onAbort = () => instance.stop({ code: 130, reason: "aborted" });
 		if (signal.aborted) onAbort();

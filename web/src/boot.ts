@@ -1663,6 +1663,9 @@ export function start(): void {
 			// Guest Vulkan on this thread's WebGPU (Debian, on by default; showVk()): nothing loads
 			// before the guest's first Vulkan instance, and nothing of it is in a snapshot.
 			vk: cfg.vk,
+			// Guest VA-API on this thread's WebCodecs (Debian, on by default, ?va=0: off): nothing is
+			// asked of WebCodecs before the guest's first VA-API connection, nothing is in a snapshot.
+			va: cfg.va,
 		});
 		// A session on this load's CPU count (another: offerResumeCpus(), above).
 		const resume = await offerResume(session, dataDisks);

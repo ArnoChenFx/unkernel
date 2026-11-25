@@ -227,18 +227,23 @@ It writes the assets to `remote/dist/`, and the install to `remote/dist/install/
 
 ## Upstream files
 
-The remote mode adds no code to upstream's own paths except the hooks below.
-They are the only files that can conflict with upstream changes:
+The remote mode adds no code to upstream's own paths except the four hooks
+below. They are the only upstream-owned files the fork changes, so they are the
+only ones that can conflict with upstream changes. The fork does not edit
+upstream's docs (README.md, AGENTS.md, .agents/, guest/, kernel/, vk/): the
+notes on the fork's differences live in this file and in
+`distros/omarchy/README.md`.
 
 - `web/src/boot.ts`: the remote branch of boot (a connection to the backend
   instead of a kernel in this page, the data disk as a file on the backend's
   computer, and the storage and suspend actions that the backend does not offer).
 - `web/src/config.ts`: the `remote` field of the page's configuration, and
-  `GL_DISTROS`, which includes Omarchy beside Debian.
+  `GL_DISTROS`, which includes Omarchy beside Debian (the last section of
+  `distros/omarchy/README.md` has the difference from `.agents/web.md`).
 - `web/src/main.tsx`: the page's configuration is read through `remote/web/page.ts`.
 - `web/scripts/kernel.ts`: the extra distro images of `KW_EXTRA_DISTROS`
   (`remote/scripts/fetch-extra-distros.ts`) join the release's images.
-- `.agents/web.md` and `.gitignore`: the Omarchy GL note, and `remote/extra-distros/`.
 
 Everything else lives in `remote/`, `distros/omarchy/` and in
-`.github/workflows/remote-*.yml` and `omarchy-image.yml`.
+`.github/workflows/remote-*.yml` and `omarchy-image.yml`. The ignore rule for
+`remote/extra-distros/` is in `remote/.gitignore`.

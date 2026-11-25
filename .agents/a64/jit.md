@@ -22,14 +22,14 @@ What is translated:
 | `branch.zig` | side exits, terminators, b_f/bl_f, br/blr, goto; the region hooks `selfLoop`, `targets`, `memberTail`, `indirect` |
 | `generic.zig` | frequent `generic` ops inline: FP/general moves, MOVI, DUP, UMOV, INS, vector logic, MRS of FPCR/FPSR/NZCV/DCZID, FCMP, scalar FP arithmetic and conversions with fast paths, loads into XZR |
 | `atomic.zig` | exclusives, LDAR/STLR, LSE LD<op>/SWP/CAS, CLREX, barriers, DC ZVA |
-| `vec.zig` | with SIMD: integer AdvSIMD, permutes, LD1/ST1 and V-register pairs, AES, PMULL, SHA1, SHA256, SHA512 |
+| `vec.zig` | with SIMD: integer AdvSIMD, AdvSIMD FP fast paths, permutes, LD1/ST1 and V-register pairs, AES, PMULL, SHA1, SHA256, SHA512 |
 | `emit.zig` | the core's hooks, family dispatch, `generic` calls |
 | `common.zig` | locals, slot access, `Use` helpers |
 | `kindtest.zig`, `tests.zig` | test helpers and the core's tests |
 
-The other `generic` ops (FMA, AdvSIMD FP, LD2-4/ST2-4, the rest of AdvSIMD
-without SIMD, other system ops, exclusive pairs, CASP, SHA3, scalar FP off
-its fast path) are calls of the reference interpreter through the
+The other `generic` ops (LD2-4/ST2-4, the rest of AdvSIMD
+(also all of it without SIMD), other system ops, exclusive pairs, CASP,
+SHA3, FP off its fast path) are calls of the reference interpreter through the
 kernel's function table (Generic ops, below); a host without the table
 hands them back and a block is compiled up to its first one.
 
@@ -266,21 +266,33 @@ registers (W/S, X/D, X/V.D[1]), UMOV, INS (general) of a 64-bit lane, DUP
 a NaN operand or with FPCR.FZ). musl's soft long double in printf and its
 memset are the main users.
 
-**Scalar FP fast paths** (`fpFast`, `cvtz`): FADD, FSUB, FMUL, FDIV, FSQRT
-(S, D), SCVTF, UCVTF (W/X to S/D), FCVTZS, FCVTZU (S/D to W/X), FCVT (S to
-D, D to S) inline, bit-exact with fparith.zig, with the interpreter call
-on the rest; FMOV, FABS, FNEG (register), FMOV (immediate) and FCSEL need
-no slow path. The fast path needs FPCR.RMode = nearest, FZ = 0, and a
-result that is a normal number away from both ends of the range (no NaN,
-infinity, zero, denormal, overflow, underflow), so IXC is the only flag
-that can arise and wasm's result is Arm's. IXC is exact: TwoSum for
-FADD/FSUB, the exact product in double for single FMUL/FDIV/FSQRT, the
-significant bits for SCVTF/UCVTF, a cut fraction for FCVTZ*. Double FMUL,
-FDIV and FSQRT need an exact product (an FMA, which MVP wasm lacks), so
-they take the fast path only while FPSR.IXC is already set. FCVTZS/FCVTZU
-do all of toFixed inline (NaN to 0, saturation, IOC); only FZ calls. The
-slow path stores only the operands the interpreter reads and loads only
-what it writes. The FMA forms (FMADD, ...) stay calls.
+**Scalar FP fast paths** (`fpFast`, `cvtz`): FADD, FSUB, FMUL, FDIV, FSQRT,
+FMAX, FMIN, FMAXNM, FMINNM, FMADD, FMSUB, FNMADD, FNMSUB (S, D), SCVTF, UCVTF
+(W/X to S/D), FCVTZS, FCVTZU (S/D to W/X), FCVT (S to D, D to S) inline,
+bit-exact with fparith.zig, with the interpreter call on the rest; FMOV,
+FABS, FNEG (register), FMOV (immediate) and FCSEL need no slow path. The
+arithmetic fast path needs FPCR.RMode = nearest and FZ = 0. FADD, FSUB,
+FMUL, FDIV and FSQRT check only the result: a normal number away from both
+ends of the range is no NaN, infinity or tiny value, and with FZ = 0 a
+denormal operand raises nothing, so IXC is the only flag that can arise
+and wasm's result is Arm's. The hot path is one test and branch: such a
+result with FPSR.IXC already set (FPCR and FPSR in one load) is written,
+and FPSR is not. Behind it, ±0.0 results take the fast path when exact (a
+zero sum always; FMUL, FDIV and FSQRT only from a zero first operand,
+either for FMUL), and with FPSR.IXC clear IXC is computed exactly: TwoSum
+for FADD/FSUB, the exact product in double for single FMUL/FDIV/FSQRT,
+significant bits for SCVTF/UCVTF, the round trip for FCVT to single;
+double FMUL/FDIV/FSQRT call the interpreter then. Scalar
+FMAX/FMIN/FMAXNM/FMINNM run inline via wasm min/max when FPCR.FZ = 0 and
+the result is not NaN. Scalar FMADD/FMSUB/FNMADD/FNMSUB run inline while
+FPCR allows fast path and FPSR.IXC is already set, with operands in range
+or ±0.0, all in one test (a branch on IXC alone first made the IXC-set
+path about 12% slower, 2026-11-24): single promotes to f64 and rejects
+exact ties (`0x1000_0000`); double uses Dekker TwoProd + Knuth TwoSum over
+bounded exponents (`580..1460`) and rejects exact powers of two or errors
+near 0.5 ULP. FCVTZS/FCVTZU do all of toFixed inline (NaN to 0, saturation, IOC);
+only FZ calls. The slow path stores only the operands the interpreter reads
+and loads only what it writes.
 
 **Loads into XZR.** The tier leaves an integer load whose Rt (or Rt2) is
 XZR `generic` (slot 32 is XZR for the ops). Compiled code runs it as its
@@ -343,8 +355,18 @@ exactly that meaning.
   ([SU]SHR, [SU]SRA, SHL, SLI, SRI, [SU]SHLL(2), SHRN(2); a right shift by
   the element size, which wasm takes modulo, is folded at decode), three
   different ([SU]MULL, [SU]MLAL, [SU]MLSL by extmul; [SU]ADDL/SUBL/ADDW/
-  SUBW), by element (MUL, MLA, MLS, [SU]MULL, [SU]MLAL, [SU]MLSL),
-  BSL/BIT/BIF, ORR/BIC (immediate), SMOV, INS (general) of B/H/S lanes.
+  SUBW), by element (MUL, MLA, MLS, [SU]MULL, [SU]MLAL, [SU]MLSL, FMUL,
+  FMLA, FMLS), BSL/BIT/BIF, ORR/BIC (immediate), SMOV, INS (general) of
+  B/H/S lanes.
+- **AdvSIMD FP fast paths.** Vector FADD, FSUB, FMUL, FDIV, FMAX, FMIN,
+  FMAXNM, FMINNM, FSQRT, FCMEQ, FCMGE, FCMGT, compares with zero (2S, 4S,
+  2D), FABS, FNEG (all bits, no fast-path guard), single-precision FMLA/FMLS
+  (vector and by-element, computed in f64x2 without double rounding), and
+  2S/4S SCVTF/UCVTF (FPCR and FPSR.IXC checks only) and FCVTZS/FCVTZU
+  (per-lane range checks); the arithmetic checks each lane for a normal
+  exponent or an exact zero, and Q = 0 neutralizes inactive high lanes. Off the fast path, `vecFpSlow`
+  stores only the V registers read and calls `opexec.jitGeneric` without
+  spilling unrelated locals.
 - **Permutations.** UZP, ZIP, TRN, EXT, REV16/32/64, DUP (element), INS
   (element), XTN(2) and SHRN(2)'s packing are one `i8x16.shuffle` each;
   UZP/ZIP/TRN and EXT indices come from `simd_move.permuteOp`/`ext` run at
@@ -393,7 +415,9 @@ exactly that meaning.
   read-only, wrapping past 2^64, and one group in eight closing a loop so
   later passes hit the TLB. vec.zig draws every class with random fields
   (so reserved and untranslated neighbours too) between MOVI edge vectors,
-  and AES pairs as OpenSSL writes them plus every broken pairing.
+  AES pairs as OpenSSL writes them plus every broken pairing, and the
+  translated AdvSIMD FP forms (and FADDP) over FP edge lanes with random
+  Q and sz.
   generic.zig's forms and the FP fast paths run over FP edge values with
   random FPCR, reading FPSR after half the ops (the end state alone hid a
   missing IXC). atomic.zig mixes monitor sequences, CAS made to pass, and

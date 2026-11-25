@@ -383,6 +383,65 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 		await vm.stop();
 	});
 
+	test("sound: worker mode delivers PCM via SharedArrayBuffer SoundSink.onRing without wake messages (Alpine)", { skip: noAlpine }, async (t) => {
+		let reader: InstanceType<typeof sdk.SoundRingReader> | undefined;
+		let totalFrames = 0;
+		const formats = new Set<string>();
+		const events: string[] = [];
+		/** The ring's records in order: its state records, and "pcm" once per run of chunks. */
+		const records: string[] = [];
+		const fallbackChunks: number[] = [];
+		const drain = (queued: number) => {
+			for (let rec; (rec = reader?.readNext());) {
+				if (rec.event) { records.push(rec.event); continue; }
+				if (records.at(-1) !== "pcm") records.push("pcm");
+				formats.add(`${rec.format.rate}/${rec.format.channels}/${rec.format.format}`);
+				totalFrames += Math.floor(rec.data.length / rec.format.frameBytes);
+				reader!.setQueuedFrames(queued);
+			}
+		};
+		const vm = await boot(t, {
+			worker: true, shared: true, log: () => {}, distro: alpine!,
+			display: () => ({ width: 320, height: 240 }),
+			sound: {
+				rate: 48000,
+				onRing: (ring) => {
+					reader = new sdk.SoundRingReader(ring);
+				},
+				onState: (_st, ev) => {
+					if (ev === "prepare" || ev === "drain" || ev === "stop" || ev === "close") drain(0);
+					events.push(ev);
+				},
+				// Set alongside onRing to verify onRing takes priority over onChunk in shared worker mode.
+				onChunk: (c) => { fallbackChunks.push(c.frames); return 0; },
+			},
+		});
+		assert.ok(reader, "onRing received SharedArrayBuffer on boot");
+		const poll = setInterval(() => drain(64), 20);
+		try {
+			const { s, waitFor } = screen(vm);
+			await waitFor(PROMPT);
+			const at = s.text.length;
+			vm.write("glimmer --test 2\n");
+			await waitFor(/glimmer: test sound done/, at, 30000);
+			await waitFor(PROMPT, s.text.length - 200);
+			await new Promise((r) => setTimeout(r, 150));
+		} finally {
+			clearInterval(poll);
+		}
+		assert.equal(fallbackChunks.length, 0, "onChunk stayed idle when onRing was attached");
+		assert.deepEqual([...formats], ["22050/2/2"]);
+		assert.equal(totalFrames, 66150);
+		assert.deepEqual([events[0], events.at(-1)], ["open", "close"], events.join(","));
+		drain(0);
+		// The ring carries the state changes too, the PCM between its start and the stop or drain.
+		assert.deepEqual(records.filter((r) => r !== "pcm"), events, records.join(","));
+		const pcm = records.indexOf("pcm");
+		assert.ok(pcm > 0 && records[pcm - 1] === "start" && /^(stop|drain)$/.test(records[pcm + 1]!), records.join(","));
+		vm.write("poweroff\n");
+		assert.equal((await vm.exited).code, 0);
+	});
+
 	test("WorkerKernel: sync() is a round trip, and a request the worker never answered resolves false with a persistent disk", async () => {
 		// A stand-in worker: records what is posted, and lets the test answer.
 		type Msg = { t: string; id?: number };
@@ -2678,6 +2737,49 @@ describe("api", { concurrency: CONCURRENCY }, () => {
 
 });
 
+// Not with the others: it replaces WebAssembly.Memory, which every boot uses.
+test("SMP: the kernel's memory is allocated once, shared, at a boot and at a restore; memoryFallbackMiB applies where a shared memory cannot be had",
+	{ skip: !hasSmpPatch && "the kernel under test carries no SMP kernel" }, async (t) => {
+	const kernel = await sdk.loadKernelModule(readFileSync(kernelFile), { smp: true });
+	const { Memory } = WebAssembly;
+	const asked: string[] = [];
+	let maxSharedMiB = Infinity;
+	WebAssembly.Memory = new Proxy(Memory, {
+		construct(target, args: [WebAssembly.MemoryDescriptor], newTarget) {
+			const mib = Number(args[0].initial) / 16;
+			if (mib >= 128) asked.push(`${mib} MiB${args[0].shared ? " shared" : ""}`);
+			if (args[0].shared && mib > maxSharedMiB) throw new RangeError("could not allocate memory");
+			return Reflect.construct(target, args, newTarget) as WebAssembly.Memory;
+		},
+	});
+	try {
+		const opts = { kernel, cpus: 1, worker: false, vsock: false, log: () => {} };
+		const vm = await boot(t, { ...opts, memoryMiB: 512 });
+		const a = screen(vm);
+		await a.waitFor(PROMPT);
+		// Saved once init is done starting the shell (as above).
+		vm.write("echo up-$((6*7))\n");
+		await a.waitFor(/up-42/);
+		const snap = await vm.snapshot({ stop: true });
+		assert.deepEqual(asked.splice(0), ["512 MiB shared"]);
+
+		const vm2 = await boot(t, { ...opts, restore: snap });
+		const b = screen(vm2);
+		vm2.write("echo restored-$((6*7))\n");
+		await b.waitFor(/restored-42/);
+		await vm2.stop({ reason: "test" });
+		assert.deepEqual(asked.splice(0), ["512 MiB shared"]);
+
+		maxSharedMiB = 256;
+		const vm3 = await boot(t, { ...opts, memoryMiB: 512, memoryFallbackMiB: [384, 256] });
+		await screen(vm3).waitFor(PROMPT);
+		assert.equal(vm3.memoryMiB, 256);
+		assert.deepEqual(asked, ["512 MiB shared", "384 MiB shared", "256 MiB shared"]);
+	} finally {
+		WebAssembly.Memory = Memory;
+	}
+});
+
 // Not with the others: it changes globalThis.crossOriginIsolated, which every worker-mode boot reads.
 test("worker mode: messages where SharedArrayBuffer cannot be used (a page that is not cross-origin isolated); shared: true then rejects", async (t) => {
 	const g = globalThis as { crossOriginIsolated?: boolean };
@@ -2693,4 +2795,61 @@ test("worker mode: messages where SharedArrayBuffer cannot be used (a page that 
 		delete g.crossOriginIsolated;
 	}
 	assert.equal(sdk.sharedMemoryAvailable(), true);
+});
+
+test("sound ring: the owner delivers states and PCM in the kernel's order, whatever the messages' timing", async () => {
+	const { SoundBridge } = await import("../js/core/worker-devices.ts");
+	const { SoundRingWriter, createSoundRing } = await import("../js/core/sound-ring.ts");
+	const fmt = (rate: number) => ({ rate, channels: 2, format: 2, frameBytes: 4 });
+	const ring = createSoundRing(1024);
+	const writer = new SoundRingWriter(ring);
+	const seen: string[] = [];
+	const logs: string[] = [];
+	const bridge = new SoundBridge({
+		onChunk: (c) => { seen.push(`pcm${c.format.rate}`); return 100; },
+		onState: (_s, ev) => { seen.push(ev); },
+	}, () => {}, (m) => logs.push(m), ring);
+	const st = { open: true, playing: false, format: null };
+	// The worker's side: a record per state, then its message (delivered late, in `msgs`).
+	const msgs: Array<() => void> = [];
+	let n = 0;
+	const state = (ev: "open" | "prepare" | "start" | "stop" | "close") => {
+		const k = ++n;
+		writer.writeEvent(k, ev);
+		msgs.push(() => bridge.onState(st, ev, k));
+	};
+	const pcm = (rate: number) => { if (writer.write(1, fmt(rate), new Uint8Array(64))) msgs.push(() => bridge.onWake()); };
+	state("open"); state("prepare"); state("start"); pcm(48000);
+	// The owner is behind: the next stream is in the ring before it has handled the first one's messages.
+	state("stop"); state("prepare"); state("start"); pcm(8000);
+	assert.equal(writer.queuedFrames(), 32, "frames in the ring count as delay");
+	for (const m of msgs.splice(0)) m();
+	assert.deepEqual(seen, ["open", "prepare", "start", "pcm48000", "stop", "prepare", "start", "pcm8000"]);
+	assert.equal(writer.queuedFrames(), 100, "the sink's answer, nothing left in the ring");
+	// A full ring: PCM is dropped and logged, the states still arrive, in order.
+	seen.length = 0;
+	for (let i = 0; i < 20; i++) pcm(8000);
+	state("stop"); state("close");
+	for (const m of msgs.splice(0)) m();
+	assert.deepEqual(seen.slice(-2), ["stop", "close"]);
+	assert.ok(seen.length < 22 && seen.slice(0, -2).every((x) => x === "pcm8000"), seen.join(","));
+	assert.match(logs.join("\n"), /sound ring was full: \d+ bytes/);
+});
+
+test("yieldToEventLoop() resolves concurrently and across turns without setImmediate", async () => {
+	const { yieldToEventLoop } = await import("../js/core/wasi.ts");
+	const g = globalThis as { setImmediate?: typeof setImmediate };
+	const orig = g.setImmediate;
+	g.setImmediate = undefined;
+	try {
+		const order: number[] = [];
+		await Promise.all([
+			yieldToEventLoop().then(() => order.push(1)),
+			yieldToEventLoop().then(() => order.push(2)),
+			yieldToEventLoop().then(() => yieldToEventLoop()).then(() => order.push(3)),
+		]);
+		assert.deepEqual(order, [1, 2, 3]);
+	} finally {
+		g.setImmediate = orig;
+	}
 });

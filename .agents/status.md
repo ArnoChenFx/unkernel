@@ -138,7 +138,7 @@ Open:
    each 64K ops cost 1 MiB of guest RAM per CPU) only if long sessions
    show the same; per-CPU code caches on
    SMP; a cheaper decoder only if decode stays above about 8% of npm's
-   time; Binaryen `-O2` after the lowering, timed on a quiet machine. Apk
+   time. Apk
    and shell: bigger regions (most remaining exits leave full ones), exits
    into self-loop modules, `run`'s entry path and region prologues, NZCV
    materialisation. Not worth revisiting: the compile threshold and heat
@@ -380,20 +380,25 @@ Open:
   Before the first aarch64 release it needs one smoke run (`release`
   unchecked), which shows its time on a hosted runner and whether
   kwtest's timing checks hold there with the A64 JIT.
-- **aarch64: FMA, AdvSIMD FP and system instructions are calls of the
-  interpreter in compiled code.** The A64 JIT (a64/jit.md)
+- **aarch64: the rest of AdvSIMD FP and system instructions are calls
+  of the interpreter in compiled code.** The A64 JIT (a64/jit.md)
   translates every ALU, memory and branch op, the frequent FP moves,
-  compares and AdvSIMD moves, scalar FP arithmetic and conversions (with
-  a fast path that needs FPCR's defaults and calls the interpreter off
-  it; double FMUL, FDIV and FSQRT only once FPSR.IXC is set) inline
+  compares and AdvSIMD moves, scalar FP arithmetic, min/max, FMADD and
+  conversions (with a fast path that needs FPCR's defaults and calls the
+  interpreter off it; FMADD, and double FMUL, FDIV and FSQRT without a
+  zero input, only once FPSR.IXC is set) inline
   (generic.zig), and where the host compiles SIMD the integer AdvSIMD
-  ops, LD1/ST1, LDP/STP of V registers, AES, PMULL, SHA1, SHA256 and
-  SHA512 (vec.zig); the other generic ops are calls of the reference
-  interpreter through the kernel's function table, with the module's
-  registers spilled around them (2026-11-18). Exclusives, LDAR/STLR and
-  the LSE atomics are inline too, with wasm atomics in SMP builds
-  (atomic.zig); pairs and CASP stay calls. The largest count left is
-  FMADD (a64/performance.md, Where the time goes).
+  ops, the AdvSIMD FP forms a64/jit.md lists (vector arithmetic, min/max,
+  compares, single-precision FMLA/FMLS and conversions; a fast path, and
+  off it a call that stores only the V registers read), LD1/ST1, LDP/STP
+  of V registers, AES, PMULL, SHA1, SHA256 and SHA512 (vec.zig); the
+  other generic ops (among them the scalar AdvSIMD FP forms, pairwise and
+  across-lanes FP, FMULX, FABD, FACGE/FACGT, the reciprocal estimates and
+  steps, FRINT*, the other FCVT* and the 2D FMLA/FMLS and conversions)
+  are calls of the reference interpreter through the kernel's function
+  table, with the module's registers spilled around them (2026-11-24).
+  Exclusives, LDAR/STLR and the LSE atomics are inline too, with wasm
+  atomics in SMP builds (atomic.zig); pairs and CASP stay calls.
 - **aarch64: OpenSSL's NEON and crypto paths need wasm SIMD in the
   host.** The image's libcrypto now picks its code from HWCAP and the
   kernel enables SHA512 by default, because the JIT translates those
@@ -416,7 +421,8 @@ Open:
 - **One long syscall delays the host.** Every syscall and page fault
   costs 1000 instructions of the 200k slice, so kernel-bound
   loops end slices, but a single syscall that stays in the kernel for long
-  holds off host events, the timer and the 20 ms yield until it returns.
+  holds off the 20 ms yield until it returns, and host events and the timer
+  until it returns or calls `cond_resched()`.
 - **Safari on plain http has no JIT** (web.md). The page does not warn.
 - **JavaScriptCore and freed JIT modules**: not confirmed on a phone, and
   about 50 MiB of growth per long WebKit session is unexplained (kwemu.md,

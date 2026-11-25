@@ -57,7 +57,7 @@ renderbuffers, which cannot be sampled (patch 17).
 | `test/gl/kwgl-state.c` | the stale-state check run by `vtest-check.sh state` (surfaceless EGL clients taking turns) |
 | `js/core/gl.ts`, `gl-stream.ts` | the SDK's host side: `createKernel({ gl })`, `GlHost` (`vm.gl`), `StreamHost`; see unkernel |
 | `js/core/gl-gpu.ts` | virtio-gpu 3D: `VirglGpuBackend` (device side), `GpuRenderer` (`vm.gl.gpu`); see The DRM path |
-| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c`, `test/gpu/window-image.c`, `test/gpu/int-attrib.c`, `test/gpu/msaa.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
+| `test/gl/drm-page.js`, `drm.html`, `test/gpu/prime.c`, `test/gpu/window-image.c`, `test/gpu/int-attrib.c`, `test/gpu/msaa.c`, `test/gpu/feedback.c` | `unkernel-check.mjs --drm`: the DRM path in headless Chromium |
 | `test/gl-gpu.test.ts` | `VirglGpuBackend` against a fake link: the snapshot blocker, contexts made again after a restore; `GpuRenderer` against fake renderers: a lost context, stale ids, new renderers (`pnpm test:gl-gpu`) |
 | `test/gl/debian-disk.mjs` | makes the prepared data disk once (Mesa and the test programs installed in Debian's upper layer) |
 | `test/gl/unkernel-check.mjs`, `unkernel.html`, `unkernel-page.js` | the whole path in unkernel in headless Chromium; see Testing |
@@ -172,6 +172,53 @@ In order, each with its reason in the commit message:
     surface 62592`, then every draw of the context; 2026-11-22, the full
     run by `unkernel-check.mjs --drm --cmd`, 0 errors since). The marker
     is UINTPTR_MAX, refused as a key.
+19. a host GL error drops a call, not the context: both builds set
+    `-Dcheck-gl-errors=false`, and without it vrend logs such an error as
+    an error (`GL error 0x502 in context N "name": the host dropped a call
+    (K so far)`; the first eight, then each time the count doubles; a
+    release build does not print warnings) and counts it
+    (`vrend_renderer_host_gl_errors()`, `kw_vgpu_gl_errors()`, the SDK's
+    `stats.glErrors`). WebGL refuses calls that GLES leaves undefined (a
+    texture both sampled and rendered into, a texture of another type than
+    its sampler, a vertex buffer too small for a draw), and with the checks
+    fatal one such call put the context in error for good (Firefox's window
+    went blank). `GL_OUT_OF_MEMORY` still puts the context in error, as do
+    vrend's own checks of the guest's commands.
+20. textures WebGL refuses kept off used units
+    (`vrend_state.strict_texture_units`, an emscripten host): WebGL refuses
+    a draw when a texture on the unit of a sampler the program uses is
+    attached to the draw framebuffer ("Feedback loop formed between
+    Framebuffer and active Texture") or is of another base type (float,
+    int, uint) than the sampler ("Mismatch between texture format and
+    sampler type"), even when the shader never samples it; GLES leaves only
+    what such a sampler returns undefined. Firefox's WebRender does both,
+    and Mesa binds its RGBA8 fallback texture to an integer sampler that
+    has no complete texture; each such draw was dropped (patch 19). Such a
+    unit, and a used sampler with no view (which kept whatever another
+    program or sub context left on its unit), now hold no texture: WebGL
+    samples an empty unit as an incomplete texture of the sampler's type
+    and does not refuse it. A unit is a loop when a level its view may
+    sample (the view's levels and the texture's base and max level) is
+    attached; the shader info records the integer samplers
+    (`samplers_sint_mask`, `samplers_uint_mask`). A stencil-only view is
+    uint only where the host samples stencil (`feat_stencil_texturing`;
+    not WebGL 2, where it returns depth, float). A unit is looked at again,
+    and its real texture comes back, when its view or the program changes,
+    when a surface of its view's texture is attached or detached, when
+    another view of that texture changes the texture's base or max level,
+    and after the GL blitter set them behind the cache (then unknown: the
+    loop check takes every level); taking a view away marks its unit too.
+    Step t (`test/gpu/feedback.c`): issue #27's three draws, a draw with an
+    RGBA8I texture on a `sampler2D` unit and an RGBA8 one on an
+    `isampler2D` unit, and two draws that sample after each case (A back
+    on its unit once only the framebuffer changed; correctly typed
+    textures on the same units). Before the patch (without the sampled
+    draws) two calls were dropped and the loop's and the type draw's
+    colours were wrong; without the
+    dirtying on detach, the sampled draw after the loop read an empty unit
+    (2026-11-24). Not handled: a shadow sampler without a depth texture
+    (or the reverse), a blit within one image and a vertex buffer too
+    small for a draw; WebGL drops such a call (patch 19).
 
 ## Single GL context
 
@@ -711,8 +758,8 @@ gives the DRM nodes udev's groups and modes (kernel/guest.md).
   ends by clearing pending GL errors (logged as `kw_virgl: blit of
   resource N: GL error ...`): with errors checked once per command buffer
   (patch 10) one left there, or by a transfer, which vrend does not check,
-  was charged to the next client's command buffer and put that context in
-  error.
+  was charged to the next client's command buffer (counted and logged as
+  that context's, patch 19).
 - **Snapshots**: refused while any 3D resource exists or a context has
   submitted commands (its objects, shaders, states, sub contexts, live
   only in the renderer), before the guest parks; the page says a program
@@ -1170,6 +1217,7 @@ Results (2026-11-21, the series of Patches):
 | `unkernel-check.mjs --drm --skip c` (inline; `--worker --skip c,d`) with window images (g), `--snapshot` (s) both modes | all pass (2026-11-22); The DRM path |
 | `unkernel-check.mjs --drm --lose` (inline, `--worker`), `page-check.mjs --lose`, `test/wland/page-check.mjs --built --gpu`'s loss case | pass (2026-11-22); Context loss |
 | `unkernel-check.mjs --drm --skip c` (inline) with multisampling (m, patch 17) | all pass (2026-11-22) |
+| `unkernel-check.mjs --drm --skip c` (inline) with texture units (t, patch 20) | all 15 pass, no WebGL error (2026-11-24) |
 | `unkernel-check.mjs --drm --skip a,b,c,d,e,g,h` (step r) and `page-check.mjs --no-apt` (R), inline and worker mode | all pass (2026-11-22); Display size |
 
 Workloads that need no window system of ours (so nothing waits on wland):

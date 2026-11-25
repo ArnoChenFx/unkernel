@@ -11,7 +11,7 @@
 // Then wasm_driver_sound_event() reports each state change: open, prepare
 // (rate, channels, ALSA format: 1 = U8, 2 = S16_LE), start, stop (with 1
 // when the stream drained) and close. While the stream runs, a kernel timer
-// on the host's monotonic clock (WASI clock_time_get) fires every 5 to 10
+// on the host's monotonic clock (WASI clock_time_get) fires every 2 to 10
 // ms and hands the frames the elapsed time is worth to
 // wasm_driver_sound_write(addr, bytes), which copies them out of kernel
 // memory during the call. The return value is how many frames the sink
@@ -20,7 +20,7 @@
 // reports an underrun to the program and the sink plays silence), so the
 // sink gets real samples only, in playback order, at the guest's clock.
 // A sink that plays on another clock (an audio device) must absorb the
-// drift between the two (e.g. web/src/audio.ts adjusts its resampling
+// drift between the two (e.g. js/web/audio.ts adjusts its resampling
 // ratio to keep its queue level). No import suspends.
 
 const ENODEV = 19;
@@ -72,6 +72,18 @@ export interface SoundSink {
 	 * part of their delay (snd_pcm_delay).
 	 */
 	onChunk?: (chunk: SoundChunk) => number | void;
+	/**
+	 * Worker mode with shared memory: receives the shared PCM ring buffer once the
+	 * kernel starts (sound-ring.ts). When set and shared memory is active, PCM
+	 * chunks remain in the ring for the consumer's SoundRingReader (exactly
+	 * one) rather than being drained into onChunk; otherwise (inline or
+	 * shared: false) onChunk receives chunks as usual, and a sink without it
+	 * gets no PCM. The ring also holds a record per state change, in order
+	 * with the PCM (a reader that was not reading meets the old stream's
+	 * records first), and the reader reports the frames it has queued with
+	 * setQueuedFrames(), which the guest sees as the stream's delay.
+	 */
+	onRing?: (ring: SharedArrayBuffer) => void;
 	/** The state changed (open, format, start, stop, close). */
 	onState?: (state: SoundState, event: SoundEvent) => void;
 }

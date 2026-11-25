@@ -13,6 +13,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./components/App.tsx";
 import { readConfig } from "./config.ts";
 import { remoteConfig } from "../../remote/web/page.ts";
+import { initDrop } from "./drop.ts";
 import { KW } from "./kw.ts";
 import { previewEscape } from "./preview.ts";
 import { checkSupport } from "./sdk.ts";
@@ -44,6 +45,7 @@ KW.ui = ui;
 // Rendered at once (it replaces index.html's static desktop, which it draws
 // the same), so boot.ts finds the terminal's element.
 flushSync(() => createRoot(document.getElementById("root")!).render(<App />));
+initDrop();
 
 async function preflight(): Promise<boolean> {
 	ui.stage("preflight", "active");

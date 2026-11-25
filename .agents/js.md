@@ -42,7 +42,14 @@ parts that are easy to get wrong.
   (`gl/wasm/build.sh`; `UNKERNEL_GL=dir` takes another build), goes along
   the same way as `dist/virgl.mjs` and `dist/virgl.wasm` (exports
   `unkernel/virgl.mjs`, `unkernel/virgl.wasm`; `js/virgl.mjs` and
-  `js/virgl.wasm` are symlinks), and the build fails without it.
+  `js/virgl.wasm` are symlinks), and the build fails without it. Guest
+  Vulkan's SPIR-V translator, `vendor/build/vk/kwvk-naga.wasm`
+  (`vk/naga/build.sh`; `UNKERNEL_VK=file` takes another), goes along as
+  `dist/kwvk-naga.wasm` (export `unkernel/kwvk-naga.wasm`), with a warning
+  instead of a failure where it is missing; the web entry finds it with
+  `new URL("./kwvk-naga.wasm", import.meta.url)` and imports the renderer
+  (`vk-host.ts`, `vk-shader.ts`) dynamically, so they are chunks of their
+  own that only `createKernel({ vk })` loads.
 - The build checks that `dist/web.mjs` reaches no Node built-in, that
   each entry (not a shared chunk) computes
   `new URL("./unkernel.wasm", import.meta.url)`, and that `dist/node.mjs`
@@ -308,6 +315,13 @@ parts that are easy to get wrong.
   `onChunk` returns the frames the sink has queued, which the guest sees
   as delay. The CLI's `--display`, `--sound`, `--sound-wav` and the
   `--input` tokens are the test hooks (`--help`).
+- `createAudioOut()` (`js/web/audio.ts`, described at its top; exported by
+  `js/web.ts`, used by the page) is the Web Audio sink. It creates no
+  AudioContext before the page may start sound, and holds what plays until
+  then. The worklet is a string (`AUDIO_WORKLET`, a Blob URL module), so it
+  needs nothing from a bundler and must not refer to the module around it.
+  `test/audio.test.ts` (`pnpm test:audio`) runs the worklet and the sink on
+  stand-ins for Web Audio.
 - `KernelHandle` (instance.ts) is the surface shared by `KernelInstance`
   and `WorkerKernel`; a new device member goes there.
 - `Kernel.boot()` retries with the other memory type if instantiation
@@ -441,9 +455,10 @@ parts that are easy to get wrong.
     and held keys are mirrored, so return values are synchronous (possibly
     a yield stale). Do not merge consecutive moves: glimmer-check expects
     every tablet position.
-  - Sound: the owner's queued-frames answer goes back stamped on a clock
-    both threads share (`performance.timeOrigin + now()`). kwsnd only
-    reports it as delay, so a few ms of error changes no timing.
+  - Sound: without the sound ring (below), the owner's queued-frames
+    answer goes back stamped on a clock both threads share
+    (`performance.timeOrigin + now()`). kwsnd only reports it as delay, so
+    a few ms of error changes no timing.
 - Shared transport (`js/core/worker-shared.ts`, described at its top).
   Where a SharedArrayBuffer can be posted (`sharedMemoryAvailable()`:
   Node always, browsers when `crossOriginIsolated`) and `shared` is not
@@ -460,9 +475,20 @@ parts that are easy to get wrong.
   allocation falls back to credits. shm reads go through a third ring
   (`SHM_HEAD`), answered by a "shm-read" message posted from the clock
   import. vsock packets for the guest go through a fourth (`VS_HEAD`,
-  length-prefixed records; what does not fit waits on the owner's side,
-  never a message, to keep the stream's order), queued in the
-  VsockDevice at the clock read. Sound, the guest's vsock packets and the
+  length-prefixed records; what does not fit waits on the owner's side),
+  queued in the VsockDevice at the clock read. While the kernel waits idle
+  a burst goes as one "vsock" message instead (transferred: the ring
+  copies every byte twice), only with the ring empty, and until the worker
+  has counted that message in `VS_ACK` the next bursts are messages too,
+  which keeps the stream's order. Sound PCM goes through a shared SPSC ring
+  (`sound-ring.ts`: `SoundRingWriter` -> one `SoundRingReader`) with coalesced
+  "sound-wake" messages (or directly to `SoundSink.onRing` without wakes) and
+  atomic queued-frame feedback; only `shared: false` falls back to
+  "sound-chunk"/"sound-queued" messages. Each state change is a record in
+  the ring as well as a "sound-state" message, with one number: the owner
+  delivers `onState` where the record sits among the chunks, so a sink
+  sees states and PCM in the kernel's order. A full ring drops the newest
+  PCM and the owner logs it. The guest's vsock packets and the
   other shm calls stay messages.
   With more than one CPU, console output comes through a SharedArrayBuffer
   of its own, the console ring (CPU threads, below), sent in the boot spec
@@ -486,6 +512,8 @@ parts that are easy to get wrong.
   through the shared transport's ring (at its next clock read; as
   messages they waited for its yield, up to 20 ms under load: 2026-11-22,
   12 ms on average of each frame of a Wayland app under load, web.md),
+  or as a message while the kernel waits idle (a cold 26 MB read from a
+  host mount: 125 ms through the ring alone, 103 ms so, 2026-11-24),
   else as messages; the worker posts the guest's per microtask (the
   kernel's next task switch or yield), or at once from inside the import
   past 64 KiB or 64 packets.
@@ -912,6 +940,44 @@ parts that are easy to get wrong.
   LIBGL_ALWAYS_SOFTWARE=1` for the guest's shells where there is no DRM
   render node (with `gpu` Mesa finds `/dev/dri` itself; the page adds
   `kw.gl=1` with its GL option); `gl` alone does not add it.
+
+## Guest Vulkan (`js/core/vk.ts`; vk.md)
+
+- `createKernel({ vk })`: `prepareVk()` before the boot (ignored with a
+  `[host]` log line without vsock, without `navigator.gpu` (Node) unless
+  `vk.device` gives one, or on an entry without the renderer: only the web
+  entry has `Platform.vk`), then `startVk()` makes a `VkHost` (`vm.vk`) on
+  the thread that owns the VM, in both modes, listening on vsock port 1018
+  (`VK_PORT`). The first connection requests the adapter and the device
+  (every adapter feature, its maximum limits), imports the renderer and
+  loads the translator; each connection gets its own `VkConnection`
+  (`VkRenderer.connect()`), fed with what the guest sends. `vm.vk.status`
+  (idle, loading, ready, lost, failed), `stats` (streams, bytes, `losses`,
+  and `renderer`: the current renderer's counters, vk-host.ts `VkStats`,
+  e.g. `presents` for a frame rate), `device` (the GPUDevice in use),
+  `loaded`, `load()`. The renderer ends a stream itself on a device loss or
+  a bad frame (`connect(send, close)`): the vsock stream is closed then. A
+  lost device (`onLost`, once every program on it was cut off) drops the
+  renderer; the next program's connection makes a new device and renderer
+  (with `vk.device`, which cannot be replaced, the state stays failed).
+  Renderer state is not in snapshots: a restore drops the connections.
+- `vm.vk.externalImage(ref)`: a page compositor's resolver for the ICD's
+  external buffers (wland's `gpu.resolveExternal`, the ref as wland gives
+  it: `{ id: bigint, width, height, format, flags }`; `VkExternalRef`):
+  the swapchain image's picture as an ImageBitmap of the caller's
+  (close() it), copied GPU to GPU on the renderer's device (a WebGPU
+  OffscreenCanvas, `transferToImageBitmap()`; premultiplied, or opaque for
+  XRGB8888/XBGR8888), synchronous, on the owner's thread in both modes (the
+  renderer is there, so nothing crosses to the worker). Null for no
+  renderer (it never starts the load), a lost device, or an id no live
+  program made (vk/PROTOCOL.md, Amendments, "External present"; vk.md,
+  Presentation). The ICD uses external buffers only where wland offers
+  the global, so a page routes wland's resolveExternal here. Before the
+  renderer is made, `probeCanvas()` tries that canvas path on a device of
+  its own (where it is broken, as in headless Chrome without
+  `--use-angle`, Chrome destroys the device): if it fails the renderer
+  offers no external present (`external: false`) and says why in a
+  `[host] vk:` line.
 
 ## Programs on a pty or on pipes (`js/core/tty.ts`)
 
@@ -1367,7 +1433,9 @@ parts that are easy to get wrong.
   WorkerKernel.frame()/readFrame() use it while a 3D resource is on the
   scanout; for screenshots, not per frame). `onFrame` hears each present
   and scanout change; `stats` (also `vm.gl.stats.gpu`) counts commands,
-  fenced answers, parks and time parked, presents, readbacks and errors,
+  fenced answers, parks and time parked, presents, readbacks, errors and
+  `glErrors` (WebGL errors of guests' commands: calls WebGL dropped, the
+  context going on; gl.md, Patches, 19),
   with `lastError` (the latest failed command, its context and resource,
   the answer and why; failures are logged at most once a second) and
   `contextLost`, `losses`, `renewals`. A lost WebGL2 context

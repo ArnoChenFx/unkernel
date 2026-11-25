@@ -14,10 +14,14 @@
 // and its retry after apt-get update installs it (launcher.ts
 // installScript()). About 68 MiB to download and 397 MiB installed (the
 // repository's index, 2026-11-23), besides the Debian libraries it needs.
-// As installed it paints on the CPU (it says so in a bar): GPU painting
-// and WebGL need Vulkan, which the guest has only as Mesa's lavapipe,
-// Vulkan in software on the emulated CPU that pulls in LLVM, so that is
-// left to the user (the line it prints). Its sandbox denies its GPU process a few reads
+// GPU painting and WebGL need Vulkan, and without a Vulkan device it
+// paints on the CPU (it says so in a bar). The device is guest Vulkan
+// (the page's option, on by default: this browser's WebGPU, .agents/vk.md)
+// once the loader is there (libvulkan1, left to the user: the line it
+// prints; Ladybird on guest Vulkan is untested). Mesa's lavapipe, Vulkan
+// in software on the emulated CPU that pulls in LLVM, is the other way,
+// for a page without guest Vulkan: with both, guest Vulkan is the first
+// device. Its sandbox denies its GPU process a few reads
 // (/proc/cpuinfo, Mesa's shader cache): warnings, left as they are. No
 // sound: it speaks only PulseAudio, which the guest does not run.
 import type { TerminalApp } from "../types.ts";
@@ -35,9 +39,13 @@ rAjURvwzxJLB/nSvi7sE
 -----END PGP PUBLIC KEY BLOCK-----
 `;
 
-/** https://apt.ladybird.org/ladybird-noble.sources */
+/**
+ * https://apt.ladybird.org/ladybird-noble.sources, over plain HTTP: the page
+ * answers that from its mirror (config.ts DEFAULT_ROUTES), and elsewhere the
+ * host redirects to https. The key signs the repository either way.
+ */
 const SOURCES = `Types: deb
-URIs: https://apt.ladybird.org/
+URIs: http://apt.ladybird.org/
 Suites: noble
 Components: main
 Signed-By: /etc/apt/keyrings/ladybird.asc
@@ -58,7 +66,7 @@ export default {
 		"/etc/apt/sources.list.d/ladybird.sources": SOURCES,
 	},
 	commands: [
-		"echo 'Without Vulkan it paints on the CPU (a bar says so). For GPU painting and WebGL on lavapipe (Vulkan in software, a large install): sudo apt-get install mesa-vulkan-drivers libgles2'",
+		"echo 'Without a Vulkan device it paints on the CPU (a bar says so). GPU painting and WebGL on guest Vulkan (the WebGPU of this browser; on in Settings by default; untested with Ladybird): sudo apt-get install libvulkan1 libgles2. Where the page has no guest Vulkan, lavapipe (Vulkan in software, a large install): sudo apt-get install mesa-vulkan-drivers libgles2'",
 		"ladybird",
 	],
 } satisfies TerminalApp;

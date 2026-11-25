@@ -15,7 +15,7 @@ overlay root are in data-disk.md.
 `vendor/build/bundle/unkernel.wasm` (command line `console=hvc0
 rdinit=/init`, the data disk template, the SMP patch) and copies that to
 `web/kernel/`. `KW_BASE_OUT=dir` puts all three in dir and copies nothing.
-1508 KiB (844 KiB gzipped), bundle 11.0 MiB with base.cpio uncompressed (2026-11-22).
+1508 KiB (844 KiB gzipped), bundle 11.0 MiB with base.cpio uncompressed (2026-11-22); 1607 KiB (885 KiB gzipped) with guest Vulkan's ICD (2026-11-24).
 
 - Alpine's static busybox (`busybox-static`, pinned in `base/pins.sh`
   with its own Alpine release), every applet linked in `/bin` (names from
@@ -60,6 +60,12 @@ with one floor: an image from before kwbox does not boot on a base with it
 - `kwbox vtest` (Guest tools, below): the guest GL forwarder, in
   the layer for the same reason (its link protocol belongs to the SDK's
   `gl` option).
+- `/usr/lib/kw/libvulkan_kw.so` and `/usr/share/vulkan/icd.d/kw_icd.json`:
+  guest Vulkan's ICD (`vk/icd/build.sh`, aarch64 glibc; vk.md), in the
+  layer for the same reason (its link protocol belongs to the SDK's `vk`
+  option); the manifest is in the loader's default search path, so
+  Debian's `libvulkan1` finds it with no environment variables. Alpine's
+  musl loader cannot load it. `KW_VK=0` builds the base without it.
 - `/usr/lib/kw/bin/wland`: Wayland apps as windows on the page (web.md,
   Wayland desktop) through wland's relay `/usr/lib/kw/wlandr`
   (https://github.com/pithings/wland, MPL-2.0 and MIT), which only the
@@ -77,7 +83,8 @@ with one floor: an image from before kwbox does not boot on a base with it
   closes the waiting apps at once), and where `/dev/dri/renderD128` exists
   `--dmabuf virtgpu:/dev/dri/renderD128` (GL apps by GPU resource; a
   running relay without it gets a note on how to restart it) with
-  `--no-fence-wait`. `wland --boot` (the layer's rc, as root, with
+  `--no-fence-wait`, and `--external-buffers` (Vulkan apps' swapchain
+  images by id; vk.md, Presentation). `wland --boot` (the layer's rc, as root, with
   `kw.wayland=1` on the command line: the page's boot) starts it for the
   image's user (`kw.user=`, else `user`, else root, as `kwtty login`
   picks), through busybox `su`, after making `/run/user/UID` (0700, the
@@ -188,7 +195,11 @@ The kw layer's `/usr/lib/kw/bin/fx`, `claude`, `opencode`, `node`, `npm`,
 `npx`, `bun`, `bunx`, `uv` and `uvx` link to `/usr/lib/kw/shim`, which installs the real program on
 its first call and runs it (described at its top). Every distro has them, the page and
 the CLI alike; `test/distro.test.ts` checks them on each image (no
-network).
+network). On the page it takes the glibc arm64 files the page's mirror has
+(claude, node, uv and the version lookups of opencode and uv) from
+`http://mirror.unkernel.dev` first, where that name resolves to a routed
+address (198.51.100.0/24: the page's own `fetch()`, web.md), and from the
+upstream when the mirror fails; elsewhere from the upstreams only.
 
 - PATH: `/usr/lib/kw/bin` comes last (kw-path.sh for every interactive
   shell, kwtty for programs it starts), and the install goes to `~/.local/bin`, which

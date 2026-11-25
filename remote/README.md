@@ -147,6 +147,33 @@ file.
 `remote\start-windows.ps1` stops the backend on Ctrl+C: it saves the guest's
 disk first and releases the data disk's lock (`<data>.lock`).
 
+## Lifecycle
+
+The backend owns the kernel and its data disk. A page is a client of it, and one
+page at a time is attached to the kernel.
+
+- A page that asks to keep its kernel (`/kiosk` does, with `keep=1`) leaves the
+  kernel running when it closes or reloads. The next page that connects gets the
+  running desktop as it is: the guest's processes and uptime are unchanged, the
+  console's last 16 KiB are shown at once, and the desktop command is not typed
+  again (the backend records whether it was typed). The page sets the guest's
+  display to the size it asks for (its window, or `?size=`) when it resumes.
+- A second page takes the desktop over. The first page is told so, with
+  `Another page took the desktop over`, and the guest releases the keys and
+  buttons that page pressed. Reloading that page takes the desktop back. The
+  close of a page that was taken over does not stop the desktop.
+- A kernel that is not kept stops when its page leaves: the backend asks the guest
+  to sync, saves the guest's disk, and then stops the kernel. That is a page that
+  did not ask to keep it, and guest GL (below). The next page starts a new
+  kernel and says that the previous desktop stopped.
+- A page that asks for another kernel, distro or GL setting stops the running
+  desktop first, saving its disk (`Restarting the desktop`).
+- Nothing else is kept for a page that is not attached: frames are sent when a
+  page asks for them.
+- Ctrl+C, SIGTERM and SIGHUP stop the backend after the same sync: the disk is
+  saved, the kernel stops, the data disk's lock is released, and a page that is
+  open says the machine stopped, with the reason.
+
 ## Guest GL (experimental)
 
 `?gl=1` runs the guest's 3D on the browser's WebGL2. On `/kiosk?gl=1` and on
@@ -163,8 +190,14 @@ read back through the backend.
   implementation. Where that is a software rasterizer (SwiftShader, llvmpipe)
   the note says `software, not a GPU`: the guest's GL is correct there, but
   it is no GPU and its speed says nothing about one.
-- One page owns the kernel. A second page takes it over, and the first one
-  says so (`The machine stopped`); reloading that page takes the kernel back.
+- One page owns the desktop. A second page takes it over, and the first one
+  says so (`Another page took the desktop over`); reloading that page takes the
+  desktop back.
+- Guest GL does not outlive its page: its WebGL2 renderer and the guest's GL
+  state live in that page, and a new page cannot take them over. A refresh of a
+  `?gl=1` page therefore stops the desktop (its disk is saved first) and starts
+  a new one, and the page says so. Only the CPU path keeps the desktop across a
+  refresh (Lifecycle below).
 - A lost WebGL2 context ends the guest's GL programs: the note says so, and
   the picture stays as it was. Reload the page to start them again.
 - Vulkan is still off (`?vk`).

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 ARNO <arnochen101@gmail.com>
-// Fetches this repository's newest distro image release (omarchy-<YYMMDD>-<commit>, made by
+// Fetches a distro image release of this repository (omarchy-<YYMMDD>-<commit>, made by
 // .github/workflows/omarchy-image.yml) into remote/extra-distros/: its distros.json, its images
 // (size and sha256 checked) and source.json (the repository and tag, for release.ts's URLs).
-// web/scripts/kernel.ts adds them to the page's images (KW_EXTRA_DISTROS) when they were made for
-// the page's kwemu ABI and base bundle. No such release is not an error: the release has no extra image.
+// The newest such release, or the one --tag names. web/scripts/kernel.ts adds the images to the
+// page (KW_EXTRA_DISTROS) when they were made for the page's kwemu ABI and base bundle. Without
+// --tag, no such release is not an error (the release has no extra image); with --tag it is.
 //
-//   node remote/scripts/fetch-extra-distros.ts [--repo owner/name] [--out remote/extra-distros]
+//   node remote/scripts/fetch-extra-distros.ts [--repo owner/name] [--out remote/extra-distros] [--tag omarchy-<YYMMDD>-<commit>]
 //   (GITHUB_TOKEN, if set, is used for the API)
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -32,15 +33,21 @@ async function main(): Promise<void> {
 	const opt = (k: string) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i + 1] : undefined; };
 	const repo = opt("repo") ?? process.env.GITHUB_REPOSITORY ?? "ArnoChenFx/unkernel";
 	const out = path.resolve(root, opt("out") ?? "remote/extra-distros");
+	const tag = opt("tag");
+	const none = (why: string): void => {
+		if (tag) throw new Error(`${why}: --tag ${tag} needs that release`);
+		console.log(`${why}; none added`);
+	};
 	rmSync(out, { recursive: true, force: true });
 	const list = JSON.parse(Buffer.from(await get(`https://api.github.com/repos/${repo}/releases?per_page=100`)).toString("utf8")) as Release[];
-	const release = list
-		.filter((r) => /^omarchy-[0-9A-Za-z._-]+$/.test(r.tag_name) && !r.draft && !r.prerelease)
-		.sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
-	if (!release) { console.log(`extra distros: ${repo} has no omarchy-* release; none added`); return; }
+	const images = list.filter((r) => /^omarchy-[0-9A-Za-z._-]+$/.test(r.tag_name) && !r.draft && !r.prerelease);
+	const release = tag
+		? images.find((r) => r.tag_name === tag)
+		: [...images].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
+	if (!release) return none(`extra distros: ${repo} has no omarchy-* release${tag ? ` ${tag}` : ""}`);
 	const url = (name: string) => release.assets.find((a) => a.name === name)?.browser_download_url;
 	const indexUrl = url("distros.json");
-	if (!indexUrl) { console.log(`extra distros: ${release.tag_name} has no distros.json; none added`); return; }
+	if (!indexUrl) return none(`extra distros: ${release.tag_name} has no distros.json`);
 	const indexBytes = await get(indexUrl);
 	const index = JSON.parse(Buffer.from(indexBytes).toString("utf8")) as { distros: Entry[] };
 	mkdirSync(out, { recursive: true });

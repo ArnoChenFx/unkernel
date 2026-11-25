@@ -14,7 +14,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledBoot } from "../js/core/kernel.ts";
 import { REMOTE_INFO_PATH, REMOTE_WIRE, REMOTE_WS_PATH } from "./wire.ts";
 import { createImageFromKwsparse } from "../js/node/disk.ts";
-import { RemoteHub, type RemoteHost, type RemoteKernel, type RemoteSocket } from "./backend.ts";
+import { RemoteHub, type RemoteAttachment, type RemoteHost, type RemoteSocket } from "./backend.ts";
 import type { RemoteConfig } from "./config.ts";
 import { localNames, sameSiteGuard, withRemoteFlag } from "./http.ts";
 
@@ -191,7 +191,7 @@ export async function startRemoteServer(config: RemoteConfig, log: (line: string
 		return new Response(file, { headers: { ...SECURITY_HEADERS, "cache-control": cache } });
 	};
 
-	const server = Bun.serve<{ kernel?: RemoteKernel }>({
+	const server = Bun.serve<{ attachment?: RemoteAttachment; keep: boolean }>({
 		hostname: "127.0.0.1",
 		port: config.port,
 		async fetch(req, srv) {
@@ -199,7 +199,7 @@ export async function startRemoteServer(config: RemoteConfig, log: (line: string
 			if (denied) return denied;
 			const url = new URL(req.url);
 			if (url.pathname === REMOTE_WS_PATH) {
-				if (srv.upgrade(req, { data: {} })) return undefined;
+				if (srv.upgrade(req, { data: { keep: url.searchParams.get("keep") === "1" } })) return undefined;
 				return new Response("expected a WebSocket upgrade", { status: 426 });
 			}
 			if (url.pathname === REMOTE_INFO_PATH) {
@@ -226,17 +226,17 @@ export async function startRemoteServer(config: RemoteConfig, log: (line: string
 					},
 					close: (code, reason) => ws.close(code, reason),
 				};
-				ws.data.kernel = hub.attach(socket);
+				ws.data.attachment = hub.attach(socket, { keep: ws.data.keep });
 			},
 			message(ws, message) {
 				if (typeof message === "string") {
 					ws.close(1003, "binary frames only");
 					return;
 				}
-				ws.data.kernel?.receive(new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
+				if (ws.data.attachment) hub.receive(ws.data.attachment, new Uint8Array(message.buffer, message.byteOffset, message.byteLength));
 			},
 			close(ws) {
-				ws.data.kernel?.closed();
+				if (ws.data.attachment) hub.detach(ws.data.attachment);
 			},
 		},
 	});

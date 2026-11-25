@@ -11,11 +11,13 @@ import { ERRNO, FsError, type Fs, type FsAttr, type FsDirEntry, type FsFile, typ
 import type { FromWorker, ToWorker } from "../js/core/worker-protocol.ts";
 
 /** The wire version: the page and the backend must agree on it (their hello). */
-export const REMOTE_WIRE = 1;
+export const REMOTE_WIRE = 2;
 /** The page's WebSocket, on the backend's origin. */
 export const REMOTE_WS_PATH = "/remote/ws";
 /** The backend's description of itself (JSON), on the same origin. */
 export const REMOTE_INFO_PATH = "/remote/info";
+/** The close code a page gets when another page takes its kernel over (a private code: 4000 to 4999). */
+export const REMOTE_TAKEN_OVER = 4001;
 
 type ViewCtor = { readonly BYTES_PER_ELEMENT: number; new (buffer: ArrayBuffer, byteOffset: number, length: number): ArrayBufferView };
 type Bytes = Uint8Array<ArrayBuffer>;
@@ -133,14 +135,38 @@ export function decodeRemote(frame: Uint8Array): unknown {
 	return untag(head.x);
 }
 
-/** Page -> backend: a kernel message, or a call of the /work file system (id answered by "fsr"). */
+/**
+ * Page -> backend: a kernel message, a call of the /work file system (id answered
+ * by "fsr"), or the page's report that it typed the console command (`typed`).
+ */
 export type RemoteRequest =
 	| { k: "kernel"; m: ToWorker }
-	| { k: "fs"; id: number; op: RemoteFsOp; a: unknown[] };
+	| { k: "fs"; id: number; op: RemoteFsOp; a: unknown[] }
+	| { k: "session"; op: "typed" };
+
+/** The kernel the backend runs, as a page connects to it (null machine: none runs). */
+export interface RemoteSession {
+	machine: RemoteMachineInfo | null;
+	/** Why the last kernel ended, once one has (null before that). */
+	ended: string | null;
+}
+
+/** A kernel's boot spec identity (the kernel and distro URLs, GL) and what it has done. */
+export interface RemoteMachineInfo {
+	state: "booting" | "running" | "ending";
+	kernel: string | null;
+	distro: string | null;
+	/** Guest GL on: its renderer is the page's, so the kernel stops with that page. */
+	gl: boolean;
+	/** The kernel outlives the page that boots it (its page asked to keep it, and it has no GL). */
+	keep: boolean;
+	/** A page reported that it typed the console command. */
+	typed: boolean;
+}
 
 /** Backend -> page. */
 export type RemoteReply =
-	| { k: "hello"; wire: number; fs: RemoteFsCaps | null; net: boolean; data: string | null; work: string | null }
+	| { k: "hello"; wire: number; fs: RemoteFsCaps | null; net: boolean; data: string | null; work: string | null; session: RemoteSession }
 	| { k: "kernel"; m: FromWorker }
 	| { k: "fsr"; id: number; ok: true; v: unknown }
 	| { k: "fsr"; id: number; ok: false; code: string; message: string };

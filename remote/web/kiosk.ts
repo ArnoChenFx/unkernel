@@ -5,13 +5,16 @@
 // or terminal). It boots the Omarchy image on the remote backend through the same link
 // as the app, types `omarchy desktop` on the guest's console once the shell is up (so
 // the image needs no change), shows the boot status until the first frame of the
-// desktop, and sends the keyboard and mouse to the guest. The guest's display size
-// follows the window.
+// desktop, and sends the keyboard and mouse to the guest. The desktop's Super key is the
+// mod key, Pause by default (keys.ts). The guest's display size follows the window.
 
 import { createKernelOn, type CreateKernelOptions, type Platform, type WorkerOption } from "../../js/core/instance.ts";
-import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux, domCodeToLinux } from "../../js/core/input.ts";
+import type { DisplayMode } from "../../js/core/display.ts";
+import { BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, domButtonToLinux } from "../../js/core/input.ts";
 import type { WorkerKernel } from "../../js/core/worker-host.ts";
+import { DEFAULT_MOD, MOD_KEYS, parseMod, routeKey } from "./keys.ts";
 import { RemoteLink } from "./link.ts";
+import { Picture } from "./picture.ts";
 
 interface KioskConfig {
 	kernel: string;
@@ -31,7 +34,32 @@ const say = (title: string, more = ""): void => {
 	detail.textContent = more;
 	document.body.classList.remove("live");
 };
-const size = () => ({ width: Math.max(320, Math.floor(innerWidth)), height: Math.max(240, Math.floor(innerHeight)), dpi: 96 });
+let kept: HTMLCanvasElement | undefined;
+const picture = new Picture({
+	canvas,
+	spare: () => (kept ??= document.createElement("canvas")),
+	say,
+	show: () => document.body.classList.add("live"),
+});
+// The guest renders in software (no virgl over the link), so its display is capped at about
+// 1280x800 worth of pixels whatever the window (a 5120x1440 window would ask for 6.6 MP,
+// slow in the guest and heavy frames for the page); the canvas is scaled up to the window.
+// ?size=WxH asks for that size exactly; ?max=WxH moves the cap.
+const params = new URLSearchParams(location.search);
+const wxh = (v: string | null): [number, number] | undefined => {
+	const m = v ? /^(\d{3,4})x(\d{3,4})$/.exec(v) : null;
+	return m ? [Number(m[1]), Number(m[2])] : undefined;
+};
+const fixed = wxh(params.get("size"));
+const cap = wxh(params.get("max")) ?? [1280, 800];
+const size = () => {
+	if (fixed) return { width: fixed[0], height: fixed[1], dpi: 96 };
+	let w = Math.max(320, innerWidth), h = Math.max(240, innerHeight);
+	const scale = Math.min(1, Math.sqrt((cap[0] * cap[1]) / (w * h)));
+	w = Math.floor((w * scale) / 8) * 8;
+	h = Math.floor((h * scale) / 2) * 2;
+	return { width: Math.max(320, w), height: Math.max(240, h), dpi: Math.round(96 * scale) || 96 };
+};
 
 async function main(): Promise<void> {
 	say("Connecting…");
@@ -43,8 +71,6 @@ async function main(): Promise<void> {
 		distroSpec: (src) => ({ kind: "http", url: new URL(String(src), location.href).href, readOnly: true }),
 	};
 	say("Starting Linux…", "first start downloads the Omarchy image, which takes a while");
-	let mode: { width: number; height: number } | null = null;
-	let shownOnce = false;
 	const opts: CreateKernelOptions & WorkerOption & { worker: true } = {
 		worker: true,
 		shared: false,
@@ -58,13 +84,7 @@ async function main(): Promise<void> {
 		disks: [{ kind: "data", template: "bundled", optional: true }],
 		vsock: true,
 		onInput: () => {},
-		onDisplay: (m) => {
-			mode = m ? { width: m.width, height: m.height } : null;
-			if (m) {
-				canvas.width = m.width;
-				canvas.height = m.height;
-			} else if (shownOnce) say("The desktop closed", "reload this page to start it again");
-		},
+		onDisplay: (m: DisplayMode | null) => picture.display(m),
 	} as never;
 	const vm: WorkerKernel = await createKernelOn(platform, opts);
 
@@ -82,7 +102,7 @@ async function main(): Promise<void> {
 		if (!typed && out.includes("⇒")) setTimeout(type, 300);
 	});
 	setTimeout(type, 90_000);
-	void vm.exited.then((r) => say("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
+	void vm.exited.then((r) => picture.stopped("The machine stopped", `exit ${r.code ?? ""} ${r.reason ?? ""}; reload this page to start it again`));
 
 	// Frames.
 	const evdev = () => vm.evdev;
@@ -90,20 +110,14 @@ async function main(): Promise<void> {
 	let seq = -1;
 	const paint = (): void => {
 		requestAnimationFrame(paint);
+		const mode = picture.mode;
 		if (!mode) return;
 		if (vm.frameSeq === seq) {
 			vm.requestFrame();
 			return;
 		}
-		if (!image || image.width !== mode.width || image.height !== mode.height) image = new ImageData(mode.width, mode.height);
-		const f = vm.frame(image.data);
-		if (!f || f.width !== mode.width || f.height !== mode.height) return;
-		ctx.putImageData(image, 0, 0);
-		seq = vm.frameSeq;
-		if (!shownOnce) {
-			shownOnce = true;
-			document.body.classList.add("live");
-		}
+		const img = image && image.width === mode.width && image.height === mode.height ? image : (image = new ImageData(mode.width, mode.height));
+		if (picture.paint(vm.frame(img.data), () => ctx.putImageData(img, 0, 0))) seq = vm.frameSeq;
 	};
 	requestAnimationFrame(paint);
 
@@ -114,19 +128,14 @@ async function main(): Promise<void> {
 		timer = window.setTimeout(() => vm.updateDisplaySize(size()), 300);
 	});
 
-	// Keyboard: everything goes to the guest (F11 and F12 stay the browser's).
+	// Keyboard: everything goes to the guest (F11 and F12 stay the browser's). The mod key
+	// stands for the desktop's Super key (keys.ts).
+	const modParam = parseMod(params.get("mod"));
+	if (modParam === undefined) console.warn(`kiosk: ?mod= takes ${MOD_KEYS.join(", ")} or none; using ${DEFAULT_MOD}`);
+	const mod = modParam === undefined ? DEFAULT_MOD : modParam;
 	const onKey = (e: KeyboardEvent): void => {
 		const ev = evdev();
-		if (!ev) return;
-		const code = domCodeToLinux(e.code);
-		const down = e.type === "keydown";
-		if (!down && code !== undefined && ev.key(code, false)) {
-			e.preventDefault();
-			return;
-		}
-		if (e.code === "F11" || e.code === "F12" || !ev.keyboardOpen) return;
-		e.preventDefault();
-		if (down && code !== undefined) ev.key(code, true);
+		if (ev && routeKey(ev, mod, e.type === "keydown", e.code)) e.preventDefault();
 	};
 	addEventListener("keydown", onKey, true);
 	addEventListener("keyup", onKey, true);

@@ -177,6 +177,15 @@ export interface VkRendererOptions {
  */
 export const VK_SUBGROUP_SIZE = 32;
 
+/**
+ * Engines (the hello's `engineName`, VkApplicationInfo.pEngineName) that draw
+ * every pass with a negative viewport height: their graphics pipelines are
+ * made for that first, the flipped variant only when a draw needs it
+ * (vk/PROTOCOL.md, Amendments, "Y flip hint"). wgpu-hal: set_viewport and
+ * begin_render_pass always flip (wgpu-hal 29, vulkan/command.rs).
+ */
+const NO_FLIP_ENGINES = new Set(["wgpu-hal"]);
+
 /** Limits on what one guest stream may make the host hold (the guest is untrusted). */
 export const VK_MAX_FRAME = 1 << 28;
 export const VK_MAX_OBJECTS = 1 << 20;
@@ -516,6 +525,11 @@ export class Conn implements VkConnection {
 	token = 0;
 	/** the subgroup size the guest reports (hello): compute stages get their subgroup builtins for it; an ICD that asks nothing reports 1 */
 	subgroupSize = 1;
+	/** the app's engine draws with negative viewport heights (hello's engineName): vertex stages are translated without the y flip first */
+	noFlip = false;
+	/** the hello's engineName, and whether a draw in the orientation its pipelines were not made for was logged (once) */
+	engineName = "";
+	flipMissLogged = false;
 	/** export id (the low 32 bits) -> the image it names; ids are never given twice */
 	exported = new Map<number, { id: number; img: any }>();
 	nextExport = 1;
@@ -1187,7 +1201,8 @@ export class Conn implements VkConnection {
 			}
 			if (arrays) opts.arrays = arrays;
 			if (kind === "compute") opts.subgroupSize = this.subgroupSize;
-			if (kind === "vertex") opts.flipY = true;
+			// the orientation the app is expected to draw with (Conn.noFlip); the other is a variant made at draw time
+			if (kind === "vertex") opts.flipY = !this.noFlip;
 			const sm = this.get(st.module, "shader");
 			if (st.specializationInfo && !sm.specTypes) sm.specTypes = specTypes(sm.code);
 			const spec = specValues(st.specializationInfo, sm.specTypes);
@@ -1537,6 +1552,9 @@ const handlers: Record<string, Handler> = {
 		// and reports 1
 		const want = msg.subgroupSize;
 		if (want !== undefined) c.subgroupSize = Number.isInteger(want) && want >= 1 && want <= 128 && !(want & (want - 1)) ? want : VK_SUBGROUP_SIZE;
+		// a hint only: a draw with the other orientation gets its variant then
+		c.engineName = typeof msg.engineName === "string" ? msg.engineName.slice(0, 64) : "";
+		c.noFlip = NO_FLIP_ENGINES.has(c.engineName);
 		const limits: Record<string, number> = {};
 		for (const k in dev.limits) {
 			const v = dev.limits[k];
@@ -2116,7 +2134,8 @@ function graphicsPipeline(c: Conn, msg: any): any {
 		const samples = msg.multisampleState?.rasterizationSamples || 1;
 		sp = { colorFormats, depthFormat, samples, key: `${colorFormats.join(",")}|${depthFormat}|${samples}` };
 	}
-	if (sp) pipelineVariant(c, p, sp, {}, undefined);
+	// in the orientation its vertex stage was translated for (Conn.noFlip), which the app is expected to draw with
+	if (sp) pipelineVariant(c, p, sp, c.noFlip ? { noFlip: true } : {}, undefined);
 	return p;
 }
 
@@ -2196,7 +2215,15 @@ export function pipelineVariant(c: Conn, p: any, sp: any, dyn: VariantDyn, strip
 	let vs = p.stages.find((s: any) => s.kind === "vertex");
 	const fs = p.stages.find((s: any) => s.kind === "fragment");
 	if (!vs) throw new Error("graphics pipeline without a vertex stage");
-	if (dyn.noFlip) vs = { ...vs, ...c.translate(vs.mod, { ...vs.opts, flipY: false }) };
+	// the stage was translated for one orientation (Conn.noFlip): the other is translated again here
+	if (!dyn.noFlip !== !!vs.opts.flipY) {
+		// what tells whether an engine belongs in NO_FLIP_ENGINES (or does not)
+		if (!c.flipMissLogged) {
+			c.flipMissLogged = true;
+			c.log(`kwvk: engine ${JSON.stringify(c.engineName)} draws with a ${dyn.noFlip ? "negative" : "positive"} viewport height, its pipelines were made for a ${dyn.noFlip ? "positive" : "negative"} one: a variant per pipeline at its first such draw (logged once)`);
+		}
+		vs = { ...vs, ...c.translate(vs.mod, { ...vs.opts, flipY: !dyn.noFlip }) };
+	}
 	const rs0 = m.rasterizationState || {};
 	const rs = { ...rs0 };
 	if (eff.cullMode !== undefined) rs.cullMode = eff.cullMode;

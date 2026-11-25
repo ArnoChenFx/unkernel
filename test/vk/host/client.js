@@ -962,6 +962,84 @@ async function suite(device, adapter, translator, label, shaderBytes) {
 	check(`${label} refused submit loses the device`, /vkQueueSubmit/.test(cl.lost) && /vkQueueSubmit/.test(serr) && cl.closedByHost === 1 && logs.some((l) => l.startsWith(`[${label}] kwvk: vkQueueSubmit:`)), `lost ${cl.lost} | sync ${serr} | closed ${cl.closedByHost}`);
 	cl.conn.close();
 	await loud(renderer, label, shaderBytes);
+	await flipHint(renderer, label, shaderBytes);
+}
+
+/**
+ * The hello's engineName (vk/PROTOCOL.md, Amendments, "Y flip hint"): a
+ * graphics pipeline is made at creation for the orientation its app is
+ * expected to draw with (wgpu-hal: negative viewport heights, with
+ * dynamic viewports, as wgpu does), the other is a variant made at the
+ * draw that needs it; both from the module the pipeline keeps after the
+ * app destroyed it. Each engine on a connection of its own.
+ */
+async function flipHint(renderer, label, shaderBytes) {
+	const W = 64, H = 64;
+	const at = (b, x, y) => [...b.subarray((y * W + x) * 4, (y * W + x) * 4 + 4)].join(",");
+	const up = { x: 0, y: H, width: W, height: -H, minDepth: 0, maxDepth: 1 };
+	const down = { x: 0, y: 0, width: W, height: H, minDepth: 0, maxDepth: 1 };
+	for (const engine of ["wgpu-hal", undefined, "vkcube"]) {
+		const name = `${label} y flip hint (engine ${engine ?? "none"})`;
+		const cl = new Client(renderer);
+		let id = 1;
+		const nid = () => id++;
+		await cl.req({ op: "hello", version: 1, subgroupSize: 0, ...(engine ? { engineName: engine } : {}) });
+		const img = nid(), view = nid(), rp = nid(), fb = nid(), vs = nid(), fs = nid(), dsl = nid(), pl = nid(), pipe = nid(), set = nid(), ubo = nid(), vbo = nid();
+		cl.post({ op: "vkCreateImage", id: img, imageType: 1, format: 37, extent: { width: W, height: H, depth: 1 }, mipLevels: 1, arrayLayers: 1, samples: 1, tiling: 0, usage: 0x10 | 0x1 | 0x4 });
+		cl.post({ op: "vkCreateImageView", id: view, image: img, viewType: 1, format: 37, subresourceRange: { aspectMask: 1, baseMipLevel: 0, levelCount: 1, baseArrayLayer: 0, layerCount: 1 } });
+		cl.post({ op: "vkCreateRenderPass", id: rp, attachments: [{ format: 37, samples: 1, loadOp: 1, storeOp: 0 }], subpasses: [{ colorAttachments: [{ attachment: 0, layout: 2 }] }] });
+		cl.post({ op: "vkCreateFramebuffer", id: fb, renderPass: rp, attachments: [view], width: W, height: H, layers: 1 });
+		cl.post({ op: "vkCreateShaderModule", id: vs }, shaderBytes("tri.vert"));
+		cl.post({ op: "vkCreateShaderModule", id: fs }, shaderBytes("tri.frag"));
+		cl.post({ op: "vkCreateDescriptorSetLayout", id: dsl, bindings: [{ binding: 0, descriptorType: 6, descriptorCount: 1, stageFlags: 1 }] });
+		cl.post({ op: "vkCreatePipelineLayout", id: pl, setLayouts: [dsl], pushConstantRanges: [{ stageFlags: 0x10, offset: 0, size: 16 }] });
+		cl.post({ op: "vkCreateBuffer", id: ubo, size: 16, usage: 0x10 });
+		cl.post({ op: "writeBuffer", buffer: ubo, offset: 0 }, u8(new Float32Array([1, 1, 0, 0])));
+		cl.post({ op: "vkCreateBuffer", id: vbo, size: 24, usage: 0x80 });
+		cl.post({ op: "writeBuffer", buffer: vbo, offset: 0 }, u8(new Float32Array([-1, -1, 1, -1, -1, 1])));
+		cl.post({ op: "vkAllocateDescriptorSets", sets: [{ id: set, layout: dsl }] });
+		cl.post({ op: "vkUpdateDescriptorSets", descriptorWrites: [{ dstSet: set, dstBinding: 0, dstArrayElement: 0, descriptorType: 6, bufferInfo: [{ buffer: ubo, offset: 0, range: 16 }] }], descriptorCopies: [] });
+		const st = cl.conn.stats;
+		const p0 = st.pipelines;
+		await cl.req({
+			op: "vkCreateGraphicsPipelines", id: pipe, layout: pl, renderPass: rp, subpass: 0,
+			stages: [{ stage: 1, module: vs, pName: "main" }, { stage: 0x10, module: fs, pName: "main" }],
+			vertexInputState: { vertexBindingDescriptions: [{ binding: 0, stride: 8, inputRate: 0 }], vertexAttributeDescriptions: [{ location: 0, binding: 0, format: 103, offset: 0 }] },
+			inputAssemblyState: { topology: 3 },
+			viewportState: { viewportCount: 1, scissorCount: 1 },
+			rasterizationState: { cullMode: 0, frontFace: 0 },
+			multisampleState: { rasterizationSamples: 1 },
+			colorBlendState: { attachments: [{ colorWriteMask: 15 }] },
+			dynamicState: { dynamicStates: [0, 1] },
+		});
+		const made = st.pipelines - p0;
+		// as wgpu does: the modules go once the pipeline is made
+		cl.post({ op: "destroy", ids: [vs, fs] });
+		const p1 = st.pipelines, t1 = st.translations;
+		const draw = async (vp) => {
+			cl.post({ op: "vkQueueSubmit", cmds: [
+				{ c: "vkCmdBeginRenderPass", renderPass: rp, framebuffer: fb, renderArea: { offset: { x: 0, y: 0 }, extent: { width: W, height: H } }, clearValues: [{ color: { float32: [0, 0, 1, 1] } }] },
+				{ c: "vkCmdBindPipeline", pipelineBindPoint: 0, pipeline: pipe },
+				{ c: "vkCmdSetViewport", viewports: [vp] },
+				{ c: "vkCmdSetScissor", scissors: [{ offset: { x: 0, y: 0 }, extent: { width: W, height: H } }] },
+				{ c: "vkCmdBindDescriptorSets", pipelineBindPoint: 0, layout: pl, firstSet: 0, descriptorSets: [set], dynamicOffsets: [] },
+				{ c: "vkCmdBindVertexBuffers", firstBinding: 0, buffers: [vbo], offsets: [0] },
+				{ c: "vkCmdPushConstants", layout: pl, stageFlags: 0x10, offset: 0, size: 16, values: [...u8(new Float32Array([1, 0, 0, 1]))] },
+				{ c: "vkCmdDraw", vertexCount: 3, instanceCount: 1, firstVertex: 0, firstInstance: 0 },
+				{ c: "vkCmdEndRenderPass" },
+			] });
+			const f = (await cl.req({ op: "present", image: img, readback: 1 })).bin;
+			// (-1,-1),(1,-1),(-1,1): the upper-left half of the image, the lower-left one with a negative height
+			const pix = `${at(f, 50, 2)} / ${at(f, 50, 60)}`;
+			return { pix, ok: pix === (vp.height < 0 ? "0,0,255,255 / 255,0,0,255" : "255,0,0,255 / 0,0,255,255"), pipes: st.pipelines - p1, trans: st.translations - t1 };
+		};
+		const first = engine === "wgpu-hal" ? up : down;
+		const a = await draw(first);
+		check(`${name}: made at creation for ${first.height < 0 ? "negative" : "positive"} heights, drawn with them`, made === 1 && a.ok && a.pipes === 0 && a.trans === 0, `made ${made}; ${a.pix}; at the draw: pipelines ${a.pipes}, translations ${a.trans}`);
+		const b = await draw(first === up ? down : up);
+		check(`${name}: the other orientation made at its draw, modules destroyed`, b.ok && b.pipes === 1 && b.trans === 1, `${b.pix}; at the draws: pipelines ${b.pipes}, translations ${b.trans}`);
+		cl.conn.close();
+	}
 }
 
 /**

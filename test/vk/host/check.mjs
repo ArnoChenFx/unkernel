@@ -8,9 +8,9 @@
 // hello, buffer round trip, a triangle (render pass, pipeline, dynamic
 // uniform offset, push constants) read back with copyImageToBuffer and
 // present, a scaled blit, and a compute dispatch; failures that must reach
-// the guest (pipelines refused or unusable, lost devices). With glslangValidator and
-// vendor/build/vk/kwvk-naga.wasm it runs again on real SPIR-V through
-// js/core/vk-shader.ts. Exit 0 when every check passes.
+// the guest (pipelines refused or unusable, lost devices). With glslangValidator
+// (else vk/glslc.sh's glslc) and vendor/build/vk/kwvk-naga.wasm it runs again on
+// real SPIR-V through js/core/vk-shader.ts. Exit 0 when every check passes.
 //
 //   node test/vk/host/check.mjs [--chrome PATH] [--keep]
 //
@@ -54,13 +54,20 @@ const naga = join(root, "vendor/build/vk/kwvk-naga.wasm");
 const spirv = {};
 const SHADERS = ["tri.vert", "tri.frag", "double.comp", "quad.vert", "quad.frag", "fs.vert", "ia.frag", "arr.frag", "store.comp", "flat.vert", "flat.frag", "wide.comp", "dead.comp", "barrier.comp", "shared512.comp", "shared512fn.comp", "earlyro.comp", "sgids.comp"];
 const work = await mkdtemp(join(tmpdir(), "kwvk-host-"));
+// glslangValidator, else vk/glslc.sh's glslc (vendor/toolchain/glslc)
+const glslc = join(root, "vendor/toolchain/glslc/bin/glslc");
+const useGlslc = spawnSync("glslangValidator", ["--version"]).error && existsSync(glslc);
 if (existsSync(naga) && existsSync(join(root, "js/core/vk-shader.ts"))) {
 	for (const name of SHADERS) {
 		const out = join(work, `${name}.spv`);
 		// subgroup builtins need Vulkan 1.1 SPIR-V
-		const r = spawnSync("glslangValidator", ["-V", "--target-env", name.startsWith("sg") ? "vulkan1.1" : "vulkan1.0", "-o", out, join(here, "shaders", name)], { encoding: "utf8" });
+		const env = name.startsWith("sg") ? "vulkan1.1" : "vulkan1.0";
+		const src = join(here, "shaders", name);
+		const r = useGlslc
+			? spawnSync(glslc, [`--target-env=${env}`, "-o", out, src], { encoding: "utf8" })
+			: spawnSync("glslangValidator", ["-V", "--target-env", env, "-o", out, src], { encoding: "utf8" });
 		if (r.status !== 0) {
-			console.log(`glslangValidator ${name}: ${r.error?.message || r.stdout}`);
+			console.log(`${useGlslc ? "glslc" : "glslangValidator"} ${name}: ${r.error?.message || r.stdout || r.stderr}`);
 			break;
 		}
 		spirv[name] = `/spv/${name}.spv`;

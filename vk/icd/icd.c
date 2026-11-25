@@ -491,7 +491,6 @@ static void pd_init(struct kw_physical_device *pd, struct kw_reply *rep)
 
 static API VkResult CALL kw_vkCreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out)
 {
-	(void)ci;
 	(void)a;
 	struct kw_link *l = link_open();
 	if (!l)
@@ -499,7 +498,16 @@ static API VkResult CALL kw_vkCreateInstance(const VkInstanceCreateInfo *ci, con
 	struct jb b = {0};
 	/* the subgroup size to report: KWVK_SUBGROUP_SIZE, else 0 (the host's
 	 * choice); the reply says what the host translates for (pd_init) */
-	jb_printf(&b, "{\"op\":\"hello\",\"version\":1,\"subgroupSize\":%u}", kw_subgroup_request());
+	jb_printf(&b, "{\"op\":\"hello\",\"version\":1,\"subgroupSize\":%u", kw_subgroup_request());
+	/* the engine's name: a hint for which way the app's viewports point,
+	 * so pipelines are made for that first (vk/PROTOCOL.md, Amendments,
+	 * "Y flip hint") */
+	const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
+	if (ai && ai->pEngineName) {
+		jb_printf(&b, ",\"engineName\":");
+		jb_str(&b, ai->pEngineName);
+	}
+	jb_printf(&b, "}");
 	struct kw_reply *rep = link_call(l, &b, NULL, 0);
 	jb_free(&b);
 	if (!rep || js_get(rep->json, "err")) {

@@ -3,7 +3,7 @@
 // tmux: a session laid out in three panes (a shell showing the README, htop,
 // and a loop printing the system's state), styled like the page. Running it
 // again attaches to the session if it still runs. tmux keeps its own prefix,
-// Ctrl-B, since the page takes Ctrl-A (Ctrl-A twice sends one on).
+// Ctrl-B, since the page takes Ctrl-A (Ctrl-A twice sends one on; not on a Mac).
 import type { TerminalApp } from "../types.ts";
 
 const CONF = `# The unkernel tmux demo's settings (source-file'd into the server).
@@ -60,7 +60,7 @@ running on Linux in this browser tab.
   Ctrl-B c   new window                  Ctrl-B n   next window
   Ctrl-B d   detach (./run.sh attaches again)
 
-tmux's prefix is Ctrl-B here: the page itself uses Ctrl-A.
+tmux's prefix is Ctrl-B here: the page itself uses Ctrl-A (not on a Mac).
 q quits htop. The settings are in tmux.conf, the layout in layout.sh.
 `;
 

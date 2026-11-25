@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Pooya Parsa <pooya@pi0.io>
-// The shortcuts HUD: while the prefix (Ctrl-A, keys.ts) is armed, a glass
+// The shortcuts HUD: while the prefix (Ctrl-A or ⌘J, keys.ts) is armed, a glass
 // panel over the page with a drawn keyboard (Keyboard) on which every key
 // bound after the prefix is lit, with its key in the corner and its
 // command's icon (icons.tsx, where one fits) and word (Command.brief), a
@@ -51,7 +51,7 @@ const ROWS: PKey[][] = [
 	[mod("caps", 1.75), ...chars("asdfghjkl"), ...chars(";'", ":\""), { k: "Enter", label: "return", w: 2.25 }],
 	[mod("shift", 2.25), ...chars("zxcvbnm"), ...chars(",./", "<>?"), mod("shift", 2.75)],
 	APPLE
-		? [mod("control", 1.5, true), mod("option", 1.25), mod("⌘", 1.5, true), { k: " ", label: "", w: 6.5 }, mod("⌘", 1.5), mod("option", 1.25), mod("control", 1.5)]
+		? [mod("control", 1.5), mod("option", 1.25), mod("⌘", 1.5, true), { k: " ", label: "", w: 6.5 }, mod("⌘", 1.5), mod("option", 1.25), mod("control", 1.5)]
 		: [mod("ctrl", 1.5, true), mod("super", 1.25), mod("alt", 1.5), { k: " ", label: "", w: 6.5 }, mod("alt", 1.5), mod("super", 1.25), mod("ctrl", 1.5)],
 ];
 /** The arrow keys, an inverted T beside the two bottom rows: [key, column, row]. */

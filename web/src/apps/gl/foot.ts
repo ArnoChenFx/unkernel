@@ -20,7 +20,7 @@ export default {
 			"runs in the guest from boot (its log is $XDG_RUNTIME_DIR/wlandr.log) and every\n" +
 			"shell has the session (echo $WAYLAND_DISPLAY says wayland-0). Where it is not\n" +
 			"(a session saved before, a killed relay), wland CMD starts it and runs CMD.\n" +
-			"The Dock's desktop tile (Ctrl-A w) switches between these windows and the\n" +
+			"The Dock's desktop tile (Ctrl-A w, ⌘J w on a Mac) switches between these windows and the\n" +
 			"others; Alt+drag moves a window, Alt+F10 maximizes it. More to try:\n" +
 			"  sudo apt-get install wl-clipboard wayland-utils\n" +
 			"  wayland-info;  echo hi | wl-copy;  wl-paste\n" +

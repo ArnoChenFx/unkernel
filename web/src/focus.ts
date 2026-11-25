@@ -8,6 +8,9 @@
 //   isTerminalEl() narrows it (never anything of wland's);
 // - isField(): a text field or a select outside the terminals (the soft
 //   keyboard's input, the Browser's address, a Settings field);
+// - hasText(): a text field of the page's with text in it, where Ctrl-A is
+//   select all and not the shortcut prefix (keys.ts); never the display's
+//   soft keyboard input, nor wland's keyboard sink (a contenteditable);
 // - inSurface(): a part of the page with its own keyboard handling: the
 //   system apps' windows (Settings, System), the modal dialogs (confirm,
 //   paste), the launcher;
@@ -44,6 +47,11 @@ const el = (t: Target): Element | null => (t && typeof (t as Element).closest ==
 export const inTerminal = (t: Target): boolean => !!el(t)?.closest(TERMINALS);
 /** A field outside the terminals (a terminal's hidden input is the guest's). */
 export const isField = (t: Target): boolean => !!el(t)?.closest(FIELDS) && !inTerminal(t);
+/** A text field with text in it, not the guest's (a terminal's input, the display's soft keyboard in #pad). */
+export const hasText = (t: Target): boolean => {
+	const f = el(t)?.closest<HTMLInputElement | HTMLTextAreaElement>("input:not([type=checkbox], [type=radio], [type=range], [type=file]), textarea");
+	return !!f && f.value !== "" && !inTerminal(f) && !f.closest("#pad");
+};
 /** In the system apps, a modal dialog or the launcher. */
 export const inSurface = (t: Target): boolean => !!el(t)?.closest(SURFACES);
 /** In the Dock, the top bar, a menu, the group stack or a top bar popover. */

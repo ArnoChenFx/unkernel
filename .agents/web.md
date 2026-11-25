@@ -349,9 +349,11 @@ deploying the page needs no kernel toolchain.
   Alpine boots in 48 MiB.
 - Keyboard shortcuts (`keys.ts`, described at its top; its `COMMANDS`
   table is what Settings' Keyboard section and the shortcuts HUD list):
-  Ctrl-A is a prefix as in GNU screen, and ⌘A too on Apple devices (it
-  takes nothing from the guest; ⌘ may stay held for the key); Ctrl-A
-  twice sends one Ctrl-A on. Digits are terminals, as windows are in
+  Ctrl-A is a prefix as in GNU screen, ⌘J on Apple devices (where Ctrl-A
+  always reaches the guest and ⌘A is select all; "Ctrl-A" in these docs
+  stands for either); Ctrl-A
+  twice sends one Ctrl-A on (⌘J twice only disarms), and in a text field
+  with text in it Ctrl-A is select all. Digits are terminals, as windows are in
   screen and tmux (0 the console; also Ctrl-Shift-digit, which terminals
   and browsers leave unused), and the arrows snap the focused window, so
   new shortcuts use letters. A new tab is n or c (as in tmux), a new
@@ -1253,7 +1255,8 @@ answered at the kernel's next yield.
   window maps focused unless it maps minimized. display.ts takes keys only
   while the Display window has the WM's focus, and the terminals ignore
   wland's elements (termtabs.ts); the page's shortcuts (Ctrl-A) still
-  come first, and Ctrl-A Ctrl-A sends Ctrl-A on to the app. Ctrl-A w and
+  come first, and Ctrl-A Ctrl-A sends Ctrl-A on to the app (on Apple
+  devices one Ctrl-A does). Ctrl-A w and
   the Dock's `#dock-wayland` (there while the relay is connected: the
   store's `wayland.attached`) go to the top Wayland window (restoring the
   top one when all are minimized), or, from a focused one, back to the
@@ -1579,7 +1582,7 @@ answered at the kernel's next yield.
   item, Escape), the wheel, a drag selection (the primary selection) and
   Ctrl+C and Ctrl+V with wl-copy and wl-paste, on the GPU path and with
   `?wlgpu=0` (`page-check.mjs --firefox`). Ctrl+A is the page's prefix
-  there as everywhere (Ctrl-A Ctrl-A sends it on). Guest memory with
+  there as everywhere but on Apple devices (Ctrl-A Ctrl-A sends it on). Guest memory with
   Firefox on a page: 730 MiB used of 1978, its processes' RSS 1.4 GiB
   (shared pages counted in each).
 - Chromium (Debian's chromium 156, 2026-11-22, headless Chromium on

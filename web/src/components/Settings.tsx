@@ -175,8 +175,7 @@ function KeysHelp() {
 						<dd className="text-muted">{c.label}</dd>
 					</div>
 				))}
-				<dt><K>{PREFIX}</K></dt><dd className="max-sm:hidden" /><dd className="text-muted">Send {PREFIX} itself to the guest</dd>
-				{APPLE && <><dt><K>⌘A</K></dt><dd className="max-sm:hidden" /><dd className="text-muted">The prefix too, as {PREFIX}; ⌘ may stay held for the key after it</dd></>}
+				{!APPLE && <><dt><K>{PREFIX}</K></dt><dd className="max-sm:hidden" /><dd className="text-muted">Send {PREFIX} itself to the guest</dd></>}
 				<dt><K>1</K>…<K>9</K></dt><dd className="text-faint max-sm:hidden">{CHORD}-1…9</dd><dd className="text-muted">Terminals 1 to 9: tabs of the Terminal windows, each its own shell ({keyFor("new-tab")} opens one; its tab closes when its shell exits)</dd>
 			</dl>
 			<H3>In Settings and System</H3>
@@ -186,7 +185,7 @@ function KeysHelp() {
 				))}
 			</dl>
 			<H3>Terminal</H3>
-			<p className="text-muted">With text selected, Ctrl-C copies instead of sending ^C; Ctrl-Shift-C always copies. On phones, pinch the terminal to change the font size; the extra keys show above the on-screen keyboard.</p>
+			<p className="text-muted">{APPLE ? "⌘C copies the selected text; Ctrl-C always sends ^C." : "With text selected, Ctrl-C copies instead of sending ^C; Ctrl-Shift-C always copies."} On phones, pinch the terminal to change the font size; the extra keys show above the on-screen keyboard.</p>
 		</>
 	);
 }

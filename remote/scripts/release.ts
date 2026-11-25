@@ -4,7 +4,7 @@
 // from the upstream release in web/kernel/release) and the backend bundle
 // (bundle.ts, run with Bun). It writes, into the output directory:
 //   unkernel-remote-app-<hash>.zip     the backend, the page, the updater and the docs
-//   unkernel-remote-kernel-<hash>.zip  the page's kernel and GL renderer
+//   unkernel-remote-kernel-<hash>.zip  the page's kernel, GL renderer and Vulkan translator
 //   manifest.json                      every install file, its asset and URL; the assets
 //   update.ps1, update.cmd, update.sh, start.sh  the updater on its own (the first download)
 //   release-notes.md, assets.txt       for the GitHub release (remote-release.yml)
@@ -29,6 +29,7 @@ const SERVER_TEMPLATE = "web/.output/server/_chunks/renderer-template.mjs";
 const PRECOMPRESSED = /\.(?:br|gz|zst)$/;
 const KERNEL_FILE = /^web\/\.output\/public\/assets\/unkernel(?:-smp)?-[A-Za-z0-9_-]+\.wasm$/;
 const GL_FILE = /^web\/\.output\/public\/assets\/virgl-[0-9a-f]+\//;
+const VK_FILE = /^web\/\.output\/public\/assets\/kwvk-naga-[0-9a-f]{16}\.wasm$/;
 const DISTRO_FILE = /^web\/\.output\/public\/distros\//;
 const ROOT_FILES = ["LICENSE", "LICENSE-MIT"];
 const REMOTE_FILES = ["start-windows.ps1", "start-windows.cmd", "unkernel-remote.example.json", "README.md", "update.ps1", "update.cmd", "update.sh", "start.sh", "start-omarchy.ps1", "start-omarchy.cmd", "start-omarchy.sh", "omarchy-desktop.cmd", "omarchy-desktop.sh"];
@@ -169,7 +170,7 @@ function main(): void {
 	for (const rel of walk(path.join(root, PUBLIC))) {
 		const r = `${PUBLIC}/${rel}`;
 		if (PRECOMPRESSED.test(r) || DISTRO_FILE.test(r)) continue;
-		staged.push({ rel: r, src: path.join(root, r), part: KERNEL_FILE.test(r) || GL_FILE.test(r) ? "kernel" : "app" });
+		staged.push({ rel: r, src: path.join(root, r), part: KERNEL_FILE.test(r) || GL_FILE.test(r) || VK_FILE.test(r) ? "kernel" : "app" });
 	}
 	for (const rel of importClosure(SERVER_TEMPLATE)) staged.push({ rel, src: path.join(root, rel), part: "app" });
 	for (const d of distros) staged.push({ rel: `${PUBLIC}/distros/${d.served}`, src: path.join(root, PUBLIC, "distros", d.served), part: "distro" });

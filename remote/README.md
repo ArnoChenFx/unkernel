@@ -97,8 +97,9 @@ Running `update.ps1` needs PowerShell 5.1 (built into Windows) or PowerShell 7.
   versions\<tag>\          one install, at the paths of the repository:
                            remote\ (the backend bundle and its worker, the start
                            scripts, the updater, the example settings, this
-                           README), web\.output\ (the page, its kernel and GL
-                           renderer, the distro images), LICENSE*, and
+                           README), web\.output\ (the page, its kernel, GL
+                           renderer and Vulkan translator, the distro images),
+                           LICENSE*, and
                            manifest.json, the release's manifest
   current.txt              the tag that runs
   update.ps1, update.cmd   the launchers; update.ps1 hands over to versions\<current>\remote\update.ps1
@@ -172,8 +173,8 @@ all uploaded:
 - `unkernel-remote-app-<hash>.zip`: the backend bundle and its worker, the page
   without its kernel, the start scripts, the updater, the example settings and
   the docs;
-- `unkernel-remote-kernel-<hash>.zip`: the page's kernel (UP and SMP) and the
-  GL renderer;
+- `unkernel-remote-kernel-<hash>.zip`: the page's kernel (UP and SMP), the GL
+  renderer and the Vulkan translator (`kwvk-naga`), all from the upstream release;
 - `manifest.json`: every install file with its size, sha256 and asset, and the
   upstream distro images with their URLs and sha256;
 - `update.ps1`, `update.cmd`, `update.sh` and `start.sh`, for the first download.
